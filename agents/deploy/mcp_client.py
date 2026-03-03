@@ -1,7 +1,8 @@
 """
-Minimal MCP client over stdio (JSON-RPC 2.0).
-Spawns the resilience MCP server (Python or Node), does initialize handshake, then list_tools / call_tool.
+Minimal MCP client over stdio (JSON-RPC 2.0) for deployment agents.
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -11,12 +12,10 @@ from pathlib import Path
 from queue import Queue
 from typing import Any
 
-from orchestrator.config import get_settings
+from agents.deploy.config import get_settings
 
-# Repo root so the Python MCP server (resilience_mcp) can be found when using -m resilience_mcp
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Optional: cache tool list per process to avoid re-spawning
 _tools_cache: list[dict[str, Any]] | None = None
 
 
@@ -43,7 +42,9 @@ def _spawn_and_request(_method: str | None, _params: dict[str, Any] | None) -> d
         return {"error": "MCP_SERVER_ARGS not set (e.g. -m resilience_mcp or path to Node server)"}
 
     env = os.environ.copy()
-    if "python" in (settings.mcp_server_command or "").lower() and "-m resilience_mcp" in (settings.mcp_server_args or ""):
+    if "python" in (settings.mcp_server_command or "").lower() and "-m resilience_mcp" in (
+        settings.mcp_server_args or ""
+    ):
         env["PYTHONPATH"] = str(_REPO_ROOT)
     try:
         proc = subprocess.Popen(
@@ -72,29 +73,27 @@ def _spawn_and_request(_method: str | None, _params: dict[str, Any] | None) -> d
         except Exception:
             return None
 
-    # 1. Initialize
-    send({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "guard-agent-orchestrator", "version": "0.1.0"},
-        },
-    })
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "guard-agent-deploy-agent", "version": "0.1.0"},
+            },
+        }
+    )
     init_resp = recv()
     if not init_resp or "result" not in init_resp:
         err = (init_resp or {}).get("error", {})
         proc.terminate()
         return {"error": err.get("message", "Initialize failed")}
 
-    # 2. Notifications/initialized
     send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    # 3. tools/list
-    req_id = 2
-    send({"jsonrpc": "2.0", "id": req_id, "method": "tools/list", "params": {}})
+    send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     resp = recv()
     proc.terminate()
     try:
@@ -127,6 +126,7 @@ def list_tools() -> list[dict[str, Any]]:
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Invoke a tool by name. Spawns server, initialize, then tools/call."""
     settings = get_settings()
+    debug_env = os.getenv("DEPLOY_AGENT_DEBUG_LLM", "").lower() in {"1", "true", "yes", "on"}
     cmd = [settings.mcp_server_command]
     if settings.mcp_server_args:
         cmd.extend(settings.mcp_server_args.strip().split())
@@ -134,7 +134,9 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": "MCP_SERVER_ARGS not set"}], "isError": True}
 
     env = os.environ.copy()
-    if "python" in (settings.mcp_server_command or "").lower() and "-m resilience_mcp" in (settings.mcp_server_args or ""):
+    if "python" in (settings.mcp_server_command or "").lower() and "-m resilience_mcp" in (
+        settings.mcp_server_args or ""
+    ):
         env["PYTHONPATH"] = str(_REPO_ROOT)
     try:
         proc = subprocess.Popen(
@@ -147,7 +149,10 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             env=env,
         )
     except FileNotFoundError:
-        return {"content": [{"type": "text", "text": f"Command not found: {settings.mcp_server_command}"}], "isError": True}
+        return {
+            "content": [{"type": "text", "text": f"Command not found: {settings.mcp_server_command}"}],
+            "isError": True,
+        }
 
     out_queue: Queue = Queue()
     reader = threading.Thread(target=_read_response_line, args=(proc, out_queue), daemon=True)
@@ -163,14 +168,27 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             return None
 
-    send({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "guard-agent-orchestrator", "version": "0.1.0"},
-        },
-    })
+    if debug_env:
+        try:
+            args_snip = json.dumps(arguments, indent=2)
+        except TypeError:
+            args_snip = str(arguments)
+        if len(args_snip) > 2000:
+            args_snip = args_snip[:2000] + "\n...[args truncated]..."
+        print(f"\n[MCP Debug] Calling tool '{name}' with arguments:\n{args_snip}\n")
+
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "guard-agent-deploy-agent", "version": "0.1.0"},
+            },
+        }
+    )
     recv()
     send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
@@ -182,5 +200,18 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         proc.kill()
 
     if not resp or "result" not in resp:
+        if debug_env:
+            print(f"[MCP Debug] Tool '{name}' returned no result or unexpected response: {resp!r}\n")
         return {"content": [{"type": "text", "text": str(resp or "No response")}], "isError": True}
-    return resp["result"]
+
+    result = resp["result"]
+    if debug_env:
+        try:
+            res_snip = json.dumps(result, indent=2)
+        except TypeError:
+            res_snip = str(result)
+        if len(res_snip) > 2000:
+            res_snip = res_snip[:2000] + "\n...[result truncated]..."
+        print(f"[MCP Debug] Tool '{name}' result:\n{res_snip}\n")
+    return result
+

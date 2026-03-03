@@ -1,4 +1,4 @@
-"""Orchestrator configuration from environment."""
+"""Agent configuration from environment (shared with deployment agents)."""
 
 import os
 from pathlib import Path
@@ -33,3 +33,4 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     return Settings()
+

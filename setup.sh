@@ -26,6 +26,27 @@ pip install -q -r "$REPO_ROOT/orchestrator/requirements.txt"
 pip install -q -r "$REPO_ROOT/resilience_mcp/requirements.txt"
 [ -f "$REPO_ROOT/shared/requirements.txt" ] && pip install -q -r "$REPO_ROOT/shared/requirements.txt" || true
 
+# Configure OpenAI API key for the deployment agent.
+# The key is stored in the build directory so that build/ is self-contained.
+BUILD_KEY_FILE="$BUILD_DIR/api_key"
+ROOT_KEY_FILE="$REPO_ROOT/api_key"
+if [ ! -f "$BUILD_KEY_FILE" ]; then
+  if [ -f "$ROOT_KEY_FILE" ]; then
+    echo "Copying OpenAI API key from $ROOT_KEY_FILE to $BUILD_KEY_FILE"
+    cp "$ROOT_KEY_FILE" "$BUILD_KEY_FILE"
+  elif [ -n "$OPENAI_API_KEY" ]; then
+    echo "Writing OpenAI API key from environment to $BUILD_KEY_FILE"
+    printf '%s\n' "$OPENAI_API_KEY" > "$BUILD_KEY_FILE"
+  else
+    echo "ERROR: OpenAI API key not configured for the deployment agent." >&2
+    echo "The setup script looks for the key in either:" >&2
+    echo "  - $ROOT_KEY_FILE (a file containing your key on a single line), or" >&2
+    echo "  - the OPENAI_API_KEY environment variable at install time." >&2
+    echo "Create one of these and re-run ./setup.sh." >&2
+    exit 1
+  fi
+fi
+
 # Runner scripts: set REPO_ROOT, activate venv, set PYTHONPATH, run example
 create_runner() {
   local name="$1"
@@ -49,7 +70,7 @@ create_runner "list_tools"       "examples/list_tools.py"
 create_runner "call_mcp_tool"    "examples/call_mcp_tool.py"
 create_runner "transform_request" "examples/transform_request.py"
 
-# Optional: script to start the orchestrator server from the build env
+# Script to start the orchestrator server from the build env
 cat > "$BUILD_DIR/run_orchestrator.sh" << 'RUNORCH'
 #!/usr/bin/env bash
 set -e
@@ -62,9 +83,70 @@ RUNORCH
 chmod +x "$BUILD_DIR/run_orchestrator.sh"
 echo "  $BUILD_DIR/run_orchestrator.sh"
 
+# Script to start the interactive agent (LLM + MCP) from the build env
+cat > "$BUILD_DIR/run_start_agent.sh" << 'RUNAGENT'
+#!/usr/bin/env bash
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/venv/bin/activate"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
+
+# Load OpenAI API key from file inside the build directory so build/ is self-contained.
+KEY_FILE="${SCRIPT_DIR}/api_key"
+if [ ! -f "$KEY_FILE" ]; then
+  echo "ERROR: OpenAI API key file not found at '$KEY_FILE'." >&2
+  echo "Re-run ./setup.sh to configure the key." >&2
+  exit 1
+fi
+
+OPENAI_API_KEY="$(head -n 1 "$KEY_FILE" | tr -d '\r\n')"
+if [ -z "$OPENAI_API_KEY" ]; then
+  echo "ERROR: api_key file exists at '$KEY_FILE' but appears to be empty." >&2
+  echo "Re-run ./setup.sh after fixing this file." >&2
+  exit 1
+fi
+export OPENAI_API_KEY
+
+exec python -m agents.deploy.start_agent "$@"
+RUNAGENT
+chmod +x "$BUILD_DIR/run_start_agent.sh"
+echo "  $BUILD_DIR/run_start_agent.sh"
+
+# Script to start the deployment agent Web UI from the build env
+cat > "$BUILD_DIR/run_deploy_webui.sh" << 'RUNWEB'
+#!/usr/bin/env bash
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$SCRIPT_DIR/venv/bin/activate"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
+
+KEY_FILE="${SCRIPT_DIR}/api_key"
+if [ ! -f "$KEY_FILE" ]; then
+  echo "ERROR: OpenAI API key file not found at '$KEY_FILE'." >&2
+  echo "Re-run ./setup.sh to configure the key." >&2
+  exit 1
+fi
+
+OPENAI_API_KEY="$(head -n 1 "$KEY_FILE" | tr -d '\r\n')"
+if [ -z "$OPENAI_API_KEY" ]; then
+  echo "ERROR: api_key file exists at '$KEY_FILE' but appears to be empty." >&2
+  echo "Re-run ./setup.sh after fixing this file." >&2
+  exit 1
+fi
+export OPENAI_API_KEY
+
+exec python -m uvicorn agents.deploy.webui:app --host 0.0.0.0 --port 8010 "$@"
+RUNWEB
+chmod +x "$BUILD_DIR/run_deploy_webui.sh"
+echo "  $BUILD_DIR/run_deploy_webui.sh"
+
 echo ""
 echo "Done. From repo root you can run:"
 echo "  ./build/run_list_tools.sh"
 echo "  ./build/run_call_mcp_tool.sh"
 echo "  ./build/run_transform_request.sh   # needs orchestrator running; set OPENAI_API_KEY for LLM"
 echo "  ./build/run_orchestrator.sh         # start the orchestrator API server"
+echo "  ./build/run_start_agent.sh          # start the interactive LLM+MCP agent"
+echo "  ./build/run_deploy_webui.sh         # start the deployment agent Web UI on http://localhost:8010"
