@@ -2,16 +2,9 @@
 LangGraph workflow for injecting VeloC-based resilient code.
 
 Workflow (from diagram):
-  0. Copy source to given workspace (ensure_directory + copy_tree); all edits happen in workspace.
-  1. Identify data to save between failures
-  2. Register these data with VeloC
-  3. Identify places in code for checkpoint/recovery (no difference failure-free vs failure-prone)
-  4. Apply VeloC to save and load checkpoint (use apply_text_patch on existing files; write_code_file only for new files or full overwrite)
-  5. Add header and CMake files for compilation
-  6. Recheck the code to ensure everything works
-  7. Complete
-
-From any step 0–6, on error → "Identify which step is wrong, fix it" → re-enter at that step.
+  0. Copy source to given workspace (ensure_directory + copy_tree); discover C/C++ sources; all edits happen in workspace.
+  1. Identify data to save between failures and inject VeloC (using only discovered file paths from step 0).
+  2. Add header and CMake files for compilation → Complete.
 """
 
 from __future__ import annotations
@@ -29,20 +22,15 @@ from agents.deploy.mcp_client import call_tool
 
 # Step names as in the workflow
 STEP_DISCOVER_SOURCES = "discover_sources"
-STEP_IDENTIFY_DATA = "identify_data"
-STEP_CODE_INJECTION = "code_injection"
+STEP_IDENTIFY_AND_INJECT = "identify_and_inject"  # merged: identify_data + code_injection
 STEP_ADD_BUILD = "add_build"
-STEP_RECHECK = "recheck"
-STEP_IDENTIFY_AND_FIX = "identify_and_fix"
 STEP_COMPLETE = "complete"
 STEP_CHECK_INPUT = "check_input"
 
 WORKFLOW_ORDER = [
     STEP_DISCOVER_SOURCES,
-    STEP_IDENTIFY_DATA,
-    STEP_CODE_INJECTION,
+    STEP_IDENTIFY_AND_INJECT,
     STEP_ADD_BUILD,
-    STEP_RECHECK,
 ]
 
 
@@ -54,7 +42,7 @@ class AgentState(TypedDict, total=False):
     workflow_plan: Dict[str, Any]
     # If set, last step reported an error; go to identify_and_fix
     workflow_error: str
-    # After identify_and_fix, which step to re-enter (e.g. "identify_data")
+    # After identify_and_fix, which step to re-enter (e.g. "identify_and_inject")
     step_to_return_to: str
     # API response fields
     status: str
@@ -156,30 +144,24 @@ VeloC integration guide:
 def _workflow_diagram_instruction() -> str:
     return """
 Workflow you are following (from diagram):
-  0. **Prepare workspace (copy + discover)** (MUST run first): Using MCP tools only (no LLM), copy the user's source tree into the given workspace path with ensure_directory + copy_tree, then list all C/C++ sources under the copied directory to select appropriate files (e.g. main drivers, MPI codes) so you work with real filenames and contents.
-  1. Identify data that needs to be saved between failures.
-  2. Plan how to register that data with VeloC (see below: VELOC_Register is C code, not an MCP tool).
-  3. Identify places in the code where we can save the registered data to checkpoint and use the saved checkpoint for recovery (ensure there is no difference between failure-free and failure-prone execution).
-  4. Apply VeloC to save and load checkpoint (inject C code via apply_text_patch).
-  5. Add header and CMake files for compilation.
-  6. Recheck the code to ensure everything works → Complete.
-
-If at any step something is wrong, the flow goes to "Identify which step is wrong, fix it" and then re-enters at the appropriate earlier step.
+  0. **Prepare workspace (copy + discover)** (MUST run first): Using MCP tools only (no LLM), copy the user's source tree into the given workspace path with ensure_directory + copy_tree, then list all C/C++ sources under the copied directory. The next step receives only these discovered file paths.
+  1. **Identify data and inject VeloC**: **Read** code files discovered from step 0, (a) identify all data that must be saved between failures, (b) inject VeloC (VELOC_Init, VELOC_Register, VELOC_Restart, VELOC_Checkpoint, VELOC_Finalize) by generating **complete new file contents** with the injected code and overwriting the existing files.
+  2. Add header and CMake files for compilation → Complete.
 
 **VeloC API vs MCP tools (critical):**
-- VELOC_Init, VELOC_Register, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize are **C library functions** provided by the VeloC library. They are **NOT** MCP tools. You must **inject them as source code** into the user's .c/.cpp files using **apply_text_patch** (search/replace that inserts the exact C line(s)). Example: search "MPI_Init(&argc, &argv);" replace "MPI_Init(&argc, &argv);\\n  VELOC_Init(MPI_COMM_WORLD, \\"myapp\\", \\"veloc.conf\\");".
-- The **only** VeloC-related MCP tool is **veloc_configure_checkpoint** (generates a config snippet for veloc.conf). All other VeloC integration is done by emitting **mcp_steps** that use read_code_file, apply_text_patch, or write_code_file to insert or create the actual C code (including every VELOC_* call).
+- VELOC_Init, VELOC_Register, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize are **C library functions** provided by the VeloC library. They are **NOT** MCP tools. You must **inject them as source code** into the user's .c/.cpp files by generating full updated file contents that include these calls and then writing those files with the MCP tool `write_code_file(path, content, overwrite=True)`. Example: read the original file with `read_code_file`, generate a complete new version that adds `VELOC_Init(MPI_COMM_WORLD, "myapp", "veloc.conf");` after `MPI_Init(&argc, &argv);`, then overwrite the original file path with the full new content.
+- The **only** VeloC-related MCP tool is **veloc_configure_checkpoint** (generates a config snippet for veloc.conf). All other VeloC integration is done by emitting **mcp_steps** that use `read_code_file` and `write_code_file` to create or replace the actual C code (including every VELOC_* call).
 
 **Path and filename rules (mandatory):**
 - Let `source_root` be the original project path and `workspace_root` be the copied project path (created in step 0 by the prepare workspace step). `workspace_root` must be **exactly** the directory path string the user provided as the workspace/output location (e.g. `examples/resilient_matrix_mul_mpi`); do not invent a different directory name.
 - For any **existing file**, you must keep the same relative path and filename: if the original file is `source_root/foo/bar/code.c` then the workspace file is `workspace_root/foo/bar/code.c`. You are **forbidden** to rename existing files (e.g. never change `code.c` to `main.c`) or move them to new directories in this workflow.
-- All `path` arguments to read_code_file, apply_text_patch, and write_code_file must be **relative to PROJECT_ROOT** and must start with `workspace_root` when referring to workspace files. `workspace_root` is a conceptual name; in tool_args you must use the concrete directory string (e.g. `examples/resilient_matrix_mul_mpi/...`), never the literal word `"workspace_root"`.
+- All `path` arguments to `read_code_file` and `write_code_file` must be **relative to PROJECT_ROOT** and must start with `workspace_root` when referring to workspace files. `workspace_root` is a conceptual name; in tool_args you must use the concrete directory string (e.g. `examples/resilient_matrix_mul_mpi/...`), never the literal word `"workspace_root"`.
 - Renaming or moving existing source files is not allowed. Do not invent new filenames for existing sources when injecting VeloC; use the exact filenames already present in the copied workspace tree.
 
 **Editing rules (mandatory):**
-- **Existing files** (e.g. .c, .cpp, .h already in the workspace): Never overwrite with write_code_file. Always use **read_code_file(path)** then **apply_text_patch(path, search, replace)** for each insertion (e.g. add #include <veloc.h>, add VELOC_Init(...), add VELOC_Register(...), add VELOC_Checkpoint(...)). Use one apply_text_patch per logical edit so the original code is preserved.
-- **New files** (e.g. veloc.conf, a new CMakeLists.txt): Use **write_code_file(path, content)** with the full content.
-- **Full overwrite** of an existing file: Use write_code_file(path, content, overwrite=True) only when you are explicitly replacing the entire file with its complete new content (e.g. you generated the full new file body). Do not use write_code_file to put a single line or partial content into an existing file.
+- **Existing files** (e.g. .c, .cpp, .h already in the workspace): Use `read_code_file(path)` to understand the current content, then generate a **complete new version** of the file that includes all original logic plus injected VeloC logic, and write it with `write_code_file(path, content, overwrite=True)`.
+- **New files** (e.g. veloc.conf, a new CMakeLists.txt): Use `write_code_file(path, content)` with the full content (and `overwrite=False` or omitted).
+- Do not emit partial text edits or refer to an `apply_text_patch` tool; that tool is not available in this workflow.
 """
 
 
@@ -278,7 +260,7 @@ Task for this step:
 
 Respond with a single JSON object (no markdown fences). Either:
 - Success: {{ "ok": true, "result": {{ ... your detailed result for this step ... }}, "mcp_steps": [ {{ "id": "...", "name": "...", "description": "...", "tool_used": "tool_name", "tool_args": {{}} }} ] }}
-  Allowed tool_used values are **only**: ensure_directory, copy_tree, read_code_file, apply_text_patch, write_code_file, veloc_configure_checkpoint, delete_path, list_project_files. There is NO tool named VELOC_Register or veloc_register—VELOC_Register is a C function; inject it by using apply_text_patch with replace string containing the C code. For existing source files use apply_text_patch only; use write_code_file only for new files or full-file overwrite. All 'path' or 'root' arguments must either equal the concrete workspace_root string (e.g. 'examples/resilient_matrix_mul_mpi') or be inside it (e.g. 'examples/resilient_matrix_mul_mpi/...'); never use the literal word 'workspace_root' in tool_args. For existing files you must keep the same relative filename as in the original project (e.g. if it was 'code.c' it must remain 'code.c'). Renaming existing files (such as 'code.c' → 'main.c') is forbidden in this workflow. Do not invent new filenames for existing code. Include tool_args.
+  Allowed tool_used values are **only**: ensure_directory, copy_tree, read_code_file, write_code_file, veloc_configure_checkpoint, delete_path, list_project_files. There is NO tool named VELOC_Register or veloc_register—VELOC_Register is a C function; inject it by generating updated C source code and writing it with write_code_file (full-file overwrite). For existing source files, you must always emit write_code_file(path, content, overwrite=True) with the **complete new file content** (do not emit partial patches). All 'path' or 'root' arguments must either equal the concrete workspace_root string (e.g. 'examples/resilient_matrix_mul_mpi') or be inside it (e.g. 'examples/resilient_matrix_mul_mpi/...'); never use the literal word 'workspace_root' in tool_args. For existing files you must keep the same relative filename as in the original project (e.g. if it was 'code.c' it must remain 'code.c'). Renaming existing files (such as 'code.c' → 'main.c') is forbidden in this workflow. Do not invent new filenames for existing code. Include tool_args.
 - Problem: {{ "ok": false, "error": "What is wrong", "wrong_step": "{wrong_steps}" }} to trigger a fix and re-run from that step."""
 
 
@@ -435,56 +417,125 @@ async def run_discover_sources(state: AgentState) -> AgentState:
     return out
 
 
-async def run_identify_data(state: AgentState) -> AgentState:
-    instruction = (
-        "Identify all application data that must be saved between failures (e.g. main loop index, "
-        "arrays, state structs). List variables, their types, and where they are defined or used."
-    )
-    return await _run_workflow_step(state, STEP_IDENTIFY_DATA, instruction)
+async def run_identify_and_inject(state: AgentState) -> AgentState:
+    """
+    Merged step: use paths from discover_sources only. Identify data to checkpoint, then inject
+    VeloC (include, init, register, restart, checkpoint, finalize) into those files.
+    """
+    plan = state.get("workflow_plan") or {}
+    discover = plan.get(STEP_DISCOVER_SOURCES) or {}
+    paths = plan.get("paths") or {}
+    workspace_root = discover.get("workspace_root") or paths.get("workspace_root") or ""
+    candidate_sources = discover.get("candidate_sources") or []
+    discovered_files = discover.get("discovered_files") or []
 
+    if not candidate_sources and not discovered_files:
+        out: AgentState = dict(state)
+        out.setdefault("workflow_plan", {})
+        out["workflow_error"] = (
+            "identify_and_inject: no discovered or candidate source files from discover_sources step. "
+            "Re-run the workflow so discover_sources populates candidate_sources."
+        )
+        out["step_to_return_to"] = STEP_DISCOVER_SOURCES
+        return out
 
-async def run_code_injection(state: AgentState) -> AgentState:
+    files_list = candidate_sources if candidate_sources else discovered_files
+    files_block = "\n".join(f"  - {f}" for f in files_list)
+    workspace_block = f"**workspace_root (use this exact path in all tool_args for paths under the workspace):** `{workspace_root}`"
+
+    # Pre-load the actual contents of each discovered source file via MCP so the LLM
+    # never has to guess the code structure. These contents are stored in the plan
+    # and included in the step prompt via _build_step_prompt.
+    inputs_snapshot: Dict[str, Any] = {
+        "workspace_root": workspace_root,
+        "files": [],
+    }
+    for path in files_list:
+        try:
+            result = call_tool("read_code_file", {"path": path, "max_bytes": 20000})
+            content = _extract_tool_result_text(result) or str(result)
+        except Exception as exc:  # noqa: BLE001
+            content = f"<error reading {path}: {exc}>"
+        inputs_snapshot["files"].append(
+            {
+                "path": path,
+                "content": content,
+            }
+        )
+
+    # Persist inputs into workflow_plan so they appear in the context JSON for this step.
+    out_plan = dict(plan)
+    out_plan["identify_and_inject_inputs"] = inputs_snapshot
+
+    # Instruction for STEP_IDENTIFY_AND_INJECT, with explicit MCP usage and VeloC algorithm guidance.
     instruction = (
-        "Using the data identified in the previous step and the discovered source files, inject complete VeloC "
-        "checkpoint/restart logic into the workspace code. Follow this algorithm, using only MCP tools to edit files:\n"
+        "You are in STEP_IDENTIFY_AND_INJECT of the VeloC workflow.\n"
         "\n"
-        "1) Inputs and context:\n"
-        "   - workflow_plan['paths'] contains 'source_root' and 'workspace_root'.\n"
-        "   - workflow_plan['discover_sources'] contains 'candidate_sources' under workspace_root.\n"
-        "   - workflow_plan['identify_data'] lists variables that must be saved across failures.\n"
+        "Inputs for this step are **only** the code file paths and workspace_root provided by discover_sources (listed below). "
+        "Do **not** invent or assume any other filenames or paths.\n"
         "\n"
-        "2) For each candidate source file under workspace_root:\n"
-        "   a) Ensure it is a C/C++ source file; then use read_code_file to inspect it.\n"
-        "   b) Locate program entry (main) and MPI_Init / MPI_Finalize, and the main time-stepping loop as described in the guide.\n"
+        "**MANDATORY – list of files discovered in the workspace (use ONLY these paths in MCP tool calls):**\n"
+        f"{files_block}\n"
+        f"\n{workspace_block}\n"
         "\n"
-        "3) For each selected file, plan and emit apply_text_patch steps that:\n"
-        "   - Add '#include <veloc.h>' at the top (respecting existing includes).\n"
-        "   - Insert VELOC_Init(...) after MPI_Init and before heavy work, using veloc.conf.\n"
-        "   - Insert VELOC_Register(...) calls after allocation of each persistent buffer identified earlier.\n"
-        "   - Insert VELOC_Restart(...) logic near the start of the main loop to restore state and set the loop index appropriately.\n"
-        "   - Insert periodic VELOC_Checkpoint(...) inside the main loop conditioned on step modulo the checkpoint interval.\n"
-        "   - Insert VELOC_Finalize() before MPI_Finalize.\n"
-        "   Each insertion must be implemented as apply_text_patch(path, search, replace) on real workspace_root-relative paths.\n"
+        "You also have the current contents of each discovered file under "
+        "workflow_plan['identify_and_inject_inputs']['files']; base all injected code strictly on those contents "
+        "(do not guess or invent missing functions or loops).\n"
         "\n"
-        "4) Semantics and safety:\n"
-        "   - Preserve the original failure-free behavior; after restart, the program must resume as if it never failed.\n"
-        "   - Do not introduce extra MPI calls or control-flow changes beyond what is needed for VeloC.\n"
-        "   - Never overwrite whole source files; always use apply_text_patch for existing .c/.cpp/.h files.\n"
+        "=== VeloC C/C++ injection algorithm (from the guide) ===\n"
+        "For each selected C/C++ source file:\n"
+        "  1) **Read the file** using the MCP tool `read_code_file` with the exact `path` from the list above.\n"
+        "  2) **Add includes**: ensure `#include <veloc.h>` is present near other system headers (e.g. after `#include <mpi.h>`).\n"
+        "  3) **Insert VELOC_Init at startup**: after `MPI_Init` (or immediately after declarations in `main` if MPI is elsewhere), "
+        "     insert a call like `VELOC_Init(MPI_COMM_WORLD, \"my_app\", \"veloc.conf\");`.\n"
+        "  4) **Insert VELOC_Register after allocation**: for each persistent state buffer (arrays, structs, etc.), "
+        "     find where it is allocated or its lifetime begins, and insert `VELOC_Register(id, ptr, size_in_bytes, VELOC_FAST);` "
+        "     with a stable id, correct pointer, and size.\n"
+        "  5) **Insert VELOC_Restart near loop start**: near the beginning of the main time-stepping loop, insert restart logic "
+        "     using `VELOC_Restart(...)` to restore all registered buffers and set the loop index so the loop resumes from the "
+        "     last checkpointed step if a restart is available.\n"
+        "  6) **Insert VELOC_Checkpoint inside the loop**: inside the main loop body, after the state update for each step, insert "
+        "     periodic checkpoints such as `if (step % checkpoint_interval == 0) { VELOC_Checkpoint(id, step); }`.\n"
+        "  7) **Insert VELOC_Finalize at shutdown**: before `MPI_Finalize`, insert `VELOC_Finalize();`.\n"
         "\n"
-        "5) In your 'result', summarize which files were modified, which variables were registered, and how restart and checkpoint "
-        "logic were wired. In 'mcp_steps', include the concrete read_code_file and apply_text_patch calls needed to realize these edits."
+        "After understanding the original file via `read_code_file`, generate a **complete new version** of the file that:\n"
+        "  - Preserves all original logic and structure (except for the added VeloC calls and minimal control-flow needed for restart).\n"
+        "  - Adds all required VeloC includes and calls in the correct places as described above.\n"
+        "\n"
+        "Then, for each modified file, emit an MCP step `write_code_file` with arguments:\n"
+        "  { \"path\": \"<same path as in the discovered list>\", \"content\": \"<full new file body>\", \"overwrite\": true }\n"
+        "so the updated file replaces the original.\n"
+        "\n"
+        "If a given file does not contain a suitable `main`/entry point, MPI_Init/Finalize, or time-stepping loop, explain this "
+        "in the result and skip injecting VeloC into that file instead of inventing new functions or loops.\n"
+        "\n"
+        "In your response:\n"
+        "  - Set 'result' to a short summary of which files were modified, which variables/buffers were treated as persistent state, "
+        "    and where VELOC_Init / VELOC_Register / VELOC_Restart / VELOC_Checkpoint / VELOC_Finalize were inserted.\n"
+        "  - Set 'mcp_steps' to an ordered list of concrete MCP tool calls that you want executed. For each modified file this "
+        "    should include at least one `read_code_file` and one `write_code_file(path, content, overwrite=True)`, using ONLY "
+        "    the file paths listed above."
     )
-    return await _run_workflow_step(state, STEP_CODE_INJECTION, instruction)
+    # For this step, we want the MCP-backed tool calls (read_code_file, write_code_file, etc.)
+    # to be executed immediately as part of the workflow, not deferred until the final plan.
+    # We also pass the enriched plan (with pre-read file contents) into the downstream prompt.
+    next_state = dict(state)
+    next_state.setdefault("workflow_plan", {})
+    next_state["workflow_plan"] = out_plan
+    return await _run_workflow_step(next_state, STEP_IDENTIFY_AND_INJECT, instruction, execute_mcp=True)
 
 
 async def run_add_build(state: AgentState) -> AgentState:
     instruction = (
-        "Add or update header includes and CMake/Makefile so the resilient code compiles. For **existing** source "
-        "files use apply_text_patch to insert #include <veloc.h> (exact search/replace). For existing CMakeLists.txt "
-        "use apply_text_patch to add VeloC include and link. Use write_code_file only for creating a new file (e.g. "
-        "a new CMakeLists.txt in the workspace) or full content of a new file."
+        "Add or update header includes and CMake/Makefile so the resilient code compiles. For **existing** source and "
+        "build files, first use read_code_file(path) to understand the current content, then generate a complete new "
+        "version of each file with the necessary VeloC includes and link flags, and write it using "
+        "write_code_file(path, content, overwrite=True). Do not emit partial text patches or use apply_text_patch; "
+        "always overwrite with the full updated file content. Use write_code_file without overwrite (or with a new path) "
+        "for creating entirely new files (e.g. a new CMakeLists.txt in the workspace)."
     )
-    return await _run_workflow_step(state, STEP_ADD_BUILD, instruction)
+    # Build-related edits should also be applied immediately via MCP tools.
+    return await _run_workflow_step(state, STEP_ADD_BUILD, instruction, execute_mcp=True)
 
 
 async def run_recheck(state: AgentState) -> AgentState:
@@ -499,8 +550,9 @@ async def _run_workflow_step(
     state: AgentState,
     step_name: str,
     step_instruction: str,
+    execute_mcp: bool = False,
 ) -> AgentState:
-    """Generic runner for one workflow step: call LLM, parse, update state."""
+    """Generic runner for one workflow step: call LLM, optionally execute MCP tools, update state."""
     out: AgentState = dict(state)
     out.setdefault("workflow_plan", {})
     out.setdefault("llm_trace", [])
@@ -530,18 +582,43 @@ async def _run_workflow_step(
     if data.get("ok") is True:
         step_result = data.get("result") or {}
         mcp_steps = data.get("mcp_steps") or []
-        step_mcp = []
+        step_mcp: List[Dict[str, Any]] = []
+        mcp_results: List[Dict[str, Any]] = []
         for i, s in enumerate(mcp_steps):
-            if isinstance(s, dict):
-                step_mcp.append({
-                    "id": s.get("id") or f"{step_name}_{i}",
-                    "name": s.get("name") or step_name,
-                    "description": s.get("description", ""),
-                    "tool_used": s.get("tool_used"),
-                    "tool_args": s.get("tool_args") or {},
-                    "order": i,
-                })
+            if not isinstance(s, dict):
+                continue
+            entry = {
+                "id": s.get("id") or f"{step_name}_{i}",
+                "name": s.get("name") or step_name,
+                "description": s.get("description", ""),
+                "tool_used": s.get("tool_used"),
+                "tool_args": s.get("tool_args") or {},
+                "order": i,
+            }
+            step_mcp.append(entry)
+            if execute_mcp:
+                tool_name = entry.get("tool_used")
+                args = entry.get("tool_args") or {}
+                if not tool_name:
+                    continue
+                try:
+                    result_obj = call_tool(tool_name, args)
+                except Exception as exc:  # noqa: BLE001
+                    out["workflow_error"] = f"Step {step_name}: MCP tool '{tool_name}' failed: {exc}"
+                    plan[step_name] = step_result
+                    out["workflow_plan"] = plan
+                    return out
+                mcp_results.append(
+                    {
+                        "id": entry["id"],
+                        "tool_used": tool_name,
+                        "tool_args": args,
+                        "result": result_obj,
+                    }
+                )
         step_result["_mcp_steps"] = step_mcp
+        if execute_mcp:
+            step_result["_mcp_results"] = mcp_results
         plan[step_name] = step_result
         out["workflow_plan"] = plan
         out["workflow_error"] = ""
@@ -555,61 +632,6 @@ async def _run_workflow_step(
         out["step_to_return_to"] = wrong
     else:
         out["step_to_return_to"] = STEP_DISCOVER_SOURCES
-    return out
-
-
-# --- identify_and_fix --------------------------------------------------------
-
-async def run_identify_and_fix(state: AgentState) -> AgentState:
-    """Identify which step is wrong and update plan; set step_to_return_to."""
-    out: AgentState = dict(state)
-    plan = dict(out.get("workflow_plan") or {})
-    err = out.get("workflow_error") or "Unknown error"
-
-    prompt = f"""The workflow reported an issue. Identify which step is wrong and how to fix it.
-
-{_workflow_diagram_instruction()}
-
-Current workflow results:
-{json.dumps(plan, indent=2)}
-
-Error: {err}
-
-{_conversation_and_context(state)}
-
-Respond with JSON only (no markdown fences):
-{{ "wrong_step": "discover_sources"|"identify_data"|"code_injection"|"add_build", "fix_description": "...", "plan_updates": {{ "step_name": {{ ... revised result for that step ... }} }} }}
-
-Use plan_updates to correct the workflow_plan for the step(s) that were wrong."""
-
-    raw = await _call_llm(prompt)
-    out["raw_llm_response"] = raw
-    trace = list(out.get("llm_trace") or [])
-    trace.append(
-        {
-            "step": STEP_IDENTIFY_AND_FIX,
-            "prompt": prompt,
-            "response": raw,
-        }
-    )
-    out["llm_trace"] = trace
-    text = _extract_json(raw)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        out["step_to_return_to"] = STEP_IDENTIFY_DATA
-        out["workflow_error"] = ""
-        return out
-
-    wrong = (data.get("wrong_step") or "").strip().lower()
-    out["step_to_return_to"] = wrong if wrong in WORKFLOW_ORDER else STEP_DISCOVER_SOURCES
-    updates = data.get("plan_updates") or {}
-    if isinstance(updates, dict):
-        for k, v in updates.items():
-            if k in WORKFLOW_ORDER:
-                plan[k] = v
-    out["workflow_plan"] = plan
-    out["workflow_error"] = ""
     return out
 
 
@@ -655,7 +677,7 @@ async def run_complete(state: AgentState) -> AgentState:
     out["plan"] = {
         "summary": summary,
         "steps": steps,
-        "transformed_code": plan.get("code_injection", {}).get("snippet") if isinstance(plan.get("code_injection"), dict) else None,
+        "transformed_code": plan.get(STEP_IDENTIFY_AND_INJECT, {}).get("snippet") if isinstance(plan.get(STEP_IDENTIFY_AND_INJECT), dict) else None,
     }
     return out
 
@@ -671,34 +693,22 @@ def route_after_check_input(state: AgentState) -> Literal["ask", "discover_sourc
 def route_after_step(
     state: AgentState,
 ) -> Literal[
-    "identify_and_fix",
     "discover_sources",
-    "identify_data",
-    "code_injection",
+    "identify_and_inject",
     "add_build",
-    "recheck",
     "complete",
 ]:
-    """From a step node: go to identify_and_fix on error, else next step or complete."""
+    """From a step node: either advance to the next step or finish."""
     if state.get("workflow_error"):
-        return "identify_and_fix"
-    plan = state.get("workflow_plan") or {}
-    if STEP_RECHECK in plan:
         return "complete"
+    plan = state.get("workflow_plan") or {}
     if STEP_ADD_BUILD in plan:
-        return "recheck"
-    if STEP_CODE_INJECTION in plan:
+        return "complete"
+    if STEP_IDENTIFY_AND_INJECT in plan:
         return "add_build"
-    if STEP_IDENTIFY_DATA in plan:
-        return "code_injection"
     if STEP_DISCOVER_SOURCES in plan:
-        return "identify_data"
-    return "identify_data"
-
-
-def route_after_fix(state: AgentState) -> str:
-    """After identify_and_fix: go back to the step indicated."""
-    return state.get("step_to_return_to") or STEP_DISCOVER_SOURCES
+        return "identify_and_inject"
+    return "identify_and_inject"
 
 
 def route_ask_end(_state: AgentState) -> Literal["__end__"]:
@@ -713,11 +723,8 @@ def build_agent_graph():
 
     workflow.add_node(STEP_CHECK_INPUT, check_input)
     workflow.add_node(STEP_DISCOVER_SOURCES, run_discover_sources)
-    workflow.add_node(STEP_IDENTIFY_DATA, run_identify_data)
-    workflow.add_node(STEP_CODE_INJECTION, run_code_injection)
+    workflow.add_node(STEP_IDENTIFY_AND_INJECT, run_identify_and_inject)
     workflow.add_node(STEP_ADD_BUILD, run_add_build)
-    workflow.add_node(STEP_RECHECK, run_recheck)
-    workflow.add_node(STEP_IDENTIFY_AND_FIX, run_identify_and_fix)
     workflow.add_node(STEP_COMPLETE, run_complete)
 
     workflow.set_entry_point(STEP_CHECK_INPUT)
@@ -728,52 +735,25 @@ def build_agent_graph():
         "discover_sources": STEP_DISCOVER_SOURCES,
     })
 
-    # discover_sources → identify_data or identify_and_fix
+    # discover_sources → identify_and_inject
     workflow.add_conditional_edges(STEP_DISCOVER_SOURCES, route_after_step, {
-        "identify_and_fix": STEP_IDENTIFY_AND_FIX,
         "discover_sources": STEP_DISCOVER_SOURCES,
-        "identify_data": STEP_IDENTIFY_DATA,
-        "code_injection": STEP_CODE_INJECTION,
+        "identify_and_inject": STEP_IDENTIFY_AND_INJECT,
         "add_build": STEP_ADD_BUILD,
-        "recheck": STEP_RECHECK,
         "complete": STEP_COMPLETE,
     })
 
-    # Step chain with error branch
-    workflow.add_conditional_edges(STEP_IDENTIFY_DATA, route_after_step, {
-        "identify_and_fix": STEP_IDENTIFY_AND_FIX,
-        "code_injection": STEP_CODE_INJECTION,
+    workflow.add_conditional_edges(STEP_IDENTIFY_AND_INJECT, route_after_step, {
+        "discover_sources": STEP_DISCOVER_SOURCES,
+        "identify_and_inject": STEP_IDENTIFY_AND_INJECT,
         "add_build": STEP_ADD_BUILD,
-        "recheck": STEP_RECHECK,
-        "complete": STEP_COMPLETE,
-    })
-    workflow.add_conditional_edges(STEP_CODE_INJECTION, route_after_step, {
-        "identify_and_fix": STEP_IDENTIFY_AND_FIX,
-        "code_injection": STEP_CODE_INJECTION,
-        "add_build": STEP_ADD_BUILD,
-        "recheck": STEP_RECHECK,
         "complete": STEP_COMPLETE,
     })
     workflow.add_conditional_edges(STEP_ADD_BUILD, route_after_step, {
-        "identify_and_fix": STEP_IDENTIFY_AND_FIX,
-        "code_injection": STEP_CODE_INJECTION,
+        "discover_sources": STEP_DISCOVER_SOURCES,
+        "identify_and_inject": STEP_IDENTIFY_AND_INJECT,
         "add_build": STEP_ADD_BUILD,
-        "recheck": STEP_RECHECK,
         "complete": STEP_COMPLETE,
-    })
-    workflow.add_conditional_edges(STEP_RECHECK, route_after_step, {
-        "identify_and_fix": STEP_IDENTIFY_AND_FIX,
-        "code_injection": STEP_CODE_INJECTION,
-        "add_build": STEP_ADD_BUILD,
-        "recheck": STEP_RECHECK,
-        "complete": STEP_COMPLETE,
-    })
-
-    workflow.add_conditional_edges(STEP_IDENTIFY_AND_FIX, route_after_fix, {
-        STEP_DISCOVER_SOURCES: STEP_DISCOVER_SOURCES,
-        STEP_IDENTIFY_DATA: STEP_IDENTIFY_DATA,
-        STEP_CODE_INJECTION: STEP_CODE_INJECTION,
-        STEP_ADD_BUILD: STEP_ADD_BUILD,
     })
 
     workflow.add_edge(STEP_COMPLETE, END)

@@ -17,15 +17,10 @@ from agents.deploy.mcp_client import call_tool, list_tools
 
 app = FastAPI(title="Guard Agent Deployment Web UI")
 
-# Run these MCP tools automatically when a plan is ready; no user confirmation.
-# Only apply_text_patch, write_code_file, delete_path require confirmation (edits to files).
-AUTO_EXECUTE_TOOLS = frozenset({
-    "ensure_directory",
-    "copy_tree",
-    "list_project_files",
-    "read_code_file",
-    "veloc_configure_checkpoint",
-})
+# The LangGraph deployment agent now executes MCP-backed steps (including file edits)
+# inside the workflow steps themselves. The Web UI no longer auto-runs MCP tools
+# based on the final plan; it only visualizes what was already executed.
+AUTO_EXECUTE_TOOLS = frozenset()
 
 GRAPH = build_agent_graph()
 
@@ -489,8 +484,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       if (Array.isArray(autoResults) && autoResults.length) {
         autoSection = `
           <div class="summary" style="margin-bottom:8px; border-color:rgba(34,197,94,0.6); background:rgba(34,197,94,0.08);">
-            <strong>Copy/setup steps run automatically</strong><br>
-            <span class="tiny">No confirmation needed for these.</span>
+            <strong>MCP-backed steps executed automatically</strong><br>
+            <span class="tiny">Includes file edits; no extra confirmation needed.</span>
             <div class="steps" style="margin-top:6px;">${autoResults.map(r =>
               `<div class="step"><div class="step-header"><div class="step-title">${escapeHtml(r.tool_used || '')}</div></div><div class="step-body">${escapeHtml((r.message || '').toString().slice(0, 200))}${(r.message || '').length > 200 ? '…' : ''}</div></div>`
             ).join('')}</div>
@@ -527,7 +522,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       });
 
       if (!stepsHtml) {
-        stepsHtml = '<div class="tiny">No file-edit steps in this plan (or they were already run).</div>';
+        stepsHtml = '<div class="tiny">All MCP-backed steps in this plan have already been executed.</div>';
       }
 
       let codeHtml = '';
@@ -562,9 +557,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
         `;
       }
 
-      const confirmLabel = steps.some(s => !executedIds.has(s.id))
-        ? 'Reply with <code>apply</code> to run the file edits above. Otherwise, describe how you would like to change the plan.'
-        : 'All steps have been run. Describe any follow-up changes you want.';
+      const confirmLabel = 'All MCP-backed steps have been executed automatically. Describe any follow-up changes or adjustments you want.';
       appendAgentBlock(`
         <div class="summary">
           <strong>Summary</strong><br>
@@ -572,7 +565,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
         </div>
         ${autoSection}
         <div style="margin-top:8px;">
-          <strong style="font-size:12px;">File-edit steps (require your confirmation)</strong>
+          <strong style="font-size:12px;">Planned MCP-backed steps</strong>
           <div class="steps">${stepsHtml}</div>
         </div>
         ${codeHtml}

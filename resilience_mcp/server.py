@@ -95,19 +95,20 @@ def read_code_file(
 def write_code_file(
     path: str,
     content: str,
-    overwrite: bool = False,
+    overwrite: bool = True,
 ) -> str:
     """
     Write a code file in the project.
 
-    Use this for: (1) creating **new** files (e.g. veloc.conf, new CMakeLists.txt),
-    or (2) **explicitly** replacing an existing file with its **complete** new content
-    (full overwrite). For modifying existing source (e.g. inserting #include or VeloC
-    calls), use read_code_file then apply_text_patch so the original code is preserved.
+    Use this for:
+      1. Creating **new** files (e.g. veloc.conf, new CMakeLists.txt), or
+      2. **Explicitly** replacing an existing file with its **complete** new content
+         (full overwrite), including any injected resilience / VeloC logic.
 
     - path: relative path from project root.
     - content: full file content to write.
-    - overwrite: if False, refuse to overwrite an existing file.
+    - overwrite: if False, refuse to overwrite an existing file. Defaults to True so
+      agents can safely regenerate files in a dedicated workspace.
     """
     target = _safe_path(path)
     if target.exists() and not overwrite:
@@ -118,46 +119,6 @@ def write_code_file(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return f"Wrote {path} ({len(content)} bytes)."
-
-
-@mcp.tool()
-def apply_text_patch(
-    path: str,
-    search: str,
-    replace: str,
-    max_replacements: int = 1,
-) -> str:
-    """
-    Apply a simple text replacement patch to a file.
-
-    This is a low-level code-editing primitive that an agent can combine
-    with read_code_file and write_code_file to iteratively inject
-    resilience code (e.g. VeLoC calls, retry wrappers).
-
-    - path: relative file path.
-    - search: substring to replace.
-    - replace: replacement text.
-    - max_replacements: maximum number of occurrences to replace
-      (<= 0 means replace all).
-    """
-    target = _safe_path(path)
-    if not target.exists():
-        return f"File not found: {path}"
-    text = target.read_text(encoding="utf-8", errors="replace")
-    occurrences = text.count(search)
-    if occurrences == 0:
-        return f"No occurrences of search text found in {path}."
-
-    if max_replacements and max_replacements > 0:
-        new_text = text.replace(search, replace, max_replacements)
-        applied = min(occurrences, max_replacements)
-    else:
-        new_text = text.replace(search, replace)
-        applied = occurrences
-
-    target.write_text(new_text, encoding="utf-8")
-    return f"Applied {applied} replacement(s) in {path}."
-
 
 @mcp.tool()
 def ensure_directory(

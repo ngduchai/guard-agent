@@ -96,7 +96,7 @@ The following guide describes how to inject VeloC checkpoint/restart into HPC ap
     {{
       "id": "step1",
       "name": "High-level change description",
-      "description": "Detailed instructions, including which files/functions to modify, which VeloC calls to insert, and any MCP tools to call (e.g. read_code_file, apply_text_patch, veloc_configure_checkpoint).",
+      "description": "Detailed instructions, including which files/functions to modify, which VeloC calls to insert, and any MCP tools to call (e.g. read_code_file for context, write_code_file with overwrite=True for full updated files, veloc_configure_checkpoint).",
       "tool_used": "tool_name_or_null",
       "tool_args": {{}},
       "order": 1
