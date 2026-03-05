@@ -145,11 +145,11 @@ def _workflow_diagram_instruction() -> str:
     return """
 Workflow you are following (from diagram):
   0. **Prepare workspace (copy + discover)** (MUST run first): Using MCP tools only (no LLM), copy the user's source tree into the given workspace path with ensure_directory + copy_tree, then list all C/C++ sources under the copied directory. The next step receives only these discovered file paths.
-  1. **Identify data and inject VeloC**: **Read** code files discovered from step 0, (a) identify all data that must be saved between failures, (b) inject VeloC (VELOC_Init, VELOC_Register, VELOC_Restart, VELOC_Checkpoint, VELOC_Finalize) by generating **complete new file contents** with the injected code and overwriting the existing files.
+  1. **Identify data and inject VeloC**: **Read** code files discovered from step 0, (a) identify all data that must be saved between failures, (b) inject VeloC (VELOC_Init, VELOC_Mem_protect, VELOC_Restart, VELOC_Checkpoint, VELOC_Finalize) by generating **complete new file contents** with the injected code and overwriting the existing files.
   2. Add header and CMake files for compilation → Complete.
 
 **VeloC API vs MCP tools (critical):**
-- VELOC_Init, VELOC_Register, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize are **C library functions** provided by the VeloC library. They are **NOT** MCP tools. You must **inject them as source code** into the user's .c/.cpp files by generating full updated file contents that include these calls and then writing those files with the MCP tool `write_code_file(path, content, overwrite=True)`. Example: read the original file with `read_code_file`, generate a complete new version that adds `VELOC_Init(MPI_COMM_WORLD, "myapp", "veloc.conf");` after `MPI_Init(&argc, &argv);`, then overwrite the original file path with the full new content.
+- VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize are **C library functions** provided by the VeloC library. They are **NOT** MCP tools. You must **inject them as source code** into the user's .c/.cpp files by generating full updated file contents that include these calls and then writing those files with the MCP tool `write_code_file(path, content, overwrite=True)`. Example: read the original file with `read_code_file`, generate a complete new version that adds `VELOC_Init(MPI_COMM_WORLD, "myapp", "veloc.conf");` after `MPI_Init(&argc, &argv);`, then overwrite the original file path with the full new content.
 - The **only** VeloC-related MCP tool is **veloc_configure_checkpoint** (generates a config snippet for veloc.conf). All other VeloC integration is done by emitting **mcp_steps** that use `read_code_file` and `write_code_file` to create or replace the actual C code (including every VELOC_* call).
 
 **Path and filename rules (mandatory):**
@@ -260,7 +260,7 @@ Task for this step:
 
 Respond with a single JSON object (no markdown fences). Either:
 - Success: {{ "ok": true, "result": {{ ... your detailed result for this step ... }}, "mcp_steps": [ {{ "id": "...", "name": "...", "description": "...", "tool_used": "tool_name", "tool_args": {{}} }} ] }}
-  Allowed tool_used values are **only**: ensure_directory, copy_tree, read_code_file, write_code_file, veloc_configure_checkpoint, delete_path, list_project_files. There is NO tool named VELOC_Register or veloc_register—VELOC_Register is a C function; inject it by generating updated C source code and writing it with write_code_file (full-file overwrite). For existing source files, you must always emit write_code_file(path, content, overwrite=True) with the **complete new file content** (do not emit partial patches). All 'path' or 'root' arguments must either equal the concrete workspace_root string (e.g. 'examples/resilient_matrix_mul_mpi') or be inside it (e.g. 'examples/resilient_matrix_mul_mpi/...'); never use the literal word 'workspace_root' in tool_args. For existing files you must keep the same relative filename as in the original project (e.g. if it was 'code.c' it must remain 'code.c'). Renaming existing files (such as 'code.c' → 'main.c') is forbidden in this workflow. Do not invent new filenames for existing code. Include tool_args.
+  Allowed tool_used values are **only**: ensure_directory, copy_tree, read_code_file, write_code_file, veloc_configure_checkpoint, delete_path, list_project_files. There is NO tool named VELOC_Mem_protect or VELOC_Mem_protect—VELOC_Mem_protect is a C function; inject it by generating updated C source code and writing it with write_code_file (full-file overwrite). For existing source files, you must always emit write_code_file(path, content, overwrite=True) with the **complete new file content** (do not emit partial patches). All 'path' or 'root' arguments must either equal the concrete workspace_root string (e.g. 'examples/resilient_matrix_mul_mpi') or be inside it (e.g. 'examples/resilient_matrix_mul_mpi/...'); never use the literal word 'workspace_root' in tool_args. For existing files you must keep the same relative filename as in the original project (e.g. if it was 'code.c' it must remain 'code.c'). Renaming existing files (such as 'code.c' → 'main.c') is forbidden in this workflow. Do not invent new filenames for existing code. Include tool_args.
 - Problem: {{ "ok": false, "error": "What is wrong", "wrong_step": "{wrong_steps}" }} to trigger a fix and re-run from that step."""
 
 
@@ -483,21 +483,11 @@ async def run_identify_and_inject(state: AgentState) -> AgentState:
         "(do not guess or invent missing functions or loops).\n"
         "\n"
         "=== VeloC C/C++ injection algorithm (from the guide) ===\n"
-        "For each selected C/C++ source file:\n"
-        "  1) **Read the file** using the MCP tool `read_code_file` with the exact `path` from the list above.\n"
-        "  2) **Add includes**: ensure `#include <veloc.h>` is present near other system headers (e.g. after `#include <mpi.h>`).\n"
-        "  3) **Insert VELOC_Init at startup**: after `MPI_Init` (or immediately after declarations in `main` if MPI is elsewhere), "
-        "     insert a call like `VELOC_Init(MPI_COMM_WORLD, \"my_app\", \"veloc.conf\");`.\n"
-        "  4) **Insert VELOC_Register after allocation**: for each persistent state buffer (arrays, structs, etc.), "
-        "     find where it is allocated or its lifetime begins, and insert `VELOC_Register(id, ptr, size_in_bytes, VELOC_FAST);` "
-        "     with a stable id, correct pointer, and size.\n"
-        "  5) **Insert VELOC_Restart near loop start**: near the beginning of the main time-stepping loop, insert restart logic "
-        "     using `VELOC_Restart(...)` to restore all registered buffers and set the loop index so the loop resumes from the "
-        "     last checkpointed step if a restart is available.\n"
-        "  6) **Insert VELOC_Checkpoint inside the loop**: inside the main loop body, after the state update for each step, insert "
-        "     periodic checkpoints such as `if (step % checkpoint_interval == 0) { VELOC_Checkpoint(id, step); }`.\n"
-        "  7) **Insert VELOC_Finalize at shutdown**: before `MPI_Finalize`, insert `VELOC_Finalize();`.\n"
-        "\n"
+        "For each selected C/C++ source file, inject VeloC function calls according to the following guide:\n"
+        "**VeloC integration guide (for this task)**\n"
+        f"{_veloc_guide_context()}\n"
+        "NOTE: End of the injection guide.\n"
+        "** POST INJECTION REQUIREMENTS **\n"
         "After understanding the original file via `read_code_file`, generate a **complete new version** of the file that:\n"
         "  - Preserves all original logic and structure (except for the added VeloC calls and minimal control-flow needed for restart).\n"
         "  - Adds all required VeloC includes and calls in the correct places as described above.\n"
@@ -511,7 +501,7 @@ async def run_identify_and_inject(state: AgentState) -> AgentState:
         "\n"
         "In your response:\n"
         "  - Set 'result' to a short summary of which files were modified, which variables/buffers were treated as persistent state, "
-        "    and where VELOC_Init / VELOC_Register / VELOC_Restart / VELOC_Checkpoint / VELOC_Finalize were inserted.\n"
+        "    and where VELOC_Init / VELOC_Mem_protect / VELOC_Restart / VELOC_Checkpoint / VELOC_Finalize were inserted.\n"
         "  - Set 'mcp_steps' to an ordered list of concrete MCP tool calls that you want executed. For each modified file this "
         "    should include at least one `read_code_file` and one `write_code_file(path, content, overwrite=True)`, using ONLY "
         "    the file paths listed above."

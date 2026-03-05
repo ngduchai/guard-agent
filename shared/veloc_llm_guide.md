@@ -100,19 +100,19 @@ For each selected source file:
    - After `MPI_Init` (or immediately after variable declarations in `main` if MPI is initialized elsewhere), insert:
      - `VELOC_Init(MPI_COMM_WORLD, "my_app", "veloc.conf");` (or a user/target-specific app name).
 
-4. **Insert `VELOC_Register` after allocation**  
+4. **Insert `VELOC_Mem_protect` after allocation**  
    - For each buffer identified as persistent state (from the identify-data step), find where it is allocated or its lifetime begins.
-   - After that point, insert `VELOC_Register(id, ptr, size_in_bytes, VELOC_FAST);` or a similar call, with:
-     - A stable integer or string `id` per buffer or logical variable.
-     - `ptr` pointing to the buffer.
-     - `size_in_bytes` matching its size (e.g. `sizeof(double) * N * M`).
+   - After that point, insert `VELOC_Mem_protect(int id, void * ptr, size_t count, size_t base_size);` or a similar call, with:
+     - `id`: An application defined id to identify the memory region, usually MPI rank of the process
+     - `ptr`: A pointer to the beginning of the memory region.
+     - `count`: The number of elements in the memory region.
+     - `base_size`: The size of each element in the memory region.
 
-5. **Insert `VELOC_Restart` near loop start**  
-   - Near the beginning of the main time-stepping loop:
-     - Insert logic to attempt a restart:
-       - If `VELOC_Restart(id, &step, ...)` (or equivalent API) reports a valid checkpoint:
-         - Restore all registered buffers.
-         - Set the loop index `step` to the recovered value so the loop resumes from the checkpointed iteration.
+5. **Insert `VELOC_Restart` before main compution loop**  
+   - Before going to the main time-stepping loop, insert `VELOC_Restart_test("my_app", int version)` where
+     - `my_app` : is the user/target-specific app name given in the `VELOC_Init` in the previous step.
+     - `max_ver` : Maximum version to restart from.
+   - This function probes for the most recent version less than max_ver that can be used to restart from. If no upper limit is desired, max_ver can be set to zero to probe for the most recent version. Specifying an upper limit is useful when the most recent version is corrupted (e.g. the restored data structures fail integrity checks) and a new restart is needed based on the preceding version. The application can repeat the process until a valid version is found or no more previous versions are available. The function returns `VELOC_FAILURE` if no version is available or a positive integer representing the most recent version otherwise. If a checkpoint is found, use the returned version to insert logic to attempt a restart with `VELOC_Restart("my_app", returned_version)`.
 
 6. **Insert `VELOC_Checkpoint` inside the loop**  
    - Inside the main loop body, after the state update for each step, insert periodic checkpointing, e.g.:
@@ -193,7 +193,7 @@ The `STEP_ADD_BUILD` node should use this guidance to produce MCP steps that mak
 
 ## 6. VeloC API vs MCP tools
 
-**Important:** `VELOC_Init`, `VELOC_Register`, `VELOC_Checkpoint`, `VELOC_Restart`, and `VELOC_Finalize` are **C library functions** provided by the VeloC library. They are **not** MCP tools. The agent must **inject them as source code** into the user's C/C++ files by generating updated file contents that contain these calls and then writing those files via `write_code_file(path, content, overwrite=True)`. Do not invent or call an MCP tool named `veloc_register` or `VELOC_Register`—there is no such tool; `VELOC_Register` is only valid as C code inside the codebase.
+**Important:** `VELOC_Init`, `VELOC_Mem_protect`, `VELOC_Checkpoint`, `VELOC_Restart`, and `VELOC_Finalize` are **C library functions** provided by the VeloC library. They are **not** MCP tools. The agent must **inject them as source code** into the user's C/C++ files by generating updated file contents that contain these calls and then writing those files via `write_code_file(path, content, overwrite=True)`. Do not invent or call an MCP tool named `veloc_register` or `VELOC_Mem_protect`—there is no such tool; `VELOC_Mem_protect` is only valid as C code inside the codebase.
 
 ---
 
@@ -208,7 +208,7 @@ The following MCP tools exposed by this server support automated injection:
   Enumerate candidate source files in the user project (e.g. `src/**/*.c`, `src/**/*.cpp`, `src/**/*.f90`). Use this to locate main programs and time-stepping loops.
 
 - `read_code_file`  
-  Fetch the contents of a file so the LLM can understand the structure and decide where to inject **C code** (e.g. VELOC_Init, VELOC_Register, VELOC_Checkpoint).
+  Fetch the contents of a file so the LLM can understand the structure and decide where to inject **C code** (e.g. VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint).
 
 - `write_code_file`  
   Create new source files (e.g. wrappers, utility modules, `veloc.conf`) or write fully regenerated source files after a transformation. Use `overwrite=True` when replacing an existing file with a complete new version that includes injected VeloC logic.
@@ -222,7 +222,7 @@ The following MCP tools exposed by this server support automated injection:
 2. **Plan VeloC integration**
    - Decide where to place:
      - `VELOC_Init` / `VELOC_Finalize`
-     - `VELOC_Register` calls
+     - `VELOC_Mem_protect` calls
      - `VELOC_Restart` logic
      - `VELOC_Checkpoint` calls
    - Call `veloc_configure_checkpoint` to synthesize a configuration comment and convert it into a `veloc.conf` file via `write_code_file`.
