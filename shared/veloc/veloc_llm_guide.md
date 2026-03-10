@@ -39,16 +39,10 @@ VeloC reads configuration from a text file (typically `veloc.conf`). This file d
 
 - **Global options**: e.g., number of protection levels, synchronous/asynchronous behavior.
 - **Storage hierarchy**: local memory, local SSD, parallel file system, etc.
-- **Paths**: where to store local and global checkpoints.
+- **Paths**: where to store scratch (local) and persistent (global) checkpoints.
 - **Policies**: frequency of flushing from fast to permanent storage, retention, compression, etc.
 
-Typical configuration knobs (names may vary; see docs for exact keys):
-
-- `scratch_dir` / `local_dir`: node-local (fast) checkpoint directory.
-- `global_dir`: shared / parallel file system checkpoint directory.
-- `max_versions`: how many versions to keep.
-- `mode`: synchronous vs. asynchronous write.
-- `compression`: compression algorithm (if enabled).
+Please refer [VeloC Configuration Spec](https://veloc.readthedocs.io/en/latest/userguide.html#configure-veloc) to generate configuration file.
 
 ### 3.1. How the agent should use configuration
 
@@ -60,8 +54,6 @@ Given user resilience requirements (e.g., checkpoint interval in seconds, storag
 4. Ensure the application either:
    - Loads `veloc.conf` from the **working directory**, or
    - Uses an environment variable or explicit path to point to the config (depending on the integration pattern).
-
-The MCP tool `veloc_configure_checkpoint` can be used to generate a **human-readable configuration snippet** and guidance. The agent can then create or update `veloc.conf` via `write_code_file`.
 
 ---
 
@@ -85,7 +77,7 @@ Work only on files under the **workspace** directory that were discovered as can
   - Loops over global timesteps or solver iterations (`for (t = 0; t < T; ++t)`, `while (!converged)`).
   - Prefer **outer loops** that represent global progress, not inner loops over local indices.
 
-### 4.2. Injection steps (per candidate file)
+### 4.2. Injection steps (per candidate file), refer to [VeloC API](https://veloc.readthedocs.io/en/latest/api.html) to inject the correct code.
 
 For each selected source file:
 
@@ -97,22 +89,14 @@ For each selected source file:
    - In the **new file content** you generate (see below), make sure the include appears near other system headers (e.g. after `#include <mpi.h>`).
 
 3. **Insert `VELOC_Init` at startup**  
-   - After `MPI_Init` (or immediately after variable declarations in `main` if MPI is initialized elsewhere), insert:
-     - `VELOC_Init(MPI_COMM_WORLD, "my_app", "veloc.conf");` (or a user/target-specific app name).
+   - After `MPI_Init` (or immediately after variable declarations in `main` if MPI is initialized elsewhere), insert `VELOC_Init` to initialize VeloC.
 
 4. **Insert `VELOC_Mem_protect` after allocation**  
-   - For each buffer identified as persistent state (from the identify-data step), find where it is allocated or its lifetime begins.
-   - After that point, insert `VELOC_Mem_protect(int id, void * ptr, size_t count, size_t base_size);` or a similar call, with:
-     - `id`: An application defined id to identify the memory region, usually MPI rank of the process
-     - `ptr`: A pointer to the beginning of the memory region.
-     - `count`: The number of elements in the memory region.
-     - `base_size`: The size of each element in the memory region.
+   - For each buffer identified as persistent state (from the identify-data step), find where it is allocated or its lifetime begins. After that point, insert `VELOC_Mem_protect` to inform VelOC to save the state when making a checkpoint and fill the state with saved checkpoint when
+   restart/recovery
 
 5. **Insert `VELOC_Restart` before main compution loop**  
-   - Before going to the main time-stepping loop, insert `VELOC_Restart_test("my_app", int version)` where
-     - `my_app` : is the user/target-specific app name given in the `VELOC_Init` in the previous step.
-     - `max_ver` : Maximum version to restart from.
-   - This function probes for the most recent version less than max_ver that can be used to restart from. If no upper limit is desired, max_ver can be set to zero to probe for the most recent version. Specifying an upper limit is useful when the most recent version is corrupted (e.g. the restored data structures fail integrity checks) and a new restart is needed based on the preceding version. The application can repeat the process until a valid version is found or no more previous versions are available. The function returns `VELOC_FAILURE` if no version is available or a positive integer representing the most recent version otherwise. If a checkpoint is found, use the returned version to insert logic to attempt a restart with `VELOC_Restart("my_app", returned_version)`.
+   - Before going to the main time-stepping loop, insert `VELOC_Restart_test` to probe for the most recent version less than max_ver that can be used to restart from. If no upper limit is desired, max_ver can be set to zero to probe for the most recent version. Specifying an upper limit is useful when the most recent version is corrupted (e.g. the restored data structures fail integrity checks) and a new restart is needed based on the preceding version. The application can repeat the process until a valid version is found or no more previous versions are available. The function returns `VELOC_FAILURE` if no version is available or a positive integer representing the most recent version otherwise. If a checkpoint is found, use the returned version to insert logic to attempt a restart with `VELOC_Restart("my_app", returned_version)`.
 
 6. **Insert `VELOC_Checkpoint` inside the loop**  
    - Inside the main loop body, after the state update for each step, insert periodic checkpointing, e.g.:
@@ -122,19 +106,11 @@ For each selected source file:
 7. **Insert `VELOC_Finalize` at shutdown**  
    - Before `MPI_Finalize`, insert `VELOC_Finalize();`.
 
-After understanding the original file via `read_code_file`, you must generate a **complete new version of the file** that:
-
-- Preserves all original logic and structure (except for the added VeloC calls and any minimal control-flow needed to support restart).
-- Adds the includes and VeloC calls described above.
-
-Then emit an MCP step using:
-
-- `write_code_file(path, content, overwrite=True)` with `content` set to the full new file body (including all original code plus the injected VeloC logic).
-
 ### 4.3. Semantic requirements
 
 - Failure-free execution and failure-prone execution (with restart) must be **semantically equivalent** once the program resumes.
 - Do not introduce extra MPI communicators or reorder collective calls.
+- Always inject code following the [Veloc API](https://veloc.readthedocs.io/en/latest/api.html),  and configuration following [VeloC Configuration](https://veloc.readthedocs.io/en/latest/userguide.html#configure-veloc) **DO NOT** invent new API/Configuration.
 - Avoid placing checkpoints inside inner loops; keep them at the global progress level.
 - Do not modify third-party or library code; limit edits to the user’s drivers / main simulation files.
 
@@ -182,57 +158,7 @@ The `STEP_ADD_BUILD` node should use this guidance to produce MCP steps that mak
   LDFLAGS  += -L$(VELOC_LIB) -lveloc_client
   ```
 
-- As with CMake, prefer adding a **separate resilient executable** target rather than overwriting the original one.
-
-### 5.5. General notes
-
-- Paths to headers and libraries are system-dependent; the agent should propose **generic patterns** and note that the user may need to adjust module names or paths according to local documentation.
-- `STEP_ADD_BUILD` should not perform non-build changes (no code injection here); it should only adjust includes and link/target configuration so that the code injected in `STEP_CODE_INJECTION` compiles and links successfully.
-
----
-
-## 6. VeloC API vs MCP tools
-
-**Important:** `VELOC_Init`, `VELOC_Mem_protect`, `VELOC_Checkpoint`, `VELOC_Restart`, and `VELOC_Finalize` are **C library functions** provided by the VeloC library. They are **not** MCP tools. The agent must **inject them as source code** into the user's C/C++ files by generating updated file contents that contain these calls and then writing those files via `write_code_file(path, content, overwrite=True)`. Do not invent or call an MCP tool named `veloc_register` or `VELOC_Mem_protect`—there is no such tool; `VELOC_Mem_protect` is only valid as C code inside the codebase.
-
----
-
-## 7. Using MCP tools for automated transformation
-
-The following MCP tools exposed by this server support automated injection:
-
-- `veloc_configure_checkpoint`  
-  Generate a human-readable VeLoC configuration summary based on checkpoint interval, directory, and compression. The agent can turn this into a `veloc.conf` file using `write_code_file`.
-
-- `list_project_files`  
-  Enumerate candidate source files in the user project (e.g. `src/**/*.c`, `src/**/*.cpp`, `src/**/*.f90`). Use this to locate main programs and time-stepping loops.
-
-- `read_code_file`  
-  Fetch the contents of a file so the LLM can understand the structure and decide where to inject **C code** (e.g. VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint).
-
-- `write_code_file`  
-  Create new source files (e.g. wrappers, utility modules, `veloc.conf`) or write fully regenerated source files after a transformation. Use `overwrite=True` when replacing an existing file with a complete new version that includes injected VeloC logic.
-
-### 7.1. Suggested agent workflow
-
-1. **Discover structure**
-   - Call `list_project_files` to find likely entry and driver files.
-   - Call `read_code_file` on top-level sources to identify `main` / driver routines and time-stepping loops.
-
-2. **Plan VeloC integration**
-   - Decide where to place:
-     - `VELOC_Init` / `VELOC_Finalize`
-     - `VELOC_Mem_protect` calls
-     - `VELOC_Restart` logic
-     - `VELOC_Checkpoint` calls
-   - Call `veloc_configure_checkpoint` to synthesize a configuration comment and convert it into a `veloc.conf` file via `write_code_file`.
-
-3. **Edit code**
-- Use `read_code_file` + LLM reasoning + `write_code_file(path, content, overwrite=True)` to regenerate entire functions, modules, or whole source files that include the injected VeloC calls.
-
-4. **Update build configuration**
-   - Identify build files (`CMakeLists.txt`, `Makefile`, etc.) via `list_project_files`.
-   - Use `read_code_file` to understand the current build configuration, then regenerate a full new version of each relevant build file (adding VeloC include paths, libraries, and resilient targets) and write it with `write_code_file(path, content, overwrite=True)`.
+Refer to [User Guide](https://veloc.readthedocs.io/en/latest/userguide.html) for more build guide.
 
 5. **Validation hints (for the user)**
    - Suggest compiling and running a short test with:

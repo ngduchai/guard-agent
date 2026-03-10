@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     # LLM: prefer OpenAI, fallback to Anthropic
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
-    llm_model: str = "gpt-4o-mini"  # or claude-3-5-haiku
+    llm_model: str = "gpt-5.2"  # or claude-3-5-haiku
     llm_provider: str = "openai"  # openai | anthropic
 
     # MCP: command to run resilience MCP server (stdio)

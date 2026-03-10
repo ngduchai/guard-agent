@@ -16,7 +16,6 @@ python -m resilience_mcp
 
 | Tool | Description |
 |------|-------------|
-| `veloc_configure_checkpoint` | Configure VeLoC checkpointing (interval, dir, compression). |
 | `load_balance_configure` | Configure load balancing (strategy, health check path). |
 | `scaler_configure` | Configure auto-scaling (min/max replicas, metric). |
 

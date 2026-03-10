@@ -4,6 +4,7 @@ Resilience MCP Server (Python).
 This server exposes:
   - Resilience planning tools (e.g., VeLoC checkpoint configuration)
   - Codebase tools for reading/writing/applying simple text edits
+  - read_url to fetch online documents for code injection and build
 
 It is intended to be called by an LLM-driven agent that is transforming
 an existing user codebase into a resilient, ready-to-deploy codebase.
@@ -11,7 +12,11 @@ an existing user codebase into a resilient, ready-to-deploy codebase.
 Run with: python -m resilience_mcp
 """
 
+import re
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from mcp.server import FastMCP
 
@@ -89,6 +94,68 @@ def read_code_file(
     if len(data) > max_bytes:
         return data[:max_bytes] + "\n... [truncated] ..."
     return data
+
+
+def _strip_html(html: str) -> str:
+    """Remove script/style blocks and HTML tags to get approximate plain text."""
+    text = re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+@mcp.tool()
+def read_url(
+    url: str,
+    max_bytes: int = 100000,
+    timeout_seconds: float = 15.0,
+    strip_html: bool = True,
+) -> str:
+    """
+    Fetch an URL and return its body as text for use in code injection or build guidance.
+
+    Use this to read online documentation (e.g. VeloC API, CMake, MPI) when the agent
+    needs up-to-date or external reference material. Only http and https URLs are allowed.
+
+    - url: full URL (e.g. https://example.com/doc.md or https://veloc.readthedocs.io/...).
+    - max_bytes: maximum response body size to return; excess is truncated (default 100000).
+    - timeout_seconds: request timeout in seconds (default 15).
+    - strip_html: if True (default), strip HTML tags and script/style from the response
+      to produce readable text; if False, return the raw body.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"Refusing to open non-http(s) URL: scheme {parsed.scheme!r} not allowed."
+    if not parsed.netloc:
+        return "Invalid URL: missing host."
+
+    req = Request(url, headers={"User-Agent": "guard-agent-resilience-mcp/1.0"})
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            body = resp.read(max_bytes + 1)
+            content_type = (resp.headers.get_content_type() or "").lower()
+    except HTTPError as e:
+        return f"HTTP error opening URL: {e.code} {e.reason}"
+    except URLError as e:
+        return f"Failed to open URL: {e.reason}"
+    except TimeoutError:
+        return f"Timeout after {timeout_seconds}s opening URL."
+    except OSError as e:
+        return f"Error opening URL: {e}"
+
+    if len(body) > max_bytes:
+        body = body[:max_bytes]
+    try:
+        text = body.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"Could not decode response as UTF-8: {e}"
+
+    if strip_html and "html" in content_type:
+        text = _strip_html(text)
+    if len(text) > max_bytes:
+        text = text[:max_bytes] + "\n... [truncated] ..."
+    return text
 
 
 @mcp.tool()
@@ -216,74 +283,47 @@ def delete_path(
     target.unlink()
     return f"Deleted file {path!r}."
 
+_VELOC_GUIDES = {
+    "general": "veloc_llm_guide.md",
+    "api": "veloc_c_api.md",
+    "config": "veloc_config.md",
+}
+
 
 @mcp.tool()
-def veloc_configure_checkpoint(
-    checkpoint_interval_seconds: int,
-    local_dir: str = "./checkpoints/local",
-    global_dir: str = "./checkpoints/global",
-    max_versions: int = 5,
-    async_flush: bool = True,
-    compression: str | None = None,
+def veloc_llm_guide(
+    guide: str = "general",
 ) -> str:
     """
-    Generate a VeLoC-style checkpoint configuration snippet.
+    Load VeloC documentation for the agent. Choose which guide(s) to load.
 
-    This helper does **not** try to mirror the full VELOC configuration
-    language. Instead, it produces a small, human-readable template that
-    the LLM or user can adapt into a `veloc.conf` file.
-
-    Parameters
-    ----------
-    checkpoint_interval_seconds:
-        Target wall-clock interval between durable checkpoints.
-    local_dir:
-        Node-local scratch directory for fast checkpoints.
-    global_dir:
-        Shared / parallel filesystem directory for durable checkpoints.
-    max_versions:
-        Maximum number of checkpoint versions to keep.
-    async_flush:
-        If true, suggest asynchronous flushing from local to global storage.
-    compression:
-        Optional compression algorithm name (e.g. "zlib", "zstd").
+    - guide: One of "general", "api", "config", or "all".
+      - general: Integration guide (when to use VeloC, injection algorithm, build guidance).
+      - api: C API reference (init, Mem_protect, Checkpoint, Restart, etc.).
+      - config: Configuration file reference (scratch, persistent, mode, etc.).
+      - all: Concatenate general + api + config (use for full code injection + config generation).
     """
-    lines: list[str] = [
-        "# Generated VeLoC configuration template",
-        "# Adjust directory paths and options to match the target system.",
-        "",
-        f"scratch_dir = {local_dir}",
-        f"global_dir = {global_dir}",
-        "",
-        f"checkpoint_interval_seconds = {checkpoint_interval_seconds}",
-        f"max_versions = {max_versions}",
-        "",
-        "# Whether to flush checkpoints asynchronously from local to global storage",
-        f"async_flush = {'1' if async_flush else '0'}",
-    ]
+    base = PROJECT_ROOT / "shared" / "veloc"
+    if not base.exists():
+        return "VeloC guides directory not found; rely on general checkpoint/restart best practices."
 
-    if compression and compression.lower() != "none":
-        lines.extend(
-            [
-                "",
-                "# Optional compression for checkpoint data",
-                f"compression = {compression}",
-            ]
-        )
-
-    lines.extend(
-        [
-            "",
-            "# NOTE:",
-            "# - Ensure this file is accessible as 'veloc.conf' from the",
-            "#   application working directory, or update your VELOC_Init",
-            "#   call to point at the correct path.",
-            "# - You may need to align option names with the VELOC version",
-            "#   installed on the target system.",
-        ]
+    to_load: list[str] = (
+        list(_VELOC_GUIDES.keys()) if guide.strip().lower() == "all" else [guide.strip().lower()]
     )
+    parts: list[str] = []
+    for key in to_load:
+        fname = _VELOC_GUIDES.get(key)
+        if not fname:
+            continue
+        path = base / fname
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8", errors="replace"))
+        else:
+            parts.append(f"[Guide {key!r} not found at {path}]")
 
-    return "\n".join(lines)
+    if not parts:
+        return "No VeloC guide found; rely on general checkpoint/restart best practices."
+    return "\n\n---\n\n".join(parts)
 
 
 def main() -> None:

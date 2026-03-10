@@ -17,7 +17,7 @@ AUTO_EXECUTE_TOOLS = frozenset({
     "copy_tree",
     "list_project_files",
     "read_code_file",
-    "veloc_configure_checkpoint",
+    "veloc_llm_guide",
 })
 
 try:

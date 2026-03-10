@@ -80,7 +80,6 @@ After running `./setup.sh`, use the scripts in `build/` to run the examples. All
 | Example | Command | Description |
 |--------|---------|-------------|
 | List MCP tools | `./build/run_list_tools.sh` | List resilience tools from the MCP server. No API key or server required. |
-| Call a tool | `./build/run_call_mcp_tool.sh` | Call `veloc_configure_checkpoint` with sample args and print the result. No API key required. |
 | Transform request | `./build/run_transform_request.sh` | Send a sample transform request to the orchestrator API. **Requires the orchestrator to be running** (see below). For real LLM plans, set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the environment used to start the orchestrator. |
 | Start orchestrator | `./build/run_orchestrator.sh` | Start the orchestrator API on port 8000 (for use with the transform request example). |
 

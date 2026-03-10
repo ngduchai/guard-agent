@@ -33,34 +33,37 @@ int main(int argc, char** argv) {
 
     const int rows_per_rank = N / size;
 
-    // Matrices
-    double A[N][N], B[N][N], C[N][N];
+    // Arrays of input matrices A and B, and accumulated result matrix.
+    // first_input[t] and second_input[t] hold the t-th input matrices.
+    double first_input[T][N][N], second_input[T][N][N];
+    double results[N][N] = {0.0};
 
     // Local buffers (rows_per_rank x N)
     double local_A[rows_per_rank][N];
     double local_C[rows_per_rank][N];
 
-    for (int t = 0; t < T; t++) {
+    // Scratch matrix on root to gather each pair-wise product.
+    double C[N][N];
 
-        // Root initializes matrices randomly for each test case
-        if (rank == 0) {
-            // Deterministic seed per test case (change if you want non-deterministic)
-            srand(1234 + t);
-
-            for (i = 0; i < N; i++) {
-                for (j = 0; j < N; j++) {
-                    A[i][j] = drand01();
-                    B[i][j] = drand01();
-                    C[i][j] = 0.0;
+    // Initialize input matrices on root only; other ranks don't need the full copies.
+    if (rank == 0) {
+        for (int t = 0; t < T; t++) {
+            for (int ii = 0; ii < N; ii++) {
+                for (int jj = 0; jj < N; jj++) {
+                    first_input[t][ii][jj] = drand01();
+                    second_input[t][ii][jj] = drand01();
                 }
             }
         }
+    }
 
-        // Broadcast B to all processes (new B every test case)
-        MPI_Bcast(B, N * N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    for (int t = 0; t < T; t++) {
 
-        // Scatter rows of A (new A every test case)
-        MPI_Scatter(A, rows_per_rank * N, MPI_DOUBLE,
+        // Broadcast B (second_input[t]) to all processes as a full N x N matrix.
+        MPI_Bcast(&second_input[t][0][0], N * N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+        // Scatter rows of A (first_input[t]) across ranks.
+        MPI_Scatter(&first_input[t][0][0], rows_per_rank * N, MPI_DOUBLE,
                     local_A, rows_per_rank * N, MPI_DOUBLE,
                     0, MPI_COMM_WORLD);
 
@@ -75,23 +78,31 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Gather results into C on root
+        // Gather results of this pair-wise multiplication into C on root.
         MPI_Gather(local_C, rows_per_rank * N, MPI_DOUBLE,
                    C, rows_per_rank * N, MPI_DOUBLE,
                    0, MPI_COMM_WORLD);
 
-        // Print result for each test case (optional)
+        // On root, accumulate this pair's product into the global results matrix.
         if (rank == 0) {
-            printf("==== Test case %d / %d ====\n", t + 1, T);
-            printf("Result Matrix C:\n");
-            for (i = 0; i < N; i++) {
-                for (j = 0; j < N; j++) {
-                    printf("%8.4f ", C[i][j]);
+            for (int ii = 0; ii < N; ii++) {
+                for (int jj = 0; jj < N; jj++) {
+                    results[ii][jj] += C[ii][jj];
                 }
-                printf("\n");
+            }
+        }
+    }
+
+    // Print the accumulated results matrix on root.
+    if (rank == 0) {
+        printf("==== Accumulated result over %d matrix pairs ====\n", T);
+        for (i = 0; i < N; i++) {
+            for (j = 0; j < N; j++) {
+                printf("%8.4f ", results[i][j]);
             }
             printf("\n");
         }
+        printf("\n");
     }
 
     MPI_Finalize();
