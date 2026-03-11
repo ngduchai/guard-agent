@@ -13,6 +13,14 @@ echo "Build directory: $BUILD_DIR"
 
 mkdir -p "$BUILD_DIR"
 
+# Copy examples into build for test/demonstration (self-contained runs from build/)
+if [ -d "$REPO_ROOT/examples" ]; then
+  echo "Copying examples to $BUILD_DIR/examples ..."
+  rm -rf "$BUILD_DIR/examples"
+  cp -r "$REPO_ROOT/examples" "$BUILD_DIR/examples"
+  echo "  $BUILD_DIR/examples"
+fi
+
 if [ ! -d "$BUILD_DIR/venv" ]; then
   echo "Creating virtualenv in build/venv ..."
   python3 -m venv "$BUILD_DIR/venv"
@@ -89,6 +97,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/venv/bin/activate"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
 
+# Project root for the agent (build dir created by setup.sh); paths like examples/ are relative to this.
+export GUARD_AGENT_PROJECT_ROOT="${SCRIPT_DIR}"
+
 # Load OpenAI API key from file inside the build directory so build/ is self-contained.
 KEY_FILE="${SCRIPT_DIR}/api_key"
 if [ ! -f "$KEY_FILE" ]; then
@@ -118,6 +129,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/venv/bin/activate"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
+
+# Project root for the agent (build dir created by setup.sh); paths like examples/ are relative to this.
+export GUARD_AGENT_PROJECT_ROOT="${SCRIPT_DIR}"
 
 KEY_FILE="${SCRIPT_DIR}/api_key"
 if [ ! -f "$KEY_FILE" ]; then

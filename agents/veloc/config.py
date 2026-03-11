@@ -6,6 +6,12 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 
 
+def _default_project_root() -> str:
+    """Project root for agent file paths when GUARD_AGENT_PROJECT_ROOT is not set."""
+    repo = Path(__file__).resolve().parents[2]
+    return str((repo / "build").resolve())
+
+
 class Settings(BaseSettings):
     """Settings loaded from env and .env."""
 
@@ -18,7 +24,17 @@ class Settings(BaseSettings):
     # Optional
     environment_type: str = os.getenv("ENVIRONMENT_TYPE", "hpc")
 
+    # Project root for paths (source_root, workspace_root, examples). Set via
+    # GUARD_AGENT_PROJECT_ROOT in env (see get_project_root).
+    project_root: str = ""
+
     model_config = {"env_file": ".env", "extra": "ignore"}
+
+
+def get_project_root() -> str:
+    """Resolved project root: env GUARD_AGENT_PROJECT_ROOT or build dir created by setup.sh."""
+    raw = (os.getenv("GUARD_AGENT_PROJECT_ROOT") or (get_settings().project_root or "")).strip()
+    return str(Path(raw).resolve()) if raw else _default_project_root()
 
 
 def get_settings() -> Settings:
