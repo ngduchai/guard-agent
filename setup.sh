@@ -23,7 +23,6 @@ echo "Activating venv and installing dependencies ..."
 . "$BUILD_DIR/venv/bin/activate"
 
 pip install -q -r "$REPO_ROOT/orchestrator/requirements.txt"
-pip install -q -r "$REPO_ROOT/resilience_mcp/requirements.txt"
 [ -f "$REPO_ROOT/shared/requirements.txt" ] && pip install -q -r "$REPO_ROOT/shared/requirements.txt" || true
 
 # Configure OpenAI API key for the deployment agent.
@@ -66,8 +65,6 @@ EOF
 }
 
 echo "Creating example runner scripts ..."
-create_runner "list_tools"       "examples/list_tools.py"
-create_runner "call_mcp_tool"    "examples/call_mcp_tool.py"
 create_runner "transform_request" "examples/transform_request.py"
 
 # Script to start the orchestrator server from the build env
@@ -83,7 +80,7 @@ RUNORCH
 chmod +x "$BUILD_DIR/run_orchestrator.sh"
 echo "  $BUILD_DIR/run_orchestrator.sh"
 
-# Script to start the interactive agent (LLM + MCP) from the build env
+# Script to start the interactive deployment agent from the build env
 cat > "$BUILD_DIR/run_start_agent.sh" << 'RUNAGENT'
 #!/usr/bin/env bash
 set -e
@@ -108,7 +105,7 @@ if [ -z "$OPENAI_API_KEY" ]; then
 fi
 export OPENAI_API_KEY
 
-exec python -m agents.deploy.start_agent "$@"
+exec python -m agents.veloc.start_agent "$@"
 RUNAGENT
 chmod +x "$BUILD_DIR/run_start_agent.sh"
 echo "  $BUILD_DIR/run_start_agent.sh"
@@ -137,16 +134,14 @@ if [ -z "$OPENAI_API_KEY" ]; then
 fi
 export OPENAI_API_KEY
 
-exec python -m uvicorn agents.deploy.webui:app --host 0.0.0.0 --port 8010 "$@"
+exec python -m uvicorn agents.veloc.webui:app --host 0.0.0.0 --port 8010 "$@"
 RUNWEB
 chmod +x "$BUILD_DIR/run_deploy_webui.sh"
 echo "  $BUILD_DIR/run_deploy_webui.sh"
 
 echo ""
 echo "Done. From repo root you can run:"
-echo "  ./build/run_list_tools.sh"
-echo "  ./build/run_call_mcp_tool.sh"
 echo "  ./build/run_transform_request.sh   # needs orchestrator running; set OPENAI_API_KEY for LLM"
 echo "  ./build/run_orchestrator.sh         # start the orchestrator API server"
-echo "  ./build/run_start_agent.sh          # start the interactive LLM+MCP agent"
+echo "  ./build/run_start_agent.sh          # start the interactive deployment agent"
 echo "  ./build/run_deploy_webui.sh         # start the deployment agent Web UI on http://localhost:8010"

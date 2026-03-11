@@ -2,19 +2,17 @@
 
 An AI agentic system that helps developers transform code **without** resilient protection into **resilient-enabled deployments** for supercomputers (HPC) or cloud. The system follows a two-component architecture.
 
-**Quick start:** `./setup.sh` then `./build/run_list_tools.sh` (see [Installation](#installation) and [Examples](#examples)).
+**Quick start:** `./setup.sh` then run the orchestrator or deployment agent (see [Installation](#installation) and [Examples](#examples)).
 
-1. **Orchestrator** – Accepts user code, description, and resilience/QoS requirements; instructs LLMs (e.g., GPT, Claude) to produce a deployment plan and optionally transformed code.
-2. **Resilience MCP Server** – A Model Context Protocol (MCP) server where resilience solutions (e.g., VeLoC checkpoint library, load balancers, scalers) register as **tools**. The LLM uses these tools to integrate resiliency into the deployment.
+1. **Orchestrator** – Accepts user code, description, and resilience/QoS requirements; uses the LLM with **OpenAI Agents SDK** and SDK-hosted tools only to produce a deployment plan.
+2. **Tools** – Only [SDK-hosted tools](https://openai.github.io/openai-agents-python/tools/#hosted-tools) (WebSearchTool, CodeInterpreterTool, optionally FileSearchTool). No custom tools are implemented.
 
 ## Architecture (high level)
 
 - **User input**: Workflow/code description + resilience/QoS constraints.
-- **Orchestrator**: Receives the prompt, discovers tools from the MCP server, calls the LLM to reason and plan, and returns a deployment/execution plan. It can consume monitoring feedback from the target environment.
-- **LLMs**: Used for reasoning and planning (e.g., which resilience tools to apply and how).
-- **Agent(s)**: Driven by the orchestrator and LLM; produce the deployment plan and interact with the MCP (tool discovery and invocation).
-- **MCP**: Registry of resilience tools; tools register here; agents use it to discover and call tools.
-- **Resilience tools**: e.g., VeLoC (checkpointing), load balance, scaler; they register with the MCP and are used in the generated deployment.
+- **Orchestrator**: Receives the prompt, calls the LLM with SDK-hosted tools (web search, code interpreter, etc.), and returns a deployment/execution plan.
+- **LLMs**: Used for reasoning and planning; they use only SDK-hosted tools (WebSearchTool, CodeInterpreterTool, etc.) via the OpenAI API.
+- **Agent(s)**: Deployment agent (OpenAI Agents SDK) and orchestrator use the same SDK tools list passed to `Agent(tools=...)`.
 
 ## Repository layout
 
@@ -23,9 +21,9 @@ The project is **all-Python**.
 ```
 guard-agent/
 ├── orchestrator/          # Orchestrator service (Python)
-├── resilience_mcp/        # MCP server for resilience tools (Python)
-├── shared/                # Shared schemas (e.g., deployment plan, requirements)
-├── examples/              # Example scripts (list tools, call tool, transform request)
+├── agents/veloc/          # VeloC code-injection agent (OpenAI Agents SDK)
+├── shared/                # Shared schemas and resilience tools (OpenAI tool specs)
+├── examples/              # Example code and transform request
 ├── build/                 # Created by setup.sh: venv + run_*.sh scripts
 ├── setup.sh               # Create build env and runner scripts
 └── README.md
@@ -37,7 +35,7 @@ guard-agent/
 
 ### Recommended: build environment (for running everything and examples)
 
-From the repository root, run the setup script. It creates a `build/` directory with a virtualenv and installs all dependencies (orchestrator, resilience MCP, shared). Runner scripts are created so you can start the API or run examples without setting `PYTHONPATH` manually.
+From the repository root, run the setup script. It creates a `build/` directory with a virtualenv and installs all dependencies (orchestrator, shared, agents). Runner scripts are created so you can start the API or run examples without setting `PYTHONPATH` manually.
 
 ```bash
 cd guard-agent
@@ -47,10 +45,10 @@ cd guard-agent
 This creates:
 
 - `build/venv/` – virtualenv with dependencies installed
-- `build/run_list_tools.sh` – list MCP tools
-- `build/run_call_mcp_tool.sh` – call a resilience tool
 - `build/run_transform_request.sh` – send a transform request to the API
 - `build/run_orchestrator.sh` – start the orchestrator server
+- `build/run_start_agent.sh` – interactive deployment agent
+- `build/run_deploy_webui.sh` – deployment agent Web UI
 
 The `build/` directory is gitignored; re-run `./setup.sh` after pulling changes if dependencies change.
 
@@ -69,7 +67,7 @@ cd ..
 PYTHONPATH=orchestrator:. python -m uvicorn orchestrator.main:app --reload
 ```
 
-The orchestrator spawns the resilience MCP server automatically; ensure the repo root is on `PYTHONPATH` when using the default `python3 -m resilience_mcp` so that the `resilience_mcp` package can be found.
+Ensure the repo root is on `PYTHONPATH` when running the orchestrator so that `shared` and `orchestrator` can be imported.
 
 ---
 
@@ -79,9 +77,9 @@ After running `./setup.sh`, use the scripts in `build/` to run the examples. All
 
 | Example | Command | Description |
 |--------|---------|-------------|
-| List MCP tools | `./build/run_list_tools.sh` | List resilience tools from the MCP server. No API key or server required. |
-| Transform request | `./build/run_transform_request.sh` | Send a sample transform request to the orchestrator API. **Requires the orchestrator to be running** (see below). For real LLM plans, set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the environment used to start the orchestrator. |
+| Transform request | `./build/run_transform_request.sh` | Send a sample transform request to the orchestrator API. **Requires the orchestrator to be running** (see below). Set `OPENAI_API_KEY` in the environment used to start the orchestrator for LLM plans. |
 | Start orchestrator | `./build/run_orchestrator.sh` | Start the orchestrator API on port 8000 (for use with the transform request example). |
+| List tools (API) | `curl http://127.0.0.1:8000/v1/tools` | List resilience tools exposed by the orchestrator (with orchestrator running). |
 
 **Run the transform example (two terminals):**
 
@@ -101,8 +99,6 @@ After running `./setup.sh`, use the scripts in `build/` to run the examples. All
 ```bash
 source build/venv/bin/activate
 export PYTHONPATH="$(pwd)/orchestrator:$(pwd)"
-python examples/list_tools.py
-python examples/call_mcp_tool.py
 python examples/transform_request.py    # optional: pass base URL as first argument
 ```
 
@@ -110,9 +106,9 @@ More detail: `examples/README.md`.
 
 ---
 
-## Adding a new resilience tool
+## Tools
 
-Add a new `@mcp.tool()` function in `resilience_mcp/server.py` (or a module it imports). The orchestrator discovers it automatically via MCP `tools/list`.
+The deploy agent and orchestrator use **only SDK-hosted tools** from the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/tools/#hosted-tools): `WebSearchTool`, `CodeInterpreterTool`, and optionally `FileSearchTool` (if `OPENAI_VECTOR_STORE_IDS` is set). No custom function tools are implemented; tools are passed to `Agent(tools=get_sdk_tools_list())` from `agents.veloc._sdk_loader`.
 
 ---
 
@@ -120,11 +116,8 @@ Add a new `@mcp.tool()` function in `resilience_mcp/server.py` (or a module it i
 
 | Context | Variable | Description |
 |--------|----------|-------------|
-| Orchestrator | `OPENAI_API_KEY` | OpenAI API key (for `LLM_PROVIDER=openai`). |
-| Orchestrator | `ANTHROPIC_API_KEY` | Anthropic API key (for `LLM_PROVIDER=anthropic`). |
-| Orchestrator | `LLM_PROVIDER` | `openai` (default) or `anthropic`. |
-| Orchestrator | `LLM_MODEL` | Model name (e.g. `gpt-4o-mini`, `claude-3-5-haiku`). |
-| Orchestrator | `MCP_SERVER_COMMAND` | Command to run the MCP server (default `python3`). |
-| Orchestrator | `MCP_SERVER_ARGS` | Arguments (default `-m resilience_mcp`). |
+| Orchestrator | `OPENAI_API_KEY` | OpenAI API key for the orchestrator LLM. |
+| Orchestrator | `ORCHESTRATOR_LLM_MODEL` | Model name (e.g. `gpt-4o`, default `gpt-4o`). |
 | Orchestrator | `ENVIRONMENT_TYPE` | Optional; e.g. `hpc`, `cloud`. |
-| Resilience MCP | — | None required when run by the orchestrator. |
+| Deployment agent | `OPENAI_API_KEY` | OpenAI API key (used by build scripts from `build/api_key`). |
+| Optional | `OPENAI_VECTOR_STORE_IDS` | Comma-separated vector store IDs to enable FileSearchTool for the agent/orchestrator. |

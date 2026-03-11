@@ -1,6 +1,2 @@
-"""
-Agents package.
-
-This top-level package groups different AI agents used by guard-agent.
-"""
-
+# Agents package: VeloC and other deployment agents.
+# The OpenAI Agents SDK is also named "agents"; use agents.veloc._sdk_loader for SDK symbols.

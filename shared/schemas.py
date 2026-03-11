@@ -1,6 +1,6 @@
 """
 Shared schemas for deployment plans, resilience requirements, and tool metadata.
-Used by both orchestrator and (via serialization) MCP tool descriptors.
+Used by the orchestrator and deployment agent.
 """
 
 from enum import Enum
@@ -44,7 +44,7 @@ class DeploymentStep(BaseModel):
     id: str
     name: str
     description: str
-    tool_used: str | None = Field(None, description="MCP tool name if this step uses one")
+    tool_used: str | None = Field(None, description="Tool name if this step uses one")
     tool_args: dict[str, Any] = Field(default_factory=dict)
     order: int = 0
 
