@@ -27,8 +27,11 @@ try:
     WebSearchTool = getattr(_sdk_module, "WebSearchTool", None)
     FileSearchTool = getattr(_sdk_module, "FileSearchTool", None)
     CodeInterpreterTool = getattr(_sdk_module, "CodeInterpreterTool", None)
+    FunctionTool = getattr(_sdk_module, "FunctionTool", None)
+    function_tool = getattr(_sdk_module, "function_tool", None)
 except ImportError:
     Agent = Runner = WebSearchTool = FileSearchTool = CodeInterpreterTool = None
+    FunctionTool = function_tool = None
 finally:
     sys.path[:] = _old_path
     if _our_agents is not None:

@@ -534,6 +534,23 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       `);
     }
 
+    function renderSuccess(summary, raw) {
+      outputModeEl.textContent = 'Success';
+      const rawSection = raw ? `
+        <details style="margin-top:6px;">
+          <summary>Show raw LLM response</summary>
+          <pre class="code-block">${escapeHtml(raw)}</pre>
+        </details>
+      ` : '';
+      appendAgentBlock(`
+        <div class="summary" style="border-color:#166534; background:rgba(22,101,52,0.1);">
+          <strong style="color:#86efac;">Task completed successfully</strong><br>
+          <div style="white-space:pre-wrap; margin-top:6px;">${escapeHtml(summary || 'No summary provided.')}</div>
+        </div>
+        ${rawSection}
+      `);
+    }
+
     function renderError(message, raw) {
       outputModeEl.textContent = 'Error';
       const rawSection = raw ? `
@@ -623,6 +640,12 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
             data.llm_trace || null,
             null
           );
+        } else if (status === 'success') {
+          setStatus('Task completed successfully.', 'idle');
+          renderSuccess(
+            data.summary || '',
+            data.raw_llm_response || null
+          );
         } else {
           setStatus('Agent returned an error.', 'error');
           renderError(
@@ -709,6 +732,7 @@ async def api_chat(request: Request) -> JSONResponse:
     status = result.get("status", "error")
     assistant_question = result.get("assistant_question")
     plan = result.get("plan")
+    summary = result.get("summary")
     raw_llm = result.get("raw_llm_response")
     llm_trace = result.get("llm_trace")
 
@@ -717,6 +741,7 @@ async def api_chat(request: Request) -> JSONResponse:
             "status": status,
             "assistant_question": assistant_question,
             "plan": plan,
+            "summary": summary,
             "raw_llm_response": raw_llm,
             "llm_trace": llm_trace,
             "state": combined_state,

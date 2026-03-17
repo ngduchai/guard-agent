@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from agents.veloc.config import get_settings, get_project_root
 from agents.veloc._sdk_loader import get_sdk_tools_list
+from agents.veloc.filesync_tools import list_directory, read_file, write_file
 
 
 def _veloc_agent_instructions() -> str:
@@ -22,34 +23,46 @@ def _veloc_agent_instructions() -> str:
 
 You have SDK-hosted tools available (e.g. web search, code interpreter). Use them when helpful to look up VeloC documentation, checkpoint/restart patterns, and resilience best practices.
 
+You have custom tools to access and modify files on the user's machine (paths are relative to the project root):
+- list_directory(dir_path): List files and subdirectories in a directory. Returns entry names, type (file/dir), and file sizes.
+- read_file(file_path): Read the full contents of a text file.
+- write_file(file_path, contents): Write contents to a file; creates parent directories if needed.
+Use these tools to read the user's code, then write back modified or new files (e.g. VeloC-instrumented code and config) under the output path they specify.
+
 ## Workflow
 
-1. **Check input.**
+Step1. **Check input.**
 If the user has not clearly described their application, target environment, or resilience
 requirements, ask the user to provide the missing information until all information is provided.
 
-2. **If you have enough information, then Prepare the workspace.**
-Create a new workspace directory, ask the user to provide the path to the workspace directory
-if it is not provided, and copy the code to the workspace directory.
+Step 2. **If you have enough information, then Prepare the workspace.**
+Use list_directory and read_file on the user's input path (e.g. examples/matrix_mul_mpi) to load the code. Ask for the path if not provided.
 
-3. ** Apply VeloC for resiliency**,
-Use your tools to research VeloC API usage, configuration, and integration patterns as needed,
-then modify the workspace code to apply VeloC checkpoints and configuration to meet the user's
-resilience requirements.
-The VeloC API/Configuration and related guides are available at [VeloC API docs](https://veloc.readthedocs.io/en/latest/).
+Step 3. ** Apply VeloC for resiliency**,
+Using the code you read from the user's machine, discover:
+- the workflow structure of the code
+- critical data that needs to be checkpointed
+- identify the control patterns to detect where and when to checkpoint the critical data
+apply VeloC checkpoints and configuration to the code to meet the user's resilience requirements.
+The VeloC API are available at [VeloC API](https://veloc.readthedocs.io/en/latest/api.html#api-specifications).
+The VeloC Configuration is available at [VeloC Configuration](https://veloc.readthedocs.io/en/latest/userguide.html#execution).
 
-4. **Build the code.**
-Check if the workspace has any build system.
+Step 4. **Build the code.**
+Write the VeloC-instrumented files with write_file to the user's output path. Check if the project has a build system (e.g. CMakeLists.txt, Makefile).
 If there is a build system, use your tools to build the code with this build system.
 If there is no build system, use your tools to build the code with the CMake build system.
 For VeloC, if it is not installed, download it from the
 [VeloC GitHub repository](https://github.com/ECP-VeloC/VELOC)
 and install it in the workspace directory then integrate it into the build system.
 
-5. **Run the code.**
+Step 5. **Run the code.**
 Use your tools to run the code in the workspace directory.
 If the code is not running, use your tools to debug the code until it is running.
-if the code is running, complete the task and return a summary of the task completion.
+
+Step 6. **Complete the task.**
+Ensure all modified and new files have been written to the user's output path with write_file. Return a summary of the task and the paths written.
+
+**After completing a step, return a summary of the task and plan for the next step, then ask the user if they want to continue or stop.**
 
 **Output format.** For every step above, unless you need to ask the user for more information,
 silently proceed to the next step until complete with sucess status.
@@ -175,11 +188,12 @@ def get_veloc_agent():
     if Agent is None:
         raise RuntimeError("OpenAI Agents SDK (openai-agents) is not installed")
     settings = get_settings()
+    tools = get_sdk_tools_list() + [list_directory, read_file, write_file]
     return Agent(
         name="VeloC injection",
         instructions=_veloc_agent_instructions(),
         model=settings.llm_model,
-        tools=get_sdk_tools_list(),
+        tools=tools,
     )
 
 
@@ -240,7 +254,17 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     user_message = "\n\n".join(parts) if parts else ""
 
     agent = get_veloc_agent()
-    result = await Runner.run(agent, user_message)
+    try:
+        result = await Runner.run(agent, user_message, max_turns=20)
+    except Exception as exc:
+        # Surface MaxTurnsExceeded and similar errors back to the user as a structured error.
+        return {
+            "status": "error",
+            "assistant_question": f"Agent run failed: {exc!r}",
+            "plan": None,
+            "raw_llm_response": "",
+            "llm_trace": [],
+        }
     raw = (result.final_output or "").strip()
     llm_trace = []  # SDK doesn't expose per-step trace the same way; optional: from result.new_items
 
@@ -285,10 +309,19 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
             "raw_llm_response": raw,
             "llm_trace": llm_trace,
         }
+    if status == "success":
+        return {
+            "status": "success",
+            "assistant_question": None,
+            "summary": str(data.get("summary", "")),
+            "plan": None,
+            "raw_llm_response": raw,
+            "llm_trace": llm_trace,
+        }
 
     return {
         "status": "error",
-        "assistant_question": str(data.get("assistant_question", raw[:500])),
+        "assistant_question": str(data.get("assistant_question", data.get("error_message", raw[:500]))),
         "plan": None,
         "raw_llm_response": raw,
         "llm_trace": llm_trace,
