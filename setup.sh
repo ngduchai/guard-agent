@@ -32,6 +32,7 @@ echo "Activating venv and installing dependencies ..."
 
 pip install -q -r "$REPO_ROOT/orchestrator/requirements.txt"
 [ -f "$REPO_ROOT/shared/requirements.txt" ] && pip install -q -r "$REPO_ROOT/shared/requirements.txt" || true
+[ -f "$REPO_ROOT/validation/requirements.txt" ] && pip install -q -r "$REPO_ROOT/validation/requirements.txt" || true
 
 # Configure OpenAI API key for the deployment agent.
 # The key is stored in the build directory so that build/ is self-contained.

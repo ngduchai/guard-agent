@@ -13,3 +13,8 @@ add_executable(art_simple_main main.cc art_simple.cc)
 
 # Link the HDF5, VeloC client, and MPI C++ libraries
 target_link_libraries(art_simple_main HDF5::HDF5 veloc-client MPI::MPI_CXX)
+
+# Install configuration files needed at runtime into the build tree.
+# The validator will run `cmake --install` with the install prefix set
+# to the build directory so that files like veloc.cfg are available.
+install(FILES veloc.cfg DESTINATION .)

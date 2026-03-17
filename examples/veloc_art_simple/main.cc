@@ -56,7 +56,7 @@ int saveAsHDF5(const char* fname, float* recon, hsize_t* output_dims) {
 int main(int argc, char* argv[])
 {
 
-    if(argc != 7) {
+    if(argc != 8) {
         std::cerr << "Usage: " << argv[0] << " <filename> <center> <num_outer_iter> <num_iter> <beginning_sino> <num_sino>" << std::endl;
         return 1;
     }
@@ -69,7 +69,7 @@ int main(int argc, char* argv[])
     int num_iter = atoi(argv[4]);
     int beg_index = atoi(argv[5]);
     int nslices = atoi(argv[6]);
-    const char* check_point_config = "veloc.cfg";
+    const char* check_point_config = argv[7];
 
     std::cout << "Reading data..." << std::endl;
 
