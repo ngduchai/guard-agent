@@ -25,9 +25,15 @@ def configure_and_build(source_dir: Path, build_dir: Path, run_install: bool = F
     """
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configure only if not already configured (no CMakeCache.txt).
+    # Consider the build "configured" only if CMakeCache.txt and a generator
+    # build file (e.g., Makefile or build.ninja) exist. This handles cases
+    # where the cache remains but the build files were cleaned.
     cache = build_dir / "CMakeCache.txt"
-    if not cache.exists():
+    makefile = build_dir / "Makefile"
+    ninja_file = build_dir / "build.ninja"
+    configured = cache.exists() and (makefile.exists() or ninja_file.exists())
+
+    if not configured:
         code = run_cmd(["cmake", "-S", str(source_dir), "-B", str(build_dir)])
         if code != 0:
             raise RuntimeError("CMake configuration failed")

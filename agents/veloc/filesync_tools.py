@@ -37,6 +37,33 @@ def _resolve_path_relative_to_root(path: str) -> str:
     return abs_path
 
 
+def _resolve_write_path(path: str) -> str:
+    """
+    Resolve a write path under an explicit output root.
+
+    To prevent accidental modifications of the repository, writes are restricted to
+    GUARD_AGENT_OUTPUT_ROOT when set. This should be a path under the project root.
+    """
+    root = os.path.abspath(get_project_root())
+    out_root_raw = (os.getenv("GUARD_AGENT_OUTPUT_ROOT") or "").strip()
+    if not out_root_raw:
+        raise PermissionError(
+            "Writes are restricted. Set GUARD_AGENT_OUTPUT_ROOT to an output directory under the project root."
+        )
+    out_root = os.path.abspath(os.path.join(root, out_root_raw)) if not os.path.isabs(out_root_raw) else os.path.abspath(out_root_raw)
+    out_root = os.path.normpath(out_root)
+    if not out_root.startswith(root):
+        raise PermissionError("GUARD_AGENT_OUTPUT_ROOT must be under the project root.")
+    if os.path.isabs(path):
+        abs_path = os.path.abspath(path)
+    else:
+        abs_path = os.path.abspath(os.path.join(out_root, path))
+    abs_path = os.path.normpath(abs_path)
+    if not abs_path.startswith(out_root):
+        raise PermissionError(f"Write path is outside output root: {path}")
+    return abs_path
+
+
 @function_tool
 def list_directory(dir_path: str) -> Dict[str, Any]:
     """List entries (files and subdirectories) in a directory on the user's machine.
@@ -107,7 +134,7 @@ def write_file(file_path: str, contents: str) -> Dict[str, Any]:
         or 'error' if the write failed.
     """
     try:
-        resolved = _resolve_path_relative_to_root(file_path)
+        resolved = _resolve_write_path(file_path)
         os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
         with open(resolved, "w", encoding="utf-8") as f:
             f.write(contents)

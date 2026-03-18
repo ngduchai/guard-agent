@@ -97,7 +97,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--delay-seconds",
         type=float,
-        default=5.0,
+        default=10.0,
         help="Seconds to wait before starting to search for a target rank",
     )
     parser.add_argument(

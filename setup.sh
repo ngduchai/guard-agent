@@ -7,11 +7,13 @@ set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
+DEFAULT_OUTPUT_ROOT_REL="examples_output"
 
 echo "Repository root: $REPO_ROOT"
 echo "Build directory: $BUILD_DIR"
 
 mkdir -p "$BUILD_DIR"
+mkdir -p "$REPO_ROOT/$DEFAULT_OUTPUT_ROOT_REL"
 
 # Copy examples into build for test/demonstration (self-contained runs from build/)
 if [ -d "$REPO_ROOT/examples" ]; then
@@ -98,8 +100,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/venv/bin/activate"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
 
-# Project root for the agent (build dir created by setup.sh); paths like examples/ are relative to this.
-export GUARD_AGENT_PROJECT_ROOT="${SCRIPT_DIR}"
+# Project root for the agent (full repo); paths like examples/ are relative to this.
+export GUARD_AGENT_PROJECT_ROOT="${REPO_ROOT}"
+
+# Restrict agent writes to an explicit output directory (relative to repo root).
+# Users should supply an output folder like `examples_output/...`; the UI/runner
+# can set this env var accordingly before launching. We default to a safe sandbox
+# under examples_output/ so the repo root stays clean.
+export GUARD_AGENT_OUTPUT_ROOT="${GUARD_AGENT_OUTPUT_ROOT:-examples_output}"
 
 # Load OpenAI API key from file inside the build directory so build/ is self-contained.
 KEY_FILE="${SCRIPT_DIR}/api_key"
@@ -131,8 +139,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/venv/bin/activate"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/agents"
 
-# Project root for the agent (build dir created by setup.sh); paths like examples/ are relative to this.
-export GUARD_AGENT_PROJECT_ROOT="${SCRIPT_DIR}"
+# Project root for the agent (full repo); paths like examples/ are relative to this.
+export GUARD_AGENT_PROJECT_ROOT="${REPO_ROOT}"
+
+# Restrict agent writes to an explicit output directory (relative to repo root).
+export GUARD_AGENT_OUTPUT_ROOT="${GUARD_AGENT_OUTPUT_ROOT:-examples_output}"
 
 KEY_FILE="${SCRIPT_DIR}/api_key"
 if [ ! -f "$KEY_FILE" ]; then

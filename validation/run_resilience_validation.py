@@ -374,7 +374,9 @@ def main(argv: list[str] | None = None) -> int:
         success_output_filename=args.output_file_name,
     )
 
-    baseline_output_file = baseline_build / args.output_file_name
+    # Keep all validation artifacts under output_root; do not assume the baseline
+    # writes outputs into its build directory.
+    baseline_output_file = baseline_out_dir / args.output_file_name
     resilient_output_file = resilient_out_dir / args.output_file_name
 
     print(f"  baseline:  {baseline_output_file}", flush=True)
