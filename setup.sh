@@ -26,6 +26,10 @@ if [ -d "$BUILD_DIR/examples_output" ]; then
   rm -rf "$BUILD_DIR/examples_output"
   echo "  Removed $BUILD_DIR/examples_output"
 fi
+if [ -d "$BUILD_DIR/data" ]; then
+  rm -rf "$BUILD_DIR/data"
+  echo "  Removed $BUILD_DIR/data"
+fi
 shopt -s nullglob
 matches=( "$BUILD_DIR"/validation*/ )
 if [ ${#matches[@]} -gt 0 ]; then
@@ -35,10 +39,15 @@ fi
 shopt -u nullglob
 
 # Copy examples into build for test/demonstration (self-contained runs from build/)
-if [ -d "$REPO_ROOT/examples" ]; then
+if [ -d "$REPO_ROOT/tests/examples" ]; then
   echo "Copying examples to $BUILD_DIR/examples ..."
   cp -r "$REPO_ROOT/tests/examples" "$BUILD_DIR/examples"
   echo "  $BUILD_DIR/examples"
+fi
+if [ -d "$REPO_ROOT/tests/data" ]; then
+  echo "Copying data to $BUILD_DIR/data ..."
+  cp -r "$REPO_ROOT/tests/data" "$BUILD_DIR/data"
+  echo "  $BUILD_DIR/data"
 fi
 
 if [ ! -d "$BUILD_DIR/venv" ]; then

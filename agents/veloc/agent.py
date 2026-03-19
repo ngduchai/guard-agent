@@ -6,7 +6,8 @@ checkpoint/resilience requirements, then:
   1. Explores the codebase using filesystem tools.
   2. Injects VeloC checkpoint calls where needed.
   3. Writes the modified files back to the output directory.
-  4. Validates the resilient version against the baseline. 
+  4. Designs and writes a validation script tailored to the application's
+     structure, then asks the user to run it and report results.
 
 Implementation uses the ``openai`` Python client directly with a manual
 tool-calling loop, so it works with **any OpenAI-compatible API endpoint**:
@@ -21,23 +22,25 @@ Streaming / observability
 ``stream_veloc_agent`` is an async generator that yields structured event dicts
 so callers (e.g. the web UI) can show live progress:
 
-  {"type": "thinking",   "turn": N, "text": "..."}
-  {"type": "tool_call",  "turn": N, "name": "...", "args": {...}}
-  {"type": "tool_result","turn": N, "name": "...", "result": "..."}
-  {"type": "done",       "result": {...}}   # final structured result dict
-  {"type": "error",      "message": "..."}
+  {"type": "thinking",      "turn": N, "text": "..."}
+  {"type": "step_summary",  "turn": N, "step": N, "name": "...", "why": "...",
+                             "how": "...", "tools": [...], "result": "..."}
+  {"type": "tool_call",     "turn": N, "name": "...", "args": {...}}
+  {"type": "tool_result",   "turn": N, "name": "...", "result": "..."}
+  {"type": "done",          "result": {...}}   # final structured result dict
+  {"type": "error",         "message": "..."}
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 from typing import Any, AsyncIterator, Callable, Dict, List, Tuple
 
 from agents.veloc.config import get_llm_client, get_project_root, get_settings
-from agents.veloc.filesync_tools import list_directory, read_file, write_file
-from agents.veloc.validation_tools import validate_resilient_output
+from agents.veloc.filesync_tools import execute_script, list_directory, read_file, remove_file, write_file
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +58,50 @@ All file paths you use with the filesystem tools must be relative to this root.
 - `list_directory(dir_path)` – list files and subdirectories.
 - `read_file(file_path)` – read a source file.
 - `write_file(file_path, contents)` – write a file (creates parent dirs).
+- `remove_file(file_path)` – delete a single file inside BUILD_DIR.
+  Returns `removed` (True/False) and, on failure, an `error` message.
+  Only files inside BUILD_DIR may be removed; any other path returns an error.
+  Directories cannot be removed with this tool.
+- `execute_script(script_path, timeout)` – execute a bash script that already exists inside BUILD_DIR.
+  Returns `returncode`, `stdout`, `stderr`, and `timed_out`.
+  The script runs with `cwd=BUILD_DIR`, `HOME=BUILD_DIR`, and a restricted `PATH`.
+  It **cannot** access or modify files outside BUILD_DIR.
+  Use `write_file` first to create the script, then `execute_script` to run it.
+  Set `timeout` (seconds, default 120) to a larger value for long builds or MPI runs.
+
+## Step-by-step transparency protocol (MANDATORY)
+You MUST break your work into clear, named steps. Before executing each step, you MUST emit a step-summary block in your response text using this exact JSON format (on its own line, no markdown fences):
+
+STEP_SUMMARY: {{"step": <number>, "name": "<short step name>", "why": "<why this step is needed>", "how": "<how you will do it>", "tools": [<list of tool names you plan to call, or empty list>]}}
+
+After completing the step (after any tool calls for that step), emit a completion block:
+
+STEP_RESULT: {{"step": <number>, "result": "<brief summary of what was found or done>"}}
+
+Rules:
+- Always emit STEP_SUMMARY before any tool calls for that step.
+- Always emit STEP_RESULT after the tool calls for that step complete.
+- Keep each step focused on one logical action.
+- Do NOT ask the user for input between steps — proceed automatically.
+- Only emit a question to the user if you genuinely cannot proceed without missing information (e.g. unknown code path, missing environment details).
 
 ## Workflow
 1. **Understand the request.** If the user's prompt is missing the code path, target environment, or resilience requirements, ask for the missing information.
-2. **Explore the codebase.** Use `list_directory` and `read_file` to understand the code structure and identify where checkpoints should be added.
-3. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file. Follow the VeloC C API (VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize).
-4. **Write files.** Use `write_file` to save all modified sources and the config.
-5. **Validate.** This step is **REQUIRED** Build and run both original code and your generated code. For the generated code, inject failures in the middle of execution then restart the execution (if needed) to test resiliency. Compare the output of both execution, validation passes if two outputs are similar. May ask user for execution instruction and output comparision if needed. If validation fails, check the error log, fix error, then run the validation again.
-6. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
+2. **Explore the codebase.** Use `list_directory` and `read_file` to understand the structure of the code given by user; if the code location is not clear, ask the user for the path relative to the project root.
+3. **Identify critical state.** From your understanding of the codebase, identify the critical data structures and variables that must be checkpointed across executions.
+4. **Identify optimal checkpoint timing.** Determine when to checkpoint to minimise overhead while maximising resilience (e.g. applying the Young-Daly formula).
+5. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file. Follow the VeloC C API (VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize).
+6. **Write files.** Use `write_file` to save all modified sources and the config.
+7. **Validate.** This step is **REQUIRED**. Based on your understanding of the application's structure and output, design and write a validation script tailored to this specific application that:
+   - Builds both the original and the resilient version.
+   - Runs the resilient version with a simulated failure (e.g. kill the process mid-run, then restart it).
+   - Compares the output of the resilient run against the baseline to confirm correctness.
+   Write the validation script using `write_file` (save it inside BUILD_DIR), then run it autonomously with `execute_script`.
+   Inspect the returned `returncode`, `stdout`, and `stderr`. If validation fails, analyse the error, fix the code, and run again.
+   If the script needs more than 120 s (e.g. for a large MPI job), pass a larger `timeout` value.
+   Only ask the user for input if the script requires information you genuinely cannot determine (e.g. unknown MPI rank count, missing dataset path).
+8. **Clean-up** remove **ALL** intermadiate files you created throughout the execution using `remove_file`, keep the original implementation and your generated resilient code intact.
+9. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
    - `{{"status": "ask", "assistant_question": "..."}}` – need more information.
    - `{{"status": "success", "summary": "..."}}` – task completed successfully.
    - `{{"status": "error", "error_message": "..."}}` – unrecoverable error.
@@ -78,7 +117,8 @@ _TOOLS: Dict[str, Callable] = {
     "list_directory": list_directory,
     "read_file": read_file,
     "write_file": write_file,
-    # "validate_resilient_output": validate_resilient_output,
+    "remove_file": remove_file,
+    "execute_script": execute_script,
 }
 
 
@@ -138,38 +178,58 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "validate_resilient_output",
+                "name": "remove_file",
                 "description": (
-                    "Build and run baseline and resilient applications with failure injection, "
-                    "then compare their outputs. Returns status, exit_code, and log tails."
+                    "Delete a single file that lives inside the BUILD_DIR sandbox. "
+                    "Any path that resolves outside BUILD_DIR is rejected and returns an error — "
+                    "the file is never touched. Directories cannot be removed with this tool."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "baseline_source_dir":       {"type": "string"},
-                        "baseline_build_dir":        {"type": "string"},
-                        "baseline_executable_name":  {"type": "string"},
-                        "resilient_source_dir":      {"type": "string"},
-                        "resilient_build_dir":       {"type": "string"},
-                        "resilient_executable_name": {"type": "string"},
-                        "output_dir":                {"type": "string"},
-                        "baseline_args":             {"type": "string", "default": ""},
-                        "resilient_args":            {"type": "string", "default": ""},
-                        "num_procs":                 {"type": "integer", "default": 4},
-                        "max_attempts":              {"type": "integer", "default": 10},
-                        "injection_delay":           {"type": "number",  "default": 5.0},
-                        "output_file_name":          {"type": "string",  "default": "recon.h5"},
-                        "comparison_method":         {"type": "string",  "enum": ["ssim", "sha256"], "default": "ssim"},
-                        "ssim_threshold":            {"type": "number",  "default": 0.9999},
-                        "hdf5_dataset":              {"type": "string",  "default": "data"},
-                        "install_resilient":         {"type": "boolean", "default": False},
-                        "veloc_config_name":         {"type": "string",  "default": "veloc.cfg"},
+                        "file_path": {
+                            "type": "string",
+                            "description": (
+                                "Path to the file to delete, relative to BUILD_DIR or absolute. "
+                                "Must resolve inside BUILD_DIR."
+                            ),
+                        },
                     },
-                    "required": [
-                        "baseline_source_dir", "baseline_build_dir", "baseline_executable_name",
-                        "resilient_source_dir", "resilient_build_dir", "resilient_executable_name",
-                        "output_dir",
-                    ],
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_script",
+                "description": (
+                    "Execute a bash script file that already exists inside the BUILD_DIR sandbox. "
+                    "The script runs with cwd=BUILD_DIR, HOME=BUILD_DIR, and a restricted PATH. "
+                    "Returns returncode, stdout, stderr, and timed_out flag. "
+                    "Use write_file first to create the script, then call execute_script to run it. "
+                    "The script cannot access or modify files outside BUILD_DIR."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script_path": {
+                            "type": "string",
+                            "description": (
+                                "Path to the bash script file, relative to BUILD_DIR or absolute. "
+                                "Must resolve inside BUILD_DIR."
+                            ),
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": (
+                                "Maximum wall-clock seconds to allow before killing the process. "
+                                "Defaults to 120. Use a larger value for long builds or MPI runs."
+                            ),
+                            "default": 120.0,
+                        },
+                    },
+                    "required": ["script_path"],
                 },
             },
         },
@@ -190,6 +250,87 @@ def _dispatch_tool(name: str, arguments_json: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step-summary parsing helpers
+# ---------------------------------------------------------------------------
+
+# Matches:  STEP_SUMMARY: { ... }   (single-line JSON object)
+_STEP_SUMMARY_RE = re.compile(
+    r"STEP_SUMMARY:\s*(\{[^\n]+\})", re.MULTILINE
+)
+# Matches:  STEP_RESULT: { ... }   (single-line JSON object)
+_STEP_RESULT_RE = re.compile(
+    r"STEP_RESULT:\s*(\{[^\n]+\})", re.MULTILINE
+)
+
+
+def _parse_step_events(text: str, turn: int) -> List[Dict[str, Any]]:
+    """
+    Scan *text* for STEP_SUMMARY and STEP_RESULT markers and return a list of
+    structured event dicts in the order they appear.
+
+    Each STEP_SUMMARY becomes a ``step_summary`` event (result field empty until
+    the matching STEP_RESULT arrives).  Each STEP_RESULT updates the result field
+    of the most recent step_summary with the same step number.
+
+    Returns a flat list of events to yield, in document order.
+    """
+    events: List[Dict[str, Any]] = []
+    # Collect all markers with their positions.
+    markers: List[Tuple[int, str, str]] = []  # (pos, kind, json_str)
+    for m in _STEP_SUMMARY_RE.finditer(text):
+        markers.append((m.start(), "summary", m.group(1)))
+    for m in _STEP_RESULT_RE.finditer(text):
+        markers.append((m.start(), "result", m.group(1)))
+    markers.sort(key=lambda x: x[0])
+
+    # Track step_summary events by step number so we can attach results.
+    step_events: Dict[int, Dict[str, Any]] = {}
+
+    for _pos, kind, json_str in markers:
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+
+        if kind == "summary":
+            step_num = int(data.get("step", 0))
+            ev = {
+                "type": "step_summary",
+                "turn": turn,
+                "step": step_num,
+                "name": str(data.get("name", "")),
+                "why": str(data.get("why", "")),
+                "how": str(data.get("how", "")),
+                "tools": data.get("tools", []),
+                "result": "",  # filled in when STEP_RESULT arrives
+            }
+            step_events[step_num] = ev
+            events.append(ev)
+        elif kind == "result":
+            step_num = int(data.get("step", 0))
+            result_text = str(data.get("result", ""))
+            if step_num in step_events:
+                # Update the existing event in-place (it's already in events list).
+                step_events[step_num]["result"] = result_text
+                # Also emit a dedicated step_result event so callers can update UI.
+                events.append({
+                    "type": "step_result",
+                    "turn": turn,
+                    "step": step_num,
+                    "result": result_text,
+                })
+            else:
+                events.append({
+                    "type": "step_result",
+                    "turn": turn,
+                    "step": step_num,
+                    "result": result_text,
+                })
+
+    return events
+
+
+# ---------------------------------------------------------------------------
 # Agentic loop — streaming (async generator)
 # ---------------------------------------------------------------------------
 
@@ -205,7 +346,15 @@ async def _stream_agent_loop(
     ------------
     ``{"type": "thinking",    "turn": N, "text": "..."}``
         The LLM produced a text chunk (thinking / reasoning) before or between
-        tool calls.
+        tool calls.  May contain STEP_SUMMARY / STEP_RESULT markers which are
+        also parsed and emitted as separate events.
+
+    ``{"type": "step_summary","turn": N, "step": N, "name": "...", "why": "...",
+                               "how": "...", "tools": [...], "result": ""}``
+        The LLM announced a new processing step (parsed from STEP_SUMMARY marker).
+
+    ``{"type": "step_result", "turn": N, "step": N, "result": "..."}``
+        The LLM reported the outcome of a step (parsed from STEP_RESULT marker).
 
     ``{"type": "tool_call",   "turn": N, "name": "...", "args": {...}}``
         The LLM requested a tool call.
@@ -244,6 +393,11 @@ async def _stream_agent_loop(
 
         # Emit any thinking/reasoning text the model produced.
         if msg.content:
+            # Parse step-summary / step-result markers from the content.
+            step_events = _parse_step_events(msg.content, turn)
+            for ev in step_events:
+                yield ev
+
             if msg.tool_calls:
                 yield {"type": "thinking", "turn": turn, "text": msg.content}
             else:
@@ -325,38 +479,80 @@ async def _run_agent_loop(
 # JSON output helpers
 # ---------------------------------------------------------------------------
 
+_STATUS_VALUES = frozenset({"ask", "success", "error", "plan"})
+
+
+def _iter_json_objects(text: str):
+    """Yield every top-level ``{...}`` JSON object found in *text* as a string.
+
+    Uses brace-depth tracking so nested objects and string literals containing
+    braces are handled correctly.  Yields each complete object in document order.
+    """
+    pos = 0
+    length = len(text)
+    while pos < length:
+        start = text.find("{", pos)
+        if start == -1:
+            break
+        depth, in_str, escape = 0, False, False
+        end = None
+        for i, c in enumerate(text[start:], start):
+            if escape:
+                escape = False
+                continue
+            if c == "\\" and in_str:
+                escape = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+        if end is not None:
+            yield text[start:end + 1]
+            pos = end + 1
+        else:
+            break
+
+
 def _extract_json(raw: str) -> str:
-    """Extract the first top-level JSON object from *raw*.
+    """Extract the best top-level JSON object from *raw*.
 
-    The LLM sometimes wraps its JSON in a markdown code fence (```json ... ```)
-    and may also include prose before/after the fence.  Nested code fences
-    inside the JSON string values (e.g. bash examples in a ``summary`` field)
-    make it unsafe to locate the closing fence by simple string search.
+    The LLM's final message may contain STEP_SUMMARY / STEP_RESULT markers
+    (which are also JSON objects) before the actual ``{"status": ...}`` result.
+    Naively returning the *first* ``{...}`` object would pick up a step marker
+    instead of the status object.
 
-    Strategy: ignore fences entirely and use brace-depth tracking on the full
-    text to find the first complete ``{...}`` object.  This is robust against
-    nested fences, prose preambles, and trailing text.
+    Strategy:
+    1. Iterate over all top-level ``{...}`` objects in the text.
+    2. Return the first one whose ``"status"`` key has a recognised value
+       (``ask`` | ``success`` | ``error`` | ``plan``).
+    3. If none has a recognised status, return the last complete object found
+       (preserving the original behaviour for simple responses).
+    4. If no complete object is found at all, return the raw text so the caller
+       can produce a meaningful error.
     """
     text = raw.strip()
-    start = text.find("{")
-    if start == -1:
-        return text
-    depth, in_str, escape = 0, False, False
-    for i, c in enumerate(text[start:], start):
-        if escape:
-            escape = False; continue
-        if c == "\\" and in_str:
-            escape = True; continue
-        if c == '"':
-            in_str = not in_str; continue
-        if not in_str:
-            if c == "{": depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start:i + 1]
-    brace = text.rfind("}")
-    return text[start:brace + 1] if brace != -1 else text[start:]
+    last_obj: str | None = None
+    for obj_str in _iter_json_objects(text):
+        last_obj = obj_str
+        try:
+            data = json.loads(obj_str)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and str(data.get("status", "")).lower() in _STATUS_VALUES:
+            return obj_str
+    # No object with a recognised status found — fall back to the last object.
+    if last_obj is not None:
+        return last_obj
+    # No complete object at all — return the raw text.
+    return text
 
 
 def _parse_json(text: str) -> Any:
@@ -483,6 +679,16 @@ async def stream_veloc_agent(
     Yields structured event dicts as the agent thinks and calls tools, then
     yields a final ``{"type": "done", "result": {...}}`` event containing the
     same structured result dict that ``run_veloc_agent`` would return.
+
+    Event types emitted:
+      - ``step_summary``  – LLM announced a new processing step (why/how/tools)
+      - ``step_result``   – LLM reported the outcome of a step
+      - ``thinking``      – raw LLM reasoning text
+      - ``tool_call``     – tool being invoked
+      - ``tool_result``   – tool output
+      - ``final``         – LLM final answer text
+      - ``done``          – structured result dict (last event)
+      - ``error``         – unrecoverable error
 
     Usage::
 
