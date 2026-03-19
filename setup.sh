@@ -26,6 +26,13 @@ if [ -d "$BUILD_DIR/examples_output" ]; then
   rm -rf "$BUILD_DIR/examples_output"
   echo "  Removed $BUILD_DIR/examples_output"
 fi
+shopt -s nullglob
+matches=( "$BUILD_DIR"/validation*/ )
+if [ ${#matches[@]} -gt 0 ]; then
+  rm -rf "${matches[@]}"
+  echo "  Removed validation directories (${matches[@]}) in $BUILD_DIR"
+fi
+shopt -u nullglob
 
 # Copy examples into build for test/demonstration (self-contained runs from build/)
 if [ -d "$REPO_ROOT/examples" ]; then
