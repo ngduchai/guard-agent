@@ -120,6 +120,7 @@ def run_with_retries(
     injection_delay: float,
     run_install: bool = False,
     success_output_filename: str | None = None,
+    veloc_config_name: str = "veloc.cfg",
 ) -> None:
     configure_and_build(source_dir, build_dir, run_install=run_install)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +136,20 @@ def run_with_retries(
         if attempt_dir.exists():
             shutil.rmtree(attempt_dir)
         attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy veloc.cfg to the attempt's cwd so VeloC can find it at runtime.
+        # VeloC searches for the config file in the process's working directory.
+        # We look in the source dir first, then the build dir.
+        for cfg_src_dir in (source_dir, build_dir):
+            cfg_src = cfg_src_dir / veloc_config_name
+            if cfg_src.exists():
+                cfg_dst = attempt_dir / veloc_config_name
+                shutil.copy2(cfg_src, cfg_dst)
+                print(
+                    f"[validation] copied {cfg_src} → {cfg_dst}",
+                    flush=True,
+                )
+                break
 
         stdout_path = attempt_dir / "stdout.txt"
         stderr_path = attempt_dir / "stderr.txt"

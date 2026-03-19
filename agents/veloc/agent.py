@@ -1,316 +1,425 @@
 """
-VeloC code-injection agent using the OpenAI Agents SDK.
+VeloC code-injection agent.
 
-Orchestration is done by the LLM via tools. See:
-https://openai.github.io/openai-agents-python/multi_agent/
+The agent receives a user prompt describing an application codebase and its
+checkpoint/resilience requirements, then:
+  1. Explores the codebase using filesystem tools.
+  2. Injects VeloC checkpoint calls where needed.
+  3. Writes the modified files back to the output directory.
+  4. Validates the resilient version against the baseline. 
+
+Implementation uses the ``openai`` Python client directly with a manual
+tool-calling loop, so it works with **any OpenAI-compatible API endpoint**:
+  - ``openai``  – real OpenAI (set OPENAI_API_KEY)
+  - ``argo``    – Argonne proxy (set ARGO_API_KEY + ARGO_BASE_URL)
+  - ``generic`` – any custom endpoint (set LLM_API_KEY + LLM_BASE_URL)
+
+Provider selection is controlled by the ``LLM_PROVIDER`` env var / .env key.
+
+Streaming / observability
+-------------------------
+``stream_veloc_agent`` is an async generator that yields structured event dicts
+so callers (e.g. the web UI) can show live progress:
+
+  {"type": "thinking",   "turn": N, "text": "..."}
+  {"type": "tool_call",  "turn": N, "name": "...", "args": {...}}
+  {"type": "tool_result","turn": N, "name": "...", "result": "..."}
+  {"type": "done",       "result": {...}}   # final structured result dict
+  {"type": "error",      "message": "..."}
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any, Dict, List
+import os
+from typing import Any, AsyncIterator, Callable, Dict, List, Tuple
 
-from agents.veloc.config import get_settings, get_project_root
-from agents.veloc._sdk_loader import get_sdk_tools_list
+from agents.veloc.config import get_llm_client, get_project_root, get_settings
 from agents.veloc.filesync_tools import list_directory, read_file, write_file
 from agents.veloc.validation_tools import validate_resilient_output
 
 
-def _veloc_agent_instructions() -> str:
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+def _system_prompt() -> str:
     root = get_project_root()
-    return f"""You are an expert in resilient HPC/cloud deployments and in integrating the VeloC API into existing codebases. You help users understand how to transform their code into VeloC-checkpointed, fault-tolerant applications.
+    return f"""You are an expert in resilient HPC/cloud deployments and in integrating the VeloC checkpointing API into existing C/C++ codebases.
 
-**Project root (user's machine).** The user's project root on their machine is `{root}`. Use this path if the user refers to the project root.
-You run in a separate environment (e.g. a sandbox) and **cannot access the user's filesystem** or that path. Always use **relative path names under this project root** when referring to files (e.g. `examples/matrix_mul_mpi`, `examples/matrix_mul_mpi/code.c`, `examples/matrix_mul_mpi/input_data`), and never guess absolute paths. Create workspaces and files **in your own environment** (e.g. in your current working directory). When the user asks to transform code under e.g. `examples/matrix_mul_mpi`, either: (1) ask them to paste the relevant file contents so you can transform and return the new contents, or (2) generate the VeloC-instrumented code and config yourself and return the full file contents in your response with the relative path (e.g. "Save as examples/matrix_mul_mpi/code.c"). Do not claim that the user's path "does not exist"; it exists on the user's machine.
+**Project root on the user's machine:** `{root}`
+All file paths you use with the filesystem tools must be relative to this root.
 
-You have SDK-hosted tools available (e.g. web search, code interpreter). Use them when helpful to look up VeloC documentation, checkpoint/restart patterns, and resilience best practices.
-
-You have custom tools to access and modify files on the user's machine (paths are relative to the project root):
-- list_directory(dir_path): List files and subdirectories in a directory. Returns entry names, type (file/dir), and file sizes.
-- read_file(file_path): Read the full contents of a text file.
-- write_file(file_path, contents): Write contents to a file; creates parent directories if needed.
-Use these tools to read the user's code, then write back modified or new files (e.g. VeloC-instrumented code and config) under the output path they specify. When applications require input data (e.g. HDF5 files or other datasets), **always ask the user for the correct data directory or file path relative to the project root** instead of inventing one, and propagate that path into any build/run commands and into validation arguments.
-
-You also have a validation tool available:
-- validate_resilient_output(...): Build and run a baseline (non-resilient) MPI application and a resilient VeloC-enabled application with failure injection, then compare their outputs using either SHA-256 hash or SSIM on an HDF5 dataset. **Validation is mandatory**: after you generate and (logically) build the resilient version of the code, you **must** call this tool at least once to verify that the resilient run produces equivalent results to the original baseline run. **Before calling this tool, ask the user for the exact input data path(s) and any run-time arguments required by the application, expressed as paths relative to `{root}`**, and pass those paths explicitly via baseline_args and resilient_args so that the baseline and resilient runs use the same, correct data.
-
-If validate_resilient_output returns a non-success status or exit_code, you **must inspect the returned logs and messages**, explain to the user what likely went wrong (e.g., build failure, runtime error, numerical mismatch), and then propose concrete adjustments to the generated VeloC-instrumented code and/or configuration to fix the problem. Iterate on the code and configuration and re-run validation until either:
-- validation succeeds (status=success), or
-- you have a clear, well-explained reason why validation cannot succeed (for example, missing external dependencies or constraints the user must resolve).
+## Your tools
+- `list_directory(dir_path)` – list files and subdirectories.
+- `read_file(file_path)` – read a source file.
+- `write_file(file_path, contents)` – write a file (creates parent dirs).
 
 ## Workflow
-
-Step1. **Check input.**
-If the user has not clearly described their application, target environment, or resilience
-requirements, ask the user to provide the missing information until all information is provided.
-
-Step 2. **If you have enough information, then Prepare the workspace.**
-Use list_directory and read_file on the user's input path (e.g. examples/matrix_mul_mpi) to load the code. Ask for the path if not provided.
-
-Step 3. ** Apply VeloC for resiliency**,
-Using the code you read from the user's machine, discover:
-- the workflow structure of the code
-- critical data that needs to be checkpointed
-- identify the control patterns to detect where and when to checkpoint the critical data
-apply VeloC checkpoints and configuration to the code to meet the user's resilience requirements.
-The VeloC API are available at [VeloC API](https://veloc.readthedocs.io/en/latest/api.html#api-specifications).
-The VeloC Configuration is available at [VeloC Configuration](https://veloc.readthedocs.io/en/latest/userguide.html#execution).
-
-Step 4. **Build the code.**
-Write the VeloC-instrumented files with write_file to the user's output path. Check if the project has a build system (e.g. CMakeLists.txt, Makefile).
-If there is a build system, use your tools to build the code with this build system.
-If there is no build system, use your tools to build the code with the CMake build system.
-For VeloC, if it is not installed, download it from the
-[VeloC GitHub repository](https://github.com/ECP-VeloC/VELOC)
-and install it in the workspace directory then integrate it into the build system.
-
-Step 5. **Run the code.**
-Use your tools to run the code in the workspace directory.
-If the code is not running, use your tools to debug the code until it is running.
-
-Step 6. **Complete the task.**
-Ensure all modified and new files have been written to the user's output path with write_file. Return a summary of the task and the paths written.
-
-**After completing a step, return a summary of the task and plan for the next step, then ask the user if they want to continue or stop.**
-
-**Output format.** For every step above, unless you need to ask the user for more information,
-silently proceed to the next step until complete with sucess status.
-If you got errors, or need to return before completing the task, return with error status.
-If you need to ask the user for more information, return with ask status.
-The return response should be a single JSON object (no markdown fences, no extra text after it)
-with the following format:
-   {{ "status": "ask", "assistant_question": "..." }} when you need more information, or
-   {{ "status": "success", "summary": "..." }} when the task is completed successfully, or
-   {{ "status": "error", "error_message": "..." }} when the task is completed with errors.
+1. **Understand the request.** If the user's prompt is missing the code path, target environment, or resilience requirements, ask for the missing information.
+2. **Explore the codebase.** Use `list_directory` and `read_file` to understand the code structure and identify where checkpoints should be added.
+3. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file. Follow the VeloC C API (VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize).
+4. **Write files.** Use `write_file` to save all modified sources and the config.
+5. **Validate.** This step is **REQUIRED** Build and run both original code and your generated code. For the generated code, inject failures in the middle of execution then restart the execution (if needed) to test resiliency. Compare the output of both execution, validation passes if two outputs are similar. May ask user for execution instruction and output comparision if needed. If validation fails, check the error log, fix error, then run the validation again.
+6. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
+   - `{{"status": "ask", "assistant_question": "..."}}` – need more information.
+   - `{{"status": "success", "summary": "..."}}` – task completed successfully.
+   - `{{"status": "error", "error_message": "..."}}` – unrecoverable error.
 """
 
 
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+# Map tool name → Python callable.  Add new tools here to expose them to the LLM.
+_TOOLS: Dict[str, Callable] = {
+    "list_directory": list_directory,
+    "read_file": read_file,
+    "write_file": write_file,
+    # "validate_resilient_output": validate_resilient_output,
+}
+
+
+def _build_tool_schemas() -> List[Dict[str, Any]]:
+    """
+    Auto-generate OpenAI function-calling schemas from the tool callables.
+
+    Each tool must have a Google-style docstring whose first line is the
+    description, and typed parameters.  For tools that need richer schemas
+    (e.g. nested objects), override the schema here.
+    """
+    # Hand-written schemas for clarity and correctness.
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "List files and subdirectories in a directory (relative to project root).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dir_path": {"type": "string", "description": "Directory path relative to project root."},
+                    },
+                    "required": ["dir_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the full text contents of a file (relative to project root).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "File path relative to project root."},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write text contents to a file, creating parent directories as needed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "File path relative to output root."},
+                        "contents": {"type": "string", "description": "Full text content to write."},
+                    },
+                    "required": ["file_path", "contents"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "validate_resilient_output",
+                "description": (
+                    "Build and run baseline and resilient applications with failure injection, "
+                    "then compare their outputs. Returns status, exit_code, and log tails."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "baseline_source_dir":       {"type": "string"},
+                        "baseline_build_dir":        {"type": "string"},
+                        "baseline_executable_name":  {"type": "string"},
+                        "resilient_source_dir":      {"type": "string"},
+                        "resilient_build_dir":       {"type": "string"},
+                        "resilient_executable_name": {"type": "string"},
+                        "output_dir":                {"type": "string"},
+                        "baseline_args":             {"type": "string", "default": ""},
+                        "resilient_args":            {"type": "string", "default": ""},
+                        "num_procs":                 {"type": "integer", "default": 4},
+                        "max_attempts":              {"type": "integer", "default": 10},
+                        "injection_delay":           {"type": "number",  "default": 5.0},
+                        "output_file_name":          {"type": "string",  "default": "recon.h5"},
+                        "comparison_method":         {"type": "string",  "enum": ["ssim", "sha256"], "default": "ssim"},
+                        "ssim_threshold":            {"type": "number",  "default": 0.9999},
+                        "hdf5_dataset":              {"type": "string",  "default": "data"},
+                        "install_resilient":         {"type": "boolean", "default": False},
+                        "veloc_config_name":         {"type": "string",  "default": "veloc.cfg"},
+                    },
+                    "required": [
+                        "baseline_source_dir", "baseline_build_dir", "baseline_executable_name",
+                        "resilient_source_dir", "resilient_build_dir", "resilient_executable_name",
+                        "output_dir",
+                    ],
+                },
+            },
+        },
+    ]
+
+
+def _dispatch_tool(name: str, arguments_json: str) -> str:
+    """Call the named tool with the given JSON arguments and return the result as JSON."""
+    fn = _TOOLS.get(name)
+    if fn is None:
+        return json.dumps({"error": f"Unknown tool: {name}"})
+    try:
+        kwargs = json.loads(arguments_json) if arguments_json else {}
+        result = fn(**kwargs)
+        return result if isinstance(result, str) else json.dumps(result)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Agentic loop — streaming (async generator)
+# ---------------------------------------------------------------------------
+
+async def _stream_agent_loop(
+    messages: List[Dict[str, Any]],
+    max_turns: int = 50,
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Run the LLM + tool-calling loop and **yield** structured event dicts for
+    each observable step so callers can stream live progress to the UI.
+
+    Event shapes
+    ------------
+    ``{"type": "thinking",    "turn": N, "text": "..."}``
+        The LLM produced a text chunk (thinking / reasoning) before or between
+        tool calls.
+
+    ``{"type": "tool_call",   "turn": N, "name": "...", "args": {...}}``
+        The LLM requested a tool call.
+
+    ``{"type": "tool_result", "turn": N, "name": "...", "result": "..."}``
+        The tool returned a result (truncated to 2 KB for display).
+
+    ``{"type": "final",       "turn": N, "text": "..."}``
+        The LLM produced its final answer (no more tool calls).
+
+    ``{"type": "error",       "message": "..."}``
+        An unrecoverable error occurred.
+    """
+    client = get_llm_client()
+    model = get_settings().llm_model
+    tool_schemas = _build_tool_schemas()
+    loop = asyncio.get_running_loop()
+
+    for turn in range(1, max_turns + 1):
+        # Offload the blocking HTTP call to a thread pool.
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                ),
+            )
+        except Exception as exc:
+            yield {"type": "error", "message": f"LLM call failed: {exc!r}"}
+            return
+
+        msg = response.choices[0].message
+
+        # Emit any thinking/reasoning text the model produced.
+        if msg.content:
+            if msg.tool_calls:
+                yield {"type": "thinking", "turn": turn, "text": msg.content}
+            else:
+                yield {"type": "final", "turn": turn, "text": msg.content}
+
+        # Build the assistant message dict for history.
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        if not msg.tool_calls:
+            # No tool calls → final answer already emitted above.
+            return
+
+        # Dispatch each tool call, emit events, append results.
+        for tc in msg.tool_calls:
+            # Parse args for display (best-effort).
+            try:
+                args_display = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except (json.JSONDecodeError, ValueError):
+                args_display = {"raw": tc.function.arguments}
+
+            yield {"type": "tool_call", "turn": turn, "name": tc.function.name, "args": args_display}
+
+            # Offload blocking tool execution (e.g. cmake/make/MPI) to a thread pool
+            # so the event loop stays responsive for SSE heartbeats.
+            result_str = await loop.run_in_executor(
+                None, _dispatch_tool, tc.function.name, tc.function.arguments
+            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_str})
+
+            # Truncate large results for display only.
+            display_result = result_str if len(result_str) <= 2048 else result_str[:2048] + "…[truncated]"
+            yield {"type": "tool_result", "turn": turn, "name": tc.function.name, "result": display_result}
+
+    # Exceeded max_turns.
+    yield {
+        "type": "error",
+        "message": f"Agent exceeded {max_turns} turns without a final answer.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agentic loop — batch (collects all events, returns final text + trace)
+# ---------------------------------------------------------------------------
+
+async def _run_agent_loop(
+    messages: List[Dict[str, Any]],
+    max_turns: int = 50,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Run the LLM + tool-calling loop until the model produces a final text answer.
+
+    Returns ``(final_text, llm_trace)`` where *llm_trace* is a list of event
+    dicts (same format as ``_stream_agent_loop``) for debugging.
+    """
+    final_text = ""
+    llm_trace: List[Dict[str, Any]] = []
+
+    async for event in _stream_agent_loop(messages, max_turns=max_turns):
+        llm_trace.append(event)
+        if event["type"] == "final":
+            final_text = event.get("text", "")
+        elif event["type"] == "error":
+            return json.dumps({"status": "error", "error_message": event["message"]}), llm_trace
+
+    return final_text, llm_trace
+
+
+# ---------------------------------------------------------------------------
+# JSON output helpers
+# ---------------------------------------------------------------------------
+
 def _extract_json(raw: str) -> str:
-    """Strip markdown code fences and return the first top-level JSON object (brace-matched)."""
+    """Extract the first top-level JSON object from *raw*.
+
+    The LLM sometimes wraps its JSON in a markdown code fence (```json ... ```)
+    and may also include prose before/after the fence.  Nested code fences
+    inside the JSON string values (e.g. bash examples in a ``summary`` field)
+    make it unsafe to locate the closing fence by simple string search.
+
+    Strategy: ignore fences entirely and use brace-depth tracking on the full
+    text to find the first complete ``{...}`` object.  This is robust against
+    nested fences, prose preambles, and trailing text.
+    """
     text = raw.strip()
-    if "```" in text:
-        start = text.find("```")
-        if text[start:].startswith("```json"):
-            start += 7
-        else:
-            start += 3
-        end = text.find("```", start)
-        if end != -1:
-            text = text[start:end]
-    # Find first '{' and its matching '}' so we don't include extra trailing braces
     start = text.find("{")
     if start == -1:
         return text
-    depth = 0
-    in_string = False
-    escape = False
-    quote = '"'
-    i = start
-    n = len(text)
-    while i < n:
-        c = text[i]
+    depth, in_str, escape = 0, False, False
+    for i, c in enumerate(text[start:], start):
         if escape:
-            escape = False
-            i += 1
-            continue
-        if c == "\\" and in_string:
-            escape = True
-            i += 1
-            continue
-        if c == quote and not escape:
-            in_string = not in_string
-            i += 1
-            continue
-        if not in_string:
-            if c == "{":
-                depth += 1
+            escape = False; continue
+        if c == "\\" and in_str:
+            escape = True; continue
+        if c == '"':
+            in_str = not in_str; continue
+        if not in_str:
+            if c == "{": depth += 1
             elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[start : i + 1]
-        i += 1
-    # Fallback: first { to last } (original behavior)
+                    return text[start:i + 1]
     brace = text.rfind("}")
-    if brace != -1:
-        return text[start : brace + 1]
-    return text[start:]
+    return text[start:brace + 1] if brace != -1 else text[start:]
 
 
-def _repair_json_string_values(text: str) -> str:
-    """Replace unescaped newlines/tabs inside JSON string values so parsing can succeed."""
-    result = []
-    i = 0
-    n = len(text)
-    in_string = False
-    escape_next = False
-    # Track whether we're in a key or value (value can be string with code blocks)
-    while i < n:
-        c = text[i]
-        if escape_next:
-            result.append(c)
-            escape_next = False
-            i += 1
-            continue
-        if c == "\\" and in_string:
-            result.append(c)
-            escape_next = True
-            i += 1
-            continue
-        if c == '"':
-            in_string = not in_string
-            result.append(c)
-            i += 1
-            continue
-        if in_string and c in ("\n", "\r", "\t"):
-            result.append("\\n" if c == "\n" else ("\\r" if c == "\r" else "\\t"))
-            i += 1
-            continue
-        result.append(c)
-        i += 1
-    return "".join(result)
-
-
-def _parse_agent_json(text: str):
-    """Parse extracted JSON, with fallbacks for double-encoding and unescaped newlines."""
+def _parse_json(text: str) -> Any:
+    """Parse JSON with fallbacks for double-encoding and unescaped newlines."""
     text = text.strip()
-    # Fallback 1: whole response might be a JSON-encoded string (double-encoded)
     if text.startswith('"') and text.endswith('"'):
         try:
-            decoded = json.loads(text)
-            if isinstance(decoded, str):
-                return json.loads(decoded)
+            inner = json.loads(text)
+            if isinstance(inner, str):
+                return json.loads(inner)
         except (json.JSONDecodeError, TypeError):
             pass
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Fallback 2: repair unescaped newlines inside string values (e.g. transformed_code)
-    repaired = _repair_json_string_values(text)
-    return json.loads(repaired)
+    # Repair unescaped newlines inside string values.
+    repaired, in_str, escape = [], False, False
+    for c in text:
+        if escape:
+            repaired.append(c); escape = False; continue
+        if c == "\\" and in_str:
+            repaired.append(c); escape = True; continue
+        if c == '"':
+            in_str = not in_str; repaired.append(c); continue
+        if in_str and c in "\n\r\t":
+            repaired.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[c]); continue
+        repaired.append(c)
+    return json.loads("".join(repaired))
 
 
-def get_veloc_agent():
-    """Build the VeloC agent (OpenAI Agents SDK) with tools."""
-    from agents.veloc._sdk_loader import Agent
-
-    if Agent is None:
-        raise RuntimeError("OpenAI Agents SDK (openai-agents) is not installed")
-    settings = get_settings()
-    tools = get_sdk_tools_list() + [
-        list_directory,
-        read_file,
-        write_file,
-        validate_resilient_output,
-    ]
-    return Agent(
-        name="VeloC injection",
-        instructions=_veloc_agent_instructions(),
-        model=settings.llm_model,
-        tools=tools,
-    )
-
-
-async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """
-    Run the VeloC agent on a conversation. Uses OpenAI Agents SDK Runner.
-    Returns a dict with status, assistant_question, plan, raw_llm_response, llm_trace.
-    """
-    from agents.veloc._sdk_loader import Runner
-
-    if Runner is None:
-        return {
-            "status": "error",
-            "assistant_question": "OpenAI Agents SDK (openai-agents) is not installed.",
-            "plan": None,
-            "raw_llm_response": "",
-            "llm_trace": [],
-        }
-    settings = get_settings()
-    if not messages:
-        return {
-            "status": "ask",
-            "assistant_question": (
-                "Please describe your application: which code or code path should be made resilient, "
-                "target environment (e.g. HPC cluster), and where to put the transformed code (workspace path)."
-            ),
-            "plan": None,
-            "raw_llm_response": "",
-            "llm_trace": [],
-        }
-    # Non-OpenAI: we could fall back to a simple LLM call; for now require OpenAI for tools
-    if settings.llm_provider != "openai":
-        return {
-            "status": "error",
-            "assistant_question": "VeloC agent requires OpenAI provider (tool-calling). Set llm_provider=openai.",
-            "plan": None,
-            "raw_llm_response": "",
-            "llm_trace": [],
-        }
-    if not settings.openai_api_key:
-        return {
-            "status": "error",
-            "assistant_question": "OPENAI_API_KEY is not set.",
-            "plan": None,
-            "raw_llm_response": "",
-            "llm_trace": [],
-        }
-
-    # Single user message: last user content or concatenate conversation
-    parts = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if role == "user":
-            parts.append(content)
-        else:
-            parts.append(f"[Assistant]: {content}")
-    user_message = "\n\n".join(parts) if parts else ""
-
-    agent = get_veloc_agent()
-    try:
-        result = await Runner.run(agent, user_message, max_turns=20)
-    except Exception as exc:
-        # Surface MaxTurnsExceeded and similar errors back to the user as a structured error.
-        return {
-            "status": "error",
-            "assistant_question": f"Agent run failed: {exc!r}",
-            "plan": None,
-            "raw_llm_response": "",
-            "llm_trace": [],
-        }
-    raw = (result.final_output or "").strip()
-    llm_trace = []  # SDK doesn't expose per-step trace the same way; optional: from result.new_items
-
+def _build_result(raw: str, llm_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Parse the LLM's final JSON response and return a structured result dict."""
     if not raw:
         return {
             "status": "error",
             "assistant_question": "Agent returned no output.",
-            "plan": None,
-            "raw_llm_response": raw,
-            "llm_trace": llm_trace,
+            "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
 
-    text = _extract_json(raw)
     try:
-        data = _parse_agent_json(text)
+        data = _parse_json(_extract_json(raw))
     except json.JSONDecodeError:
         return {
             "status": "error",
             "assistant_question": "Agent output could not be parsed as JSON. Please try again.",
-            "plan": None,
-            "raw_llm_response": raw,
-            "llm_trace": llm_trace,
+            "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
 
     status = str(data.get("status", "")).lower()
+
     if status == "ask":
         return {
             "status": "ask",
             "assistant_question": str(data.get("assistant_question", "Please provide more details.")),
-            "plan": None,
-            "raw_llm_response": raw,
-            "llm_trace": llm_trace,
+            "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
+        }
+    if status == "success":
+        return {
+            "status": "success",
+            "assistant_question": None,
+            "summary": str(data.get("summary", "")),
+            "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
     if status == "plan":
         plan = data.get("plan")
@@ -319,24 +428,108 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
         return {
             "status": "plan",
             "assistant_question": None,
-            "plan": plan,
-            "raw_llm_response": raw,
-            "llm_trace": llm_trace,
-        }
-    if status == "success":
-        return {
-            "status": "success",
-            "assistant_question": None,
-            "summary": str(data.get("summary", "")),
-            "plan": None,
-            "raw_llm_response": raw,
-            "llm_trace": llm_trace,
+            "plan": plan, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
 
+    # error or unknown
     return {
         "status": "error",
         "assistant_question": str(data.get("assistant_question", data.get("error_message", raw[:500]))),
-        "plan": None,
-        "raw_llm_response": raw,
-        "llm_trace": llm_trace,
+        "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
     }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    """
+    Run the VeloC agent on a conversation and return a structured result dict.
+
+    Args:
+        messages: List of ``{"role": ..., "content": ...}`` dicts representing
+                  the conversation so far.
+
+    Returns:
+        Dict with keys: ``status`` ('ask'|'success'|'error'|'plan'),
+        ``assistant_question``, ``summary``, ``plan``,
+        ``raw_llm_response``, ``llm_trace``.
+    """
+    if not messages:
+        return {
+            "status": "ask",
+            "assistant_question": (
+                "Please describe your application: which code path should be made resilient, "
+                "the target environment (e.g. HPC cluster), and where to write the output."
+            ),
+            "plan": None, "raw_llm_response": "", "llm_trace": [],
+        }
+
+    # Build the full message list: system prompt + conversation history.
+    chat: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
+    chat.extend({"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages)
+
+    raw, llm_trace = await _run_agent_loop(chat)
+    return _build_result(raw, llm_trace)
+
+
+async def stream_veloc_agent(
+    messages: List[Dict[str, str]],
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Streaming version of ``run_veloc_agent``.
+
+    Yields structured event dicts as the agent thinks and calls tools, then
+    yields a final ``{"type": "done", "result": {...}}`` event containing the
+    same structured result dict that ``run_veloc_agent`` would return.
+
+    Usage::
+
+        async for event in stream_veloc_agent(messages):
+            if event["type"] == "done":
+                result = event["result"]
+            else:
+                # render live progress
+                ...
+    """
+    if not messages:
+        yield {
+            "type": "done",
+            "result": {
+                "status": "ask",
+                "assistant_question": (
+                    "Please describe your application: which code path should be made resilient, "
+                    "the target environment (e.g. HPC cluster), and where to write the output."
+                ),
+                "plan": None, "raw_llm_response": "", "llm_trace": [],
+            },
+        }
+        return
+
+    # Build the full message list: system prompt + conversation history.
+    chat: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
+    chat.extend({"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages)
+
+    final_text = ""
+    llm_trace: List[Dict[str, Any]] = []
+
+    async for event in _stream_agent_loop(chat):
+        llm_trace.append(event)
+        yield event  # forward every event to the caller
+
+        if event["type"] == "final":
+            final_text = event.get("text", "")
+        elif event["type"] == "error":
+            yield {
+                "type": "done",
+                "result": {
+                    "status": "error",
+                    "assistant_question": event["message"],
+                    "plan": None, "raw_llm_response": "", "llm_trace": llm_trace,
+                },
+            }
+            return
+
+    result = _build_result(final_text, llm_trace)
+    yield {"type": "done", "result": result}

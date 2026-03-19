@@ -63,7 +63,12 @@ def run_baseline(
     num_procs: int,
     app_args: list[str],
 ) -> None:
-    """Build and run the baseline (non-resilient) application once."""
+    """Build and run the baseline (non-resilient) application once.
+
+    The MPI process runs with ``cwd=output_dir`` so that any output files
+    (e.g. ``recon.h5``) are written directly into the baseline output
+    directory where the comparison step expects to find them.
+    """
     configure_and_build(source_dir, build_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -77,6 +82,7 @@ def run_baseline(
         app_args=app_args,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        run_cwd=output_dir,
     )
     code = proc.wait()
     if code != 0:
@@ -372,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         injection_delay=args.injection_delay,
         run_install=args.install_resilient,
         success_output_filename=args.output_file_name,
+        veloc_config_name=args.veloc_config_name,
     )
 
     # Keep all validation artifacts under output_root; do not assume the baseline

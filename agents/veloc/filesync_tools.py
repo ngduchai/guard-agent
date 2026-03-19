@@ -1,145 +1,161 @@
+"""
+Local filesystem tools for the VeloC agent.
+
+These tools run in the same process as the agent and let the LLM list, read,
+and write files under the BUILD_DIR (the agent's self-contained sandbox).
+
+All file access — reads AND writes — is strictly restricted to the directory
+returned by ``get_project_root()`` (i.e. ``GUARD_AGENT_PROJECT_ROOT``, which
+``setup.sh`` sets to the ``build/`` directory).  Any path that resolves outside
+that directory is rejected immediately and the caller receives a structured
+error dict that includes the ``allowed_root`` so the LLM can self-correct.
+
+All functions are plain Python callables — no SDK decorator is required.
+"""
+
 from __future__ import annotations
 
-"""
-Local filesystem tools for the VeloC agent (OpenAI Agents SDK).
-
-These tools run in the same environment as the agent runner and let the LLM
-list, read, and write files under the project root on the user's machine.
-"""
-
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from agents.veloc.config import get_project_root
-from agents.veloc._sdk_loader import function_tool
 
 
-def _debug_enabled() -> bool:
-    return os.getenv("DEPLOY_AGENT_DEBUG_LLM") == "1"
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _get_allowed_root() -> str:
+    """Return the single allowed root for all agent file access (BUILD_DIR)."""
+    return os.path.normpath(os.path.abspath(get_project_root()))
 
 
-def _debug_print(message: str) -> None:
-    if _debug_enabled():
-        print(f"[filesync_tools] {message}")
-
-
-def _resolve_path_relative_to_root(path: str) -> str:
-    """Resolve path to an absolute path under the project root. Rejects escapes."""
-    root = os.path.abspath(get_project_root())
-    if os.path.isabs(path):
-        abs_path = os.path.abspath(path)
-    else:
-        abs_path = os.path.abspath(os.path.join(root, path))
-    # Ensure result is under project root (no .. escape)
-    abs_path = os.path.normpath(abs_path)
-    if not abs_path.startswith(root):
-        raise PermissionError(f"Path is outside project root: {path}")
-    return abs_path
-
-
-def _resolve_write_path(path: str) -> str:
+def _resolve_path(path: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Resolve a write path under an explicit output root.
-
-    To prevent accidental modifications of the repository, writes are restricted to
-    GUARD_AGENT_OUTPUT_ROOT when set. This should be a path under the project root.
-    """
-    root = os.path.abspath(get_project_root())
-    out_root_raw = (os.getenv("GUARD_AGENT_OUTPUT_ROOT") or "").strip()
-    if not out_root_raw:
-        raise PermissionError(
-            "Writes are restricted. Set GUARD_AGENT_OUTPUT_ROOT to an output directory under the project root."
-        )
-    out_root = os.path.abspath(os.path.join(root, out_root_raw)) if not os.path.isabs(out_root_raw) else os.path.abspath(out_root_raw)
-    out_root = os.path.normpath(out_root)
-    if not out_root.startswith(root):
-        raise PermissionError("GUARD_AGENT_OUTPUT_ROOT must be under the project root.")
-    if os.path.isabs(path):
-        abs_path = os.path.abspath(path)
-    else:
-        abs_path = os.path.abspath(os.path.join(out_root, path))
-    abs_path = os.path.normpath(abs_path)
-    if not abs_path.startswith(out_root):
-        raise PermissionError(f"Write path is outside output root: {path}")
-    return abs_path
-
-
-@function_tool
-def list_directory(dir_path: str) -> Dict[str, Any]:
-    """List entries (files and subdirectories) in a directory on the user's machine.
-
-    Args:
-        dir_path: Path to the directory, absolute or relative to the project root.
+    Resolve *path* to an absolute path under the allowed root.
 
     Returns:
-        A dict with 'path' (resolved path), 'entries' (list of dicts with 'name',
-        'type' ('file' or 'dir'), and for files 'size' in bytes).
+        ``(abs_path, None)`` on success, or ``('', error_dict)`` when the
+        resolved path escapes the allowed root.  The error dict always contains:
+
+        - ``error``        – human-readable reason
+        - ``allowed_root`` – the absolute path the agent is permitted to access
+        - ``requested_path`` – the original *path* argument
     """
+    allowed_root = _get_allowed_root()
+    # Resolve relative paths against the allowed root so the LLM can use
+    # short names like "examples/art_simple/main.cc".
+    if os.path.isabs(path):
+        abs_path = os.path.normpath(path)
+    else:
+        abs_path = os.path.normpath(os.path.join(allowed_root, path))
+
+    if not abs_path.startswith(allowed_root + os.sep) and abs_path != allowed_root:
+        return None, {
+            "error": (
+                "Access denied: the requested path is outside the allowed directory. "
+                "All file operations must stay within the allowed_root shown below."
+            ),
+            "allowed_root": allowed_root,
+            "requested_path": path,
+        }
+    return abs_path, None
+
+
+# ---------------------------------------------------------------------------
+# Tool functions
+# ---------------------------------------------------------------------------
+
+def list_directory(dir_path: str) -> Dict[str, Any]:
+    """List entries (files and subdirectories) in a directory.
+
+    Args:
+        dir_path: Path relative to the allowed root (BUILD_DIR), or absolute.
+
+    Returns:
+        Dict with ``path`` (resolved), ``allowed_root``, and ``entries``
+        (list of dicts with ``name``, ``type`` ('file'/'dir'), and ``size``
+        for files).  On error, returns a dict with ``error`` and
+        ``allowed_root``.
+    """
+    allowed_root = _get_allowed_root()
+    abs_path, err = _resolve_path(dir_path)
+    if err is not None:
+        return err
     try:
-        resolved = _resolve_path_relative_to_root(dir_path)
-        if not os.path.isdir(resolved):
+        if not os.path.isdir(abs_path):
             return {
-                "path": resolved,
+                "path": abs_path,
+                "allowed_root": allowed_root,
                 "error": f"Not a directory: {dir_path}",
                 "entries": [],
             }
         entries: List[Dict[str, Any]] = []
-        for name in sorted(os.listdir(resolved)):
-            full = os.path.join(resolved, name)
+        for name in sorted(os.listdir(abs_path)):
+            full = os.path.join(abs_path, name)
             if os.path.isdir(full):
                 entries.append({"name": name, "type": "dir"})
             else:
                 entries.append({"name": name, "type": "file", "size": os.path.getsize(full)})
-        _debug_print(f"list_directory '{dir_path}' -> {len(entries)} entries")
-        return {"path": resolved, "entries": entries}
+        return {"path": abs_path, "allowed_root": allowed_root, "entries": entries}
     except Exception as exc:
-        _debug_print(f"list_directory failed for '{dir_path}': {exc!r}")
-        return {"path": dir_path, "error": str(exc), "entries": []}
+        return {"path": dir_path, "allowed_root": allowed_root, "error": str(exc), "entries": []}
 
 
-@function_tool
 def read_file(file_path: str) -> Dict[str, Any]:
-    """Read the full contents of a text file on the user's machine.
+    """Read the full contents of a text file.
 
     Args:
-        file_path: Path to the file, absolute or relative to the project root.
+        file_path: Path relative to the allowed root (BUILD_DIR), or absolute.
 
     Returns:
-        A dict with 'path' (resolved path), 'contents' (file contents as string),
-        or 'error' if the file could not be read.
+        Dict with ``path`` (resolved), ``allowed_root``, and ``contents``
+        (str).  On error, returns a dict with ``error`` and ``allowed_root``.
     """
+    allowed_root = _get_allowed_root()
+    abs_path, err = _resolve_path(file_path)
+    if err is not None:
+        return err
     try:
-        resolved = _resolve_path_relative_to_root(file_path)
-        if not os.path.isfile(resolved):
-            return {"path": resolved, "error": f"Not a file: {file_path}", "contents": None}
-        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+        if not os.path.isfile(abs_path):
+            return {
+                "path": abs_path,
+                "allowed_root": allowed_root,
+                "error": f"Not a file: {file_path}",
+                "contents": None,
+            }
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
             contents = f.read()
-        _debug_print(f"read_file '{file_path}' -> {len(contents)} chars")
-        return {"path": resolved, "contents": contents}
+        return {"path": abs_path, "allowed_root": allowed_root, "contents": contents}
     except Exception as exc:
-        _debug_print(f"read_file failed for '{file_path}': {exc!r}")
-        return {"path": file_path, "error": str(exc), "contents": None}
+        return {"path": file_path, "allowed_root": allowed_root, "error": str(exc), "contents": None}
 
 
-@function_tool
 def write_file(file_path: str, contents: str) -> Dict[str, Any]:
-    """Write contents to a file on the user's machine. Creates parent directories if needed.
+    """Write text contents to a file, creating parent directories as needed.
+
+    Writes are restricted to the allowed root (BUILD_DIR) exactly like reads.
+    No separate output-root env var is consulted; the entire BUILD_DIR is the
+    writable sandbox.
 
     Args:
-        file_path: Path to the file, absolute or relative to the project root.
-        contents: Full file contents to write (text).
+        file_path: Path relative to the allowed root (BUILD_DIR), or absolute.
+        contents: Full text content to write.
 
     Returns:
-        A dict with 'path' (resolved path), 'written' (True if successful),
-        or 'error' if the write failed.
+        Dict with ``path`` (resolved), ``allowed_root``, and ``written``
+        (True).  On error, returns a dict with ``error`` and ``allowed_root``.
     """
+    allowed_root = _get_allowed_root()
+    abs_path, err = _resolve_path(file_path)
+    if err is not None:
+        return err
     try:
-        resolved = _resolve_write_path(file_path)
-        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
-        with open(resolved, "w", encoding="utf-8") as f:
+        parent = os.path.dirname(abs_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
             f.write(contents)
-        _debug_print(f"write_file '{file_path}' -> {len(contents)} chars")
-        return {"path": resolved, "written": True}
+        return {"path": abs_path, "allowed_root": allowed_root, "written": True}
     except Exception as exc:
-        _debug_print(f"write_file failed for '{file_path}': {exc!r}")
-        return {"path": file_path, "written": False, "error": str(exc)}
+        return {"path": file_path, "allowed_root": allowed_root, "written": False, "error": str(exc)}
