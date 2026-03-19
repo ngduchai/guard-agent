@@ -2,11 +2,15 @@
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
+#include <cstdlib>
+#include <cerrno>
+#include <sys/stat.h>
 #include "art_simple.h"
 #include "hdf5.h"
 
 #include <mpi.h>
-#include "veloc.hpp"
+
+#include <veloc.h>
 
 #include <unistd.h>
 #include <limits.h>
@@ -56,8 +60,10 @@ int saveAsHDF5(const char* fname, float* recon, hsize_t* output_dims) {
 int main(int argc, char* argv[])
 {
 
-    if(argc != 8) {
-        std::cerr << "Usage: " << argv[0] << " <filename> <center> <num_outer_iter> <num_iter> <beginning_sino> <num_sino>" << std::endl;
+    if(argc < 7 || argc > 9) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <filename> <center> <num_outer_iter> <num_iter> <beginning_sino> <num_sino>"
+                  << " [veloc_cfg]" << std::endl;
         return 1;
     }
 
@@ -69,7 +75,13 @@ int main(int argc, char* argv[])
     int num_iter = atoi(argv[4]);
     int beg_index = atoi(argv[5]);
     int nslices = atoi(argv[6]);
-    const char* check_point_config = argv[7];
+
+    // Optional: allow overriding VeloC configuration.
+    // Any additional CLI arg (legacy) is ignored.
+    const char* veloc_cfg_file = (argc >= 8) ? argv[7] : "veloc.cfg";
+
+    // Name used by VeloC for the checkpoint namespace (must be alphanumeric).
+    const char* veloc_ckpt_name = "artsimple";
 
     std::cout << "Reading data..." << std::endl;
 
@@ -218,70 +230,101 @@ int main(int argc, char* argv[])
     float * w_recon = new float [w_recon_size];
     float * w_data = data_swap + w_offset*dt*dx;
     std::cout << "[task-" << id << "]: offset: " << w_offset << ", w_dt: " << w_dt << ", w_dy: " << w_dy << ", w_dx: " << w_dx << ", w_ngridx: " << w_ngridx << ", w_ngridy: " << w_ngridy << ", num_iter: " << num_iter << ", center: " << center << std::endl;
-    
-    // Initiate VeloC
-    veloc::client_t *ckpt = veloc::get_client((unsigned int)id, check_point_config);
 
-    // ckpt->mem_protect(0, w_recon, sizeof(float), w_recon_size);
-    ckpt->mem_protect(0, recon, sizeof(float), recon_size);
-    const char* ckpt_name = "art_simple";
+    // --- VeloC state to checkpoint/restart ---
+    // next_outer_iter represents the outer-loop index to start from.
+    int next_outer_iter = 0;
+    std::fill(w_recon, w_recon + w_recon_size, 0.0f);
 
-    
-
-    int v = ckpt->restart_test(ckpt_name, 0);
-    if (v > 0) {
-        std::cout << "[task-" << id << "]: Found a checkpoint version " << v << " at iteration #" << v-1 << std::endl;
-    }else {
-        v = 0;
-    }
-    
-    // Determine the latest checkpoint
-    int latest_v = 0;
-    MPI_Allreduce(&v, &latest_v, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-
-    if (latest_v > 0) {
-        
-        // Determine who is responsible to read the checkpoint and redistribute it to others
-        // This is needed if more than 1 worker finds the latest checkpoint.
-        int dist_id = -1;
-        int vid = -1;
-        if (latest_v == v) {
-            vid = id;
+    // Initialize VeloC (collective across all MPI ranks).
+    int veloc_rc = VELOC_Init(MPI_COMM_WORLD, veloc_cfg_file);
+    if (veloc_rc != VELOC_SUCCESS) {
+        if (id == (int)mpi_root) {
+            std::cerr << "VELOC_Init failed (rc=" << veloc_rc << ") cfg=" << veloc_cfg_file << std::endl;
         }
-        MPI_Allreduce(&vid, &dist_id, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+    }
 
-        // Read the checkpoint
-        if (dist_id == id) {
-            std::cout << "[task-" << id << "]: Initiate restart from iteration #" << v-1 << std::endl;
-            if (!ckpt->restart(ckpt_name, v)) {
-                throw std::runtime_error("restart failed");
+    // Register memory regions we want to checkpoint/restart.
+    veloc_rc = VELOC_Mem_protect(0, &next_outer_iter, 1, sizeof(next_outer_iter));
+    if (veloc_rc != VELOC_SUCCESS) {
+        if (id == (int)mpi_root) {
+            std::cerr << "VELOC_Mem_protect(next_outer_iter) failed (rc=" << veloc_rc << ")" << std::endl;
+        }
+        MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+    }
+    veloc_rc = VELOC_Mem_protect(1, w_recon, static_cast<size_t>(w_recon_size), sizeof(float));
+    if (veloc_rc != VELOC_SUCCESS) {
+        if (id == (int)mpi_root) {
+            std::cerr << "VELOC_Mem_protect(w_recon) failed (rc=" << veloc_rc << ")" << std::endl;
+        }
+        MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+    }
+
+    // Probe for the latest checkpoint and restore state if available.
+    int latest_version = VELOC_Restart_test(veloc_ckpt_name, 0);
+    if (latest_version > 0) {
+        veloc_rc = VELOC_Restart(veloc_ckpt_name, latest_version);
+        if (veloc_rc != VELOC_SUCCESS) {
+            if (id == (int)mpi_root) {
+                std::cerr << "VELOC_Restart failed (rc=" << veloc_rc << ") version=" << latest_version << std::endl;
             }
-            std::cout << "[task-" << id << "]: Distributed the reconstruction to other tasks" << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, veloc_rc);
         }
-        // Distribute the checkpoint to others
-        MPI_Scatter(recon, w_recon_size, MPI_FLOAT, w_recon, w_recon_size, MPI_FLOAT, dist_id, MPI_COMM_WORLD);
+        std::cout << "[task-" << id << "]: Resumed from VeloC version " << latest_version
+                  << ", starting outer iteration #" << next_outer_iter << std::endl;
+    } else {
+        if (id == (int)mpi_root) {
+            std::cout << "[task-" << id << "]: No checkpoint found; starting from outer iteration #0" << std::endl;
+        }
     }
-    v = latest_v;
-    // // Copy data from the shared workspace to local workspace
-    // for (int i = 0; i < w_recon_size; ++i) {
-    //     w_recon[i] = recon[i + w_offset*ngridx*ngridy];
-    // }
 
-    std::cout << "[task-" << id << "]: Start the reconstruction from iteration #" << v << std::endl;
+    std::cout << "[task-" << id << "]: Start the reconstruction from outer iteration #" << next_outer_iter << std::endl;
+
+    const double checkpoint_period_sec = 5.0;
+    double last_checkpoint_time = MPI_Wtime();
+    int last_checkpoint_version = next_outer_iter; // next_outer_iter is how far we've completed
 
     // run the reconstruction
-    for (int i = v; i < num_outer_iter; i++)
+    for (int i = next_outer_iter; i < num_outer_iter; i++)
     {
         std::cout << "[task-" << id << "]: Outer iteration: " << i << std::endl;
         art(w_data, w_dy, w_dt, w_dx, &center, theta, w_recon, w_ngridx, w_ngridy, num_iter);
         
         MPI_Allgather(w_recon, w_recon_size, MPI_FLOAT, recon, w_recon_size, MPI_FLOAT, MPI_COMM_WORLD);
 
-        // Checkpointing
-        if (!ckpt->checkpoint(ckpt_name, i+1)) {
-            throw std::runtime_error("Checkpointing failured");
+        // Update restartable state so a future failure can resume safely.
+        next_outer_iter = i + 1;
+
+        // Time-based checkpointing. Decision must be collective-safe across ranks.
+        const int local_should_checkpoint = (MPI_Wtime() - last_checkpoint_time >= checkpoint_period_sec) ? 1 : 0;
+        int global_should_checkpoint = 0;
+        MPI_Allreduce(&local_should_checkpoint, &global_should_checkpoint, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+
+        if (global_should_checkpoint) {
+            // Version is monotonic and equals "next_outer_iter" after this outer iteration.
+            veloc_rc = VELOC_Checkpoint(veloc_ckpt_name, next_outer_iter);
+            if (veloc_rc != VELOC_SUCCESS) {
+                if (id == (int)mpi_root) {
+                    std::cerr << "VELOC_Checkpoint failed (rc=" << veloc_rc << ") version=" << next_outer_iter << std::endl;
+                }
+                MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+            }
+
+            last_checkpoint_time = MPI_Wtime();
+            last_checkpoint_version = next_outer_iter;
         }
-        std::cout << "[task-" << id << "]: Checkpointed version " << i+1 << std::endl;
+    }
+
+    // Always checkpoint the final completed iteration (if not already covered).
+    if (last_checkpoint_version != num_outer_iter) {
+        veloc_rc = VELOC_Checkpoint(veloc_ckpt_name, num_outer_iter);
+        if (veloc_rc != VELOC_SUCCESS) {
+            if (id == (int)mpi_root) {
+                std::cerr << "VELOC_Checkpoint(final) failed (rc=" << veloc_rc << ")" << std::endl;
+            }
+            MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+        }
     }
 
     if (id == mpi_root) {
@@ -310,6 +353,14 @@ int main(int argc, char* argv[])
 
     }
 
+    // Finalize VeloC collectively before shutting down MPI.
+    veloc_rc = VELOC_Finalize(1);
+    if (veloc_rc != VELOC_SUCCESS) {
+        if (id == (int)mpi_root) {
+            std::cerr << "VELOC_Finalize failed (rc=" << veloc_rc << ")" << std::endl;
+        }
+        MPI_Abort(MPI_COMM_WORLD, veloc_rc);
+    }
 
     // free the memory
     delete[] data;
