@@ -8,10 +8,9 @@ Provides:
     record per-turn latency, token counts, tool call timing, step timing, and
     the full per-turn conversation (user context, model response, tool calls /
     results).
-  - log_session()    – always saves a full session log to
-                       ``<BUILD_DIR>/log/<codebase>_<YYYYMMDD>.json``.
-  - export_metrics() – serialises a SessionMetrics object to a JSON file on
-                       disk (kept for backward-compat / download endpoint).
+  - log_session()     – saves the full session log to
+                        ``<BUILD_DIR>/log/<codebase>_<YYYYMMDD>.json``.
+                        This is the single authoritative record for every run.
   - metrics_summary() – returns a compact dict suitable for embedding in the
                         "done" SSE event so the web UI and terminal can display
                         a quick summary.
@@ -485,28 +484,6 @@ def log_session(metrics: SessionMetrics, output_dir: str) -> str:
 
     return str(file_path)
 
-
-def export_metrics(metrics: SessionMetrics, output_dir: str) -> str:
-    """
-    Serialise ``metrics`` to a JSON file and return the file path.
-
-    The file is written to ``<output_dir>/metrics/metrics_<session_id>.json``.
-    The ``metrics/`` subdirectory is created if it does not exist.
-
-    .. note::
-        Prefer :func:`log_session` for the always-on audit log.  This function
-        is kept for the web UI download endpoint which uses the session UUID as
-        the filename.
-    """
-    metrics_dir = Path(output_dir) / "metrics"
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    file_path = metrics_dir / f"metrics_{metrics.session_id}.json"
-
-    data = asdict(metrics)
-    with open(file_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-
-    return str(file_path)
 
 
 def metrics_summary(metrics: SessionMetrics) -> Dict[str, Any]:

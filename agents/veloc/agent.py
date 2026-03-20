@@ -45,7 +45,6 @@ from agents.veloc.config import get_llm_client, get_project_root, get_settings
 from agents.veloc.filesync_tools import execute_script, list_directory, read_file, remove_file, write_file
 from agents.veloc.metrics import (
     MetricsCollector,
-    export_metrics,
     extract_codebase_name,
     log_session,
     metrics_summary,
@@ -779,11 +778,7 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     try:
         log_session(session_metrics, get_project_root())
     except Exception:
-        pass  # Never let metrics export crash the agent.
-    try:
-        export_metrics(session_metrics, get_project_root())
-    except Exception:
-        pass
+        pass  # Never let metrics log crash the agent.
 
     result["metrics"] = metrics_summary(session_metrics)
     return result
@@ -865,11 +860,7 @@ async def stream_veloc_agent(
                 llm_model=get_settings().llm_model,
             )
             try:
-                log_session(session_metrics, get_project_root())
-            except Exception:
-                pass
-            try:
-                saved_path = export_metrics(session_metrics, get_project_root())
+                saved_path = log_session(session_metrics, get_project_root())
                 error_result["metrics_path"] = saved_path
             except Exception:
                 pass
@@ -888,13 +879,9 @@ async def stream_veloc_agent(
     )
     saved_path: str | None = None
     try:
-        log_session(session_metrics, get_project_root())
+        saved_path = log_session(session_metrics, get_project_root())
     except Exception:
         pass  # Never let metrics log crash the agent.
-    try:
-        saved_path = export_metrics(session_metrics, get_project_root())
-    except Exception:
-        pass  # Never let metrics export crash the agent.
 
     m_summary = metrics_summary(session_metrics)
     m_full = asdict(session_metrics)

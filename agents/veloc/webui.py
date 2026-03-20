@@ -1484,6 +1484,8 @@ async def api_metrics_export(
       returned.
 
     Returns a JSON file download (``Content-Disposition: attachment``).
+    The download filename matches the log file naming convention:
+    ``<codebase>_<YYYYMMDD>.json``.
     """
     if session_id and session_id in _session_metrics:
         data = _session_metrics[session_id]
@@ -1499,8 +1501,11 @@ async def api_metrics_export(
             status_code=404,
         )
 
-    sid = data.get("session_id", "unknown")
-    filename = f"metrics_{sid}.json"
+    # Build a filename that matches the log/ file naming convention.
+    codebase = data.get("codebase") or data.get("session_id", "unknown")
+    started_at = data.get("started_at", "")
+    date_str = started_at[:10].replace("-", "") if started_at else "unknown"
+    filename = f"{codebase}_{date_str}.json"
     content = json.dumps(data, indent=2, ensure_ascii=False)
     return Response(
         content=content,
