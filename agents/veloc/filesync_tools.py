@@ -166,25 +166,30 @@ def write_file(file_path: str, contents: str) -> Dict[str, Any]:
 
 
 def remove_file(file_path: str) -> Dict[str, Any]:
-    """Remove a single file that lives inside the BUILD_DIR sandbox.
+    """Remove a file **or an empty directory** that lives inside the BUILD_DIR sandbox.
 
-    Only files that resolve inside the allowed root (BUILD_DIR) may be deleted.
+    Only paths that resolve inside the allowed root (BUILD_DIR) may be deleted.
     Any attempt to remove a path outside BUILD_DIR is rejected immediately and
-    returns an error dict — the file is never touched.
+    returns an error dict — the path is never touched.
 
-    Directories are not removed by this tool; use it only for individual files.
+    - If the path is a **file**, it is deleted with ``os.remove``.
+    - If the path is an **empty directory**, it is deleted with ``os.rmdir``.
+    - If the path is a **non-empty directory**, the call is rejected with an
+      error; use a shell command (via ``execute_script``) to remove non-empty
+      trees.
 
     Args:
-        file_path: Path to the file to delete, relative to BUILD_DIR or absolute.
-                   Must resolve inside BUILD_DIR.
+        file_path: Path to the file or empty directory to delete, relative to
+                   BUILD_DIR or absolute.  Must resolve inside BUILD_DIR.
 
     Returns:
         Dict with:
-        - ``path``         – resolved absolute path of the deleted file
+        - ``path``         – resolved absolute path of the deleted entry
         - ``allowed_root`` – the BUILD_DIR sandbox root
         - ``removed``      – True on success
-        - ``error``        – present only when the operation failed (access denied,
-                             file not found, is a directory, OS error, etc.)
+        - ``kind``         – ``"file"`` or ``"directory"`` (present on success)
+        - ``error``        – present only when the operation failed (access
+                             denied, not found, non-empty directory, OS error)
     """
     allowed_root = _get_allowed_root()
     abs_path, err = _resolve_path(file_path)
@@ -196,23 +201,57 @@ def remove_file(file_path: str) -> Dict[str, Any]:
             "path": abs_path,
             "allowed_root": allowed_root,
             "removed": False,
-            "error": f"File not found: {file_path}",
+            "error": f"Path not found: {file_path}",
         }
 
     if os.path.isdir(abs_path):
+        # Only allow removal of *empty* directories.
+        try:
+            contents = os.listdir(abs_path)
+        except Exception as exc:
+            return {
+                "path": abs_path,
+                "allowed_root": allowed_root,
+                "removed": False,
+                "error": f"Cannot list directory: {exc}",
+            }
+        if contents:
+            return {
+                "path": abs_path,
+                "allowed_root": allowed_root,
+                "removed": False,
+                "error": (
+                    f"Directory is not empty: {file_path} "
+                    f"({len(contents)} item(s) inside). "
+                    "Remove the contents first, or use execute_script with "
+                    "'rm -rf' for non-empty trees."
+                ),
+            }
+        try:
+            os.rmdir(abs_path)
+            return {
+                "path": abs_path,
+                "allowed_root": allowed_root,
+                "removed": True,
+                "kind": "directory",
+            }
+        except Exception as exc:
+            return {
+                "path": abs_path,
+                "allowed_root": allowed_root,
+                "removed": False,
+                "error": str(exc),
+            }
+
+    # Regular file.
+    try:
+        os.remove(abs_path)
         return {
             "path": abs_path,
             "allowed_root": allowed_root,
-            "removed": False,
-            "error": (
-                f"Path is a directory, not a file: {file_path}. "
-                "This tool only removes individual files."
-            ),
+            "removed": True,
+            "kind": "file",
         }
-
-    try:
-        os.remove(abs_path)
-        return {"path": abs_path, "allowed_root": allowed_root, "removed": True}
     except Exception as exc:
         return {
             "path": abs_path,

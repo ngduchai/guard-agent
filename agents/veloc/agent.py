@@ -37,10 +37,19 @@ import asyncio
 import json
 import re
 import os
+import time
+from dataclasses import asdict
 from typing import Any, AsyncIterator, Callable, Dict, List, Tuple
 
 from agents.veloc.config import get_llm_client, get_project_root, get_settings
 from agents.veloc.filesync_tools import execute_script, list_directory, read_file, remove_file, write_file
+from agents.veloc.metrics import (
+    MetricsCollector,
+    export_metrics,
+    extract_codebase_name,
+    log_session,
+    metrics_summary,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +67,10 @@ All file paths you use with the filesystem tools must be relative to this root.
 - `list_directory(dir_path)` – list files and subdirectories.
 - `read_file(file_path)` – read a source file.
 - `write_file(file_path, contents)` – write a file (creates parent dirs).
-- `remove_file(file_path)` – delete a single file inside BUILD_DIR.
-  Returns `removed` (True/False) and, on failure, an `error` message.
-  Only files inside BUILD_DIR may be removed; any other path returns an error.
-  Directories cannot be removed with this tool.
+- `remove_file(file_path)` – delete a file **or an empty directory** inside BUILD_DIR.
+  Returns `removed` (True/False), `kind` ("file" or "directory"), and, on failure, an `error` message.
+  Only paths inside BUILD_DIR may be removed; any other path returns an error.
+  Non-empty directories are rejected — remove their contents first, or use `execute_script` with `rm -rf`.
 - `execute_script(script_path, timeout)` – execute a bash script that already exists inside BUILD_DIR.
   Returns `returncode`, `stdout`, `stderr`, and `timed_out`.
   The script runs with `cwd=BUILD_DIR`, `HOME=BUILD_DIR`, and a restricted `PATH`.
@@ -84,6 +93,7 @@ Rules:
 - Keep each step focused on one logical action.
 - Do NOT ask the user for input between steps — proceed automatically.
 - Only emit a question to the user if you genuinely cannot proceed without missing information (e.g. unknown code path, missing environment details).
+- Keep track of temporary/intermediate files you create during the whole process and remember to remove them once complete
 
 ## Workflow
 1. **Understand the request.** If the user's prompt is missing the code path, target environment, or resilience requirements, ask for the missing information.
@@ -100,7 +110,8 @@ Rules:
    Inspect the returned `returncode`, `stdout`, and `stderr`. If validation fails, analyse the error, fix the code, and run again.
    If the script needs more than 120 s (e.g. for a large MPI job), pass a larger `timeout` value.
    Only ask the user for input if the script requires information you genuinely cannot determine (e.g. unknown MPI rank count, missing dataset path).
-8. **Clean-up** remove **ALL** intermadiate files you created throughout the execution using `remove_file`, keep the original implementation and your generated resilient code intact.
+8. **Clean-up** remove **ALL** temporary/intermediate files you created throughout the execution using `remove_file`, keep the original implementation and your generated resilient code intact.
+    Clean not only temporary/intermediate files created in the original codebase and the generated codebase, but also **ALL** files and directories you created within the project root.
 9. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
    - `{{"status": "ask", "assistant_question": "..."}}` – need more information.
    - `{{"status": "success", "summary": "..."}}` – task completed successfully.
@@ -180,9 +191,13 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
             "function": {
                 "name": "remove_file",
                 "description": (
-                    "Delete a single file that lives inside the BUILD_DIR sandbox. "
+                    "Delete a file or an empty directory that lives inside the BUILD_DIR sandbox. "
                     "Any path that resolves outside BUILD_DIR is rejected and returns an error — "
-                    "the file is never touched. Directories cannot be removed with this tool."
+                    "the path is never touched. "
+                    "Non-empty directories are also rejected; remove their contents first, "
+                    "or use execute_script with 'rm -rf' for non-empty trees. "
+                    "Returns 'removed' (True/False), 'kind' ('file' or 'directory'), "
+                    "and on failure an 'error' message."
                 ),
                 "parameters": {
                     "type": "object",
@@ -190,7 +205,8 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
                         "file_path": {
                             "type": "string",
                             "description": (
-                                "Path to the file to delete, relative to BUILD_DIR or absolute. "
+                                "Path to the file or empty directory to delete, "
+                                "relative to BUILD_DIR or absolute. "
                                 "Must resolve inside BUILD_DIR."
                             ),
                         },
@@ -337,6 +353,7 @@ def _parse_step_events(text: str, turn: int) -> List[Dict[str, Any]]:
 async def _stream_agent_loop(
     messages: List[Dict[str, Any]],
     max_turns: int = 50,
+    collector: MetricsCollector | None = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
     Run the LLM + tool-calling loop and **yield** structured event dicts for
@@ -367,6 +384,16 @@ async def _stream_agent_loop(
 
     ``{"type": "error",       "message": "..."}``
         An unrecoverable error occurred.
+
+    Parameters
+    ----------
+    messages:
+        Full chat message list (system prompt + conversation history).
+    max_turns:
+        Maximum number of LLM API calls before giving up.
+    collector:
+        Optional :class:`MetricsCollector` instance.  When provided, per-turn
+        latency, token counts, tool call timing, and step timing are recorded.
     """
     client = get_llm_client()
     model = get_settings().llm_model
@@ -383,6 +410,10 @@ async def _stream_agent_loop(
         # correct history even if the list is mutated before the executor
         # thread starts (avoids a subtle closure/race condition).
         messages_snapshot = list(messages)
+
+        # ── Record turn start ────────────────────────────────────────────────
+        if collector is not None:
+            collector.start_turn(turn)
 
         # Offload the blocking HTTP call to a thread pool.
         try:
@@ -411,13 +442,29 @@ async def _stream_agent_loop(
             yield {"type": "error", "message": f"LLM call failed: {exc!r}"}
             return
 
+        # ── Record turn end (token counts from response.usage) ───────────────
+        if collector is not None:
+            collector.end_turn(turn, getattr(response, "usage", None))
+            # Record the messages that were in context for this turn.
+            collector.record_context_messages(turn, messages_snapshot)
+
         msg = response.choices[0].message
 
         # Emit any thinking/reasoning text the model produced.
         if msg.content:
+            # Record the model's text response for this turn.
+            if collector is not None:
+                collector.record_model_response(turn, msg.content)
+
             # Parse step-summary / step-result markers from the content.
             step_events = _parse_step_events(msg.content, turn)
             for ev in step_events:
+                # ── Record step start / end in the collector ─────────────────
+                if collector is not None:
+                    if ev["type"] == "step_summary":
+                        collector.record_step_start(ev["step"], ev.get("name", ""))
+                    elif ev["type"] == "step_result":
+                        collector.record_step_end(ev["step"])
                 yield ev
 
             if msg.tool_calls:
@@ -454,9 +501,20 @@ async def _stream_agent_loop(
 
             # Offload blocking tool execution (e.g. cmake/make/MPI) to a thread pool
             # so the event loop stays responsive for SSE heartbeats.
+            # ── Time the tool call for metrics ───────────────────────────────
+            _tool_t0 = time.monotonic()
             result_str = await loop.run_in_executor(
                 None, _dispatch_tool, tc.function.name, tc.function.arguments
             )
+            _tool_elapsed = time.monotonic() - _tool_t0
+            if collector is not None:
+                collector.record_tool_call(
+                    tc.function.name,
+                    _tool_elapsed,
+                    args=args_display,
+                    result=result_str,
+                )
+
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_str})
 
             # Truncate large results for display only.
@@ -477,6 +535,7 @@ async def _stream_agent_loop(
 async def _run_agent_loop(
     messages: List[Dict[str, Any]],
     max_turns: int = 50,
+    collector: MetricsCollector | None = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Run the LLM + tool-calling loop until the model produces a final text answer.
@@ -487,7 +546,7 @@ async def _run_agent_loop(
     final_text = ""
     llm_trace: List[Dict[str, Any]] = []
 
-    async for event in _stream_agent_loop(messages, max_turns=max_turns):
+    async for event in _stream_agent_loop(messages, max_turns=max_turns, collector=collector):
         llm_trace.append(event)
         if event["type"] == "final":
             final_text = event.get("text", "")
@@ -689,7 +748,7 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
     Returns:
         Dict with keys: ``status`` ('ask'|'success'|'error'|'plan'),
         ``assistant_question``, ``summary``, ``plan``,
-        ``raw_llm_response``, ``llm_trace``.
+        ``raw_llm_response``, ``llm_trace``, ``metrics``.
     """
     if not messages:
         return {
@@ -698,15 +757,36 @@ async def run_veloc_agent(messages: List[Dict[str, str]]) -> Dict[str, Any]:
                 "Please describe your application: which code path should be made resilient, "
                 "the target environment (e.g. HPC cluster), and where to write the output."
             ),
-            "plan": None, "raw_llm_response": "", "llm_trace": [],
+            "plan": None, "raw_llm_response": "", "llm_trace": [], "metrics": None,
         }
 
     # Build the full message list: system prompt + conversation history.
     chat: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
     chat.extend({"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages)
 
-    raw, llm_trace = await _run_agent_loop(chat)
-    return _build_result(raw, llm_trace)
+    # Extract codebase name from the first user message for the log filename.
+    codebase = extract_codebase_name(list(messages))
+
+    # Initialise metrics collector.
+    collector = MetricsCollector()
+    collector.start_session()
+
+    raw, llm_trace = await _run_agent_loop(chat, collector=collector)
+    result = _build_result(raw, llm_trace)
+
+    # Finalise metrics and auto-save to disk.
+    session_metrics = collector.finish_session(chat, result, codebase=codebase)
+    try:
+        log_session(session_metrics, get_project_root())
+    except Exception:
+        pass  # Never let metrics export crash the agent.
+    try:
+        export_metrics(session_metrics, get_project_root())
+    except Exception:
+        pass
+
+    result["metrics"] = metrics_summary(session_metrics)
+    return result
 
 
 async def stream_veloc_agent(
@@ -747,8 +827,9 @@ async def stream_veloc_agent(
                     "Please describe your application: which code path should be made resilient, "
                     "the target environment (e.g. HPC cluster), and where to write the output."
                 ),
-                "plan": None, "raw_llm_response": "", "llm_trace": [],
+                "plan": None, "raw_llm_response": "", "llm_trace": [], "metrics": None,
             },
+            "metrics": None,
         }
         return
 
@@ -756,25 +837,69 @@ async def stream_veloc_agent(
     chat: List[Dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
     chat.extend({"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages)
 
+    # Extract codebase name from the first user message for the log filename.
+    codebase = extract_codebase_name(list(messages))
+
+    # Initialise metrics collector.
+    collector = MetricsCollector()
+    collector.start_session()
+
     final_text = ""
     llm_trace: List[Dict[str, Any]] = []
 
-    async for event in _stream_agent_loop(chat):
+    async for event in _stream_agent_loop(chat, collector=collector):
         llm_trace.append(event)
         yield event  # forward every event to the caller
 
         if event["type"] == "final":
             final_text = event.get("text", "")
         elif event["type"] == "error":
-            yield {
-                "type": "done",
-                "result": {
-                    "status": "error",
-                    "assistant_question": event["message"],
-                    "plan": None, "raw_llm_response": "", "llm_trace": llm_trace,
-                },
+            # Finalise metrics even on error.
+            error_result: Dict[str, Any] = {
+                "status": "error",
+                "assistant_question": event["message"],
+                "plan": None, "raw_llm_response": "", "llm_trace": llm_trace,
             }
+            session_metrics = collector.finish_session(
+                chat, error_result, codebase=codebase,
+                llm_model=get_settings().llm_model,
+            )
+            try:
+                log_session(session_metrics, get_project_root())
+            except Exception:
+                pass
+            try:
+                saved_path = export_metrics(session_metrics, get_project_root())
+                error_result["metrics_path"] = saved_path
+            except Exception:
+                pass
+            m_summary = metrics_summary(session_metrics)
+            m_full = asdict(session_metrics)
+            error_result["metrics"] = m_summary
+            yield {"type": "done", "result": error_result, "metrics": m_summary, "full_metrics": m_full}
             return
 
     result = _build_result(final_text, llm_trace)
-    yield {"type": "done", "result": result}
+
+    # Finalise metrics and auto-save to disk.
+    session_metrics = collector.finish_session(
+        chat, result, codebase=codebase,
+        llm_model=get_settings().llm_model,
+    )
+    saved_path: str | None = None
+    try:
+        log_session(session_metrics, get_project_root())
+    except Exception:
+        pass  # Never let metrics log crash the agent.
+    try:
+        saved_path = export_metrics(session_metrics, get_project_root())
+    except Exception:
+        pass  # Never let metrics export crash the agent.
+
+    m_summary = metrics_summary(session_metrics)
+    m_full = asdict(session_metrics)
+    result["metrics"] = m_summary
+    if saved_path:
+        result["metrics_path"] = saved_path
+
+    yield {"type": "done", "result": result, "metrics": m_summary, "full_metrics": m_full}

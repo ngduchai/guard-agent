@@ -104,6 +104,55 @@ def _print_final_success(summary: str) -> None:
     _hr("═", _GREEN)
 
 
+def _print_metrics_summary(metrics: dict[str, Any]) -> None:
+    """Print a formatted performance summary block to the terminal."""
+    if not metrics:
+        return
+
+    _hr("═", _BLUE)
+    print(f"{_BLUE}{_BOLD}  📊 Performance Summary{_RESET}")
+    _hr("─", _DIM)
+
+    session_id   = metrics.get("session_id", "n/a")
+    total_s      = metrics.get("total_elapsed_s")
+    total_turns  = metrics.get("total_turns", 0)
+    total_tools  = metrics.get("total_tool_calls", 0)
+    total_tok    = metrics.get("total_tokens")
+    prompt_tok   = metrics.get("total_prompt_tokens")
+    compl_tok    = metrics.get("total_completion_tokens")
+
+    print(f"  {_DIM}Session ID  :{_RESET} {session_id}")
+    if total_s is not None:
+        print(f"  {_DIM}Total time  :{_RESET} {total_s:.1f} s")
+    print(f"  {_DIM}LLM turns   :{_RESET} {total_turns}")
+    print(f"  {_DIM}Tool calls  :{_RESET} {total_tools}")
+    if total_tok is not None:
+        tok_str = f"{total_tok:,}"
+        if prompt_tok is not None and compl_tok is not None:
+            tok_str += f"  (prompt: {prompt_tok:,} | completion: {compl_tok:,})"
+        print(f"  {_DIM}Tokens used :{_RESET} {tok_str}")
+
+    per_turn = metrics.get("per_turn") or []
+    if per_turn:
+        _hr("─", _DIM)
+        print(f"  {_DIM}Per-turn breakdown:{_RESET}")
+        header = f"  {'Turn':>4}  {'Elapsed':>8}  {'Tokens':>8}  {'Tool calls':>10}  {'Steps':>5}"
+        print(f"{_DIM}{header}{_RESET}")
+        for t in per_turn:
+            turn_n   = t.get("turn", "?")
+            elapsed  = t.get("elapsed_s")
+            tokens   = t.get("total_tokens")
+            tools    = t.get("tool_call_count", 0)
+            steps    = t.get("step_count", 0)
+            elapsed_str = f"{elapsed:.1f} s" if elapsed is not None else "  n/a  "
+            tokens_str  = f"{tokens:,}"      if tokens  is not None else "   n/a"
+            print(
+                f"  {turn_n:>4}  {elapsed_str:>8}  {tokens_str:>8}  {tools:>10}  {steps:>5}"
+            )
+
+    _hr("═", _BLUE)
+
+
 def _print_final_ask(question: str) -> None:
     _hr("─", _YELLOW)
     print(f"{_YELLOW}{_BOLD}  ⚠ Agent needs more information:{_RESET}")
@@ -238,10 +287,25 @@ async def _handle_single_interaction() -> None:
 
             elif etype == "done":
                 final_result = event.get("result") or {}
+                # Capture metrics from the done event (top-level key).
+                _done_metrics = event.get("metrics") or (final_result or {}).get("metrics")
+                if _done_metrics and not (final_result or {}).get("metrics"):
+                    final_result["metrics"] = _done_metrics
+                if _done_metrics and not (final_result or {}).get("metrics_path"):
+                    final_result["metrics_path"] = event.get("result", {}).get("metrics_path")
 
         if final_result is None:
             _print_final_error("Agent returned no result.")
             return
+
+        # ── Print performance metrics ─────────────────────────────────────────
+        metrics = final_result.get("metrics")
+        if metrics:
+            _print_metrics_summary(metrics)
+            saved_path = final_result.get("metrics_path")
+            if saved_path:
+                print(f"  {_DIM}📁 Metrics saved to:{_RESET} {saved_path}")
+                _hr("═", _BLUE)
 
         status = final_result.get("status", "error")
 
