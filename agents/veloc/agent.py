@@ -373,18 +373,40 @@ async def _stream_agent_loop(
     tool_schemas = _build_tool_schemas()
     loop = asyncio.get_running_loop()
 
+    # Maximum seconds to wait for a single LLM API response.  Long enough for
+    # slow models / large contexts, but prevents an indefinite hang if the
+    # endpoint is unreachable or stalled.
+    LLM_TIMEOUT = 300  # 5 minutes
+
     for turn in range(1, max_turns + 1):
+        # Snapshot the message list for the lambda so each turn uses the
+        # correct history even if the list is mutated before the executor
+        # thread starts (avoids a subtle closure/race condition).
+        messages_snapshot = list(messages)
+
         # Offload the blocking HTTP call to a thread pool.
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=tool_schemas,
-                    tool_choice="auto",
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: client.chat.completions.create(
+                        model=model,
+                        messages=messages_snapshot,
+                        tools=tool_schemas,
+                        tool_choice="auto",
+                    ),
                 ),
+                timeout=LLM_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            yield {
+                "type": "error",
+                "message": (
+                    f"LLM API call timed out after {LLM_TIMEOUT} s on turn {turn}. "
+                    "The endpoint may be slow or unreachable. Please try again."
+                ),
+            }
+            return
         except Exception as exc:
             yield {"type": "error", "message": f"LLM call failed: {exc!r}"}
             return
@@ -585,7 +607,13 @@ def _parse_json(text: str) -> Any:
 
 
 def _build_result(raw: str, llm_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Parse the LLM's final JSON response and return a structured result dict."""
+    """Parse the LLM's final JSON response and return a structured result dict.
+
+    The LLM is instructed to return a JSON object with a ``"status"`` key.
+    However, when the LLM asks a clarifying question conversationally (without
+    using the JSON format), we treat the raw text as an ``ask`` response so the
+    user sees the question rather than a confusing error message.
+    """
     if not raw:
         return {
             "status": "error",
@@ -596,9 +624,11 @@ def _build_result(raw: str, llm_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
     try:
         data = _parse_json(_extract_json(raw))
     except json.JSONDecodeError:
+        # The LLM responded conversationally (no JSON).  Treat the full text as
+        # an "ask" so the user sees the message and can reply.
         return {
-            "status": "error",
-            "assistant_question": "Agent output could not be parsed as JSON. Please try again.",
+            "status": "ask",
+            "assistant_question": raw.strip(),
             "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
 
@@ -627,7 +657,16 @@ def _build_result(raw: str, llm_trace: List[Dict[str, Any]]) -> Dict[str, Any]:
             "plan": plan, "raw_llm_response": raw, "llm_trace": llm_trace,
         }
 
-    # error or unknown
+    if not status:
+        # No "status" key at all — the LLM responded conversationally with a
+        # JSON-like structure (e.g. a step marker).  Treat as ask.
+        return {
+            "status": "ask",
+            "assistant_question": raw.strip(),
+            "plan": None, "raw_llm_response": raw, "llm_trace": llm_trace,
+        }
+
+    # error or unknown status value
     return {
         "status": "error",
         "assistant_question": str(data.get("assistant_question", data.get("error_message", raw[:500]))),

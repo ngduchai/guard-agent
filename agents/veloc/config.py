@@ -76,6 +76,13 @@ def get_project_root() -> str:
     return str(Path(raw).resolve()) if raw else _default_project_root()
 
 
+# Default HTTP timeout (seconds) for LLM API calls.  Long enough for slow
+# models / large contexts, but prevents an indefinite hang if the endpoint
+# is unreachable or stalled.  Can be overridden by setting LLM_TIMEOUT in
+# the environment.
+_LLM_HTTP_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))
+
+
 def get_llm_client():
     """
     Return a configured ``openai.OpenAI`` client for the active provider.
@@ -86,6 +93,9 @@ def get_llm_client():
     - ``openai``  → real OpenAI endpoint (no base_url override).
     - ``argo``    → Argonne proxy (base_url = ARGO_BASE_URL).
     - ``generic`` → custom endpoint (base_url = LLM_BASE_URL, key = LLM_API_KEY).
+
+    A ``timeout`` of ``_LLM_HTTP_TIMEOUT`` seconds is applied at the HTTP
+    level so that a slow or unreachable endpoint does not block indefinitely.
     """
     from openai import OpenAI
 
@@ -94,7 +104,7 @@ def get_llm_client():
 
     if provider == "openai":
         api_key = s.openai_api_key or os.getenv("OPENAI_API_KEY")
-        return OpenAI(api_key=api_key)
+        return OpenAI(api_key=api_key, timeout=_LLM_HTTP_TIMEOUT)
 
     if provider == "argo":
         api_key = (
@@ -102,7 +112,7 @@ def get_llm_client():
             or s.openai_api_key
             or os.getenv("OPENAI_API_KEY")
         )
-        return OpenAI(api_key=api_key, base_url=s.argo_base_url)
+        return OpenAI(api_key=api_key, base_url=s.argo_base_url, timeout=_LLM_HTTP_TIMEOUT)
 
     if provider == "generic":
         api_key = (
@@ -120,7 +130,7 @@ def get_llm_client():
             )
             api_key = "placeholder"
         base_url = s.llm_base_url or os.getenv("OPENAI_BASE_URL")
-        return OpenAI(api_key=api_key, base_url=base_url)
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=_LLM_HTTP_TIMEOUT)
 
     raise ValueError(
         f"Unknown llm_provider '{provider}'. "
