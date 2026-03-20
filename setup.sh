@@ -39,10 +39,15 @@ fi
 shopt -u nullglob
 
 # Copy examples into build for test/demonstration (self-contained runs from build/)
-if [ -d "$REPO_ROOT/tests/examples" ]; then
-  echo "Copying examples to $BUILD_DIR/examples ..."
-  cp -r "$REPO_ROOT/tests/examples" "$BUILD_DIR/examples"
+if [ -d "$REPO_ROOT/tests/examples/original" ]; then
+  echo "Copying examples/original to $BUILD_DIR/examples ..."
+  cp -r "$REPO_ROOT/tests/examples/original" "$BUILD_DIR/examples"
   echo "  $BUILD_DIR/examples"
+fi
+if [ -d "$REPO_ROOT/tests/ecp" ]; then
+  echo "Copying ecp to $BUILD_DIR/ecp ..."
+  cp -r "$REPO_ROOT/tests/ecp" "$BUILD_DIR/ecp"
+  echo "  $BUILD_DIR/ecp"
 fi
 if [ -d "$REPO_ROOT/tests/data" ]; then
   echo "Copying data to $BUILD_DIR/data ..."
