@@ -149,8 +149,9 @@ MPI_FLAGS = -DHAVE_MPI
 OPTFLAGS = -g -O2
 
 CXX=mpicxx
-CXXFLAGS = -std=c++11 $(OPTFLAGS) -Wpedantic
-CPPFLAGS = $(MPI_FLAGS) $(OPENMP_FLAGS) -include portability.hh
+# -include portability.hh ensures uint64_t is available in all translation units
+CXXFLAGS = -std=c++11 $(OPTFLAGS) -include portability.hh
+CPPFLAGS = $(MPI_FLAGS) $(OPENMP_FLAGS)
 LDFLAGS = $(OPENMP_LDFLAGS)
 
 
