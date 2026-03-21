@@ -192,6 +192,10 @@ class MetricsCollector:
         self._open_steps: Dict[int, tuple[float, StepMetrics]] = {}
         # RAG interactions recorded during this session
         self._rag_interactions: List[RAGInteractionMetrics] = []
+        # Most recently started step number (persists across turns so that
+        # tool calls in continuation turns — where the LLM emits no new
+        # STEP_SUMMARY — are still associated with the correct step.
+        self._current_step: Optional[int] = None
 
     # ── Session ──────────────────────────────────────────────────────────────
 
@@ -318,7 +322,16 @@ class MetricsCollector:
         that step number, so the JSON trace reflects the correct reasoning flow
         (thinking → step_summary → tool_call → tool_result) rather than always
         appending tool events at the end of the turn.
+
+        When *step* is None but a step is currently active (tracked via
+        ``_current_step``), the active step number is used as a fallback.
+        This handles continuation turns where the LLM emits no new STEP_SUMMARY
+        but continues executing tool calls for the same step.
         """
+        # Fall back to the most recently started step when the caller did not
+        # supply an explicit step number (e.g. continuation turns).
+        if step is None and self._current_step is not None:
+            step = self._current_step
         tm = self._turns.get(self._current_turn)
         if tm is None:
             return
@@ -399,8 +412,12 @@ class MetricsCollector:
         """Record a STEP_SUMMARY event in conversation_events (interleaved order).
 
         Also calls :meth:`record_step_start` to begin timing the step.
+        Sets ``_current_step`` so that tool calls in subsequent continuation
+        turns (where the LLM emits no new STEP_SUMMARY) are still associated
+        with this step.
         """
         self.record_step_start(step, name)
+        self._current_step = step
         tm = self._turns.get(turn)
         if tm is not None:
             tm.conversation_events.append(
@@ -419,8 +436,13 @@ class MetricsCollector:
         """Record a STEP_RESULT event in conversation_events (interleaved order).
 
         Also calls :meth:`record_step_end` to finish timing the step.
+        Clears ``_current_step`` so that tool calls after this point are not
+        incorrectly attributed to the completed step.
         """
         self.record_step_end(step)
+        # Clear the active step tracker once the step is complete.
+        if self._current_step == step:
+            self._current_step = None
         tm = self._turns.get(turn)
         if tm is not None:
             tm.conversation_events.append(

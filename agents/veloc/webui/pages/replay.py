@@ -655,8 +655,20 @@ def replay_html() -> str:
     // ── Helper: detect whether a turn uses the new interleaved event format ───
     // New logs have explicit "thinking" / "step_summary" / "step_result" events.
     // Old logs only have "model_response" / "tool_call" / "tool_result".
+    //
+    // Continuation turns — where the LLM returned only tool calls with no text
+    // (no model_response) — also use the interleaved path so that their tool
+    // calls are appended to the active step card from the previous turn rather
+    // than being silently dropped by the legacy path.
     function hasInterleavedEvents(events) {
-      return events.some(e => e.kind === 'thinking' || e.kind === 'step_summary' || e.kind === 'step_result');
+      if (events.some(e => e.kind === 'thinking' || e.kind === 'step_summary' || e.kind === 'step_result')) {
+        return true;
+      }
+      // Continuation turn: has tool_call/tool_result but no model_response.
+      // These turns belong to the same step as the previous turn.
+      const hasToolEvents = events.some(e => e.kind === 'tool_call' || e.kind === 'tool_result');
+      const hasModelResponse = events.some(e => e.kind === 'model_response');
+      return hasToolEvents && !hasModelResponse;
     }
 
     // Render turns that have conversation_events.
