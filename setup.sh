@@ -13,30 +13,53 @@ echo "Build directory: $BUILD_DIR"
 
 mkdir -p "$BUILD_DIR"
 
+# ── Knowledge base: snapshot before cleaning ────────────────────────────────
+# The knowledge_db/ directory accumulates VeloC insights across sessions.
+# If a knowledge base already exists, save a timestamped backup now (before
+# the clean sweep) and then preserve the directory intact.  Only create a
+# fresh empty knowledge base when none exists yet.
+KNOWLEDGE_DB_DIR="$BUILD_DIR/knowledge_db"
+KNOWLEDGE_DB_FILE="$KNOWLEDGE_DB_DIR/knowledge.json"
+KNOWLEDGE_BACKUP_DIR="$KNOWLEDGE_DB_DIR/backups"
+_KNOWLEDGE_EXISTS=false
+if [ -f "$KNOWLEDGE_DB_FILE" ]; then
+  _KNOWLEDGE_EXISTS=true
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "$KNOWLEDGE_BACKUP_DIR"
+  cp "$KNOWLEDGE_DB_FILE" "$KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
+  echo "Knowledge base backup saved → $KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
+fi
+
 # Clean generated/output files from a previous run before refreshing the sandbox.
-# The agent writes modified source files back into BUILD_DIR/examples/ and may
-# produce output artefacts in BUILD_DIR/examples_output/.  Remove both so that
-# each setup.sh run starts from a clean, known state.
+# Remove everything inside BUILD_DIR except the preserved folders:
+#   - log/          : run history / agent logs
+#   - venv/         : Python virtual environment (expensive to recreate)
+#   - knowledge_db/ : accumulated insights (preserved when it already exists)
 echo "Cleaning generated files from previous runs ..."
-if [ -d "$BUILD_DIR/examples" ]; then
-  rm -rf "$BUILD_DIR/examples"
-  echo "  Removed $BUILD_DIR/examples"
+if [ -d "$BUILD_DIR" ]; then
+  for entry in "$BUILD_DIR"/*; do
+    base="$(basename "$entry")"
+    case "$base" in
+      log|venv|knowledge_db)
+        echo "  Preserving $entry"
+        ;;
+      *)
+        rm -rf "$entry"
+        echo "  Removed $entry"
+        ;;
+    esac
+  done
 fi
-if [ -d "$BUILD_DIR/examples_output" ]; then
-  rm -rf "$BUILD_DIR/examples_output"
-  echo "  Removed $BUILD_DIR/examples_output"
+
+# ── Knowledge base: create only if none existed ──────────────────────────────
+# If there was no knowledge base before the clean, create the directory now
+# so the agent can initialise it on first run.
+if [ "$_KNOWLEDGE_EXISTS" = false ]; then
+  mkdir -p "$KNOWLEDGE_DB_DIR"
+  echo "Knowledge base: no existing DB found, directory created for first run."
+else
+  echo "Knowledge base: existing DB preserved → $KNOWLEDGE_DB_FILE"
 fi
-if [ -d "$BUILD_DIR/data" ]; then
-  rm -rf "$BUILD_DIR/data"
-  echo "  Removed $BUILD_DIR/data"
-fi
-shopt -s nullglob
-matches=( "$BUILD_DIR"/validation*/ )
-if [ ${#matches[@]} -gt 0 ]; then
-  rm -rf "${matches[@]}"
-  echo "  Removed validation directories (${matches[@]}) in $BUILD_DIR"
-fi
-shopt -u nullglob
 
 # Copy examples into build for test/demonstration (self-contained runs from build/)
 if [ -d "$REPO_ROOT/tests/examples/original" ]; then
@@ -46,7 +69,7 @@ if [ -d "$REPO_ROOT/tests/examples/original" ]; then
 fi
 if [ -d "$REPO_ROOT/tests/ecp" ]; then
   echo "Copying ecp to $BUILD_DIR/ecp ..."
-  cp -r "$REPO_ROOT/tests/ecp" "$BUILD_DIR/ecp"
+  cp -r "$REPO_ROOT/tests/ecp" "$BUILD_DIR"
   echo "  $BUILD_DIR/ecp"
 fi
 if [ -d "$REPO_ROOT/tests/data" ]; then
