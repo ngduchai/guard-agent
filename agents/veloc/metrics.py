@@ -62,7 +62,17 @@ class ConversationEvent:
       - ``"context_user"``    – a user message that was in the LLM context for
                                 this turn (may be from a previous turn).
       - ``"context_assistant"`` – an assistant message in context (prior turn).
-      - ``"model_response"``  – the model's text output for this turn.
+      - ``"model_response"``  – the model's full text output for this turn
+                                (kept for backward-compat; new logs also emit
+                                ``"thinking"`` chunks in interleaved order).
+      - ``"thinking"``        – a reasoning chunk emitted between step markers
+                                (interleaved with ``"step_summary"`` /
+                                ``"step_result"`` events to reflect the LLM's
+                                actual reasoning flow).
+      - ``"step_summary"``    – a STEP_SUMMARY marker parsed from the model
+                                response (step number, name, why, how, tools).
+      - ``"step_result"``     – a STEP_RESULT marker parsed from the model
+                                response (step number, result text).
       - ``"tool_call"``       – a tool invocation (name + args).
       - ``"tool_result"``     – the result returned by a tool.
     """
@@ -70,6 +80,11 @@ class ConversationEvent:
     content: str
     name: Optional[str] = None   # tool name (for tool_call / tool_result)
     args: Optional[Dict[str, Any]] = None  # tool args (for tool_call)
+    step: Optional[int] = None   # step number (for step_summary / step_result)
+    step_name: Optional[str] = None  # step name (for step_summary)
+    step_why: Optional[str] = None   # step why  (for step_summary)
+    step_how: Optional[str] = None   # step how  (for step_summary)
+    step_tools: Optional[List[str]] = None  # step tools (for step_summary)
 
 
 @dataclass
@@ -89,6 +104,21 @@ class TurnMetrics:
 
 
 @dataclass
+class RAGInteractionMetrics:
+    """Record of a single RAG (knowledge base) interaction."""
+    kind: str                          # "query" | "store" | "update"
+    turn: int
+    elapsed_s: float
+    rag_enabled: bool
+    query: Optional[str] = None        # for kind="query"
+    results_count: Optional[int] = None  # for kind="query"
+    title: Optional[str] = None        # for kind="store" / "update"
+    insight_id: Optional[str] = None   # for kind="store" / "update"
+    category: Optional[str] = None     # for kind="store"
+    confidence: Optional[float] = None # for kind="store" / "update"
+
+
+@dataclass
 class SessionMetrics:
     """Full performance record for one agent session."""
     session_id: str
@@ -103,6 +133,9 @@ class SessionMetrics:
     conversation: List[Dict[str, Any]] = field(default_factory=list)
     # Final result dict from _build_result (status, summary, error_message, etc.)
     final_result: Optional[Dict[str, Any]] = None
+    # RAG / knowledge base interactions recorded during this session.
+    rag_interactions: List[RAGInteractionMetrics] = field(default_factory=list)
+    rag_enabled: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +190,8 @@ class MetricsCollector:
         self._turns: Dict[int, TurnMetrics] = {}
         # step_num → (start_monotonic, StepMetrics)
         self._open_steps: Dict[int, tuple[float, StepMetrics]] = {}
+        # RAG interactions recorded during this session
+        self._rag_interactions: List[RAGInteractionMetrics] = []
 
     # ── Session ──────────────────────────────────────────────────────────────
 
@@ -240,11 +275,30 @@ class MetricsCollector:
             )
 
     def record_model_response(self, turn: int, text: str) -> None:
-        """Record the model's text output for this turn."""
+        """Record the model's full text output for this turn (backward-compat).
+
+        The full text is stored as a ``"model_response"`` event.  Callers that
+        also call :meth:`record_thinking_chunk` / :meth:`record_step_summary` /
+        :meth:`record_step_result` will produce a richer interleaved event list
+        that the replay page can use to reconstruct the exact reasoning flow.
+        """
         tm = self._turns.get(turn)
         if tm is not None and text:
             tm.conversation_events.append(
                 ConversationEvent(kind="model_response", content=text)
+            )
+
+    def record_thinking_chunk(self, turn: int, text: str) -> None:
+        """Record a thinking/reasoning chunk emitted between step markers.
+
+        These events are interleaved with ``step_summary`` / ``step_result``
+        events in :attr:`TurnMetrics.conversation_events` to reflect the LLM's
+        actual reasoning flow.
+        """
+        tm = self._turns.get(turn)
+        if tm is not None and text:
+            tm.conversation_events.append(
+                ConversationEvent(kind="thinking", content=text)
             )
 
     # ── Tool calls ────────────────────────────────────────────────────────────
@@ -255,8 +309,16 @@ class MetricsCollector:
         elapsed_s: float,
         args: Optional[Dict[str, Any]] = None,
         result: Optional[str] = None,
+        step: Optional[int] = None,
     ) -> None:
-        """Append a tool call record to the current turn."""
+        """Append a tool call record to the current turn.
+
+        When *step* is provided the tool_call / tool_result conversation events
+        are inserted immediately after the matching ``step_summary`` event for
+        that step number, so the JSON trace reflects the correct reasoning flow
+        (thinking → step_summary → tool_call → tool_result) rather than always
+        appending tool events at the end of the turn.
+        """
         tm = self._turns.get(self._current_turn)
         if tm is None:
             return
@@ -269,18 +331,54 @@ class MetricsCollector:
                 result_snippet=snippet,
             )
         )
-        # Also record as conversation events.
-        tm.conversation_events.append(
-            ConversationEvent(kind="tool_call", content="", name=name, args=args)
+        # Build the conversation events for this tool call.
+        tc_ev = ConversationEvent(kind="tool_call", content="", name=name, args=args, step=step)
+        tr_ev = (
+            ConversationEvent(kind="tool_result", content=snippet or "", name=name, step=step)
+            if result is not None
+            else None
         )
-        if result is not None:
-            tm.conversation_events.append(
-                ConversationEvent(
-                    kind="tool_result",
-                    content=snippet or "",
-                    name=name,
-                )
-            )
+
+        if step is not None:
+            # Insert tool_call (and tool_result) immediately BEFORE the
+            # step_result event for this step (or after the last tool_call /
+            # tool_result already inserted for this step if multiple tools
+            # share the same step).  This keeps the JSON trace in the correct
+            # reasoning order:
+            #   step_summary → thinking → tool_call → tool_result → step_result
+            # so the replay page shows tool calls inside the correct step card.
+            #
+            # Search strategy:
+            #   1. Find the step_result index for this step (insertion point).
+            #   2. If no step_result yet, fall back to inserting after the last
+            #      tool_call/tool_result already recorded for this step, or
+            #      after the step_summary if none exist.
+            step_result_idx = None
+            last_step_ev_idx = None
+            for i, ev in enumerate(tm.conversation_events):
+                if ev.step == step:
+                    if ev.kind == "step_result":
+                        step_result_idx = i
+                    else:
+                        last_step_ev_idx = i
+            if step_result_idx is not None:
+                # Insert just before the step_result.
+                pos = step_result_idx
+                tm.conversation_events.insert(pos, tc_ev)
+                if tr_ev is not None:
+                    tm.conversation_events.insert(pos + 1, tr_ev)
+                return
+            if last_step_ev_idx is not None:
+                # No step_result yet — insert after the last step event.
+                pos = last_step_ev_idx + 1
+                tm.conversation_events.insert(pos, tc_ev)
+                if tr_ev is not None:
+                    tm.conversation_events.insert(pos + 1, tr_ev)
+                return
+        # Fallback: append at the end (no step info or step not found).
+        tm.conversation_events.append(tc_ev)
+        if tr_ev is not None:
+            tm.conversation_events.append(tr_ev)
 
     # ── Steps ─────────────────────────────────────────────────────────────────
 
@@ -288,6 +386,50 @@ class MetricsCollector:
         """Record the start of an agent step (from a STEP_SUMMARY event)."""
         sm = StepMetrics(step=step, name=name, started_at=_utcnow())
         self._open_steps[step] = (time.monotonic(), sm)
+
+    def record_step_summary(
+        self,
+        turn: int,
+        step: int,
+        name: str,
+        why: str = "",
+        how: str = "",
+        tools: Optional[List[str]] = None,
+    ) -> None:
+        """Record a STEP_SUMMARY event in conversation_events (interleaved order).
+
+        Also calls :meth:`record_step_start` to begin timing the step.
+        """
+        self.record_step_start(step, name)
+        tm = self._turns.get(turn)
+        if tm is not None:
+            tm.conversation_events.append(
+                ConversationEvent(
+                    kind="step_summary",
+                    content="",
+                    step=step,
+                    step_name=name,
+                    step_why=why,
+                    step_how=how,
+                    step_tools=tools or [],
+                )
+            )
+
+    def record_step_result(self, turn: int, step: int, result: str) -> None:
+        """Record a STEP_RESULT event in conversation_events (interleaved order).
+
+        Also calls :meth:`record_step_end` to finish timing the step.
+        """
+        self.record_step_end(step)
+        tm = self._turns.get(turn)
+        if tm is not None:
+            tm.conversation_events.append(
+                ConversationEvent(
+                    kind="step_result",
+                    content=result,
+                    step=step,
+                )
+            )
 
     def record_step_end(self, step: int) -> None:
         """
@@ -302,6 +444,36 @@ class MetricsCollector:
         tm = self._turns.get(self._current_turn)
         if tm is not None:
             tm.steps.append(sm)
+
+    # ── RAG interactions ──────────────────────────────────────────────────────
+
+    def record_rag_interaction(
+        self,
+        kind: str,
+        elapsed_s: float,
+        rag_enabled: bool,
+        query: Optional[str] = None,
+        results_count: Optional[int] = None,
+        title: Optional[str] = None,
+        insight_id: Optional[str] = None,
+        category: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> None:
+        """Record a RAG knowledge base interaction (query / store / update)."""
+        self._rag_interactions.append(
+            RAGInteractionMetrics(
+                kind=kind,
+                turn=self._current_turn,
+                elapsed_s=round(elapsed_s, 3),
+                rag_enabled=rag_enabled,
+                query=query,
+                results_count=results_count,
+                title=title,
+                insight_id=insight_id,
+                category=category,
+                confidence=confidence,
+            )
+        )
 
     # ── Finalise ──────────────────────────────────────────────────────────────
 
@@ -373,6 +545,13 @@ class MetricsCollector:
                 if k not in ("raw_llm_response", "llm_trace", "metrics", "metrics_path")
             }
 
+        # Import here to avoid circular imports; _is_rag_enabled lives in vector_db.
+        try:
+            from agents.veloc.vector_db import _is_rag_enabled as _rag_flag
+            rag_enabled_flag = _rag_flag()
+        except Exception:
+            rag_enabled_flag = True
+
         return SessionMetrics(
             session_id=self._session_id,
             codebase=codebase,
@@ -384,6 +563,8 @@ class MetricsCollector:
             turns=turns_list,
             conversation=clean_conv,
             final_result=clean_result,
+            rag_interactions=list(self._rag_interactions),
+            rag_enabled=rag_enabled_flag,
         )
 
 

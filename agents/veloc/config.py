@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     environment_type: str = "hpc"
     project_root: str = ""
 
+    # RAG / Vector DB
+    # Set VELOC_RAG_ENABLED=false to disable the knowledge base entirely.
+    # When disabled, all three RAG tool calls (query_knowledge_base,
+    # store_insight, update_insight) behave as no-ops: queries return empty
+    # results and store/update calls make no changes to the database.
+    # This allows A/B experiments comparing agent performance with and without
+    # the knowledge base.
+    veloc_rag_enabled: bool = True
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 

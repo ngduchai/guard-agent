@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import textwrap
 from typing import Any
@@ -42,6 +43,7 @@ _YELLOW = "\033[33m"
 _RED    = "\033[31m"
 _BLUE   = "\033[34m"
 _MAGENTA= "\033[35m"
+_PURPLE  = "\033[95m"
 
 
 def _hr(char: str = "─", color: str = _DIM) -> None:
@@ -51,6 +53,112 @@ def _hr(char: str = "─", color: str = _DIM) -> None:
 def _wrap(text: str, indent: int = 4) -> str:
     prefix = " " * indent
     return textwrap.fill(text, width=_WIDTH - indent, initial_indent=prefix, subsequent_indent=prefix)
+
+
+_ITALIC  = "\033[3m"
+_UNDERLINE = "\033[4m"
+
+
+def _md_to_ansi(text: str, base_color: str = _YELLOW) -> str:
+    """Convert a subset of Markdown to ANSI-escaped terminal text.
+
+    Handles: headings (#/##/###), bold (**), italic (*/_), inline code (`),
+    fenced code blocks (```), unordered lists (- / *), horizontal rules (---),
+    and blockquotes (>).  Everything is tinted with *base_color* so the output
+    stays visually consistent with the caller's colour scheme.
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code_block = False
+    code_fence_re = re.compile(r"^```")
+
+    for line in lines:
+        # ── Fenced code blocks ────────────────────────────────────────────────
+        if code_fence_re.match(line):
+            in_code_block = not in_code_block
+            if in_code_block:
+                out.append(f"{_DIM}{base_color}{'─' * (_WIDTH - 4)}{_RESET}")
+            else:
+                out.append(f"{_DIM}{base_color}{'─' * (_WIDTH - 4)}{_RESET}")
+            continue
+
+        if in_code_block:
+            out.append(f"  {_DIM}{base_color}{line}{_RESET}")
+            continue
+
+        # ── Headings ──────────────────────────────────────────────────────────
+        h_match = re.match(r"^(#{1,6})\s+(.*)", line)
+        if h_match:
+            level = len(h_match.group(1))
+            content = h_match.group(2)
+            # Apply inline formatting inside heading
+            content = _inline_md(content, base_color)
+            prefix = "  " * max(0, level - 1)
+            out.append(f"{prefix}{_BOLD}{_UNDERLINE}{base_color}{content}{_RESET}")
+            continue
+
+        # ── Horizontal rule ───────────────────────────────────────────────────
+        if re.match(r"^[-*_]{3,}\s*$", line):
+            out.append(f"{_DIM}{base_color}{'─' * _WIDTH}{_RESET}")
+            continue
+
+        # ── Blockquote ────────────────────────────────────────────────────────
+        bq_match = re.match(r"^>\s?(.*)", line)
+        if bq_match:
+            content = _inline_md(bq_match.group(1), base_color)
+            out.append(f"  {_DIM}{base_color}│ {content}{_RESET}")
+            continue
+
+        # ── Unordered list items ──────────────────────────────────────────────
+        li_match = re.match(r"^(\s*)[-*+]\s+(.*)", line)
+        if li_match:
+            indent_str = li_match.group(1)
+            content = _inline_md(li_match.group(2), base_color)
+            out.append(f"{indent_str}  {base_color}•{_RESET} {base_color}{content}{_RESET}")
+            continue
+
+        # ── Ordered list items ────────────────────────────────────────────────
+        oli_match = re.match(r"^(\s*)(\d+)\.\s+(.*)", line)
+        if oli_match:
+            indent_str = oli_match.group(1)
+            num = oli_match.group(2)
+            content = _inline_md(oli_match.group(3), base_color)
+            out.append(f"{indent_str}  {base_color}{num}.{_RESET} {base_color}{content}{_RESET}")
+            continue
+
+        # ── Normal paragraph line ─────────────────────────────────────────────
+        out.append(f"{base_color}{_inline_md(line, base_color)}{_RESET}")
+
+    return "\n".join(out)
+
+
+def _inline_md(text: str, base_color: str = _YELLOW) -> str:
+    """Apply inline Markdown formatting (bold, italic, code) with ANSI codes."""
+    # Inline code: `code`
+    text = re.sub(
+        r"`([^`]+)`",
+        lambda m: f"{_DIM}{base_color}{m.group(1)}{_RESET}{base_color}",
+        text,
+    )
+    # Bold+italic: ***text***
+    text = re.sub(
+        r"\*\*\*(.+?)\*\*\*",
+        lambda m: f"{_BOLD}{_ITALIC}{m.group(1)}{_RESET}{base_color}",
+        text,
+    )
+    # Bold: **text** or __text__
+    text = re.sub(
+        r"\*\*(.+?)\*\*|__(.+?)__",
+        lambda m: f"{_BOLD}{m.group(1) or m.group(2)}{_RESET}{base_color}",
+        text,
+    )
+    # Italic: *text* or _text_
+    text = re.sub(
+        r"\*(.+?)\*|_(.+?)_",
+        lambda m: f"{_ITALIC}{m.group(1) or m.group(2)}{_RESET}{base_color}",
+        text,
+    )
+    return text
 
 
 def _print_step_summary(ev: dict[str, Any]) -> None:
@@ -151,6 +259,86 @@ def _print_metrics_summary(metrics: dict[str, Any]) -> None:
             )
 
     _hr("═", _BLUE)
+
+
+# ---------------------------------------------------------------------------
+# RAG / knowledge base insight box renderers
+# ---------------------------------------------------------------------------
+
+def _print_rag_query(ev: dict[str, Any]) -> None:
+    """Render a knowledge-base query insight box in the shell."""
+    query = ev.get("query", "")
+    results = ev.get("results", [])
+    count = ev.get("results_count", len(results))
+    rag_enabled = ev.get("rag_enabled", True)
+
+    _hr("─", _PURPLE)
+    if not rag_enabled:
+        print(f"{_PURPLE}{_BOLD}  🔍 [Knowledge Base] RAG disabled — query skipped{_RESET}")
+        _hr("─", _PURPLE)
+        return
+
+    print(f"{_PURPLE}{_BOLD}  🔍 [Knowledge Base] Query{_RESET}")
+    print(f"  {_DIM}Query :{_RESET} {query}")
+    print(f"  {_DIM}Hits  :{_RESET} {count}")
+    if results:
+        for i, r in enumerate(results[:3], 1):
+            title = r.get("title", "")
+            score = r.get("score", 0.0)
+            category = r.get("category", "")
+            confidence = r.get("confidence", 0.0)
+            print(f"  {_DIM}  [{i}] {title}{_RESET}  "
+                  f"{_DIM}(cat={category}, score={score:.2f}, conf={confidence:.2f}){_RESET}")
+            snippet = r.get("content", "")[:120]
+            if snippet:
+                print(f"       {_DIM}{snippet}…{_RESET}")
+    _hr("─", _PURPLE)
+
+
+def _print_rag_store(ev: dict[str, Any]) -> None:
+    """Render a knowledge-base store insight box in the shell."""
+    title = ev.get("title", "")
+    category = ev.get("category", "")
+    confidence = ev.get("confidence", 0.8)
+    insight_id = ev.get("insight_id", "")
+    rag_enabled = ev.get("rag_enabled", True)
+
+    _hr("─", _PURPLE)
+    if not rag_enabled:
+        print(f"{_PURPLE}{_BOLD}  💾 [Knowledge Base] RAG disabled — store skipped{_RESET}")
+        _hr("─", _PURPLE)
+        return
+
+    print(f"{_PURPLE}{_BOLD}  💾 [Knowledge Base] Insight Stored{_RESET}")
+    print(f"  {_DIM}Title     :{_RESET} {title}")
+    print(f"  {_DIM}Category  :{_RESET} {category}")
+    print(f"  {_DIM}Confidence:{_RESET} {confidence:.2f}")
+    if insight_id:
+        print(f"  {_DIM}ID        :{_RESET} {insight_id[:16]}…")
+    _hr("─", _PURPLE)
+
+
+def _print_rag_update(ev: dict[str, Any]) -> None:
+    """Render a knowledge-base update insight box in the shell."""
+    title = ev.get("title", "")
+    insight_id = ev.get("insight_id", "")
+    confidence = ev.get("confidence")
+    rag_enabled = ev.get("rag_enabled", True)
+
+    _hr("─", _PURPLE)
+    if not rag_enabled:
+        print(f"{_PURPLE}{_BOLD}  ✏️  [Knowledge Base] RAG disabled — update skipped{_RESET}")
+        _hr("─", _PURPLE)
+        return
+
+    print(f"{_PURPLE}{_BOLD}  ✏️  [Knowledge Base] Insight Updated{_RESET}")
+    if title:
+        print(f"  {_DIM}Title     :{_RESET} {title}")
+    if insight_id:
+        print(f"  {_DIM}ID        :{_RESET} {insight_id[:16]}…")
+    if confidence is not None:
+        print(f"  {_DIM}Confidence:{_RESET} {confidence:.2f}")
+    _hr("─", _PURPLE)
 
 
 def _print_final_ask(question: str) -> None:
@@ -254,7 +442,81 @@ async def _handle_single_interaction() -> None:
 
         final_result: dict[str, Any] | None = None
 
+        # Collect all events so we can reorder tool_call / tool_result events
+        # to appear immediately after the step_summary that announced them.
+        # The OpenAI API always returns tool calls after all text content, so
+        # without buffering the shell would show:
+        #   step_summary(1) → step_result(1) → step_summary(2) → step_result(2)
+        #   → tool_call(1) → tool_result(1) → tool_call(2) → tool_result(2)
+        # With buffering we reorder to:
+        #   step_summary(1) → tool_call(1) → tool_result(1) → step_result(1)
+        #   → step_summary(2) → tool_call(2) → tool_result(2) → step_result(2)
+        _turn_events: list[dict[str, Any]] = []
+        _done_event: dict[str, Any] | None = None
+        _error_event: dict[str, Any] | None = None
+
         async for event in stream_veloc_agent(messages):
+            etype = event.get("type", "")
+            if etype == "done":
+                final_result = event.get("result") or {}
+                # Capture metrics from the done event (top-level key).
+                _done_metrics = event.get("metrics") or (final_result or {}).get("metrics")
+                if _done_metrics and not (final_result or {}).get("metrics"):
+                    final_result["metrics"] = _done_metrics
+                if _done_metrics and not (final_result or {}).get("metrics_path"):
+                    final_result["metrics_path"] = event.get("result", {}).get("metrics_path")
+                _done_event = event
+            elif etype == "error":
+                _error_event = event
+            else:
+                _turn_events.append(event)
+
+        # ── Reorder events to reflect the correct reasoning flow ─────────────
+        # The OpenAI API always returns tool calls after all text content, so
+        # the raw stream order is:
+        #   thinking → step_summary(1) → thinking → step_result(1) → …
+        #   → tool_call(1) → tool_result(1) → tool_call(2) → tool_result(2)
+        #
+        # We reorder to the desired reasoning flow:
+        #   thinking → step_summary(1) → thinking → tool_call(1) → tool_result(1)
+        #   → step_result(1) → thinking → step_summary(2) → …
+        #
+        # Strategy: inject each step's tool_call/tool_result events immediately
+        # BEFORE the step_result event for that step (preserving any thinking
+        # blocks that appear between step_summary and step_result).
+
+        # Build a map: step_num → [tool_call, tool_result, ...] events
+        _step_tool_events: dict[int, list[dict[str, Any]]] = {}
+        _unstepped_tool_events: list[dict[str, Any]] = []
+        for ev in _turn_events:
+            if ev.get("type") in ("tool_call", "tool_result"):
+                s = ev.get("step")
+                if s is not None:
+                    _step_tool_events.setdefault(s, []).append(ev)
+                else:
+                    _unstepped_tool_events.append(ev)
+
+        # Build the reordered event list:
+        # Inject tool_call/tool_result events immediately before the step_result
+        # for the same step number.
+        _reordered: list[dict[str, Any]] = []
+        _injected_steps: set[int] = set()
+        for ev in _turn_events:
+            etype = ev.get("type", "")
+            if etype in ("tool_call", "tool_result") and ev.get("step") is not None:
+                # Will be injected before the matching step_result — skip here.
+                continue
+            if etype == "step_result":
+                s = ev.get("step")
+                if s is not None and s not in _injected_steps:
+                    _injected_steps.add(s)
+                    _reordered.extend(_step_tool_events.get(s, []))
+            _reordered.append(ev)
+        # Append any tool events that had no step association.
+        _reordered.extend(_unstepped_tool_events)
+
+        # ── Print the reordered events ────────────────────────────────────────
+        for event in _reordered:
             etype = event.get("type", "")
 
             if etype == "step_summary":
@@ -270,29 +532,32 @@ async def _handle_single_interaction() -> None:
                 _print_tool_result(event)
 
             elif etype == "thinking":
-                # Raw LLM text — only show if it doesn't contain step markers
-                # (step markers are already rendered as step_summary/step_result)
-                text = event.get("text", "")
-                if "STEP_SUMMARY:" not in text and "STEP_RESULT:" not in text and text.strip():
-                    snippet = text[:400] + "…" if len(text) > 400 else text
-                    print(f"\n{_YELLOW}{_BOLD}💭 [thinking]{_RESET} {_YELLOW}{snippet}{_RESET}")
+                # The agent now emits thinking chunks with STEP_SUMMARY /
+                # STEP_RESULT markers already stripped and interleaved with
+                # step_summary / step_result events in the correct order.
+                # A thinking event may arrive before OR after a step_summary,
+                # reflecting the LLM's actual reasoning flow.
+                text = event.get("text", "").strip()
+                if text:
+                    print(f"\n{_YELLOW}{_BOLD}💭 [thinking]{_RESET}")
+                    print(_md_to_ansi(text, base_color=_YELLOW))
 
             elif etype == "final":
                 # The raw final text — skip; done event handles rendering
                 pass
 
-            elif etype == "error":
-                _print_final_error(event.get("message", "Unknown error"))
-                return
+            elif etype == "rag_query":
+                _print_rag_query(event)
 
-            elif etype == "done":
-                final_result = event.get("result") or {}
-                # Capture metrics from the done event (top-level key).
-                _done_metrics = event.get("metrics") or (final_result or {}).get("metrics")
-                if _done_metrics and not (final_result or {}).get("metrics"):
-                    final_result["metrics"] = _done_metrics
-                if _done_metrics and not (final_result or {}).get("metrics_path"):
-                    final_result["metrics_path"] = event.get("result", {}).get("metrics_path")
+            elif etype == "rag_store":
+                _print_rag_store(event)
+
+            elif etype == "rag_update":
+                _print_rag_update(event)
+
+        if _error_event is not None:
+            _print_final_error(_error_event.get("message", "Unknown error"))
+            return
 
         if final_result is None:
             _print_final_error("Agent returned no result.")

@@ -49,6 +49,70 @@ from agents.veloc.metrics import (
     log_session,
     metrics_summary,
 )
+from agents.veloc.vector_db import (
+    query_knowledge_base,
+    store_insight,
+    update_insight,
+    _is_rag_enabled,
+)
+
+
+# ---------------------------------------------------------------------------
+# VeloC guide tool
+# ---------------------------------------------------------------------------
+
+_VELOC_GUIDE_PATH = os.path.join(os.path.dirname(__file__), "guides", "veloc_guide.md")
+
+
+def get_veloc_guide(section: str = "", list_sections: bool = False) -> str:
+    """Return the VeloC guide Markdown document, a named section, or the section index.
+
+    Args:
+        section: Optional section heading to retrieve (e.g. "C API Reference",
+                 "Configuration File Reference", "Complete Code Examples").
+                 When empty and list_sections is False, the full guide is returned.
+        list_sections: When True, return only the list of available top-level section
+                 headings so the caller can decide which section to fetch next.
+                 Ignores the ``section`` argument when True.
+
+    Returns:
+        A JSON string with one of:
+        - ``{"sections": [...]}``  – when list_sections=True
+        - ``{"content": "..."}``   – the requested (or full) guide text
+        - ``{"error": "..."}``     – if the guide file cannot be read
+    """
+    try:
+        with open(_VELOC_GUIDE_PATH, "r", encoding="utf-8") as fh:
+            full_text = fh.read()
+    except OSError as exc:
+        return json.dumps({"error": f"Cannot read VeloC guide: {exc}"})
+
+    # Return the list of top-level (##) section headings.
+    if list_sections:
+        import re as _re
+        headings = _re.findall(r"^##\s+(.+)$", full_text, _re.MULTILINE)
+        return json.dumps({"sections": headings})
+
+    if not section:
+        return json.dumps({"content": full_text})
+
+    # Try to extract the requested section by heading.
+    # A section starts at a line beginning with "## <section>" and ends at the
+    # next "## " heading (or end of file).
+    import re as _re
+    pattern = _re.compile(
+        r"(^##\s+" + _re.escape(section) + r".*?)(?=^##\s|\Z)",
+        _re.MULTILINE | _re.DOTALL | _re.IGNORECASE,
+    )
+    match = pattern.search(full_text)
+    if match:
+        return json.dumps({"content": match.group(1).strip()})
+
+    # Section not found — return the full guide with a note.
+    return json.dumps({
+        "content": full_text,
+        "note": f"Section '{section}' not found; returning full guide.",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +121,47 @@ from agents.veloc.metrics import (
 
 def _system_prompt() -> str:
     root = get_project_root()
+    rag_enabled = _is_rag_enabled()
+    rag_section = ""
+    if rag_enabled:
+        rag_section = """
+## Knowledge Base (RAG) — MANDATORY USAGE
+You have access to a persistent knowledge base that accumulates insights from every VeloC integration session.
+**You MUST use it actively — it makes you faster and more accurate.**
+
+### Reading from the knowledge base
+- **At the very start of every session**, call `query_knowledge_base(query="VeloC best practices checkpoint state")` to load general guidance.
+- **Before writing any VeloC code**, call `query_knowledge_base` with a query describing what you are about to do (e.g. "MPI checkpoint restart pattern", "protect array state VeloC", "veloc.cfg configuration keys").
+- **When you encounter an error or unexpected behaviour**, call `query_knowledge_base` with a description of the error to find known solutions.
+- Use the returned insights to guide your implementation. High-confidence entries are especially reliable.
+
+### Writing to the knowledge base
+You MUST store insights whenever you discover something useful. Store insights for:
+- **Best practices**: correct VeloC API call ordering, initialisation patterns, finalisation patterns.
+- **State identification**: how to identify and protect critical state in a given type of application (MPI, OpenMP, serial, etc.).
+- **Checkpoint timing**: when to checkpoint (loop boundaries, after expensive computation, Young-Daly formula results).
+- **Error solutions**: if a build or runtime error occurs and you find the fix, store the error description and its solution.
+- **Code patterns**: reusable VeloC code snippets that work correctly.
+- **Configuration**: which `veloc.cfg` keys matter for which scenarios.
+
+Call `store_insight(title, content, category, tags, confidence)` to add a new entry.
+Valid categories: `best_practice`, `api_usage`, `error_solution`, `state_identification`, `checkpoint_timing`, `code_pattern`.
+
+### Correcting the knowledge base
+If you apply an insight from the knowledge base and it does **not** work as expected:
+- Call `update_insight(insight_id, content, confidence)` to correct or downgrade the entry.
+- Include what actually happened and what the correct approach is.
+
+### Knowledge base tools
+- `query_knowledge_base(query, top_k, min_score, category)` – semantic search; returns ranked insights.
+- `store_insight(title, content, category, tags, confidence)` – add a new insight (confidence 0.0–1.0).
+- `update_insight(insight_id, title, content, tags, confidence, verified)` – update an existing insight.
+"""
     return f"""You are an expert in resilient HPC/cloud deployments and in integrating the VeloC checkpointing API into existing C/C++ codebases.
 
 **Project root on the user's machine:** `{root}`
 All file paths you use with the filesystem tools must be relative to this root.
-
+{rag_section}
 ## Your tools
 - `list_directory(dir_path)` – list files and subdirectories.
 - `read_file(file_path)` – read a source file.
@@ -76,6 +176,17 @@ All file paths you use with the filesystem tools must be relative to this root.
   It **cannot** access or modify files outside BUILD_DIR.
   Use `write_file` first to create the script, then `execute_script` to run it.
   Set `timeout` (seconds, default 120) to a larger value for long builds or MPI runs.
+- `get_veloc_guide(list_sections, section)` – return the local VeloC reference guide as Markdown.
+  The guide contains the **complete C API** (all function signatures, parameters, return codes),
+  the **C++ `veloc::client_t` API**, the **INI configuration file specification** (all keys and defaults),
+  **full code examples** for both memory-based and file-based modes, **CMakeLists.txt integration**,
+  and **best practices** (Young-Daly formula, checkpoint placement patterns).
+  **Usage pattern:**
+  1. Call `get_veloc_guide(list_sections=true)` → returns `{{"sections": [...]}}` listing all available headings.
+  2. Call `get_veloc_guide(section="<heading>")` → returns `{{"content": "..."}}` for that section only.
+  3. Or call `get_veloc_guide()` (no args) to get the entire guide at once.
+  **You MUST call this tool before writing any VeloC code or configuration** to ensure you use
+  correct API signatures, parameter order, and configuration keys.
 
 ## Step-by-step transparency protocol (MANDATORY)
 You MUST break your work into clear, named steps. Before executing each step, you MUST emit a step-summary block in your response text using this exact JSON format (on its own line, no markdown fences):
@@ -99,8 +210,12 @@ Rules:
 2. **Explore the codebase.** Use `list_directory` and `read_file` to understand the structure of the code given by user; if the code location is not clear, ask the user for the path relative to the project root.
 3. **Identify critical state.** From your understanding of the codebase, identify the critical data structures and variables that must be checkpointed across executions.
 4. **Identify optimal checkpoint timing.** Determine when to checkpoint to minimise overhead while maximising resilience (e.g. applying the Young-Daly formula).
-5. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file. Follow the VeloC C API (VELOC_Init, VELOC_Mem_protect, VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize).
-6. **Write files.** Use `write_file` to save all modified sources and the config.
+5. **Consult the VeloC guide.** Before writing any VeloC code or configuration, retrieve the relevant parts of the guide:
+   - Call `get_veloc_guide(list_sections=true)` to discover all available section headings.
+   - Then call `get_veloc_guide(section="<heading>")` for each section you need (e.g. `"C API Reference"`, `"Configuration File Reference"`, `"Complete Code Examples"`).
+   - Alternatively, call `get_veloc_guide()` (no arguments) to get the entire guide at once.
+   Use the retrieved content to select the correct API mode (memory-based vs. file-based), verify all function signatures and parameter order, and choose the right configuration keys.
+6. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file, using the API signatures and configuration keys from the guide retrieved in the previous step. Use `write_file` to save all modified sources and the config.
 7. **Validate.** This step is **REQUIRED**. Based on your understanding of the application's structure and output, design and write a validation script tailored to this specific application that:
    - Builds both the original and the resilient version.
    - Runs the resilient version with a simulated failure (e.g. kill the process mid-run, then restart it).
@@ -129,6 +244,11 @@ _TOOLS: Dict[str, Callable] = {
     "write_file": write_file,
     "remove_file": remove_file,
     "execute_script": execute_script,
+    "get_veloc_guide": get_veloc_guide,
+    # RAG / knowledge base tools
+    "query_knowledge_base": query_knowledge_base,
+    "store_insight": store_insight,
+    "update_insight": update_insight,
 }
 
 
@@ -248,6 +368,196 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_veloc_guide",
+                "description": (
+                    "Return the VeloC reference guide as Markdown. "
+                    "The guide covers the full C API (VELOC_Init, VELOC_Mem_protect, "
+                    "VELOC_Checkpoint, VELOC_Restart, VELOC_Finalize, etc.), the C++ "
+                    "client API (veloc::client_t), the INI configuration file format "
+                    "(scratch, persistent, mode, intervals, versions, checksums), "
+                    "complete code examples for both memory-based and file-based modes, "
+                    "CMakeLists.txt integration, and best practices. "
+                    "Call this tool before writing any VeloC code or configuration to "
+                    "ensure you use the correct API signatures and config keys. "
+                    "Workflow: (1) call with list_sections=true to discover available "
+                    "section headings, then (2) call with the desired section name to "
+                    "retrieve only that section, or omit both to get the full guide."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "list_sections": {
+                            "type": "boolean",
+                            "description": (
+                                "When true, return only the list of available top-level section "
+                                "headings (e.g. 'C API Reference', 'Configuration File Reference', "
+                                "'Complete Code Examples', etc.) so you can decide which section "
+                                "to fetch next. Ignores the 'section' argument when true."
+                            ),
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": (
+                                "Name of the section to retrieve. Must match one of the headings "
+                                "returned by list_sections=true (case-insensitive). "
+                                "Leave empty (and list_sections=false) to retrieve the full guide."
+                            ),
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        # ── RAG / knowledge base tools ────────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "query_knowledge_base",
+                "description": (
+                    "Search the persistent VeloC knowledge base for insights relevant to your current task. "
+                    "Returns the top-k most similar entries ranked by TF-IDF cosine similarity. "
+                    "Call this at session start and before writing any VeloC code to retrieve "
+                    "best practices, known error solutions, and reusable code patterns. "
+                    "Also call it when you encounter an error to find known fixes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Natural-language description of what you are looking for. "
+                                "E.g. 'MPI checkpoint restart pattern', 'veloc.cfg scratch key', "
+                                "'VELOC_Mem_protect array', 'build error undefined reference veloc'."
+                            ),
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default 5, max 20).",
+                            "default": 5,
+                        },
+                        "min_score": {
+                            "type": "number",
+                            "description": "Minimum similarity score threshold 0.0–1.0 (default 0.1).",
+                            "default": 0.1,
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "Optional category filter. One of: best_practice, api_usage, "
+                                "error_solution, state_identification, checkpoint_timing, code_pattern."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "store_insight",
+                "description": (
+                    "Store a new insight in the persistent VeloC knowledge base. "
+                    "Call this whenever you discover something useful: a correct API pattern, "
+                    "a working code snippet, a solution to a build/runtime error, a best practice "
+                    "for checkpoint timing or state identification, or a useful configuration tip. "
+                    "The insight will be available to future sessions to speed up code generation."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short descriptive title for the insight (max 120 chars).",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": (
+                                "Full text of the insight. Include concrete details: "
+                                "code snippets, exact error messages, parameter values, "
+                                "and the reasoning behind the recommendation."
+                            ),
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "Category for this insight. Must be one of: "
+                                "best_practice, api_usage, error_solution, "
+                                "state_identification, checkpoint_timing, code_pattern."
+                            ),
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "List of keyword tags to improve searchability "
+                                "(e.g. ['MPI', 'VELOC_Init', 'memory-based'])."
+                            ),
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": (
+                                "Confidence score 0.0–1.0. Use 0.9+ for verified working patterns, "
+                                "0.7 for likely-correct patterns, 0.5 for uncertain hints."
+                            ),
+                            "default": 0.8,
+                        },
+                    },
+                    "required": ["title", "content", "category"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_insight",
+                "description": (
+                    "Update an existing insight in the knowledge base. "
+                    "Call this when you applied an insight and it did NOT work as expected — "
+                    "correct the content and lower the confidence. "
+                    "Also call it to add new information to an existing entry or mark it as verified. "
+                    "The insight_id comes from a previous query_knowledge_base result."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "insight_id": {
+                            "type": "string",
+                            "description": "UUID of the insight to update (from query_knowledge_base results).",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Updated title (leave empty to keep existing).",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Updated content (leave empty to keep existing).",
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Updated tags list (leave empty to keep existing).",
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": (
+                                "Updated confidence 0.0–1.0. Lower this if the insight was incorrect. "
+                                "Leave as null to keep existing."
+                            ),
+                        },
+                        "verified": {
+                            "type": "boolean",
+                            "description": "Set to true if you have confirmed this insight works correctly.",
+                        },
+                    },
+                    "required": ["insight_id"],
+                },
+            },
+        },
     ]
 
 
@@ -276,6 +586,100 @@ _STEP_SUMMARY_RE = re.compile(
 _STEP_RESULT_RE = re.compile(
     r"STEP_RESULT:\s*(\{[^\n]+\})", re.MULTILINE
 )
+# Matches either marker line (used for splitting thinking text into chunks)
+_STEP_MARKER_LINE_RE = re.compile(
+    r"^[ \t]*(STEP_SUMMARY|STEP_RESULT):[ \t]*\{[^\n]+\}[ \t]*$", re.MULTILINE
+)
+
+
+def _parse_interleaved_events(text: str, turn: int, has_tool_calls: bool) -> List[Dict[str, Any]]:
+    """
+    Parse *text* and return a list of events that interleave thinking chunks
+    with step_summary / step_result events in the order they appear in the text.
+
+    This preserves the LLM's reasoning flow: a thinking chunk may appear before
+    a STEP_SUMMARY (pre-step reasoning), between markers (inter-step reasoning),
+    or after the last marker (post-step reasoning before tool calls).
+
+    Event types returned:
+      - ``{"type": "thinking", "turn": N, "text": "..."}``   – reasoning chunk
+      - ``{"type": "step_summary", "turn": N, ...}``          – step announcement
+      - ``{"type": "step_result",  "turn": N, ...}``          – step outcome
+
+    When *has_tool_calls* is False the text is the final answer; in that case
+    thinking chunks are emitted as ``"final"`` events instead.
+    """
+    events: List[Dict[str, Any]] = []
+
+    # Collect all marker matches with their span so we can split the text.
+    markers: List[Tuple[int, int, str, str]] = []  # (start, end, kind, json_str)
+    for m in _STEP_SUMMARY_RE.finditer(text):
+        markers.append((m.start(), m.end(), "summary", m.group(1)))
+    for m in _STEP_RESULT_RE.finditer(text):
+        markers.append((m.start(), m.end(), "result", m.group(1)))
+    markers.sort(key=lambda x: x[0])
+
+    # Track step_summary events by step number so we can attach results.
+    step_events: Dict[int, Dict[str, Any]] = {}
+
+    # Helper: strip marker lines from a text chunk and return cleaned text.
+    def _strip_markers(chunk: str) -> str:
+        return _STEP_MARKER_LINE_RE.sub("", chunk).strip()
+
+    # Helper: emit a thinking/final event for a text chunk (if non-empty).
+    def _emit_text(chunk: str) -> None:
+        cleaned = _strip_markers(chunk)
+        if not cleaned:
+            return
+        ev_type = "thinking" if has_tool_calls else "final"
+        events.append({"type": ev_type, "turn": turn, "text": cleaned})
+
+    if not markers:
+        # No markers — emit the whole text as a single thinking/final event.
+        _emit_text(text)
+        return events
+
+    # Emit text before the first marker.
+    _emit_text(text[: markers[0][0]])
+
+    for i, (start, end, kind, json_str) in enumerate(markers):
+        # Parse and emit the marker event.
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if kind == "summary":
+                step_num = int(data.get("step", 0))
+                ev = {
+                    "type": "step_summary",
+                    "turn": turn,
+                    "step": step_num,
+                    "name": str(data.get("name", "")),
+                    "why": str(data.get("why", "")),
+                    "how": str(data.get("how", "")),
+                    "tools": data.get("tools", []),
+                    "result": "",  # filled in when STEP_RESULT arrives
+                }
+                step_events[step_num] = ev
+                events.append(ev)
+            elif kind == "result":
+                step_num = int(data.get("step", 0))
+                result_text = str(data.get("result", ""))
+                if step_num in step_events:
+                    step_events[step_num]["result"] = result_text
+                events.append({
+                    "type": "step_result",
+                    "turn": turn,
+                    "step": step_num,
+                    "result": result_text,
+                })
+
+        # Emit text between this marker and the next (or end of text).
+        next_start = markers[i + 1][0] if i + 1 < len(markers) else len(text)
+        _emit_text(text[end: next_start])
+
+    return events
 
 
 def _parse_step_events(text: str, turn: int) -> List[Dict[str, Any]]:
@@ -288,6 +692,10 @@ def _parse_step_events(text: str, turn: int) -> List[Dict[str, Any]]:
     of the most recent step_summary with the same step number.
 
     Returns a flat list of events to yield, in document order.
+
+    .. deprecated::
+        Use :func:`_parse_interleaved_events` instead, which also interleaves
+        thinking chunks between step markers.
     """
     events: List[Dict[str, Any]] = []
     # Collect all markers with their positions.
@@ -351,7 +759,7 @@ def _parse_step_events(text: str, turn: int) -> List[Dict[str, Any]]:
 
 async def _stream_agent_loop(
     messages: List[Dict[str, Any]],
-    max_turns: int = 50,
+    max_turns: int = 100,
     collector: MetricsCollector | None = None,
 ) -> AsyncIterator[Dict[str, Any]]:
     """
@@ -455,21 +863,30 @@ async def _stream_agent_loop(
             if collector is not None:
                 collector.record_model_response(turn, msg.content)
 
-            # Parse step-summary / step-result markers from the content.
-            step_events = _parse_step_events(msg.content, turn)
-            for ev in step_events:
-                # ── Record step start / end in the collector ─────────────────
+            # Parse the content into interleaved thinking chunks and step events
+            # so the UI shows them in the order the LLM actually reasoned:
+            #   thinking chunk → step_summary → thinking chunk → step_summary → …
+            # Tool calls follow after all text events (OpenAI API constraint).
+            interleaved = _parse_interleaved_events(
+                msg.content, turn, has_tool_calls=bool(msg.tool_calls)
+            )
+            for ev in interleaved:
+                # ── Record events in the collector (interleaved order) ────────
                 if collector is not None:
                     if ev["type"] == "step_summary":
-                        collector.record_step_start(ev["step"], ev.get("name", ""))
+                        collector.record_step_summary(
+                            turn,
+                            ev["step"],
+                            ev.get("name", ""),
+                            why=ev.get("why", ""),
+                            how=ev.get("how", ""),
+                            tools=ev.get("tools", []),
+                        )
                     elif ev["type"] == "step_result":
-                        collector.record_step_end(ev["step"])
+                        collector.record_step_result(turn, ev["step"], ev.get("result", ""))
+                    elif ev["type"] in ("thinking", "final"):
+                        collector.record_thinking_chunk(turn, ev["text"])
                 yield ev
-
-            if msg.tool_calls:
-                yield {"type": "thinking", "turn": turn, "text": msg.content}
-            else:
-                yield {"type": "final", "turn": turn, "text": msg.content}
 
         # Build the assistant message dict for history.
         assistant_msg: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
@@ -488,6 +905,27 @@ async def _stream_agent_loop(
             # No tool calls → final answer already emitted above.
             return
 
+        # Build a queue mapping tool names → step numbers from the step_summary
+        # events emitted above.  This lets us associate each tool call with the
+        # step that announced it, so the UI can place tool-call boxes inside the
+        # correct step card rather than always in the last one.
+        # The queue preserves order so that if the same tool is used in multiple
+        # steps, each call is assigned to the earliest unmatched step.
+        _tool_step_queue: List[Tuple[str, int]] = []  # [(tool_name, step_num), ...]
+        if msg.content:
+            for ev in _parse_interleaved_events(msg.content, turn, has_tool_calls=True):
+                if ev["type"] == "step_summary":
+                    for _t in ev.get("tools", []):
+                        _tool_step_queue.append((_t, ev["step"]))
+
+        def _pop_step_for_tool(tool_name: str) -> int | None:
+            """Return the step number for the next unmatched occurrence of tool_name."""
+            for i, (tname, snum) in enumerate(_tool_step_queue):
+                if tname == tool_name:
+                    _tool_step_queue.pop(i)
+                    return snum
+            return None
+
         # Dispatch each tool call, emit events, append results.
         for tc in msg.tool_calls:
             # Parse args for display (best-effort).
@@ -496,7 +934,18 @@ async def _stream_agent_loop(
             except (json.JSONDecodeError, ValueError):
                 args_display = {"raw": tc.function.arguments}
 
-            yield {"type": "tool_call", "turn": turn, "name": tc.function.name, "args": args_display}
+            # Determine which step this tool call belongs to.
+            _tc_step = _pop_step_for_tool(tc.function.name)
+
+            _tool_call_ev: Dict[str, Any] = {
+                "type": "tool_call",
+                "turn": turn,
+                "name": tc.function.name,
+                "args": args_display,
+            }
+            if _tc_step is not None:
+                _tool_call_ev["step"] = _tc_step
+            yield _tool_call_ev
 
             # Offload blocking tool execution (e.g. cmake/make/MPI) to a thread pool
             # so the event loop stays responsive for SSE heartbeats.
@@ -512,13 +961,93 @@ async def _stream_agent_loop(
                     _tool_elapsed,
                     args=args_display,
                     result=result_str,
+                    step=_tc_step,
                 )
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_str})
 
             # Truncate large results for display only.
             display_result = result_str if len(result_str) <= 2048 else result_str[:2048] + "…[truncated]"
-            yield {"type": "tool_result", "turn": turn, "name": tc.function.name, "result": display_result}
+            _tool_result_ev: Dict[str, Any] = {
+                "type": "tool_result",
+                "turn": turn,
+                "name": tc.function.name,
+                "result": display_result,
+            }
+            if _tc_step is not None:
+                _tool_result_ev["step"] = _tc_step
+            yield _tool_result_ev
+
+            # ── Emit RAG-specific events for knowledge base interactions ──────
+            _rag_tool_name = tc.function.name
+            if _rag_tool_name in ("query_knowledge_base", "store_insight", "update_insight"):
+                try:
+                    _rag_result = json.loads(result_str)
+                except (json.JSONDecodeError, ValueError):
+                    _rag_result = {}
+                _rag_enabled_flag = _rag_result.get("rag_enabled", True)
+
+                if _rag_tool_name == "query_knowledge_base":
+                    _results = _rag_result.get("results", [])
+                    _rag_ev = {
+                        "type": "rag_query",
+                        "turn": turn,
+                        "query": args_display.get("query", ""),
+                        "results_count": len(_results),
+                        "results": _results,
+                        "rag_enabled": _rag_enabled_flag,
+                    }
+                    yield _rag_ev
+                    if collector is not None:
+                        collector.record_rag_interaction(
+                            kind="query",
+                            elapsed_s=_tool_elapsed,
+                            rag_enabled=_rag_enabled_flag,
+                            query=args_display.get("query", ""),
+                            results_count=len(_results),
+                        )
+
+                elif _rag_tool_name == "store_insight":
+                    _rag_ev = {
+                        "type": "rag_store",
+                        "turn": turn,
+                        "insight_id": _rag_result.get("id", ""),
+                        "title": _rag_result.get("title", args_display.get("title", "")),
+                        "category": _rag_result.get("category", args_display.get("category", "")),
+                        "confidence": _rag_result.get("confidence", args_display.get("confidence", 0.8)),
+                        "rag_enabled": _rag_enabled_flag,
+                    }
+                    yield _rag_ev
+                    if collector is not None:
+                        collector.record_rag_interaction(
+                            kind="store",
+                            elapsed_s=_tool_elapsed,
+                            rag_enabled=_rag_enabled_flag,
+                            title=_rag_result.get("title", args_display.get("title", "")),
+                            insight_id=_rag_result.get("id", ""),
+                            category=_rag_result.get("category", args_display.get("category", "")),
+                            confidence=_rag_result.get("confidence", args_display.get("confidence")),
+                        )
+
+                elif _rag_tool_name == "update_insight":
+                    _rag_ev = {
+                        "type": "rag_update",
+                        "turn": turn,
+                        "insight_id": _rag_result.get("id", args_display.get("insight_id", "")),
+                        "title": _rag_result.get("title", ""),
+                        "confidence": _rag_result.get("confidence"),
+                        "rag_enabled": _rag_enabled_flag,
+                    }
+                    yield _rag_ev
+                    if collector is not None:
+                        collector.record_rag_interaction(
+                            kind="update",
+                            elapsed_s=_tool_elapsed,
+                            rag_enabled=_rag_enabled_flag,
+                            title=_rag_result.get("title", ""),
+                            insight_id=_rag_result.get("id", args_display.get("insight_id", "")),
+                            confidence=_rag_result.get("confidence"),
+                        )
 
     # Exceeded max_turns.
     yield {
