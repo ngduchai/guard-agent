@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Provider selection
     llm_provider: str = "argo"   # openai | argo | generic
-    llm_model: str = "claudesonnet46"
+    llm_model: str = "claudeopus46"
 
     # OpenAI
     openai_api_key: str | None = None
