@@ -1098,7 +1098,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       } else {
         // No active step — place in the agent bubble (pre-step or between-step reasoning).
         ensureAgentBubble().appendChild(details);
-        scrollBottom();
+        // Scroll to the newly added thinking block so the user sees it.
+        scrollToElement(details, 'nearest');
       }
     }
 
