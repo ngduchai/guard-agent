@@ -882,6 +882,17 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     let busy  = false;
     let currentES = null;   // EventSource for SSE
 
+    // Turn counter — incremented on each send() to generate unique DOM IDs
+    // for step cards across turns.  Without this, step cards from different
+    // turns that share the same step number (e.g. both have step 1) would
+    // collide on getElementById, causing badges to never update to "done".
+    let turnId = 0;
+
+    // Build a DOM-safe ID prefix for the current turn + step number.
+    function stepDomId(stepNum) {
+      return 't' + turnId + '-s' + stepNum;
+    }
+
     // ── Utilities ──────────────────────────────────────────────────────────
 
     function setStatus(text, mode) {
@@ -909,11 +920,32 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     }
 
     // ── Smart auto-scroll helpers ──────────────────────────────────────────
+
+    // Check whether the user is scrolled near the bottom of the output panel.
+    // Returns true when the scroll position is within 150px of the bottom,
+    // meaning the user is "following along" and auto-scroll should happen.
+    // When the user has scrolled up to read earlier content, returns false
+    // so we don't yank the viewport away from what they're reading.
+    function isUserNearBottom() {
+      const threshold = 150;
+      return (outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight) < threshold;
+    }
+
     // Scroll a specific element into view inside the chat output panel.
     // block='start' ensures the top of the element is visible (good for new step cards).
     function scrollToElement(el, block) {
       if (!el) return;
       el.scrollIntoView({ behavior: 'smooth', block: block || 'start' });
+    }
+
+    // Guarded scroll: only scrolls if the user is near the bottom (following along).
+    // Prevents the viewport from jumping away when the user has scrolled up.
+    // Use force=true to bypass the guard (e.g. for user-initiated actions).
+    function scrollToElementIfFollowing(el, block, force) {
+      if (!el) return;
+      if (force || isUserNearBottom()) {
+        scrollToElement(el, block);
+      }
     }
 
     // Scroll the chat output to the very bottom (used for generic updates
@@ -923,12 +955,33 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     }
 
     // Scroll to the currently active step card (the "running" box).
-    // Uses block='start' so the top of the step card is visible, letting the
-    // user see the step header and watch content grow downward.
+    // For short step cards that fit in the viewport, scroll to the card top
+    // so the user sees the header and watches content grow downward.
+    // For long step cards that exceed the viewport height, scroll to the
+    // last child element inside the step's calls area so the user always
+    // sees the most recently added block (thinking, tool call, etc.).
     function scrollToActiveStep() {
+      if (!isUserNearBottom()) return;  // don't steal focus if user scrolled up
       if (activeStepNum !== null) {
-        const card = document.getElementById('step-card-' + activeStepNum);
-        if (card) { scrollToElement(card, 'start'); return; }
+        const sid = stepDomId(activeStepNum);
+        const card = document.getElementById('step-card-' + sid);
+        if (card) {
+          const viewportHeight = outputEl.clientHeight;
+          const cardHeight = card.offsetHeight;
+          if (cardHeight > viewportHeight) {
+            // Step card is taller than the viewport — scroll to the last
+            // child inside the step-calls container so the newest block
+            // is visible, rather than always jumping to the card top.
+            const callsEl = document.getElementById('step-calls-' + sid);
+            if (callsEl && callsEl.lastElementChild) {
+              scrollToElement(callsEl.lastElementChild, 'end');
+              return;
+            }
+          }
+          // Card fits in the viewport — show the card top.
+          scrollToElement(card, 'start');
+          return;
+        }
       }
       // Fallback: scroll to the bottom of the output.
       scrollBottom();
@@ -952,7 +1005,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
           <div class="msg-user-bubble">${escapeHtml(text)}</div>
         </div>
       `);
-      // Scroll to the user message so it's visible.
+      // Always scroll to the user message (user just sent it, so force=true).
       const lastChild = outputEl.lastElementChild;
       scrollToElement(lastChild);
     }
@@ -962,8 +1015,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       wrap.className = 'msg-agent';
       wrap.innerHTML = `<div class="msg-agent-bubble">${innerHtml}</div>`;
       outputEl.appendChild(wrap);
-      // Scroll to the newly appended bubble.
-      scrollToElement(wrap);
+      // Scroll to the newly appended bubble only if user is following along.
+      scrollToElementIfFollowing(wrap, 'start');
       return wrap.querySelector('.msg-agent-bubble');
     }
 
@@ -989,18 +1042,19 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     function renderStepSummary(ev) {
       const bubble = ensureAgentBubble();
       const stepNum = ev.step || '?';
+      const sid = stepDomId(stepNum);  // turn-scoped unique ID
       const tools = Array.isArray(ev.tools) && ev.tools.length
         ? ev.tools.map(t => `<span class="tool-badge">⚙ ${escapeHtml(t)}</span>`).join('')
         : '<span style="color:var(--muted);font-size:10px;">none</span>';
 
       const card = document.createElement('div');
       card.className = 'step-card';
-      card.id = 'step-card-' + stepNum;
+      card.id = 'step-card-' + sid;
       card.innerHTML = `
         <div class="step-card-header">
           <span class="step-num">Step ${escapeHtml(String(stepNum))}</span>
           <span class="step-name">${escapeHtml(ev.name || '')}</span>
-          <span class="step-status-badge running" id="step-badge-${stepNum}">running…</span>
+          <span class="step-status-badge running" id="step-badge-${sid}">running…</span>
         </div>
         <div class="step-row">
           <span class="step-label">Why</span>
@@ -1012,25 +1066,26 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
         </div>
         <div class="step-row">
           <span class="step-label">Tools</span>
-          <span class="step-value" id="step-tools-${stepNum}">${tools}</span>
+          <span class="step-value" id="step-tools-${sid}">${tools}</span>
         </div>
-        <div id="step-calls-${stepNum}"></div>
-        <div id="step-result-${stepNum}"></div>
+        <div id="step-calls-${sid}"></div>
+        <div id="step-result-${sid}"></div>
       `;
       bubble.appendChild(card);
       stepCards[stepNum] = card;
       activeStepNum = stepNum;  // mark this step as active
       // Scroll to the newly created step card so the user sees the running step.
-      scrollToElement(card);
+      scrollToElementIfFollowing(card, 'start');
     }
 
     function renderStepResult(ev) {
       const stepNum = ev.step || '?';
-      const resultEl = document.getElementById('step-result-' + stepNum);
+      const sid = stepDomId(stepNum);  // turn-scoped unique ID
+      const resultEl = document.getElementById('step-result-' + sid);
       if (resultEl && ev.result) {
         resultEl.innerHTML = `<div class="step-result-box">${escapeHtml(ev.result)}</div>`;
       }
-      const badge = document.getElementById('step-badge-' + stepNum);
+      const badge = document.getElementById('step-badge-' + sid);
       if (badge) {
         badge.textContent = 'done';
         badge.className = 'step-status-badge done';
@@ -1038,8 +1093,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       // Clear the active step so thinking blocks between steps go to the bubble.
       if (activeStepNum === stepNum) activeStepNum = null;
       // Scroll to the completed step card to show the result.
-      const card = document.getElementById('step-card-' + stepNum);
-      if (card) scrollToElement(card);
+      const card = document.getElementById('step-card-' + sid);
+      if (card) scrollToElementIfFollowing(card, 'start');
     }
 
     // Mark every step that is still showing "running…" as done.
@@ -1047,7 +1102,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     // STEP_RESULT the LLM skipped or emitted in a later turn don't stay stuck.
     function finishAllRunningSteps() {
       Object.keys(stepCards).forEach(k => {
-        const badge = document.getElementById('step-badge-' + k);
+        const sid = stepDomId(k);
+        const badge = document.getElementById('step-badge-' + sid);
         if (badge && badge.classList.contains('running')) {
           badge.textContent = 'done';
           badge.className = 'step-status-badge done';
@@ -1087,19 +1143,19 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       // Use activeStepNum to determine placement: inside the active step card
       // (if a step is currently running) or in the agent bubble (pre/between steps).
       const callsEl = activeStepNum !== null
-        ? document.getElementById('step-calls-' + activeStepNum)
+        ? document.getElementById('step-calls-' + stepDomId(activeStepNum))
         : null;
 
       if (callsEl) {
         // Place thinking block inside the active step card (interleaved reasoning).
         callsEl.appendChild(details);
-        // Scroll to keep the active step card in view.
-        scrollToActiveStep();
+        // Scroll to the newly added thinking block only if user is following along.
+        scrollToElementIfFollowing(details, 'end');
       } else {
         // No active step — place in the agent bubble (pre-step or between-step reasoning).
         ensureAgentBubble().appendChild(details);
-        // Scroll to the newly added thinking block so the user sees it.
-        scrollToElement(details, 'nearest');
+        // Scroll to the newly added thinking block only if user is following along.
+        scrollToElementIfFollowing(details, 'nearest');
       }
     }
 
@@ -1113,13 +1169,13 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     function _toolCallsEl(stepHint) {
       // Prefer the step card identified by stepHint (if provided and exists).
       if (stepHint != null) {
-        const el = document.getElementById('step-calls-' + stepHint);
+        const el = document.getElementById('step-calls-' + stepDomId(stepHint));
         if (el) return el;
       }
       // Fall back to the most recently opened step card.
       const stepNums = Object.keys(stepCards).map(Number).sort((a,b)=>b-a);
       const targetStep = stepNums.length ? stepNums[0] : null;
-      return targetStep !== null ? document.getElementById('step-calls-' + targetStep) : null;
+      return targetStep !== null ? document.getElementById('step-calls-' + stepDomId(targetStep)) : null;
     }
 
     function renderToolCall(ev) {
@@ -1133,10 +1189,12 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       `;
       if (callsEl) {
         callsEl.insertAdjacentHTML('beforeend', callHtml);
+        // Scroll to the newly added tool call block only if user is following along.
+        scrollToElementIfFollowing(callsEl.lastElementChild, 'end');
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', callHtml);
+        scrollToActiveStep();
       }
-      scrollToActiveStep();
     }
 
     function renderToolResult(ev) {
@@ -1148,10 +1206,12 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       `;
       if (callsEl) {
         callsEl.insertAdjacentHTML('beforeend', resultHtml);
+        // Scroll to the newly added tool result block only if user is following along.
+        scrollToElementIfFollowing(callsEl.lastElementChild, 'end');
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', resultHtml);
+        scrollToActiveStep();
       }
-      scrollToActiveStep();
     }
 
     // ── RAG / Knowledge Base collapsible block renderers ──────────────────
@@ -1162,13 +1222,13 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
     // falls back to the most recently opened step card (highest step num).
     function _ragInsertTarget() {
       if (activeStepNum !== null) {
-        const el = document.getElementById('step-calls-' + activeStepNum);
+        const el = document.getElementById('step-calls-' + stepDomId(activeStepNum));
         if (el) return el;
       }
       const stepNums = Object.keys(stepCards).map(Number).sort((a,b)=>b-a);
       const targetStep = stepNums.length ? stepNums[0] : null;
       return targetStep !== null
-        ? document.getElementById('step-calls-' + targetStep)
+        ? document.getElementById('step-calls-' + stepDomId(targetStep))
         : null;
     }
 
@@ -1176,10 +1236,12 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       const target = _ragInsertTarget();
       if (target) {
         target.insertAdjacentHTML('beforeend', html);
+        // Scroll to the newly added RAG block only if user is following along.
+        scrollToElementIfFollowing(target.lastElementChild, 'end');
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', html);
+        scrollToActiveStep();
       }
-      scrollToActiveStep();
     }
 
     function renderRAGQuery(ev) {
@@ -1371,6 +1433,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       state.messages.push({ role: 'user', content: llmMessage });
 
       busy = true;
+      turnId++;             // new turn → new DOM ID namespace for step cards
       agentBubble = null;   // reset for new agent turn
       Object.keys(stepCards).forEach(k => delete stepCards[k]);
       activeStepNum = null; // reset active step tracking
@@ -1570,6 +1633,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       agentBubble = null;
       Object.keys(stepCards).forEach(k => delete stepCards[k]);
       activeStepNum = null; // reset active step tracking
+      turnId = 0;           // reset turn counter
       enableInput();
       promptEl.focus();
       // Hide metrics panel on reset

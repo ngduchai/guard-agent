@@ -2,6 +2,7 @@
 Knowledge base browser page HTML for the Guard Agent Web UI.
 
 Returns the full HTML for the ``/knowledge`` route.
+Supports Add, Edit, and Delete operations on knowledge base entries.
 """
 
 from __future__ import annotations
@@ -9,11 +10,11 @@ from __future__ import annotations
 
 def knowledge_browser_html() -> str:
     """Return the HTML for the knowledge base browser page."""
-    return """<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Guard Agent \u2013 Knowledge Base</title>
+  <title>Guard Agent – Knowledge Base</title>
   <style>
     :root {
       color-scheme: dark;
@@ -142,12 +143,92 @@ def knowledge_browser_html() -> str:
     .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
     .loading { text-align: center; padding: 40px; color: var(--muted); }
     .error-msg { color: var(--danger); font-size: 13px; padding: 12px; }
-    .refresh-btn {
-      padding: 6px 12px; border-radius: 8px;
-      background: rgba(168,85,247,0.2); border: 1px solid rgba(168,85,247,0.4);
-      color: rgba(216,180,254,0.9); font-size: 11px; cursor: pointer;
+
+    /* ── Buttons ── */
+    .btn {
+      padding: 6px 12px; border-radius: 8px; font-size: 11px; cursor: pointer;
+      border: 1px solid transparent; transition: background 0.15s, border-color 0.15s;
     }
-    .refresh-btn:hover { background: rgba(168,85,247,0.3); }
+    .btn-primary {
+      background: rgba(168,85,247,0.25); border-color: rgba(168,85,247,0.5);
+      color: rgba(216,180,254,0.95);
+    }
+    .btn-primary:hover { background: rgba(168,85,247,0.4); }
+    .btn-secondary {
+      background: rgba(56,189,248,0.1); border-color: rgba(56,189,248,0.35);
+      color: var(--accent);
+    }
+    .btn-secondary:hover { background: rgba(56,189,248,0.2); }
+    .btn-danger {
+      background: rgba(249,115,115,0.1); border-color: rgba(249,115,115,0.35);
+      color: var(--danger);
+    }
+    .btn-danger:hover { background: rgba(249,115,115,0.25); }
+    .btn-success {
+      background: rgba(134,239,172,0.1); border-color: rgba(134,239,172,0.35);
+      color: var(--success);
+    }
+    .btn-success:hover { background: rgba(134,239,172,0.25); }
+
+    /* ── Entry action row ── */
+    .entry-actions { display: flex; gap: 6px; margin-top: 8px; justify-content: flex-end; }
+
+    /* ── Modal overlay ── */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(2,6,23,0.85); backdrop-filter: blur(4px);
+      z-index: 1000; align-items: center; justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--panel); border: 1px solid rgba(168,85,247,0.4);
+      border-radius: 16px; padding: 24px; width: 100%; max-width: 640px;
+      max-height: 90vh; overflow-y: auto;
+      box-shadow: 0 32px 80px rgba(0,0,0,0.8);
+    }
+    .modal-title { font-size: 16px; font-weight: 700; color: rgba(216,180,254,0.95); margin-bottom: 16px; }
+    .form-group { margin-bottom: 12px; }
+    .form-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; display: block; }
+    .form-input, .form-select, .form-textarea {
+      width: 100%; padding: 7px 10px; border-radius: 8px;
+      background: rgba(15,23,42,0.9); border: 1px solid rgba(168,85,247,0.35);
+      color: var(--text); font-size: 12px; outline: none; font-family: var(--sans);
+    }
+    .form-input:focus, .form-select:focus, .form-textarea:focus {
+      border-color: rgba(168,85,247,0.7);
+    }
+    .form-textarea { resize: vertical; min-height: 120px; font-family: var(--mono); }
+    .form-row { display: flex; gap: 10px; }
+    .form-row .form-group { flex: 1; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 2000;
+      padding: 10px 16px; border-radius: 10px; font-size: 13px;
+      background: rgba(15,23,42,0.97); border: 1px solid rgba(168,85,247,0.4);
+      color: var(--text); opacity: 0; transition: opacity 0.25s;
+      pointer-events: none; max-width: 360px;
+    }
+    #toast.show { opacity: 1; }
+    #toast.ok { border-color: rgba(134,239,172,0.5); color: var(--success); }
+    #toast.err { border-color: rgba(249,115,115,0.5); color: var(--danger); }
+
+    /* ── Confirm dialog ── */
+    .confirm-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(2,6,23,0.85); backdrop-filter: blur(4px);
+      z-index: 1100; align-items: center; justify-content: center;
+    }
+    .confirm-overlay.open { display: flex; }
+    .confirm-box {
+      background: var(--panel); border: 1px solid rgba(249,115,115,0.4);
+      border-radius: 14px; padding: 24px; width: 100%; max-width: 400px;
+      box-shadow: 0 32px 80px rgba(0,0,0,0.8);
+    }
+    .confirm-title { font-size: 15px; font-weight: 700; color: var(--danger); margin-bottom: 10px; }
+    .confirm-msg { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+    .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
@@ -156,16 +237,16 @@ def knowledge_browser_html() -> str:
     <div class="card">
       <div class="header">
         <div>
-          <div class="title">\U0001f9e0 Knowledge Base</div>
-          <div class="subtitle">VeloC agent accumulated insights \u2014 updated automatically during sessions</div>
+          <div class="title">🧠 Knowledge Base</div>
+          <div class="subtitle">VeloC agent accumulated insights — add, edit or remove entries</div>
         </div>
-        <a href="/" class="nav-link">\u2190 Back to Agent</a>
+        <a href="/" class="nav-link">← Back to Agent</a>
       </div>
 
       <div id="stats-grid" class="stats-grid" style="display:none;"></div>
 
       <div class="controls">
-        <input id="search" class="search-input" type="text" placeholder="Search insights\u2026" oninput="filterEntries()">
+        <input id="search" class="search-input" type="text" placeholder="Search insights…" oninput="filterEntries()">
         <select id="cat-filter" class="filter-select" onchange="filterEntries()">
           <option value="">All categories</option>
           <option value="best_practice">Best Practice</option>
@@ -176,30 +257,102 @@ def knowledge_browser_html() -> str:
           <option value="code_pattern">Code Pattern</option>
         </select>
         <span id="entry-count" class="entry-count"></span>
-        <button class="refresh-btn" onclick="loadData()">\u21bb Refresh</button>
+        <button class="btn btn-primary" onclick="openAddModal()">＋ Add Entry</button>
+        <button class="btn btn-secondary" onclick="loadData()">↻ Refresh</button>
       </div>
 
       <div id="entries-list" class="entries-list">
-        <div class="loading">Loading knowledge base\u2026</div>
+        <div class="loading">Loading knowledge base…</div>
       </div>
     </div>
   </div>
 
+  <!-- ── Add / Edit Modal ── -->
+  <div id="entry-modal" class="modal-overlay" onclick="handleOverlayClick(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-title" id="modal-title">Add Entry</div>
+      <input type="hidden" id="modal-entry-id">
+
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Title *</label>
+          <input id="f-title" class="form-input" type="text" placeholder="Short descriptive title">
+        </div>
+        <div class="form-group" style="max-width:200px;">
+          <label class="form-label">Category *</label>
+          <select id="f-category" class="form-select">
+            <option value="best_practice">Best Practice</option>
+            <option value="api_usage">API Usage</option>
+            <option value="error_solution">Error Solution</option>
+            <option value="state_identification">State Identification</option>
+            <option value="checkpoint_timing">Checkpoint Timing</option>
+            <option value="code_pattern">Code Pattern</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Content * (Markdown supported)</label>
+        <textarea id="f-content" class="form-textarea" rows="8" placeholder="Full text of the insight…"></textarea>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Tags (comma-separated)</label>
+          <input id="f-tags" class="form-input" type="text" placeholder="veloc, mpi, checkpoint">
+        </div>
+        <div class="form-group" style="max-width:160px;">
+          <label class="form-label">Confidence (0–1)</label>
+          <input id="f-confidence" class="form-input" type="number" min="0" max="1" step="0.05" value="0.5">
+        </div>
+        <div class="form-group" style="max-width:120px; display:flex; flex-direction:column; justify-content:flex-end;">
+          <label class="form-label" style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input id="f-verified" type="checkbox" style="accent-color: rgba(134,239,172,0.9);">
+            Verified
+          </label>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-success" onclick="submitEntry()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Confirm Delete Dialog ── -->
+  <div id="confirm-overlay" class="confirm-overlay" onclick="closeConfirm()">
+    <div class="confirm-box" onclick="event.stopPropagation()">
+      <div class="confirm-title">⚠ Delete Entry</div>
+      <div class="confirm-msg" id="confirm-msg">Are you sure you want to delete this entry? This action cannot be undone.</div>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary" onclick="closeConfirm()">Cancel</button>
+        <button class="btn btn-danger" onclick="confirmDelete()">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Toast ── -->
+  <div id="toast"></div>
+
   <script>
     let allEntries = [];
+    let pendingDeleteId = null;
+    let toastTimer = null;
+
+    // ── Utilities ──────────────────────────────────────────────────────────
 
     function escapeHtml(s) {
       return String(s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        .replace(/&/g, '&').replace(/</g, '<')
+        .replace(/>/g, '>').replace(/"/g, '"');
     }
 
     function renderMarkdown(text) {
       if (!text) return '';
       if (typeof marked !== 'undefined') {
-        try {
-          return marked.parse(String(text), { breaks: true, gfm: true });
-        } catch(e) { /* fall through */ }
+        try { return marked.parse(String(text), { breaks: true, gfm: true }); }
+        catch(e) { /* fall through */ }
       }
       return '<pre style="white-space:pre-wrap; margin:0;">' + escapeHtml(String(text)) + '</pre>';
     }
@@ -218,6 +371,16 @@ def knowledge_browser_html() -> str:
       return map[cat] || cat;
     }
 
+    function showToast(msg, type = '') {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'show' + (type ? ' ' + type : '');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { t.className = ''; }, 3500);
+    }
+
+    // ── Stats ──────────────────────────────────────────────────────────────
+
     function renderStats(stats) {
       const grid = document.getElementById('stats-grid');
       if (!stats) { grid.style.display = 'none'; return; }
@@ -235,30 +398,39 @@ def knowledge_browser_html() -> str:
       grid.style.display = 'grid';
     }
 
+    // ── Render entries ─────────────────────────────────────────────────────
+
+    // Keep a reference to the currently-rendered entries so edit/delete
+    // buttons can look them up by index instead of inlining JSON into
+    // onclick attributes (which breaks when content contains quotes / angle brackets).
+    let renderedEntries = [];
+
     function renderEntries(entries) {
       const list = document.getElementById('entries-list');
       const count = document.getElementById('entry-count');
       if (!entries || entries.length === 0) {
-        list.innerHTML = `<div class="empty-state"><div class="icon">\U0001f9e0</div>No insights yet. Run the agent on a VeloC task to start building the knowledge base.</div>`;
+        renderedEntries = [];
+        list.innerHTML = `<div class="empty-state"><div class="icon">🧠</div>No insights yet. Run the agent on a VeloC task to start building the knowledge base, or add one manually.</div>`;
         count.textContent = '0 entries';
         return;
       }
+      renderedEntries = entries;
       count.textContent = entries.length + ' entr' + (entries.length === 1 ? 'y' : 'ies');
-      list.innerHTML = entries.map(e => {
+      list.innerHTML = entries.map((e, idx) => {
         const conf = typeof e.confidence === 'number' ? e.confidence : 0.8;
         const confPct = Math.round(conf * 100);
         const tags = Array.isArray(e.tags) ? e.tags : [];
         const tagsHtml = tags.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('');
-        const verifiedHtml = e.verified ? `<span class="verified-badge">\u2713 verified</span>` : '';
+        const verifiedHtml = e.verified ? `<span class="verified-badge">✓ verified</span>` : '';
         return `
-          <div class="entry-card" data-title="${escapeHtml((e.title||'').toLowerCase())}" data-content="${escapeHtml((e.content||'').toLowerCase())}" data-cat="${escapeHtml(e.category||'')}">
+          <div class="entry-card" data-cat="${escapeHtml(e.category||'')}">
             <div class="entry-header">
               <div class="entry-title">${escapeHtml(e.title || '(untitled)')}</div>
               <span class="entry-cat">${escapeHtml(catLabel(e.category||''))}</span>
               ${verifiedHtml}
             </div>
             <div class="entry-meta">
-              <span><strong>ID:</strong> ${escapeHtml((e.id||'').slice(0,16))}\u2026</span>
+              <span><strong>ID:</strong> ${escapeHtml((e.id||'').slice(0,16))}…</span>
               <span><strong>Created:</strong> ${escapeHtml(fmtDate(e.created_at))}</span>
               ${e.updated_at && e.updated_at !== e.created_at ? `<span><strong>Updated:</strong> ${escapeHtml(fmtDate(e.updated_at))}</span>` : ''}
               ${e.source ? `<span><strong>Source:</strong> ${escapeHtml(e.source)}</span>` : ''}
@@ -269,9 +441,15 @@ def knowledge_browser_html() -> str:
             </div>
             <div class="entry-content md-content">${renderMarkdown(e.content||'')}</div>
             ${tagsHtml ? `<div class="entry-tags">${tagsHtml}</div>` : ''}
+            <div class="entry-actions">
+              <button class="btn btn-secondary" onclick="openEditModal(renderedEntries[${idx}])">✏ Edit</button>
+              <button class="btn btn-danger" onclick="askDeleteByIndex(${idx})">🗑 Delete</button>
+            </div>
           </div>`;
       }).join('');
     }
+
+    // ── Filter ─────────────────────────────────────────────────────────────
 
     function filterEntries() {
       const q = (document.getElementById('search').value || '').toLowerCase();
@@ -287,9 +465,11 @@ def knowledge_browser_html() -> str:
       renderEntries(filtered);
     }
 
+    // ── Load data ──────────────────────────────────────────────────────────
+
     async function loadData() {
       const list = document.getElementById('entries-list');
-      list.innerHTML = '<div class="loading">Loading\u2026</div>';
+      list.innerHTML = '<div class="loading">Loading…</div>';
       try {
         const resp = await fetch('/api/knowledge');
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -302,6 +482,126 @@ def knowledge_browser_html() -> str:
         list.innerHTML = `<div class="error-msg">Failed to load knowledge base: ${escapeHtml(String(err))}</div>`;
       }
     }
+
+    // ── Modal helpers ──────────────────────────────────────────────────────
+
+    function openAddModal() {
+      document.getElementById('modal-title').textContent = 'Add Entry';
+      document.getElementById('modal-entry-id').value = '';
+      document.getElementById('f-title').value = '';
+      document.getElementById('f-category').value = 'best_practice';
+      document.getElementById('f-content').value = '';
+      document.getElementById('f-tags').value = '';
+      document.getElementById('f-confidence').value = '0.5';
+      document.getElementById('f-verified').checked = false;
+      document.getElementById('entry-modal').classList.add('open');
+      document.getElementById('f-title').focus();
+    }
+
+    function openEditModal(entry) {
+      document.getElementById('modal-title').textContent = 'Edit Entry';
+      document.getElementById('modal-entry-id').value = entry.id || '';
+      document.getElementById('f-title').value = entry.title || '';
+      document.getElementById('f-category').value = entry.category || 'best_practice';
+      document.getElementById('f-content').value = entry.content || '';
+      document.getElementById('f-tags').value = (entry.tags || []).join(', ');
+      document.getElementById('f-confidence').value = typeof entry.confidence === 'number' ? entry.confidence : 0.5;
+      document.getElementById('f-verified').checked = !!entry.verified;
+      document.getElementById('entry-modal').classList.add('open');
+      document.getElementById('f-title').focus();
+    }
+
+    function closeModal() {
+      document.getElementById('entry-modal').classList.remove('open');
+    }
+
+    function handleOverlayClick(e) {
+      if (e.target === document.getElementById('entry-modal')) closeModal();
+    }
+
+    // ── Submit (add or edit) ───────────────────────────────────────────────
+
+    async function submitEntry() {
+      const id = document.getElementById('modal-entry-id').value.trim();
+      const title = document.getElementById('f-title').value.trim();
+      const category = document.getElementById('f-category').value;
+      const content = document.getElementById('f-content').value.trim();
+      const tagsRaw = document.getElementById('f-tags').value;
+      const tags = tagsRaw.split(',').map(t => t.trim()).filter(Boolean);
+      const confidence = parseFloat(document.getElementById('f-confidence').value) || 0.5;
+      const verified = document.getElementById('f-verified').checked;
+
+      if (!title) { showToast('Title is required.', 'err'); return; }
+      if (!content) { showToast('Content is required.', 'err'); return; }
+
+      const isEdit = !!id;
+      const url = isEdit ? `/api/knowledge/${encodeURIComponent(id)}` : '/api/knowledge';
+      const method = isEdit ? 'PUT' : 'POST';
+      const body = isEdit
+        ? { title, category, content, tags, confidence, verified }
+        : { title, category, content, tags, confidence, source: 'webui' };
+
+      try {
+        const resp = await fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'Unknown error');
+        closeModal();
+        showToast(isEdit ? '✓ Entry updated.' : '✓ Entry added.', 'ok');
+        await loadData();
+      } catch (err) {
+        showToast('Error: ' + String(err), 'err');
+      }
+    }
+
+    // ── Delete ─────────────────────────────────────────────────────────────
+
+    function askDeleteByIndex(idx) {
+      const e = renderedEntries[idx];
+      if (!e) return;
+      askDelete(e.id || '', e.title || '(untitled)');
+    }
+
+    function askDelete(id, title) {
+      pendingDeleteId = id;
+      document.getElementById('confirm-msg').textContent =
+        `Delete "${title}"? This action cannot be undone.`;
+      document.getElementById('confirm-overlay').classList.add('open');
+    }
+
+    function closeConfirm() {
+      pendingDeleteId = null;
+      document.getElementById('confirm-overlay').classList.remove('open');
+    }
+
+    async function confirmDelete() {
+      if (!pendingDeleteId) return;
+      const id = pendingDeleteId;
+      closeConfirm();
+      try {
+        const resp = await fetch(`/api/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'Unknown error');
+        showToast('✓ Entry deleted.', 'ok');
+        await loadData();
+      } catch (err) {
+        showToast('Error: ' + String(err), 'err');
+      }
+    }
+
+    // ── Keyboard shortcuts ─────────────────────────────────────────────────
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        closeModal();
+        closeConfirm();
+      }
+    });
+
+    // ── Init ───────────────────────────────────────────────────────────────
 
     loadData();
   </script>
