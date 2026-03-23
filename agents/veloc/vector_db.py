@@ -237,14 +237,23 @@ class VectorDB:
         content: Optional[str] = None,
         confidence: Optional[float] = None,
         verified: Optional[bool] = None,
+        title: Optional[str] = None,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Update an existing entry by ID.  Returns the updated entry or None."""
         data = self._read()
         entries: List[Dict[str, Any]] = data.get("entries", [])
         for entry in entries:
             if entry.get("id") == insight_id:
+                if title is not None:
+                    entry["title"] = title.strip()
+                if category is not None and category in VALID_CATEGORIES:
+                    entry["category"] = category
                 if content is not None:
                     entry["content"] = content.strip()
+                if tags is not None:
+                    entry["tags"] = [t.strip() for t in tags if t.strip()]
                 if confidence is not None:
                     entry["confidence"] = max(0.0, min(1.0, float(confidence)))
                 if verified is not None:
@@ -253,6 +262,19 @@ class VectorDB:
                 self._write(data)
                 return entry
         return None
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
+    def delete(self, insight_id: str) -> bool:
+        """Delete an entry by ID.  Returns True if found and deleted."""
+        data = self._read()
+        entries: List[Dict[str, Any]] = data.get("entries", [])
+        new_entries = [e for e in entries if e.get("id") != insight_id]
+        if len(new_entries) == len(entries):
+            return False
+        data["entries"] = new_entries
+        self._write(data)
+        return True
 
     # ── List all ──────────────────────────────────────────────────────────────
 
@@ -493,3 +515,51 @@ def get_knowledge_db_entries(category: Optional[str] = None) -> List[Dict[str, A
         return db.list_all(category=category)
     except Exception:
         return []
+
+
+def add_knowledge_db_entry(
+    category: str,
+    title: str,
+    content: str,
+    tags: Optional[List[str]] = None,
+    confidence: float = 0.5,
+    source: str = "webui",
+) -> Dict[str, Any]:
+    """Add a new entry via the web UI."""
+    db = _get_db()
+    return db.store(
+        category=category,
+        title=title,
+        content=content,
+        tags=tags or [],
+        confidence=confidence,
+        source=source,
+    )
+
+
+def update_knowledge_db_entry(
+    insight_id: str,
+    title: Optional[str] = None,
+    category: Optional[str] = None,
+    content: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    confidence: Optional[float] = None,
+    verified: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    """Update an existing entry via the web UI."""
+    db = _get_db()
+    return db.update(
+        insight_id=insight_id,
+        title=title,
+        category=category,
+        content=content,
+        tags=tags,
+        confidence=confidence,
+        verified=verified,
+    )
+
+
+def delete_knowledge_db_entry(insight_id: str) -> bool:
+    """Delete an entry by ID via the web UI."""
+    db = _get_db()
+    return db.delete(insight_id)
