@@ -204,6 +204,7 @@ Rules:
 - Do NOT ask the user for input between steps — proceed automatically.
 - Only emit a question to the user if you genuinely cannot proceed without missing information (e.g. unknown code path, missing environment details).
 - Keep track of temporary/intermediate files you create during the whole process and remember to remove them once complete
+- The resiliency support must be **TRANSPARENT** to the user: **DO NOT** change the original application's existing command-line parameters or behaviour. The only permitted addition is an **optional** `--veloc-cfg <path>` argument (or equivalent) for the VeloC configuration file path, which must default to `veloc.cfg` in the current working directory when omitted.
 
 ## Workflow
 1. **Understand the request.** If the user's prompt is missing the code path, target environment, or resilience requirements, ask for the missing information.
@@ -216,10 +217,23 @@ Rules:
    - Alternatively, call `get_veloc_guide()` (no arguments) to get the entire guide at once.
    Use the retrieved content to select the correct API mode (memory-based vs. file-based), verify all function signatures and parameter order, and choose the right configuration keys.
 6. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file, using the API signatures and configuration keys from the guide retrieved in the previous step. Use `write_file` to save all modified sources and the config.
+   **Optional `veloc.cfg` path argument (REQUIRED):** The modified executable **must** accept the path to `veloc.cfg` as an optional command-line argument so that users can supply a custom config location without changing the binary. Implement it as follows:
+   - Add an optional positional or named argument (e.g. `--veloc-cfg <path>` for C++ with a simple loop over `argv`, or a positional last argument) that the user may pass when launching the program.
+   - If the argument is **not** provided, default to the string `"veloc.cfg"` (i.e. the file is looked up in the current working directory at runtime).
+   - Pass the resolved path string to `VELOC_Init` (C API) or `veloc::client_t` constructor (C++ API) instead of a hard-coded literal.
+   - **Do not** remove or rename any of the original application's existing command-line arguments; only append this new optional one.
+   - Document the new argument in a comment near `main()` so it is easy to discover.
+   - In the validation script, explicitly test both cases: (a) run without the argument (config file named `veloc.cfg` placed in the working directory) and (b) run with `--veloc-cfg <explicit_path>` pointing to the same config file at a different path, and verify both succeed.
 7. **Validate.** This step is **REQUIRED**. Based on your understanding of the application's structure and output, design and write a validation script tailored to this specific application that:
    - Builds both the original and the resilient version.
    - Runs the resilient version with a simulated failure (e.g. kill the process mid-run, then restart it).
    - Compares the output of the resilient run against the baseline to confirm correctness.
+   - **Before starting each independent resilient test scenario** (e.g. before the failure-injection run, and before the failure-free run), the validation script **must** purge any leftover VeloC checkpoint data to guarantee a clean state. Do this by:
+     1. Parsing the `veloc.cfg` file (INI format) located in the working directory where the executable is launched (or at the path passed via `--veloc-cfg`).
+     2. Reading the `scratch` and `persistent` directory paths from the `[veloc]` section.
+     3. Deleting all files and subdirectories inside both directories (e.g. `rm -rf "$SCRATCH"/* "$PERSISTENT"/*`) **once, before the first attempt** of that scenario.
+     **Important:** Do NOT clear checkpoints between retry attempts within the same failure-injection scenario. The retry loop relies on the checkpoint written by the previous (killed) attempt to restart from — clearing between attempts would destroy the checkpoint and prevent recovery.
+     This prevents checkpoint files from a previous independent run from being accidentally picked up by a subsequent run, which would produce incorrect validation results.
    Write the validation script using `write_file` (save it inside BUILD_DIR), then run it autonomously with `execute_script`.
    Inspect the returned `returncode`, `stdout`, and `stderr`. If validation fails, analyse the error, fix the code, and run again.
    If the script needs more than 120 s (e.g. for a large MPI job), pass a larger `timeout` value.
