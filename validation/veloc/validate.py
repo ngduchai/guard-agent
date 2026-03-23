@@ -404,8 +404,14 @@ def _build_parser() -> argparse.ArgumentParser:
     bench_grp.add_argument(
         "--benchmark-num-runs",
         type=int,
-        default=3,
-        help="Number of repetitions per scenario (default scenario only).",
+        default=None,
+        help=(
+            "Override the number of repetitions for every benchmark scenario. "
+            "When set, this takes priority over per-scenario 'num_runs' in the JSON config. "
+            "When omitted (the default), per-scenario 'num_runs' from the JSON is used "
+            "(falling back to 3 if a scenario does not specify it). "
+            "Set via the NUM_RUNS environment variable in run_art_simple_validation.sh."
+        ),
     )
 
     # Pipeline control.
@@ -570,6 +576,7 @@ def _stage_benchmarks(
     res_exe: str,
     orig_app_args: list[str],
     res_app_args: list[str],
+    resume: bool = False,
 ) -> BenchmarkResults:
     """Run the benchmark sweep and return BenchmarkResults."""
     print("\n" + "=" * 70, flush=True)
@@ -578,20 +585,37 @@ def _stage_benchmarks(
 
     if args.benchmark_config:
         config_path = Path(args.benchmark_config).resolve()
-        print(f"[validate] Loading benchmark config from {config_path}", flush=True)
-        scenarios = load_benchmark_config(config_path)
+        if args.benchmark_num_runs is not None:
+            print(
+                f"[validate] Loading benchmark config from {config_path} "
+                f"(NUM_RUNS override={args.benchmark_num_runs}; "
+                f"overrides per-scenario 'num_runs' in JSON)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[validate] Loading benchmark config from {config_path} "
+                f"(using per-scenario 'num_runs' from JSON; "
+                f"set NUM_RUNS env var to override)",
+                flush=True,
+            )
+        scenarios = load_benchmark_config(
+            config_path,
+            override_num_runs=args.benchmark_num_runs,
+        )
     else:
         print(
             "[validate] No benchmark config provided; using default two-scenario sweep.",
             flush=True,
         )
         # Use resilient args for the sweep (they may differ from original args).
+        # When benchmark_num_runs is None (NUM_RUNS not set), fall back to 3.
         scenarios = default_scenario(
             num_procs=args.num_procs,
             app_args=res_app_args,
             injection_delay=args.injection_delay,
             max_attempts=args.max_attempts,
-            num_runs=args.benchmark_num_runs,
+            num_runs=args.benchmark_num_runs if args.benchmark_num_runs is not None else 3,
         )
 
     return run_benchmark_sweep(
@@ -605,6 +629,7 @@ def _stage_benchmarks(
         output_dir=output_dir,
         veloc_config_name=args.veloc_config_name,
         install_resilient=args.install_resilient,
+        resume=resume,
     )
 
 
@@ -662,14 +687,31 @@ def _fail(
 # ---------------------------------------------------------------------------
 
 def _build_resume_cmd(argv: list[str], output_dir: Path) -> str:
-    """Build the command string a user can run to resume from the last stage."""
+    """Build the command string a user can run to resume from the last stage.
+
+    Prepends any environment variables that the benchmark JSON config may
+    expand (e.g. ``DATA_PATH``) so the resume command is self-contained.
+    """
+    import os
+
+    # Collect env vars that the benchmark config may reference.
+    env_prefix_parts: list[str] = []
+    for var in ("DATA_PATH",):
+        val = os.environ.get(var)
+        if val:
+            env_prefix_parts.append(f"{var}={shlex.quote(val)}")
+
     # Reconstruct the original invocation, injecting --resume if not already present.
-    parts = [sys.executable, "-m", "validation.veloc.validate"]
+    cmd_parts = [sys.executable, "-m", "validation.veloc.validate"]
     has_resume = "--resume" in argv
-    parts += list(argv)
+    cmd_parts += list(argv)
     if not has_resume:
-        parts.append("--resume")
-    return " ".join(shlex.quote(str(p)) for p in parts)
+        cmd_parts.append("--resume")
+
+    cmd_str = " ".join(shlex.quote(str(p)) for p in cmd_parts)
+    if env_prefix_parts:
+        return " ".join(env_prefix_parts) + " " + cmd_str
+    return cmd_str
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -827,6 +869,9 @@ def main(argv: list[str] | None = None) -> int:
                     res_exe=res_exe,
                     orig_app_args=orig_app_args,
                     res_app_args=res_app_args,
+                    # Pass resume=True so the sweep can skip already-completed
+                    # individual runs (fine-grained resume within the stage).
+                    resume=args.resume,
                 )
             except Exception as exc:
                 _fail(

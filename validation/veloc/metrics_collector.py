@@ -99,8 +99,33 @@ class BenchmarkResults:
 # Config loading
 # ---------------------------------------------------------------------------
 
-def load_benchmark_config(config_path: Path) -> list[BenchmarkScenario]:
+def load_benchmark_config(
+    config_path: Path,
+    default_num_runs: int = 3,
+    override_num_runs: int | None = None,
+) -> list[BenchmarkScenario]:
     """Parse a JSON benchmark config file into a list of BenchmarkScenario objects.
+
+    Parameters
+    ----------
+    config_path:
+        Path to the JSON config file.
+    default_num_runs:
+        Fallback ``num_runs`` value used for any scenario that does **not**
+        specify ``num_runs`` in the JSON.  Only used when *override_num_runs*
+        is ``None``.
+    override_num_runs:
+        When set (not ``None``), this value overrides the per-scenario
+        ``num_runs`` in the JSON for **every** scenario.  This lets the caller
+        pass ``NUM_RUNS`` from the environment to force a specific repetition
+        count regardless of what the JSON says.  When ``None`` (the default),
+        the JSON ``num_runs`` is used as-is (falling back to *default_num_runs*
+        for scenarios that omit it).
+
+    Priority (highest → lowest):
+        1. *override_num_runs* (set via ``NUM_RUNS`` env var / ``--benchmark-num-runs``)
+        2. Per-scenario ``num_runs`` in the JSON
+        3. *default_num_runs* (3)
 
     Expected JSON schema::
 
@@ -111,7 +136,7 @@ def load_benchmark_config(config_path: Path) -> list[BenchmarkScenario]:
               "num_procs": 4,
               "app_args": ["data.h5", "294.078", "3", "2", "0", "2"],
               "inject_failures": false,
-              "num_runs": 3,
+              "num_runs": 3,          // optional – used when override_num_runs is None
               "injection_delay": 5.0,
               "max_attempts": 10
             },
@@ -137,13 +162,20 @@ def load_benchmark_config(config_path: Path) -> list[BenchmarkScenario]:
 
         raw_args = entry.get("app_args", [])
         expanded_args: list[str] = [_expand_arg(str(a)) for a in raw_args]
+        # Priority: override_num_runs > JSON num_runs > default_num_runs.
+        if override_num_runs is not None:
+            num_runs = override_num_runs
+        elif "num_runs" in entry:
+            num_runs = int(entry["num_runs"])
+        else:
+            num_runs = default_num_runs
         scenarios.append(
             BenchmarkScenario(
                 name=entry["name"],
                 num_procs=int(entry["num_procs"]),
                 app_args=expanded_args,
                 inject_failures=bool(entry.get("inject_failures", True)),
-                num_runs=int(entry.get("num_runs", 3)),
+                num_runs=num_runs,
                 injection_delay=float(entry.get("injection_delay", 5.0)),
                 max_attempts=int(entry.get("max_attempts", 10)),
             )
@@ -305,6 +337,7 @@ def _run_scenario_once(
             injection_delay=scenario.injection_delay,
             run_install=run_install,
             veloc_config_name=veloc_config_name,
+            require_injection=False,  # benchmarking: OK if app finishes before injection
         )
     else:
         # Clean run (no failure injection) – used for both original and
@@ -404,6 +437,74 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Benchmark progress helpers (fine-grained resume within the sweep)
+# ---------------------------------------------------------------------------
+
+_BENCH_PROGRESS_FILE = "benchmark_progress.json"
+
+
+def _bench_progress_key(scenario_name: str, codebase: str, run_index: int) -> str:
+    """Unique string key identifying a single benchmark run."""
+    return f"{scenario_name}:{codebase}:{run_index}"
+
+
+def _load_bench_progress(benchmarks_dir: Path) -> tuple[list[RunMetrics], set[str]]:
+    """Load previously completed benchmark runs from *benchmark_progress.json*.
+
+    Returns
+    -------
+    completed_runs : list[RunMetrics]
+        All runs that were already completed in a previous (interrupted) sweep.
+    completed_keys : set[str]
+        Set of ``_bench_progress_key`` strings for fast membership testing.
+    """
+    progress_path = benchmarks_dir / _BENCH_PROGRESS_FILE
+    if not progress_path.exists():
+        return [], set()
+    try:
+        raw = json.loads(progress_path.read_text(encoding="utf-8"))
+        runs = [
+            RunMetrics(
+                scenario_name=r["scenario_name"],
+                codebase=r["codebase"],
+                run_index=int(r["run_index"]),
+                elapsed_s=float(r["elapsed_s"]),
+                injected=bool(r.get("injected", False)),
+                num_attempts=int(r.get("num_attempts", 1)),
+                checkpoint_size_bytes=r.get("checkpoint_size_bytes"),
+                recovery_time_s=r.get("recovery_time_s"),
+                peak_memory_bytes=r.get("peak_memory_bytes"),
+            )
+            for r in raw.get("runs", [])
+        ]
+        keys = {
+            _bench_progress_key(r.scenario_name, r.codebase, r.run_index)
+            for r in runs
+        }
+        print(
+            f"[metrics] Loaded {len(runs)} previously completed benchmark run(s) "
+            f"from {progress_path}",
+            flush=True,
+        )
+        return runs, keys
+    except Exception as exc:
+        print(
+            f"[metrics] WARNING: could not load benchmark progress from {progress_path}: {exc}; "
+            "starting sweep from scratch.",
+            flush=True,
+        )
+        return [], set()
+
+
+def _save_bench_progress(benchmarks_dir: Path, runs: list[RunMetrics]) -> None:
+    """Persist the list of completed runs to *benchmark_progress.json*."""
+    progress_path = benchmarks_dir / _BENCH_PROGRESS_FILE
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"runs": [r.to_dict() for r in runs]}
+    progress_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Main sweep function
 # ---------------------------------------------------------------------------
 
@@ -418,6 +519,7 @@ def run_benchmark_sweep(
     output_dir: Path,
     veloc_config_name: str = "veloc.cfg",
     install_resilient: bool = False,
+    resume: bool = False,
 ) -> BenchmarkResults:
     """Execute all scenarios for both codebases and collect RunMetrics.
 
@@ -428,71 +530,114 @@ def run_benchmark_sweep(
 
     Each scenario is repeated ``scenario.num_runs`` times for statistical
     stability.
+
+    Parameters
+    ----------
+    resume:
+        When ``True``, load previously completed runs from
+        ``benchmark_progress.json`` and skip them.  This allows the sweep to
+        resume from the exact run where it was interrupted, rather than
+        re-running the entire stage.
     """
+    benchmarks_dir = output_dir / "benchmarks"
+
+    # Load previously completed runs when resuming.
+    if resume:
+        all_runs, completed_keys = _load_bench_progress(benchmarks_dir)
+        if completed_keys:
+            print(
+                f"[metrics] Resuming benchmark sweep – {len(completed_keys)} run(s) already done.",
+                flush=True,
+            )
+    else:
+        all_runs = []
+        completed_keys: set[str] = set()
+
     # Build both codebases once before the sweep.
     print("[metrics] building original codebase...", flush=True)
     configure_and_build(original_source_dir, original_build_dir)
     print("[metrics] building resilient codebase...", flush=True)
     configure_and_build(resilient_source_dir, resilient_build_dir, run_install=install_resilient)
 
-    all_runs: list[RunMetrics] = []
-
-    for scenario in scenarios:
+    total_scenarios = len(scenarios)
+    for scenario_idx, scenario in enumerate(scenarios, 1):
         print(
-            f"\n[metrics] === scenario: {scenario.name!r} "
+            f"\n[metrics] === scenario {scenario_idx}/{total_scenarios}: {scenario.name!r} "
             f"(num_procs={scenario.num_procs}, inject={scenario.inject_failures}, "
             f"num_runs={scenario.num_runs}) ===",
             flush=True,
         )
 
         for run_idx in range(1, scenario.num_runs + 1):
-            print(
-                f"[metrics] --- original run {run_idx}/{scenario.num_runs} ---",
-                flush=True,
-            )
-            orig_metrics = _run_scenario_once(
-                scenario=scenario,
-                codebase="original",
-                run_index=run_idx,
-                source_dir=original_source_dir,
-                build_dir=original_build_dir,
-                output_dir=output_dir / "benchmarks",
-                executable_name=original_executable_name,
-                veloc_config_name=veloc_config_name,
-            )
-            all_runs.append(orig_metrics)
-            print(
-                f"[metrics] original run {run_idx}: elapsed={orig_metrics.elapsed_s:.2f}s",
-                flush=True,
-            )
+            # --- Original run ---
+            orig_key = _bench_progress_key(scenario.name, "original", run_idx)
+            if orig_key in completed_keys:
+                print(
+                    f"[metrics] --- original run {run_idx}/{scenario.num_runs} "
+                    f"[SKIPPED – already completed] ---",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[metrics] --- original run {run_idx}/{scenario.num_runs} ---",
+                    flush=True,
+                )
+                orig_metrics = _run_scenario_once(
+                    scenario=scenario,
+                    codebase="original",
+                    run_index=run_idx,
+                    source_dir=original_source_dir,
+                    build_dir=original_build_dir,
+                    output_dir=benchmarks_dir,
+                    executable_name=original_executable_name,
+                    veloc_config_name=veloc_config_name,
+                )
+                all_runs.append(orig_metrics)
+                completed_keys.add(orig_key)
+                _save_bench_progress(benchmarks_dir, all_runs)
+                print(
+                    f"[metrics] original run {run_idx}: elapsed={orig_metrics.elapsed_s:.2f}s",
+                    flush=True,
+                )
 
-            print(
-                f"[metrics] --- resilient run {run_idx}/{scenario.num_runs} ---",
-                flush=True,
-            )
-            res_metrics = _run_scenario_once(
-                scenario=scenario,
-                codebase="resilient",
-                run_index=run_idx,
-                source_dir=resilient_source_dir,
-                build_dir=resilient_build_dir,
-                output_dir=output_dir / "benchmarks",
-                executable_name=resilient_executable_name,
-                veloc_config_name=veloc_config_name,
-                run_install=install_resilient,
-            )
-            all_runs.append(res_metrics)
-            print(
-                f"[metrics] resilient run {run_idx}: elapsed={res_metrics.elapsed_s:.2f}s, "
-                f"injected={res_metrics.injected}, attempts={res_metrics.num_attempts}",
-                flush=True,
-            )
+            # --- Resilient run ---
+            res_key = _bench_progress_key(scenario.name, "resilient", run_idx)
+            if res_key in completed_keys:
+                print(
+                    f"[metrics] --- resilient run {run_idx}/{scenario.num_runs} "
+                    f"[SKIPPED – already completed] ---",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[metrics] --- resilient run {run_idx}/{scenario.num_runs} ---",
+                    flush=True,
+                )
+                res_metrics = _run_scenario_once(
+                    scenario=scenario,
+                    codebase="resilient",
+                    run_index=run_idx,
+                    source_dir=resilient_source_dir,
+                    build_dir=resilient_build_dir,
+                    output_dir=benchmarks_dir,
+                    executable_name=resilient_executable_name,
+                    veloc_config_name=veloc_config_name,
+                    run_install=install_resilient,
+                )
+                all_runs.append(res_metrics)
+                completed_keys.add(res_key)
+                _save_bench_progress(benchmarks_dir, all_runs)
+                print(
+                    f"[metrics] resilient run {run_idx}: elapsed={res_metrics.elapsed_s:.2f}s, "
+                    f"injected={res_metrics.injected}, attempts={res_metrics.num_attempts}",
+                    flush=True,
+                )
 
     summary = _build_summary(all_runs)
     results = BenchmarkResults(scenarios=scenarios, runs=all_runs, summary=summary)
 
-    # Save raw metrics JSON.
-    raw_path = output_dir / "benchmarks" / "raw_metrics.json"
+    # Save final raw metrics JSON.
+    raw_path = benchmarks_dir / "raw_metrics.json"
     results.save(raw_path)
     print(f"\n[metrics] raw metrics saved to {raw_path}", flush=True)
 

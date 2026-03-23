@@ -10,9 +10,18 @@
 # Optional environment variables:
 #   ORIGINAL_DIR   – path to the original codebase (default: build/examples/art_simple)
 #   RESILIENT_DIR  – path to the resilient codebase (default: build/examples_output/resilient_art_simple)
-#   DATA_PATH      – path to the HDF5 input file    (default: data/tooth_preprocessed.h5)
+#   DATA_PATH      – path to the HDF5 input file    (default: build/data/tooth_preprocessed.h5)
+#                    (exported so benchmark JSON config can expand ${DATA_PATH:-...})
 #   NUM_PROCS      – number of MPI ranks             (default: 4)
 #   OUTPUT_DIR     – validation output directory     (default: build/validation_output/art_simple)
+#   NUM_RUNS       – override benchmark repetitions for ALL scenarios (unset by default;
+#                    when unset, each scenario uses its own num_runs from the JSON config;
+#                    set to 1 for a quick smoke-test: NUM_RUNS=1 ./run_art_simple_validation.sh)
+#
+# Benchmark scenarios are defined in:
+#   validation/veloc/benchmark_configs/art_simple.json
+# Each scenario specifies its own num_runs, num_procs, app_args, and failure injection settings.
+# NUM_RUNS (if set) takes priority over per-scenario num_runs in the JSON.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -22,6 +31,12 @@ cd "$REPO_ROOT"
 if [[ -d "build/venv" ]]; then
   # shellcheck disable=SC1091
   source "build/venv/bin/activate"
+
+  # Ensure validation Python dependencies are installed (matplotlib, numpy, etc.)
+  REQS="${REPO_ROOT}/validation/requirements.txt"
+  if [[ -f "${REQS}" ]]; then
+    pip install -q -r "${REQS}"
+  fi
 fi
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
@@ -31,9 +46,12 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # ---------------------------------------------------------------------------
 ORIGINAL_DIR="${ORIGINAL_DIR:-${REPO_ROOT}/build/examples/art_simple}"
 RESILIENT_DIR="${RESILIENT_DIR:-${REPO_ROOT}/build/examples_output/resilient_art_simple}"
-DATA_PATH="${DATA_PATH:-${REPO_ROOT}/build/data/tooth_preprocessed.h5}"
+# Export DATA_PATH so the benchmark JSON config can expand ${DATA_PATH:-...} via os.environ.
+export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/build/data/tooth_preprocessed.h5}"
 NUM_PROCS="${NUM_PROCS:-4}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/build/validation_output/art_simple}"
+
+BENCHMARK_CONFIG="${REPO_ROOT}/validation/veloc/benchmark_configs/art_simple.json"
 
 COMMON_ARGS="${DATA_PATH} 294.078 5 2 0 4"
 
@@ -144,8 +162,32 @@ except Exception:
 fi
 
 # ---------------------------------------------------------------------------
+# Build optional --benchmark-num-runs flag (only when NUM_RUNS is set).
+# When NUM_RUNS is set it overrides per-scenario num_runs in the JSON config.
+# When NUM_RUNS is unset, per-scenario num_runs from the JSON is used.
+# ---------------------------------------------------------------------------
+NUM_RUNS_FLAG=""
+if [[ -n "${NUM_RUNS:-}" ]]; then
+  NUM_RUNS_FLAG="--benchmark-num-runs ${NUM_RUNS}"
+fi
+
+# ---------------------------------------------------------------------------
 # Run the validation framework
 # ---------------------------------------------------------------------------
+echo ""
+echo "[run] Configuration:"
+echo "  ORIGINAL_DIR     : ${ORIGINAL_DIR}"
+echo "  RESILIENT_DIR    : ${RESILIENT_DIR}"
+echo "  NUM_PROCS        : ${NUM_PROCS}"
+echo "  BENCHMARK_CONFIG : ${BENCHMARK_CONFIG}"
+if [[ -n "${NUM_RUNS:-}" ]]; then
+  echo "  NUM_RUNS         : ${NUM_RUNS}  (overrides per-scenario num_runs in JSON)"
+else
+  echo "  NUM_RUNS         : (unset – using per-scenario num_runs from JSON)"
+fi
+echo "  OUTPUT_DIR       : ${OUTPUT_DIR}"
+echo ""
+
 python -m validation.veloc.validate \
   "${ORIGINAL_DIR}" \
   "${RESILIENT_DIR}" \
@@ -162,5 +204,7 @@ python -m validation.veloc.validate \
   --injection-delay 10.0 \
   --install-resilient \
   --veloc-config-name veloc.cfg \
+  --benchmark-config "${BENCHMARK_CONFIG}" \
+  ${NUM_RUNS_FLAG} \
   ${RESUME_FLAG} \
   "$@"

@@ -385,12 +385,26 @@ def run_with_failure_injection(
     run_install: bool = False,
     success_output_filename: str | None = None,
     veloc_config_name: str = "veloc.cfg",
+    require_injection: bool = True,
 ) -> RunResult:
-    """Retry loop: inject failures until the resilient app completes successfully
-    with at least one failure injected.
+    """Retry loop: inject failures until the resilient app completes successfully.
+
+    Parameters
+    ----------
+    require_injection:
+        When ``True`` (default, used for correctness validation), the loop
+        retries until at least one failure has been injected before the app
+        completes successfully.  If the app finishes before the injector fires,
+        the run is retried.
+
+        When ``False`` (used for benchmarking), a successful exit (code 0) is
+        accepted even if no failure was injected — this happens when the
+        injection delay is longer than the total runtime.  The returned
+        :class:`RunResult` will have ``injected=False`` in that case.
 
     Returns a :class:`RunResult` for the final successful attempt, with
-    ``injected=True`` and ``num_attempts`` set to the total number of attempts.
+    ``injected`` reflecting whether a failure was actually injected and
+    ``num_attempts`` set to the total number of attempts.
     """
     configure_and_build(source_dir, build_dir, run_install=run_install)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,7 +508,7 @@ def run_with_failure_injection(
         )
 
         if mpi_return == 0 and total_injections >= 1:
-            # Success: copy final outputs to the top-level output dir.
+            # Success with injection: copy final outputs to the top-level output dir.
             final_stdout = output_dir / "stdout_success.txt"
             final_stderr = output_dir / "stderr_success.txt"
             shutil.copy2(stdout_path, final_stdout)
@@ -519,6 +533,33 @@ def run_with_failure_injection(
             )
 
         if mpi_return == 0 and total_injections == 0:
+            if not require_injection:
+                # Benchmarking mode: app completed before injection fired – that's OK.
+                # Copy outputs and return success with injected=False.
+                final_stdout = output_dir / "stdout_success.txt"
+                final_stderr = output_dir / "stderr_success.txt"
+                shutil.copy2(stdout_path, final_stdout)
+                shutil.copy2(stderr_path, final_stderr)
+                if success_output_filename:
+                    src = attempt_dir / success_output_filename
+                    if src.exists():
+                        shutil.copy2(src, output_dir / success_output_filename)
+                print(
+                    f"[runner] run completed with exit 0 and no injection "
+                    f"(injection_delay={injection_delay}s exceeded runtime). "
+                    "Accepted as success (require_injection=False).",
+                    flush=True,
+                )
+                return RunResult(
+                    exit_code=0,
+                    stdout=last_stdout,
+                    stderr=last_stderr,
+                    elapsed_s=total_elapsed,
+                    injected=False,
+                    num_attempts=attempt,
+                    output_dir=output_dir,
+                )
+            # Correctness mode: must have injection – retry.
             print(
                 "[runner] run completed with exit 0 but no injection yet; "
                 "retrying to ensure at least one failure is injected.",
