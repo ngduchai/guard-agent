@@ -177,7 +177,7 @@ def index_html() -> str:
 
     /* ── Chat layout ── */
     .chat-panel { margin-top: 6px; margin-bottom: 10px; flex: 1; min-height: 0; }
-    .chat-output { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 2px 2px 2px; }
+    .chat-output { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 2px 2px 2px; scroll-behavior: smooth; }
     .input-panel { margin-top: 6px; flex-shrink: 0; }
 
     /* ── Message bubbles ── */
@@ -908,8 +908,40 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       return '<pre style="white-space:pre-wrap; margin:0;">' + escapeHtml(String(text)) + '</pre>';
     }
 
+    // ── Smart auto-scroll helpers ──────────────────────────────────────────
+    // Scroll a specific element into view inside the chat output panel.
+    // block='start' ensures the top of the element is visible (good for new step cards).
+    function scrollToElement(el, block) {
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: block || 'start' });
+    }
+
+    // Scroll the chat output to the very bottom (used for generic updates
+    // when no specific target element is available).
     function scrollBottom() {
       outputEl.scrollTop = outputEl.scrollHeight;
+    }
+
+    // Scroll to the currently active step card (the "running" box).
+    // Uses block='start' so the top of the step card is visible, letting the
+    // user see the step header and watch content grow downward.
+    function scrollToActiveStep() {
+      if (activeStepNum !== null) {
+        const card = document.getElementById('step-card-' + activeStepNum);
+        if (card) { scrollToElement(card, 'start'); return; }
+      }
+      // Fallback: scroll to the bottom of the output.
+      scrollBottom();
+    }
+
+    // Scroll to the last child element of the output panel (the final result box).
+    // Uses block='nearest' so we don't over-scroll if it's already visible.
+    function scrollToLastMessage() {
+      const children = outputEl.children;
+      if (children.length > 0) {
+        const last = children[children.length - 1];
+        scrollToElement(last, 'nearest');
+      }
     }
 
     // ── Message rendering ──────────────────────────────────────────────────
@@ -920,7 +952,9 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
           <div class="msg-user-bubble">${escapeHtml(text)}</div>
         </div>
       `);
-      scrollBottom();
+      // Scroll to the user message so it's visible.
+      const lastChild = outputEl.lastElementChild;
+      scrollToElement(lastChild);
     }
 
     function appendAgentBubble(innerHtml) {
@@ -928,7 +962,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       wrap.className = 'msg-agent';
       wrap.innerHTML = `<div class="msg-agent-bubble">${innerHtml}</div>`;
       outputEl.appendChild(wrap);
-      scrollBottom();
+      // Scroll to the newly appended bubble.
+      scrollToElement(wrap);
       return wrap.querySelector('.msg-agent-bubble');
     }
 
@@ -985,7 +1020,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       bubble.appendChild(card);
       stepCards[stepNum] = card;
       activeStepNum = stepNum;  // mark this step as active
-      scrollBottom();
+      // Scroll to the newly created step card so the user sees the running step.
+      scrollToElement(card);
     }
 
     function renderStepResult(ev) {
@@ -1001,7 +1037,9 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       }
       // Clear the active step so thinking blocks between steps go to the bubble.
       if (activeStepNum === stepNum) activeStepNum = null;
-      scrollBottom();
+      // Scroll to the completed step card to show the result.
+      const card = document.getElementById('step-card-' + stepNum);
+      if (card) scrollToElement(card);
     }
 
     // Mark every step that is still showing "running…" as done.
@@ -1055,11 +1093,13 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       if (callsEl) {
         // Place thinking block inside the active step card (interleaved reasoning).
         callsEl.appendChild(details);
+        // Scroll to keep the active step card in view.
+        scrollToActiveStep();
       } else {
         // No active step — place in the agent bubble (pre-step or between-step reasoning).
         ensureAgentBubble().appendChild(details);
+        scrollBottom();
       }
-      scrollBottom();
     }
 
     // ── Tool call / result rendering ──────────────────────────────────────────
@@ -1095,7 +1135,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', callHtml);
       }
-      scrollBottom();
+      scrollToActiveStep();
     }
 
     function renderToolResult(ev) {
@@ -1110,7 +1150,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', resultHtml);
       }
-      scrollBottom();
+      scrollToActiveStep();
     }
 
     // ── RAG / Knowledge Base collapsible block renderers ──────────────────
@@ -1138,7 +1178,7 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       } else {
         ensureAgentBubble().insertAdjacentHTML('beforeend', html);
       }
-      scrollBottom();
+      scrollToActiveStep();
     }
 
     function renderRAGQuery(ev) {
@@ -1466,6 +1506,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
           finishAllRunningSteps();
           setStatus('Idle', 'idle');
           renderFinalDone(ev.result || {});
+          // Scroll to the final result box so the user sees the outcome.
+          scrollToLastMessage();
           if ((ev.result || {}).status !== 'ask') {
             enableInput();
           }
@@ -1490,6 +1532,8 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
               ${escapeHtml(ev.message || 'Unknown error')}
             </div>
           `);
+          // Scroll to the error box so the user sees it.
+          scrollToLastMessage();
           enableInput();
           break;
       }
