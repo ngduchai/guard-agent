@@ -32,15 +32,16 @@ fi
 
 # Clean generated/output files from a previous run before refreshing the sandbox.
 # Remove everything inside BUILD_DIR except the preserved folders:
-#   - log/          : run history / agent logs
-#   - venv/         : Python virtual environment (expensive to recreate)
-#   - knowledge_db/ : accumulated insights (preserved when it already exists)
+#   - log/               : run history / agent logs
+#   - venv/              : Python virtual environment (expensive to recreate)
+#   - knowledge_db/      : accumulated insights (preserved when it already exists)
+#   - validation_output/ : validation results (preserved across runs)
 echo "Cleaning generated files from previous runs ..."
 if [ -d "$BUILD_DIR" ]; then
   for entry in "$BUILD_DIR"/*; do
     base="$(basename "$entry")"
     case "$base" in
-      log|venv|knowledge_db)
+      log|venv|knowledge_db|validation_output)
         echo "  Preserving $entry"
         ;;
       *)
@@ -69,7 +70,7 @@ if [ -d "$REPO_ROOT/tests/examples/original" ]; then
 fi
 if [ -d "$REPO_ROOT/tests/ecp" ]; then
   echo "Copying ecp to $BUILD_DIR/ecp ..."
-  cp -r "$REPO_ROOT/tests/ecp" "$BUILD_DIR"
+  cp -r "$REPO_ROOT/tests/ecp/vanillas" "$BUILD_DIR/ecp"
   echo "  $BUILD_DIR/ecp"
 fi
 if [ -d "$REPO_ROOT/tests/data" ]; then
