@@ -441,22 +441,16 @@ async def _handle_single_interaction() -> None:
         _hr("═", _CYAN)
 
         final_result: dict[str, Any] | None = None
-
-        # Collect all events so we can reorder tool_call / tool_result events
-        # to appear immediately after the step_summary that announced them.
-        # The OpenAI API always returns tool calls after all text content, so
-        # without buffering the shell would show:
-        #   step_summary(1) → step_result(1) → step_summary(2) → step_result(2)
-        #   → tool_call(1) → tool_result(1) → tool_call(2) → tool_result(2)
-        # With buffering we reorder to:
-        #   step_summary(1) → tool_call(1) → tool_result(1) → step_result(1)
-        #   → step_summary(2) → tool_call(2) → tool_result(2) → step_result(2)
-        _turn_events: list[dict[str, Any]] = []
-        _done_event: dict[str, Any] | None = None
         _error_event: dict[str, Any] | None = None
 
+        # Stream events and print them immediately as they arrive so the user
+        # sees live progress instead of a silent hang.  The previous approach
+        # buffered all events to reorder tool_call/tool_result relative to
+        # step_result, but that caused the shell to appear frozen for the
+        # entire duration of the LLM call(s).
         async for event in stream_veloc_agent(messages):
             etype = event.get("type", "")
+
             if etype == "done":
                 final_result = event.get("result") or {}
                 # Capture metrics from the done event (top-level key).
@@ -465,61 +459,11 @@ async def _handle_single_interaction() -> None:
                     final_result["metrics"] = _done_metrics
                 if _done_metrics and not (final_result or {}).get("metrics_path"):
                     final_result["metrics_path"] = event.get("result", {}).get("metrics_path")
-                _done_event = event
+
             elif etype == "error":
                 _error_event = event
-            else:
-                _turn_events.append(event)
 
-        # ── Reorder events to reflect the correct reasoning flow ─────────────
-        # The OpenAI API always returns tool calls after all text content, so
-        # the raw stream order is:
-        #   thinking → step_summary(1) → thinking → step_result(1) → …
-        #   → tool_call(1) → tool_result(1) → tool_call(2) → tool_result(2)
-        #
-        # We reorder to the desired reasoning flow:
-        #   thinking → step_summary(1) → thinking → tool_call(1) → tool_result(1)
-        #   → step_result(1) → thinking → step_summary(2) → …
-        #
-        # Strategy: inject each step's tool_call/tool_result events immediately
-        # BEFORE the step_result event for that step (preserving any thinking
-        # blocks that appear between step_summary and step_result).
-
-        # Build a map: step_num → [tool_call, tool_result, ...] events
-        _step_tool_events: dict[int, list[dict[str, Any]]] = {}
-        _unstepped_tool_events: list[dict[str, Any]] = []
-        for ev in _turn_events:
-            if ev.get("type") in ("tool_call", "tool_result"):
-                s = ev.get("step")
-                if s is not None:
-                    _step_tool_events.setdefault(s, []).append(ev)
-                else:
-                    _unstepped_tool_events.append(ev)
-
-        # Build the reordered event list:
-        # Inject tool_call/tool_result events immediately before the step_result
-        # for the same step number.
-        _reordered: list[dict[str, Any]] = []
-        _injected_steps: set[int] = set()
-        for ev in _turn_events:
-            etype = ev.get("type", "")
-            if etype in ("tool_call", "tool_result") and ev.get("step") is not None:
-                # Will be injected before the matching step_result — skip here.
-                continue
-            if etype == "step_result":
-                s = ev.get("step")
-                if s is not None and s not in _injected_steps:
-                    _injected_steps.add(s)
-                    _reordered.extend(_step_tool_events.get(s, []))
-            _reordered.append(ev)
-        # Append any tool events that had no step association.
-        _reordered.extend(_unstepped_tool_events)
-
-        # ── Print the reordered events ────────────────────────────────────────
-        for event in _reordered:
-            etype = event.get("type", "")
-
-            if etype == "step_summary":
+            elif etype == "step_summary":
                 _print_step_summary(event)
 
             elif etype == "step_result":
@@ -532,11 +476,6 @@ async def _handle_single_interaction() -> None:
                 _print_tool_result(event)
 
             elif etype == "thinking":
-                # The agent now emits thinking chunks with STEP_SUMMARY /
-                # STEP_RESULT markers already stripped and interleaved with
-                # step_summary / step_result events in the correct order.
-                # A thinking event may arrive before OR after a step_summary,
-                # reflecting the LLM's actual reasoning flow.
                 text = event.get("text", "").strip()
                 if text:
                     print(f"\n{_YELLOW}{_BOLD}💭 [thinking]{_RESET}")
