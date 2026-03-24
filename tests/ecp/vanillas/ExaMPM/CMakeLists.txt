@@ -28,6 +28,14 @@ list(REMOVE_DUPLICATES CMAKE_PREFIX_PATH)
 
 # find dependencies
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
+
+# Prefer parallel HDF5 over serial.  On systems where both serial and
+# parallel HDF5 are installed (e.g. Ubuntu with libhdf5-dev AND
+# libhdf5-openmpi-dev), CMake's FindHDF5 may pick the serial version
+# by default, which lacks the MPI-parallel symbols (H5Pset_fapl_mpio,
+# etc.) that Cabana's HDF5ParticleOutput requires.
+set(HDF5_PREFER_PARALLEL TRUE)
+
 find_package(Cabana 0.6.1 REQUIRED COMPONENTS Cabana::Grid Cabana::Core)
 if( NOT Cabana_ENABLE_MPI )
   message( FATAL_ERROR "Cabana must be compiled with MPI" )

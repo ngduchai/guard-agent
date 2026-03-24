@@ -91,9 +91,11 @@ download() {
   fi
 }
 
-# Get actual top-level directory name from a tarball
+# Get actual top-level directory name from a tarball.
+# Note: We use a subshell with pipefail disabled to avoid SIGPIPE (exit 141)
+# when head closes the pipe early while tar is still listing files.
 tarball_top_dir() {
-  tar -tzf "$1" | head -1 | cut -d/ -f1
+  (set +o pipefail; tar -tzf "$1" | head -1 | cut -d/ -f1)
 }
 
 # ---- Check system prerequisites ----------------------------------------------
@@ -128,9 +130,12 @@ if $ENABLE_HDF5; then
     warn "Serial HDF5 found (h5cc). Cabana requires parallel HDF5 for particle output."
     warn "If the build fails, re-run with --no-hdf5 or install parallel HDF5."
   else
-    warn "HDF5 not found. Cabana will be built without HDF5 particle output."
-    warn "Re-run with --no-hdf5 to suppress this warning."
-    ENABLE_HDF5=false
+    echo "[ERROR] Parallel HDF5 (h5pcc) not found." >&2
+    echo "[ERROR] HDF5 is required for particle output (.h5 files) and validation comparison." >&2
+    echo "[ERROR] Install parallel HDF5 first, e.g.:" >&2
+    echo "[ERROR]   Debian/Ubuntu: apt install libhdf5-mpi-dev" >&2
+    echo "[ERROR]   RHEL/CentOS:   yum install hdf5-openmpi-devel" >&2
+    error "Or re-run with --no-hdf5 to explicitly skip HDF5 support (no .h5 particle output)."
   fi
 fi
 
