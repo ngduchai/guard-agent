@@ -417,6 +417,34 @@ def _read_followup_message(question: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _read_followup_prompt() -> str:
+    """
+    After the agent completes successfully, offer the user a chance to send
+    a follow-up prompt (feedback, refinement, new request, etc.).
+
+    Returns the user's input, or an empty string if they just press Enter
+    (which signals they are done).
+    """
+    if not _IS_TTY:
+        return ""
+
+    print(
+        f"\n{_CYAN}You can now send follow-up feedback or a new request.{_RESET}\n"
+        "Press Enter on an empty line to exit, or type your message below.\n"
+        f"Type {_BOLD}'quit'{_RESET} or {_BOLD}'exit'{_RESET} to stop.\n"
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input("> ")
+        except EOFError:
+            break
+        if line.strip() == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 # ---------------------------------------------------------------------------
 # Main streaming interaction loop
 # ---------------------------------------------------------------------------
@@ -515,7 +543,9 @@ async def _handle_single_interaction() -> None:
 
         if status == "success":
             _print_final_success(final_result.get("summary", ""))
-            return
+            # Append the assistant's summary so context is preserved for
+            # any follow-up conversation.
+            messages.append({"role": "assistant", "content": final_result.get("summary", "")})
 
         elif status == "ask":
             question = final_result.get(
@@ -553,7 +583,7 @@ async def _handle_single_interaction() -> None:
                 if desc:
                     print(_wrap(desc, 6))
             _hr("═", _CYAN)
-            return
+            messages.append({"role": "assistant", "content": summary})
 
         else:
             # error or unknown
@@ -563,6 +593,18 @@ async def _handle_single_interaction() -> None:
                 or f"Unexpected status: {status}"
             )
             return
+
+        # ── Offer follow-up prompt after success / plan ────────────────────
+        # In non-TTY mode there is no interactive user — exit.
+        if not _IS_TTY:
+            return
+
+        followup = _read_followup_prompt()
+        if not followup or followup.strip().lower() in {"quit", "exit"}:
+            print("Exiting.")
+            return
+        messages.append({"role": "user", "content": followup})
+        # Loop back to run the agent again with the follow-up.
 
 
 def main() -> None:
