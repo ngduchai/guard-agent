@@ -560,6 +560,22 @@ def run_with_failure_injection(
                     output_dir=output_dir,
                 )
             # Correctness mode: must have injection – retry.
+            # Clear checkpoint directories so the next attempt starts from
+            # scratch instead of restoring from the completed checkpoint
+            # (which would cause it to finish instantly again).
+            for cfg_candidate in (build_dir / veloc_config_name, source_dir / veloc_config_name):
+                if cfg_candidate.exists():
+                    ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_candidate)
+                    if ckpt_dirs:
+                        print(
+                            "[runner] clearing VeloC checkpoints before retry "
+                            "(previous run completed without injection):",
+                            flush=True,
+                        )
+                        for d in ckpt_dirs:
+                            print(f"  - {d}", flush=True)
+                        clear_checkpoint_dirs(ckpt_dirs)
+                    break
             print(
                 "[runner] run completed with exit 0 but no injection yet; "
                 "retrying to ensure at least one failure is injected.",
