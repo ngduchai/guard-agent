@@ -5,51 +5,103 @@
 #
 set -e
 
+# ── Parse clean mode ────────────────────────────────────────────────────────
+# Usage: ./setup.sh [--deep-clean | --clean]
+#   --deep-clean : remove everything in BUILD_DIR before setting up
+#   --clean      : remove everything except dot-folders and
+#                  log, venv, knowledge_db, validation_output
+#   (default)    : keep existing BUILD_DIR contents, overlay new setup
+CLEAN_MODE="default"
+for arg in "$@"; do
+  case "$arg" in
+    --deep-clean) CLEAN_MODE="deep-clean"; shift ;;
+    --clean)      CLEAN_MODE="clean";      shift ;;
+  esac
+done
+
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
 
 echo "Repository root: $REPO_ROOT"
 echo "Build directory: $BUILD_DIR"
+echo "Clean mode:      $CLEAN_MODE"
 
 mkdir -p "$BUILD_DIR"
 
-# ── Knowledge base: snapshot before cleaning ────────────────────────────────
-# The knowledge_db/ directory accumulates VeloC insights across sessions.
-# If a knowledge base already exists, save a timestamped backup now (before
-# the clean sweep) and then preserve the directory intact.  Only create a
-# fresh empty knowledge base when none exists yet.
+# ── Backup persistent data before cleaning ───────────────────────────────────
+# When cleaning, back up knowledge_db, validation_output, and log directories
+# so that accumulated data is not lost.
 KNOWLEDGE_DB_DIR="$BUILD_DIR/knowledge_db"
 KNOWLEDGE_DB_FILE="$KNOWLEDGE_DB_DIR/knowledge.json"
 KNOWLEDGE_BACKUP_DIR="$KNOWLEDGE_DB_DIR/backups"
 _KNOWLEDGE_EXISTS=false
-if [ -f "$KNOWLEDGE_DB_FILE" ]; then
+
+BACKUP_DIR="$BUILD_DIR/.backups"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
+if [ "$CLEAN_MODE" != "default" ]; then
+  # Knowledge base
+  if [ -f "$KNOWLEDGE_DB_FILE" ]; then
+    _KNOWLEDGE_EXISTS=true
+    mkdir -p "$KNOWLEDGE_BACKUP_DIR"
+    cp "$KNOWLEDGE_DB_FILE" "$KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
+    echo "Knowledge base backup saved → $KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
+  fi
+
+  # Validation output
+  if [ -d "$BUILD_DIR/validation_output" ]; then
+    mkdir -p "$BACKUP_DIR/validation_output"
+    cp -r "$BUILD_DIR/validation_output" "$BACKUP_DIR/validation_output/$TIMESTAMP"
+    echo "Validation output backup saved → $BACKUP_DIR/validation_output/$TIMESTAMP"
+  fi
+
+  # Logs
+  if [ -d "$BUILD_DIR/log" ]; then
+    mkdir -p "$BACKUP_DIR/log"
+    cp -r "$BUILD_DIR/log" "$BACKUP_DIR/log/$TIMESTAMP"
+    echo "Log backup saved → $BACKUP_DIR/log/$TIMESTAMP"
+  fi
+elif [ -f "$KNOWLEDGE_DB_FILE" ]; then
   _KNOWLEDGE_EXISTS=true
-  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-  mkdir -p "$KNOWLEDGE_BACKUP_DIR"
-  cp "$KNOWLEDGE_DB_FILE" "$KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
-  echo "Knowledge base backup saved → $KNOWLEDGE_BACKUP_DIR/knowledge_${TIMESTAMP}.json"
 fi
 
-# Clean generated/output files from a previous run before refreshing the sandbox.
-# Remove everything inside BUILD_DIR except the preserved folders:
-#   - log/               : run history / agent logs
-#   - venv/              : Python virtual environment (expensive to recreate)
-#   - knowledge_db/      : accumulated insights (preserved when it already exists)
-#   - validation_output/ : validation results (preserved across runs)
-echo "Cleaning generated files from previous runs ..."
-if [ -d "$BUILD_DIR" ]; then
-  for entry in "$BUILD_DIR"/*; do
-    base="$(basename "$entry")"
-    case "$base" in
-      log|venv|knowledge_db|validation_output)
-        echo "  Preserving $entry"
-        ;;
-      *)
-        rm -rf "$entry"
-        echo "  Removed $entry"
-        ;;
-    esac
-  done
+# ── Clean BUILD_DIR according to mode ────────────────────────────────────────
+if [ "$CLEAN_MODE" = "deep-clean" ]; then
+  echo "Deep-cleaning: removing everything in $BUILD_DIR ..."
+  if [ -d "$BUILD_DIR" ]; then
+    for entry in "$BUILD_DIR"/* "$BUILD_DIR"/.[!.]* "$BUILD_DIR"/..?*; do
+      [ -e "$entry" ] || continue
+      base="$(basename "$entry")"
+      case "$base" in
+        .backups)
+          echo "  Preserving $entry"
+          ;;
+        *)
+          rm -rf "$entry"
+          echo "  Removed $entry"
+          ;;
+      esac
+    done
+  fi
+elif [ "$CLEAN_MODE" = "clean" ]; then
+  echo "Cleaning generated files from previous runs ..."
+  if [ -d "$BUILD_DIR" ]; then
+    for entry in "$BUILD_DIR"/* "$BUILD_DIR"/.[!.]* "$BUILD_DIR"/..?*; do
+      [ -e "$entry" ] || continue
+      base="$(basename "$entry")"
+      case "$base" in
+        .*|log|venv|knowledge_db|validation_output)
+          echo "  Preserving $entry"
+          ;;
+        *)
+          rm -rf "$entry"
+          echo "  Removed $entry"
+          ;;
+      esac
+    done
+  fi
+else
+  echo "Default mode: keeping existing build contents, overlaying new setup."
 fi
 
 # ── Knowledge base: create only if none existed ──────────────────────────────
