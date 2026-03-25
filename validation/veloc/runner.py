@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +91,8 @@ class RunResult:
     injected: bool = False          # True if a failure was injected during this run
     num_attempts: int = 1           # total attempts consumed (>1 for retry runs)
     output_dir: Path = field(default_factory=Path)
+    last_attempt_elapsed_s: float = 0.0  # wall-clock time of the final (successful) attempt
+    memory_samples_bytes: list[int] = field(default_factory=list)  # RSS samples collected during run
 
     @property
     def succeeded(self) -> bool:
@@ -175,6 +178,9 @@ def run_once(
     env: dict | None = None,
     veloc_config_sources: list[Path] | None = None,
     veloc_config_name: str = "veloc.cfg",
+    memory_monitor_fn: "callable | None" = None,
+    memory_stop_event: "threading.Event | None" = None,
+    memory_samples_holder: "list | None" = None,
 ) -> RunResult:
     """Run the application once under mpirun, capturing stdout/stderr and timing.
 
@@ -182,6 +188,10 @@ def run_once(
     for *veloc_config_name* (default ``veloc.cfg``) and copies the first one found
     into the run CWD so that VeloC can locate it at runtime.  This is a no-op when
     the config is already present in the CWD or when *veloc_config_sources* is None.
+
+    If *memory_monitor_fn* is provided along with *memory_stop_event* and
+    *memory_samples_holder*, a background thread is started to monitor memory
+    usage of the subprocess.
 
     Returns a :class:`RunResult` with ``injected=False`` (callers that perform
     failure injection should set this field themselves).
@@ -224,8 +234,25 @@ def run_once(
         proc = subprocess.Popen(
             cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=env
         )
+
+        # Start memory monitoring thread if requested.
+        mem_thread = None
+        if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
+            mem_thread = threading.Thread(
+                target=memory_monitor_fn,
+                args=(proc.pid, memory_samples_holder, memory_stop_event),
+                daemon=True,
+            )
+            mem_thread.start()
+
         exit_code = proc.wait()
+
     elapsed = time.monotonic() - t0
+
+    # Signal memory monitor to stop and wait for it.
+    if mem_thread is not None and memory_stop_event is not None:
+        memory_stop_event.set()
+        mem_thread.join(timeout=5.0)
 
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -238,6 +265,7 @@ def run_once(
         injected=False,
         num_attempts=1,
         output_dir=output_dir,
+        last_attempt_elapsed_s=elapsed,
     )
 
 
@@ -386,6 +414,9 @@ def run_with_failure_injection(
     success_output_filename: str | None = None,
     veloc_config_name: str = "veloc.cfg",
     require_injection: bool = True,
+    memory_monitor_fn: "callable | None" = None,
+    memory_stop_event: "threading.Event | None" = None,
+    memory_samples_holder: "list | None" = None,
 ) -> RunResult:
     """Retry loop: inject failures until the resilient app completes successfully.
 
@@ -427,6 +458,7 @@ def run_with_failure_injection(
     attempt = 0
     total_injections = 0
     total_elapsed = 0.0
+    all_mem_samples: list[int] = []
     last_stdout = ""
     last_stderr = ""
     last_exit_code = -1
@@ -471,6 +503,18 @@ def run_with_failure_injection(
                 cmd, cwd=str(attempt_dir), stdout=out_f, stderr=err_f
             )
 
+        # Start per-attempt memory monitoring if requested.
+        mem_thread = None
+        if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
+            memory_stop_event.clear()
+            memory_samples_holder[0] = []
+            mem_thread = threading.Thread(
+                target=memory_monitor_fn,
+                args=(mpi_proc.pid, memory_samples_holder, memory_stop_event),
+                daemon=True,
+            )
+            mem_thread.start()
+
         injector_proc = _start_failure_injector(
             target_parent_pid=mpi_proc.pid,
             executable_name=executable_name,
@@ -481,6 +525,13 @@ def run_with_failure_injection(
         mpi_return = mpi_proc.wait()
         elapsed = time.monotonic() - t0
         total_elapsed += elapsed
+
+        # Stop memory monitor for this attempt.
+        if mem_thread is not None and memory_stop_event is not None:
+            memory_stop_event.set()
+            mem_thread.join(timeout=5.0)
+            # Accumulate samples from this attempt.
+            all_mem_samples.extend(memory_samples_holder[0])
 
         # Ensure injector has finished.
         try:
@@ -530,6 +581,8 @@ def run_with_failure_injection(
                 injected=True,
                 num_attempts=attempt,
                 output_dir=output_dir,
+                last_attempt_elapsed_s=elapsed,
+                memory_samples_bytes=all_mem_samples,
             )
 
         if mpi_return == 0 and total_injections == 0:
@@ -558,6 +611,8 @@ def run_with_failure_injection(
                     injected=False,
                     num_attempts=attempt,
                     output_dir=output_dir,
+                    last_attempt_elapsed_s=elapsed,
+                    memory_samples_bytes=all_mem_samples,
                 )
             # Correctness mode: must have injection – retry.
             # Clear checkpoint directories so the next attempt starts from

@@ -70,7 +70,8 @@ class RunMetrics:
     num_attempts: int
     checkpoint_size_bytes: int | None = None
     recovery_time_s: float | None = None
-    peak_memory_bytes: int | None = None
+    peak_memory_bytes: int | None = None    # kept for backward compat with saved data
+    memory_samples_bytes: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -245,18 +246,24 @@ def _measure_checkpoint_size(veloc_cfg_path: Path) -> int | None:
 # Recovery time estimation
 # ---------------------------------------------------------------------------
 
-_RECOVERY_PATTERNS = [
-    # VeloC log lines (heuristic – adjust as VeloC output evolves)
+_RECOVERY_TIME_PATTERNS = [
+    # VeloC log lines with explicit timing (heuristic – adjust as VeloC output evolves)
     re.compile(r"[Rr]estart.*?completed.*?(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
     re.compile(r"[Rr]ecovery.*?(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
     re.compile(r"[Rr]estarted.*?in\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
 ]
 
+# Pattern to detect that a restart actually happened (even without timing info).
+# Matches lines like: "[task-1]: Restarted from checkpoint version 3, outer_iter=3"
+_RESTART_DETECTED_PATTERN = re.compile(
+    r"[Rr]estart(?:ed)?\s+from\s+checkpoint", re.IGNORECASE
+)
+
 
 def _parse_recovery_time(stdout: str) -> float | None:
     """Heuristic: search VeloC stdout for restart/recovery timing lines."""
     for line in stdout.splitlines():
-        for pattern in _RECOVERY_PATTERNS:
+        for pattern in _RECOVERY_TIME_PATTERNS:
             m = pattern.search(line)
             if m:
                 try:
@@ -266,32 +273,56 @@ def _parse_recovery_time(stdout: str) -> float | None:
     return None
 
 
+def _detect_restart(stdout: str) -> bool:
+    """Return True if the stdout indicates a VeloC restart from checkpoint."""
+    for line in stdout.splitlines():
+        if _RESTART_DETECTED_PATTERN.search(line):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Peak memory monitoring
+# Memory monitoring (sample-based)
 # ---------------------------------------------------------------------------
 
-def _monitor_peak_memory(pid: int, result_holder: list[int | None], interval: float = 0.5) -> None:
-    """Poll the RSS of *pid* every *interval* seconds; store peak in result_holder[0]."""
+def _monitor_memory_samples(
+    pid: int,
+    samples_holder: list[list[int]],
+    stop_event: threading.Event,
+    interval: float = 0.5,
+) -> None:
+    """Poll the RSS of *pid* (and its children) every *interval* seconds.
+
+    Stores all collected samples in ``samples_holder[0]``.  The caller should
+    set *stop_event* when the monitored process has finished.
+    """
     try:
         import psutil
     except ImportError:
-        result_holder[0] = None
         return
 
-    peak = 0
+    samples: list[int] = []
     try:
         proc = psutil.Process(pid)
-        while True:
+        while not stop_event.is_set():
             try:
-                rss = proc.memory_info().rss
-                if rss > peak:
-                    peak = rss
+                # Sum RSS of the main process and all children (mpirun + workers).
+                total_rss = proc.memory_info().rss
+                try:
+                    for child in proc.children(recursive=True):
+                        try:
+                            total_rss += child.memory_info().rss
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                samples.append(total_rss)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 break
-            time.sleep(interval)
+            stop_event.wait(interval)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
-    result_holder[0] = peak if peak > 0 else None
+    samples_holder[0] = samples
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +352,15 @@ def _run_scenario_once(
                 veloc_cfg = candidate
                 break
 
-    # Start memory monitor in a background thread.
-    peak_mem_holder: list[int | None] = [None]
+    # Prepare memory monitoring.
+    mem_samples_holder: list[list[int]] = [[]]
+    mem_stop_event = threading.Event()
 
     if scenario.inject_failures and codebase == "resilient":
         # Resilient run with failure injection.
+        # Memory is monitored per-attempt inside run_with_failure_injection;
+        # samples are accumulated across all attempts and returned via
+        # result.memory_samples_bytes.
         result: RunResult = run_with_failure_injection(
             source_dir=source_dir,
             build_dir=build_dir,
@@ -338,6 +373,9 @@ def _run_scenario_once(
             run_install=run_install,
             veloc_config_name=veloc_config_name,
             require_injection=False,  # benchmarking: OK if app finishes before injection
+            memory_monitor_fn=_monitor_memory_samples,
+            memory_stop_event=mem_stop_event,
+            memory_samples_holder=mem_samples_holder,
         )
     else:
         # Clean run (no failure injection) – used for both original and
@@ -353,6 +391,9 @@ def _run_scenario_once(
             run_cwd=run_output_dir,
             veloc_config_sources=veloc_sources,
             veloc_config_name=veloc_config_name,
+            memory_monitor_fn=_monitor_memory_samples,
+            memory_stop_event=mem_stop_event,
+            memory_samples_holder=mem_samples_holder,
         )
         if not result.succeeded:
             raise ValidationError(
@@ -370,8 +411,15 @@ def _run_scenario_once(
     if veloc_cfg is not None:
         ckpt_size = _measure_checkpoint_size(veloc_cfg)
 
-    # Recovery time (from stdout).
-    recovery_time = _parse_recovery_time(result.stdout) if result.injected else None
+    # Memory samples: for clean runs they come from mem_samples_holder (filled
+    # by the thread started in run_once); for failure-injection runs they come
+    # from result.memory_samples_bytes (accumulated per-attempt inside
+    # run_with_failure_injection).
+    if result.memory_samples_bytes:
+        mem_samples = result.memory_samples_bytes
+    else:
+        mem_samples = mem_samples_holder[0] if mem_samples_holder[0] else []
+    peak_mem = max(mem_samples) if mem_samples else None
 
     return RunMetrics(
         scenario_name=scenario.name,
@@ -381,8 +429,9 @@ def _run_scenario_once(
         injected=result.injected,
         num_attempts=result.num_attempts,
         checkpoint_size_bytes=ckpt_size,
-        recovery_time_s=recovery_time,
-        peak_memory_bytes=peak_mem_holder[0],
+        recovery_time_s=None,
+        peak_memory_bytes=peak_mem,
+        memory_samples_bytes=mem_samples,
     )
 
 
@@ -414,6 +463,7 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
             "checkpoint_size_bytes": [],
             "recovery_time_s": [],
             "peak_memory_bytes": [],
+            "memory_samples_bytes": [],
             "num_attempts": [],
         })
         bucket = summary[s][c]
@@ -424,6 +474,8 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
             bucket["recovery_time_s"].append(run.recovery_time_s)
         if run.peak_memory_bytes is not None:
             bucket["peak_memory_bytes"].append(run.peak_memory_bytes)
+        if run.memory_samples_bytes:
+            bucket["memory_samples_bytes"].extend(run.memory_samples_bytes)
         bucket["num_attempts"].append(run.num_attempts)
 
     # Replace raw lists with aggregated stats.
@@ -474,6 +526,7 @@ def _load_bench_progress(benchmarks_dir: Path) -> tuple[list[RunMetrics], set[st
                 checkpoint_size_bytes=r.get("checkpoint_size_bytes"),
                 recovery_time_s=r.get("recovery_time_s"),
                 peak_memory_bytes=r.get("peak_memory_bytes"),
+                memory_samples_bytes=r.get("memory_samples_bytes", []),
             )
             for r in raw.get("runs", [])
         ]

@@ -14,7 +14,8 @@ Output directory layout
   │   └── raw_metrics.json          (written by metrics_collector)
   ├── plots/
   │   ├── execution_time.png
-  │   ├── recovery_time.png
+  │   ├── resilience_overhead.png
+  │   ├── resilience_overhead_absolute.png
   │   ├── checkpoint_size.png
   │   └── memory_usage.png
   └── summary_report.md
@@ -32,8 +33,8 @@ injection_delay, app_args positions, …) and maps them to graph elements:
   • bar-group (column group across x) → second varying parameter (e.g. workload)
   • subplot panel (row of subplots)   → third varying parameter (e.g. num_procs)
 
-For failure-injection metrics (recovery_time, checkpoint_size, overhead) only
-scenarios with inject_failures=True are included.
+For failure-injection metrics (checkpoint_size, overhead) only scenarios
+with inject_failures=True are included.
 
 The number of plots is kept minimal: one figure per metric, with all varying
 parameters encoded inside that figure.
@@ -449,19 +450,64 @@ def plot_execution_time(results: BenchmarkResults, output_dir: Path) -> Path:
     return out
 
 
-def plot_recovery_time(results: BenchmarkResults, output_dir: Path) -> Path:
-    """Recovery time for failure-injection scenarios (resilient only)."""
-    out = output_dir / "plots" / "recovery_time.png"
-    _plot_metric_figure(
-        results=results,
-        metric="recovery_time_s",
-        y_label="Recovery Time (s)",
-        title="Estimated Recovery Time under Failure Injection",
-        output_path=out,
-        failure_only=True,
-        scale=1.0,
-        codebase="resilient",
-    )
+def plot_resilience_overhead_absolute(results: BenchmarkResults, output_dir: Path) -> Path:
+    """Absolute resilience overhead (seconds) relative to no-failure baseline.
+
+    For each failure-injection scenario, overhead = resilient_time - baseline_time.
+    The baseline is the no-failure scenario with the same workload parameters.
+    """
+    plt, np = _import_matplotlib()
+    _apply_style(plt)
+
+    failure_scenarios = [s for s in results.scenarios if s.inject_failures]
+    baseline_scenarios = [s for s in results.scenarios if not s.inject_failures]
+    out = output_dir / "plots" / "resilience_overhead_absolute.png"
+    if not failure_scenarios:
+        return out
+
+    def _baseline_key(s: BenchmarkScenario):
+        return (s.num_procs, tuple(s.app_args))
+
+    baseline_lookup: dict[tuple, float] = {}
+    for bs in baseline_scenarios:
+        key = _baseline_key(bs)
+        vals = _collect_metric_values(results.runs, bs.name, "elapsed_s", "resilient")
+        if not vals:
+            vals = _collect_metric_values(results.runs, bs.name, "elapsed_s", "original")
+        if vals:
+            baseline_lookup[key] = sum(vals) / len(vals)
+
+    # Compute absolute overhead per scenario.
+    scenario_names = [s.name for s in failure_scenarios]
+    means = []
+    stds = []
+    for s in failure_scenarios:
+        bkey = _baseline_key(s)
+        base = baseline_lookup.get(bkey)
+        if base is None:
+            means.append(0.0)
+            stds.append(0.0)
+            continue
+        res_vals = _collect_metric_values(results.runs, s.name, "elapsed_s", "resilient")
+        overhead_vals = [rv - base for rv in res_vals]
+        m, sd = _mean_std(overhead_vals)
+        means.append(m)
+        stds.append(sd)
+
+    x_positions = np.arange(len(scenario_names))
+    fig, ax = plt.subplots(figsize=(max(7, 2.5 * len(scenario_names) + 1.5), 5))
+    ax.bar(x_positions, means, 0.6, yerr=stds, capsize=4,
+           color="#4c72b0", alpha=0.85, error_kw={"elinewidth": 1.2})
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(scenario_names, rotation=30 if len(scenario_names) > 4 else 0,
+                       ha="right" if len(scenario_names) > 4 else "center")
+    ax.set_ylabel("Overhead (seconds)")
+    ax.set_title("Resilience Overhead vs No-Failure Baseline\n(Resilient − Baseline) in seconds",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    _save_fig(fig, out)
+    plt.close(fig)
     return out
 
 
@@ -482,18 +528,39 @@ def plot_checkpoint_size(results: BenchmarkResults, output_dir: Path) -> Path:
 
 
 def plot_memory_usage(results: BenchmarkResults, output_dir: Path) -> Path:
-    """Peak memory usage for failure-injection scenarios (resilient only)."""
+    """Memory usage statistics (avg, median, p90, p99) for failure-injection scenarios."""
+    plt, np = _import_matplotlib()
+    _apply_style(plt)
+
     out = output_dir / "plots" / "memory_usage.png"
-    _plot_metric_figure(
-        results=results,
-        metric="peak_memory_bytes",
-        y_label="Peak Memory (MiB)",
-        title="Peak Memory Usage under Failure Injection (Resilient)",
-        output_path=out,
-        failure_only=True,
-        scale=1.0 / (1024 ** 2),
-        codebase="resilient",
-    )
+    failure_scenarios = [s for s in results.scenarios if s.inject_failures]
+    if not failure_scenarios:
+        return out
+
+    scenario_names = [s.name for s in failure_scenarios]
+    avgs, medians, p90s, p99s = [], [], [], []
+    for sname in scenario_names:
+        samples = _extract_memory_samples_mib(results, sname, "resilient")
+        avgs.append(_mean(samples) or 0.0)
+        medians.append(_median(samples) or 0.0)
+        p90s.append(_percentile(samples, 90.0) or 0.0)
+        p99s.append(_percentile(samples, 99.0) or 0.0)
+
+    x = np.arange(len(scenario_names))
+    width = 0.2
+    fig, ax = plt.subplots(figsize=(max(8, len(scenario_names) * 2), 5))
+    ax.bar(x - 1.5 * width, avgs, width, label="Average", color="#2196F3")
+    ax.bar(x - 0.5 * width, medians, width, label="Median", color="#4CAF50")
+    ax.bar(x + 0.5 * width, p90s, width, label="P90", color="#FF9800")
+    ax.bar(x + 1.5 * width, p99s, width, label="P99", color="#F44336")
+    ax.set_ylabel("Memory (MiB)")
+    ax.set_title("Memory Usage under Failure Injection (Resilient)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(scenario_names, rotation=30, ha="right", fontsize=8)
+    ax.legend()
+    fig.tight_layout()
+    _save_fig(fig, out)
+    plt.close(fig)
     return out
 
 
@@ -720,6 +787,27 @@ def _std(vals: list[float]) -> float | None:
     return statistics.stdev(vals)
 
 
+def _percentile(vals: list[float], pct: float) -> float | None:
+    """Return the *pct*-th percentile (0–100) using linear interpolation, or None if empty."""
+    if not vals:
+        return None
+    sorted_vals = sorted(vals)
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    # Use linear interpolation (same as numpy default)
+    k = (pct / 100.0) * (n - 1)
+    lo = int(k)
+    hi = min(lo + 1, n - 1)
+    frac = k - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+
+def _median(vals: list[float]) -> float | None:
+    """Return the median of *vals*, or None if empty."""
+    return _percentile(vals, 50.0)
+
+
 def _extract_metric_from_results(
     results: BenchmarkResults,
     scenario_name: str,
@@ -734,6 +822,21 @@ def _extract_metric_from_results(
         if val is not None:
             values.append(float(val))
     return values
+
+
+def _extract_memory_samples_mib(
+    results: BenchmarkResults,
+    scenario_name: str,
+    codebase: str,
+) -> list[float]:
+    """Collect all memory samples (in MiB) across runs for a given scenario/codebase."""
+    samples: list[float] = []
+    for r in results.runs:
+        if r.scenario_name != scenario_name or r.codebase != codebase:
+            continue
+        for s in r.memory_samples_bytes:
+            samples.append(s / (1024 ** 2))
+    return samples
 
 
 def write_summary_report(
@@ -785,16 +888,41 @@ def write_summary_report(
             vals = _extract_metric_from_results(benchmark_results, sname, "resilient", "elapsed_s")
             lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} ± {_fmt_opt(_std(vals))} |")
 
+        # Resilience overhead: resilient_elapsed - baseline_elapsed (seconds).
+        # Baseline is the no-failure scenario with matching workload params.
+        baseline_scenarios = [s for s in benchmark_results.scenarios if not s.inject_failures]
+
+        def _baseline_key_report(s):
+            return (s.num_procs, tuple(s.app_args))
+
+        baseline_lookup: dict[tuple, float] = {}
+        for bs in baseline_scenarios:
+            key = _baseline_key_report(bs)
+            vals = _extract_metric_from_results(benchmark_results, bs.name, "resilient", "elapsed_s")
+            if not vals:
+                vals = _extract_metric_from_results(benchmark_results, bs.name, "original", "elapsed_s")
+            if vals:
+                baseline_lookup[key] = sum(vals) / len(vals)
+
         lines += [
             "",
-            "### Recovery Time (seconds)",
+            "### Resilience Overhead (seconds)",
+            "",
+            "*Total runtime (resilient, all attempts) minus baseline (original, failure-free).*",
+            "*Includes checkpoint, recovery, and retry costs.*",
             "",
             "| Scenario | Mean ± Std |",
             "|----------|------------|",
         ]
-        for sname in scenario_names:
-            vals = _extract_metric_from_results(benchmark_results, sname, "resilient", "recovery_time_s")
-            lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} ± {_fmt_opt(_std(vals))} |")
+        for fs in failure_scenarios:
+            bkey = _baseline_key_report(fs)
+            base = baseline_lookup.get(bkey)
+            res_vals = _extract_metric_from_results(benchmark_results, fs.name, "resilient", "elapsed_s")
+            if base is not None and res_vals:
+                overhead_vals = [rv - base for rv in res_vals]
+                lines.append(f"| {fs.name} | {_fmt_opt(_mean(overhead_vals))} ± {_fmt_opt(_std(overhead_vals))} |")
+            else:
+                lines.append(f"| {fs.name} | N/A |")
 
         lines += [
             "",
@@ -812,26 +940,30 @@ def write_summary_report(
 
         lines += [
             "",
-            "### Peak Memory Usage (MiB)",
+            "### Memory Usage (MiB)",
             "",
-            "| Scenario | Mean | Std |",
-            "|----------|------|-----|",
+            "| Scenario | Average | Median | P90 | P99 |",
+            "|----------|---------|--------|-----|-----|",
         ]
         for sname in scenario_names:
-            vals = [
-                v / (1024 ** 2)
-                for v in _extract_metric_from_results(benchmark_results, sname, "resilient", "peak_memory_bytes")
-            ]
-            lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} | {_fmt_opt(_std(vals))} |")
+            mem_samples = _extract_memory_samples_mib(benchmark_results, sname, "resilient")
+            avg = _mean(mem_samples)
+            med = _median(mem_samples)
+            p90 = _percentile(mem_samples, 90.0)
+            p99 = _percentile(mem_samples, 99.0)
+            lines.append(
+                f"| {sname} | {_fmt_opt(avg)} | {_fmt_opt(med)} "
+                f"| {_fmt_opt(p90)} | {_fmt_opt(p99)} |"
+            )
 
     lines += ["", "---", "", "## 3. Plots", ""]
 
     plot_labels = {
         "execution_time": "Execution Time (Failure-Injection, Resilient)",
-        "resilience_overhead": "Resilience Overhead vs No-Failure Baseline",
+        "resilience_overhead": "Resilience Overhead vs No-Failure Baseline (%)",
+        "resilience_overhead_abs": "Resilience Overhead vs No-Failure Baseline (seconds)",
         "checkpoint_size": "Checkpoint Storage Size",
-        "recovery_time": "Recovery Time",
-        "memory_usage": "Peak Memory Usage",
+        "memory_usage": "Memory Usage (Avg / Median / P90 / P99)",
     }
     for key, label in plot_labels.items():
         if key in plot_paths:
@@ -873,7 +1005,7 @@ def generate_report(
             plot_paths["execution_time"] = plot_execution_time(benchmark_results, output_dir)
             plot_paths["resilience_overhead"] = plot_resilience_overhead(benchmark_results, output_dir)
             plot_paths["checkpoint_size"] = plot_checkpoint_size(benchmark_results, output_dir)
-            plot_paths["recovery_time"] = plot_recovery_time(benchmark_results, output_dir)
+            plot_paths["resilience_overhead_abs"] = plot_resilience_overhead_absolute(benchmark_results, output_dir)
             plot_paths["memory_usage"] = plot_memory_usage(benchmark_results, output_dir)
             print(f"[reporter] plots saved to {output_dir / 'plots'}", flush=True)
         except ImportError as exc:
