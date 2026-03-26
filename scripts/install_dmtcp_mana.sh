@@ -325,6 +325,15 @@ else
       sed -i 's/rex\.W\\n rdfsbase/.byte 0x48; rdfsbase/g; s/rex\.W\\n wrfsbase/.byte 0x48; wrfsbase/g' "${SWITCH_CTX}"
     fi
 
+    # 7. lower-half/copy-stack.c is compiled by mpic++ (icpx) which treats
+    #    .c files as C++.  In C++ mode, arithmetic on void* is illegal.
+    #    Cast the void* to char* so the pointer arithmetic compiles.
+    COPY_STACK="mpi-proxy-split/lower-half/copy-stack.c"
+    if [ -f "${COPY_STACK}" ] && grep -q 'rc2 + dest_mem_len' "${COPY_STACK}"; then
+      info "Patching ${COPY_STACK}: void* arithmetic -> char* cast ..."
+      sed -i 's/rc2 + dest_mem_len/(char *)rc2 + dest_mem_len/g' "${COPY_STACK}"
+    fi
+
     info "Patches applied."
   fi
 
