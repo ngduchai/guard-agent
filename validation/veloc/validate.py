@@ -37,10 +37,12 @@ from pathlib import Path
 
 from .comparator import CompareResult, make_comparator
 from .metrics_collector import (
+    ApproachConfig,
     BenchmarkResults,
     BenchmarkScenario,
     RunMetrics,
     default_scenario,
+    load_approaches_config,
     load_benchmark_config,
     run_benchmark_sweep,
 )
@@ -414,6 +416,31 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Comparison approaches.
+    approaches_grp = parser.add_argument_group("Comparison approaches")
+    approaches_grp.add_argument(
+        "--approaches-config",
+        default=None,
+        metavar="CONFIG_JSON",
+        help=(
+            "Path to a JSON config file defining comparison approaches (e.g., DMTCP). "
+            "Each approach specifies its codebase path, executable, and settings. "
+            "See benchmark_configs/art_simple_approaches.json for an example."
+        ),
+    )
+    # Legacy DMTCP flags (deprecated; use --approaches-config instead).
+    approaches_grp.add_argument(
+        "--dmtcp-codebase",
+        default=None,
+        metavar="DMTCP_CODEBASE",
+        help="[Deprecated: use --approaches-config] Path to DMTCP codebase directory.",
+    )
+    approaches_grp.add_argument(
+        "--dmtcp-executable-name",
+        default=None,
+        help="[Deprecated: use --approaches-config] Executable name for DMTCP codebase.",
+    )
+
     # Pipeline control.
     ctrl_grp = parser.add_argument_group("Pipeline control")
     ctrl_grp.add_argument(
@@ -577,6 +604,7 @@ def _stage_benchmarks(
     orig_app_args: list[str],
     res_app_args: list[str],
     resume: bool = False,
+    extra_approaches: list[ApproachConfig] | None = None,
 ) -> BenchmarkResults:
     """Run the benchmark sweep and return BenchmarkResults."""
     print("\n" + "=" * 70, flush=True)
@@ -630,6 +658,7 @@ def _stage_benchmarks(
         veloc_config_name=args.veloc_config_name,
         install_resilient=args.install_resilient,
         resume=resume,
+        extra_approaches=extra_approaches,
     )
 
 
@@ -637,6 +666,7 @@ def _stage_report(
     correctness_results: list[CompareResult],
     benchmark_results: BenchmarkResults | None,
     output_dir: Path,
+    approach_labels: dict[str, str] | None = None,
 ) -> Path:
     """Generate plots and summary report."""
     print("\n" + "=" * 70, flush=True)
@@ -647,6 +677,7 @@ def _stage_report(
         correctness_results=correctness_results,
         benchmark_results=benchmark_results,
         output_dir=output_dir,
+        approach_labels=approach_labels,
     )
 
 
@@ -736,6 +767,36 @@ def main(argv: list[str] | None = None) -> int:
     orig_app_args = shlex.split(args.original_args)
     res_app_args = shlex.split(args.resilient_args)
 
+    # Load comparison approaches from config or legacy DMTCP flags.
+    repo_root = Path(__file__).resolve().parents[2]
+    approaches: list[ApproachConfig] = []
+    if args.approaches_config:
+        approaches = load_approaches_config(
+            Path(args.approaches_config).resolve(), repo_root
+        )
+        if approaches:
+            print(
+                f"[validate] Loaded {len(approaches)} approach(es) from "
+                f"{args.approaches_config}: "
+                f"{', '.join(a.name for a in approaches)}",
+                flush=True,
+            )
+    elif args.dmtcp_codebase:
+        # Legacy backward compat: convert --dmtcp-codebase to ApproachConfig.
+        approaches = [
+            ApproachConfig(
+                name="dmtcp",
+                label="DMTCP",
+                enabled=True,
+                approach_type="dmtcp",
+                codebase_dir=Path(args.dmtcp_codebase).resolve(),
+                executable_name=args.dmtcp_executable_name,
+            )
+        ]
+
+    # Build approach_labels for reporter.
+    approach_labels: dict[str, str] = {a.name: a.label for a in approaches}
+
     # ------------------------------------------------------------------
     # Pipeline state: load existing state (for --resume) or start fresh.
     # ------------------------------------------------------------------
@@ -765,10 +826,15 @@ def main(argv: list[str] | None = None) -> int:
     # Pre-build the resume command so we can print it on any failure.
     resume_cmd = _build_resume_cmd(list(argv), output_dir)
 
+    approaches_line = ""
+    if approaches:
+        labels = ", ".join(f"{a.name} ({a.label})" for a in approaches)
+        approaches_line = f"  Approaches        : {labels}\n"
     print(
         f"\n[validate] VeloC Validation Framework\n"
         f"  Original codebase : {original_src}\n"
         f"  Resilient codebase: {resilient_src}\n"
+        f"{approaches_line}"
         f"  Output directory  : {output_dir}\n"
         f"  Executable        : orig={orig_exe!r}, resilient={res_exe!r}\n"
         f"  MPI processes     : {args.num_procs}\n"
@@ -872,6 +938,7 @@ def main(argv: list[str] | None = None) -> int:
                     # Pass resume=True so the sweep can skip already-completed
                     # individual runs (fine-grained resume within the stage).
                     resume=args.resume,
+                    extra_approaches=approaches if approaches else None,
                 )
             except Exception as exc:
                 _fail(
@@ -901,6 +968,7 @@ def main(argv: list[str] | None = None) -> int:
                     correctness_results=correctness_results,
                     benchmark_results=benchmark_results,
                     output_dir=output_dir,
+                    approach_labels=approach_labels if approach_labels else None,
                 )
                 print(f"\n[validate] Report: {report_path}", flush=True)
             except Exception as exc:

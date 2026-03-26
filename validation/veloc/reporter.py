@@ -844,6 +844,7 @@ def write_summary_report(
     benchmark_results: BenchmarkResults | None,
     plot_paths: dict[str, Path],
     output_dir: Path,
+    approach_labels: dict[str, str] | None = None,
 ) -> Path:
     """Write summary_report.md with embedded plot references and tabular metrics."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -878,17 +879,32 @@ def write_summary_report(
         failure_scenarios = [s for s in benchmark_results.scenarios if s.inject_failures]
         scenario_names = [s.name for s in failure_scenarios]
 
-        lines += [
-            "### Execution Time – Resilient (seconds)",
-            "",
-            "| Scenario | Mean ± Std |",
-            "|----------|------------|",
-        ]
-        for sname in scenario_names:
-            vals = _extract_metric_from_results(benchmark_results, sname, "resilient", "elapsed_s")
-            lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} ± {_fmt_opt(_std(vals))} |")
+        # Discover non-original codebases present in the data.
+        non_orig_codebases = sorted({
+            r.codebase for r in benchmark_results.runs if r.codebase != "original"
+        })
+        codebase_labels = {"resilient": "VeloC (Resilient)"}
+        if approach_labels:
+            codebase_labels.update(approach_labels)
+        else:
+            # Backward compat: if no labels provided, use defaults for known codebases.
+            codebase_labels.setdefault("dmtcp", "DMTCP")
 
-        # Resilience overhead: resilient_elapsed - baseline_elapsed (seconds).
+        # --- Execution Time per codebase ---
+        for cb in non_orig_codebases:
+            label = codebase_labels.get(cb, cb)
+            lines += [
+                f"### Execution Time – {label} (seconds)",
+                "",
+                "| Scenario | Mean ± Std |",
+                "|----------|------------|",
+            ]
+            for sname in scenario_names:
+                vals = _extract_metric_from_results(benchmark_results, sname, cb, "elapsed_s")
+                lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} ± {_fmt_opt(_std(vals))} |")
+            lines.append("")
+
+        # --- Resilience Overhead per codebase ---
         # Baseline is the no-failure scenario with matching workload params.
         baseline_scenarios = [s for s in benchmark_results.scenarios if not s.inject_failures]
 
@@ -898,63 +914,75 @@ def write_summary_report(
         baseline_lookup: dict[tuple, float] = {}
         for bs in baseline_scenarios:
             key = _baseline_key_report(bs)
-            vals = _extract_metric_from_results(benchmark_results, bs.name, "resilient", "elapsed_s")
-            if not vals:
-                vals = _extract_metric_from_results(benchmark_results, bs.name, "original", "elapsed_s")
+            vals = _extract_metric_from_results(benchmark_results, bs.name, "original", "elapsed_s")
             if vals:
                 baseline_lookup[key] = sum(vals) / len(vals)
 
+        # Build header with one column per non-original codebase.
+        oh_header_cols = " | ".join(codebase_labels.get(cb, cb) for cb in non_orig_codebases)
+        oh_sep_cols = " | ".join("---" for _ in non_orig_codebases)
         lines += [
-            "",
             "### Resilience Overhead (seconds)",
             "",
-            "*Total runtime (resilient, all attempts) minus baseline (original, failure-free).*",
+            "*Total runtime (all attempts) minus baseline (original, failure-free).*",
             "*Includes checkpoint, recovery, and retry costs.*",
             "",
-            "| Scenario | Mean ± Std |",
-            "|----------|------------|",
+            f"| Scenario | {oh_header_cols} |",
+            f"|----------|{oh_sep_cols}|",
         ]
         for fs in failure_scenarios:
             bkey = _baseline_key_report(fs)
             base = baseline_lookup.get(bkey)
-            res_vals = _extract_metric_from_results(benchmark_results, fs.name, "resilient", "elapsed_s")
-            if base is not None and res_vals:
-                overhead_vals = [rv - base for rv in res_vals]
-                lines.append(f"| {fs.name} | {_fmt_opt(_mean(overhead_vals))} ± {_fmt_opt(_std(overhead_vals))} |")
-            else:
-                lines.append(f"| {fs.name} | N/A |")
+            cells = []
+            for cb in non_orig_codebases:
+                cb_vals = _extract_metric_from_results(benchmark_results, fs.name, cb, "elapsed_s")
+                if base is not None and cb_vals:
+                    overhead_vals = [rv - base for rv in cb_vals]
+                    cells.append(f"{_fmt_opt(_mean(overhead_vals))} ± {_fmt_opt(_std(overhead_vals))}")
+                else:
+                    cells.append("N/A")
+            lines.append(f"| {fs.name} | {' | '.join(cells)} |")
 
+        # --- Checkpoint Storage per codebase ---
+        ckpt_header_cols = " | ".join(codebase_labels.get(cb, cb) for cb in non_orig_codebases)
+        ckpt_sep_cols = " | ".join("---" for _ in non_orig_codebases)
         lines += [
             "",
             "### Checkpoint Storage (MiB)",
             "",
-            "| Scenario | Mean | Std |",
-            "|----------|------|-----|",
+            f"| Scenario | {ckpt_header_cols} |",
+            f"|----------|{ckpt_sep_cols}|",
         ]
         for sname in scenario_names:
-            vals = [
-                v / (1024 ** 2)
-                for v in _extract_metric_from_results(benchmark_results, sname, "resilient", "checkpoint_size_bytes")
-            ]
-            lines.append(f"| {sname} | {_fmt_opt(_mean(vals))} | {_fmt_opt(_std(vals))} |")
+            cells = []
+            for cb in non_orig_codebases:
+                vals = [
+                    v / (1024 ** 2)
+                    for v in _extract_metric_from_results(benchmark_results, sname, cb, "checkpoint_size_bytes")
+                ]
+                cells.append(f"{_fmt_opt(_mean(vals))}")
+            lines.append(f"| {sname} | {' | '.join(cells)} |")
 
-        lines += [
-            "",
-            "### Memory Usage (MiB)",
-            "",
-            "| Scenario | Average | Median | P90 | P99 |",
-            "|----------|---------|--------|-----|-----|",
-        ]
-        for sname in scenario_names:
-            mem_samples = _extract_memory_samples_mib(benchmark_results, sname, "resilient")
-            avg = _mean(mem_samples)
-            med = _median(mem_samples)
-            p90 = _percentile(mem_samples, 90.0)
-            p99 = _percentile(mem_samples, 99.0)
-            lines.append(
-                f"| {sname} | {_fmt_opt(avg)} | {_fmt_opt(med)} "
-                f"| {_fmt_opt(p90)} | {_fmt_opt(p99)} |"
-            )
+        # --- Memory Usage per codebase ---
+        for cb in non_orig_codebases:
+            label = codebase_labels.get(cb, cb)
+            lines += [
+                "",
+                f"### Memory Usage – {label} (MiB)",
+                "",
+                "| Scenario | Average | Median | P90 | P99 |",
+                "|----------|---------|--------|-----|-----|",
+            ]
+            for sname in scenario_names:
+                mem_samples = _extract_memory_samples_mib(benchmark_results, sname, cb)
+                avg = _mean(mem_samples)
+                med = _median(mem_samples)
+                p90 = _percentile(mem_samples, 90.0)
+                p99 = _percentile(mem_samples, 99.0)
+                lines.append(
+                    f"| {sname} | {_fmt_opt(avg)} | {_fmt_opt(med)} "
+                    f"| {_fmt_opt(p90)} | {_fmt_opt(p99)} |"
+                )
 
     lines += ["", "---", "", "## 3. Plots", ""]
 
@@ -988,6 +1016,7 @@ def generate_report(
     correctness_results: list[CompareResult],
     benchmark_results: BenchmarkResults | None,
     output_dir: Path,
+    approach_labels: dict[str, str] | None = None,
 ) -> Path:
     """Generate all plots and the summary report.
 
@@ -1017,6 +1046,7 @@ def generate_report(
         benchmark_results=benchmark_results,
         plot_paths=plot_paths,
         output_dir=output_dir,
+        approach_labels=approach_labels,
     )
     print(f"[reporter] summary report saved to {report_path}", flush=True)
     return report_path

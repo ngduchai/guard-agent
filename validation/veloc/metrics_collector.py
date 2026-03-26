@@ -41,11 +41,29 @@ from .runner import (
     run_once,
     run_with_failure_injection,
 )
+from .dmtcp_runner import (
+    check_dmtcp_available,
+    dmtcp_run_once,
+    dmtcp_run_with_failure_injection,
+    measure_checkpoint_size as dmtcp_measure_checkpoint_size,
+)
 
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ApproachConfig:
+    """Configuration for a comparison approach (e.g., DMTCP)."""
+    name: str                          # unique identifier, used as codebase label
+    label: str                         # human-readable display name
+    enabled: bool
+    approach_type: str                 # "dmtcp", or future types
+    codebase_dir: Path
+    executable_name: str | None = None # None = use main --executable-name
+    install_prefix: str | None = None  # for DMTCP: None = auto-discover
+
 
 @dataclass
 class BenchmarkScenario:
@@ -220,6 +238,38 @@ def default_scenario(
     ]
 
 
+def load_approaches_config(
+    config_path: Path,
+    repo_root: Path,
+) -> list[ApproachConfig]:
+    """Parse a JSON approaches config into a list of enabled ApproachConfig objects.
+
+    Returns an empty list if the file does not exist (backward compat).
+    """
+    if not config_path.exists():
+        return []
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    approaches: list[ApproachConfig] = []
+    for entry in raw.get("approaches", []):
+        if not entry.get("enabled", True):
+            continue
+        codebase_dir = Path(entry["codebase_dir"])
+        if not codebase_dir.is_absolute():
+            codebase_dir = repo_root / codebase_dir
+        approaches.append(
+            ApproachConfig(
+                name=entry["name"],
+                label=entry.get("label", entry["name"]),
+                enabled=True,
+                approach_type=entry.get("type", "unknown"),
+                codebase_dir=codebase_dir,
+                executable_name=entry.get("executable_name"),
+                install_prefix=entry.get("install_prefix"),
+            )
+        )
+    return approaches
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint size measurement
 # ---------------------------------------------------------------------------
@@ -339,6 +389,8 @@ def _run_scenario_once(
     executable_name: str,
     veloc_config_name: str = "veloc.cfg",
     run_install: bool = False,
+    install_prefix: str | None = None,
+    dmtcp_coord_port: int = 0,
 ) -> RunMetrics:
     """Execute one run of *scenario* for *codebase* and collect metrics."""
     run_output_dir = output_dir / codebase / scenario.name / f"run_{run_index}"
@@ -356,12 +408,60 @@ def _run_scenario_once(
     mem_samples_holder: list[list[int]] = [[]]
     mem_stop_event = threading.Event()
 
-    if scenario.inject_failures and codebase == "resilient":
-        # Resilient run with failure injection.
+    if codebase == "dmtcp":
+        # ── DMTCP run ──────────────────────────────────────────────────
+        ckpt_dir = run_output_dir / "dmtcp_ckpt"
+        coord_port = dmtcp_coord_port if dmtcp_coord_port else 7800
+
+        if scenario.inject_failures:
+            result: RunResult = dmtcp_run_with_failure_injection(
+                build_dir=build_dir,
+                executable_name=executable_name,
+                num_procs=scenario.num_procs,
+                app_args=scenario.app_args,
+                output_dir=run_output_dir,
+                ckpt_dir=ckpt_dir,
+                coord_port=coord_port,
+                injection_delay=scenario.injection_delay,
+                run_cwd=run_output_dir,
+                install_prefix=install_prefix,
+                memory_monitor_fn=_monitor_memory_samples,
+                memory_stop_event=mem_stop_event,
+                memory_samples_holder=mem_samples_holder,
+            )
+        else:
+            result = dmtcp_run_once(
+                build_dir=build_dir,
+                executable_name=executable_name,
+                num_procs=scenario.num_procs,
+                app_args=scenario.app_args,
+                output_dir=run_output_dir,
+                ckpt_dir=ckpt_dir,
+                coord_port=coord_port,
+                run_cwd=run_output_dir,
+                install_prefix=install_prefix,
+                memory_monitor_fn=_monitor_memory_samples,
+                memory_stop_event=mem_stop_event,
+                memory_samples_holder=mem_samples_holder,
+            )
+            if not result.succeeded:
+                raise ValidationError(
+                    f"DMTCP benchmark run failed for scenario={scenario.name!r}, "
+                    f"run={run_index}, exit code={result.exit_code}",
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_code=result.exit_code,
+                    output_dir=run_output_dir,
+                )
+        # DMTCP checkpoint size.
+        ckpt_size: int | None = dmtcp_measure_checkpoint_size(ckpt_dir)
+
+    elif scenario.inject_failures and codebase == "resilient":
+        # ── Resilient run with failure injection ───────────────────────
         # Memory is monitored per-attempt inside run_with_failure_injection;
         # samples are accumulated across all attempts and returned via
         # result.memory_samples_bytes.
-        result: RunResult = run_with_failure_injection(
+        result = run_with_failure_injection(
             source_dir=source_dir,
             build_dir=build_dir,
             output_dir=run_output_dir,
@@ -377,10 +477,14 @@ def _run_scenario_once(
             memory_stop_event=mem_stop_event,
             memory_samples_holder=mem_samples_holder,
         )
+        # VeloC checkpoint size.
+        ckpt_size = None
+        if veloc_cfg is not None:
+            ckpt_size = _measure_checkpoint_size(veloc_cfg)
+
     else:
-        # Clean run (no failure injection) – used for both original and
-        # failure-free resilient benchmarks.
-        # For the resilient codebase, ensure veloc.cfg is present in the CWD.
+        # ── Clean run (no failure injection) ───────────────────────────
+        # Used for original and failure-free resilient benchmarks.
         veloc_sources = [source_dir, build_dir] if codebase == "resilient" else None
         result = run_once(
             build_dir=build_dir,
@@ -405,16 +509,14 @@ def _run_scenario_once(
                 exit_code=result.exit_code,
                 output_dir=run_output_dir,
             )
+        # VeloC checkpoint size (resilient clean runs only).
+        ckpt_size = None
+        if veloc_cfg is not None:
+            ckpt_size = _measure_checkpoint_size(veloc_cfg)
 
-    # Checkpoint size (post-run).
-    ckpt_size: int | None = None
-    if veloc_cfg is not None:
-        ckpt_size = _measure_checkpoint_size(veloc_cfg)
-
-    # Memory samples: for clean runs they come from mem_samples_holder (filled
-    # by the thread started in run_once); for failure-injection runs they come
-    # from result.memory_samples_bytes (accumulated per-attempt inside
-    # run_with_failure_injection).
+    # Memory samples: prefer result.memory_samples_bytes (filled by
+    # run_with_failure_injection / dmtcp runners), fall back to
+    # mem_samples_holder (filled by run_once's background thread).
     if result.memory_samples_bytes:
         mem_samples = result.memory_samples_bytes
     else:
@@ -573,13 +675,20 @@ def run_benchmark_sweep(
     veloc_config_name: str = "veloc.cfg",
     install_resilient: bool = False,
     resume: bool = False,
+    dmtcp_source_dir: Path | None = None,
+    dmtcp_build_dir: Path | None = None,
+    dmtcp_executable_name: str | None = None,
+    dmtcp_coord_base_port: int = 7800,
+    extra_approaches: list[ApproachConfig] | None = None,
 ) -> BenchmarkResults:
-    """Execute all scenarios for both codebases and collect RunMetrics.
+    """Execute all scenarios for all codebases and collect RunMetrics.
 
     For each scenario:
       - The *original* codebase is always run without failure injection.
       - The *resilient* codebase is run with or without failure injection
         depending on ``scenario.inject_failures``.
+      - The *dmtcp* codebase (if provided) is run with the same logic as
+        resilient, but using DMTCP transparent checkpointing.
 
     Each scenario is repeated ``scenario.num_runs`` times for statistical
     stability.
@@ -588,11 +697,57 @@ def run_benchmark_sweep(
     ----------
     resume:
         When ``True``, load previously completed runs from
-        ``benchmark_progress.json`` and skip them.  This allows the sweep to
-        resume from the exact run where it was interrupted, rather than
-        re-running the entire stage.
+        ``benchmark_progress.json`` and skip them.
+    dmtcp_source_dir, dmtcp_build_dir, dmtcp_executable_name:
+        When all three are provided and DMTCP is available, the sweep
+        includes a third "dmtcp" codebase.  When ``None``, only original
+        and resilient codebases are benchmarked (backward-compatible).
+    dmtcp_coord_base_port:
+        Base port for DMTCP coordinators.  Each run gets a unique port
+        derived from this base to avoid collisions.
     """
     benchmarks_dir = output_dir / "benchmarks"
+    build_root = output_dir / "build"
+
+    # Merge legacy DMTCP params with extra_approaches into a unified list.
+    active_approaches: list[ApproachConfig] = []
+    if extra_approaches:
+        active_approaches = list(extra_approaches)
+    elif (
+        dmtcp_source_dir is not None
+        and dmtcp_build_dir is not None
+        and dmtcp_executable_name is not None
+    ):
+        # Backward compat: convert legacy params to ApproachConfig.
+        active_approaches = [
+            ApproachConfig(
+                name="dmtcp",
+                label="DMTCP",
+                enabled=True,
+                approach_type="dmtcp",
+                codebase_dir=dmtcp_source_dir,
+                executable_name=dmtcp_executable_name,
+            )
+        ]
+
+    # Filter to approaches whose tools are available.
+    verified_approaches: list[ApproachConfig] = []
+    for approach in active_approaches:
+        if approach.approach_type == "dmtcp":
+            if check_dmtcp_available(approach.install_prefix):
+                verified_approaches.append(approach)
+            else:
+                print(
+                    f"[metrics] WARNING: approach {approach.name!r} skipped – "
+                    "DMTCP tools not found.",
+                    flush=True,
+                )
+        else:
+            print(
+                f"[metrics] WARNING: unknown approach type {approach.approach_type!r} "
+                f"for {approach.name!r}; skipping.",
+                flush=True,
+            )
 
     # Load previously completed runs when resuming.
     if resume:
@@ -606,11 +761,24 @@ def run_benchmark_sweep(
         all_runs = []
         completed_keys: set[str] = set()
 
-    # Build both codebases once before the sweep.
+    # Build all codebases once before the sweep.
     print("[metrics] building original codebase...", flush=True)
     configure_and_build(original_source_dir, original_build_dir)
     print("[metrics] building resilient codebase...", flush=True)
     configure_and_build(resilient_source_dir, resilient_build_dir, run_install=install_resilient)
+
+    # Build approach codebases and resolve their build dirs.
+    approach_build_dirs: dict[str, Path] = {}
+    for approach in verified_approaches:
+        # Use legacy dmtcp_build_dir if it was passed directly, otherwise
+        # create a build dir under the output build root.
+        if approach.approach_type == "dmtcp" and dmtcp_build_dir is not None and not extra_approaches:
+            a_build = dmtcp_build_dir
+        else:
+            a_build = build_root / approach.name
+        print(f"[metrics] building {approach.name} codebase...", flush=True)
+        configure_and_build(approach.codebase_dir, a_build)
+        approach_build_dirs[approach.name] = a_build
 
     total_scenarios = len(scenarios)
     for scenario_idx, scenario in enumerate(scenarios, 1):
@@ -685,6 +853,44 @@ def run_benchmark_sweep(
                     f"injected={res_metrics.injected}, attempts={res_metrics.num_attempts}",
                     flush=True,
                 )
+
+            # --- Extra approach runs (DMTCP, etc.) ---
+            for approach in verified_approaches:
+                a_key = _bench_progress_key(scenario.name, approach.name, run_idx)
+                if a_key in completed_keys:
+                    print(
+                        f"[metrics] --- {approach.name} run {run_idx}/{scenario.num_runs} "
+                        f"[SKIPPED – already completed] ---",
+                        flush=True,
+                    )
+                else:
+                    coord_port = dmtcp_coord_base_port + scenario_idx * 100 + run_idx
+                    a_exe = approach.executable_name or resilient_executable_name
+                    a_build = approach_build_dirs[approach.name]
+                    print(
+                        f"[metrics] --- {approach.name} run {run_idx}/{scenario.num_runs} ---",
+                        flush=True,
+                    )
+                    a_metrics = _run_scenario_once(
+                        scenario=scenario,
+                        codebase=approach.name,
+                        run_index=run_idx,
+                        source_dir=approach.codebase_dir,
+                        build_dir=a_build,
+                        output_dir=benchmarks_dir,
+                        executable_name=a_exe,
+                        dmtcp_coord_port=coord_port,
+                        install_prefix=approach.install_prefix,
+                    )
+                    all_runs.append(a_metrics)
+                    completed_keys.add(a_key)
+                    _save_bench_progress(benchmarks_dir, all_runs)
+                    print(
+                        f"[metrics] {approach.name} run {run_idx}: "
+                        f"elapsed={a_metrics.elapsed_s:.2f}s, "
+                        f"injected={a_metrics.injected}",
+                        flush=True,
+                    )
 
     summary = _build_summary(all_runs)
     results = BenchmarkResults(scenarios=scenarios, runs=all_runs, summary=summary)

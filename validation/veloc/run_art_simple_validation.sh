@@ -52,6 +52,7 @@ NUM_PROCS="${NUM_PROCS:-4}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/build/validation_output/art_simple}"
 
 BENCHMARK_CONFIG="${REPO_ROOT}/validation/veloc/benchmark_configs/art_simple.json"
+APPROACHES_CONFIG="${REPO_ROOT}/validation/veloc/benchmark_configs/art_simple_approaches.json"
 
 COMMON_ARGS="${DATA_PATH} 294.078 5 2 0 4"
 
@@ -172,12 +173,23 @@ if [[ -n "${NUM_RUNS:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Auto-detect comparison approaches
+# ---------------------------------------------------------------------------
+APPROACHES_FLAG=""
+if [[ -f "${APPROACHES_CONFIG}" ]]; then
+  APPROACHES_FLAG="--approaches-config ${APPROACHES_CONFIG}"
+fi
+
+# ---------------------------------------------------------------------------
 # Run the validation framework
 # ---------------------------------------------------------------------------
 echo ""
 echo "[run] Configuration:"
 echo "  ORIGINAL_DIR     : ${ORIGINAL_DIR}"
 echo "  RESILIENT_DIR    : ${RESILIENT_DIR}"
+if [[ -n "${APPROACHES_FLAG}" ]]; then
+  echo "  APPROACHES_CONFIG: ${APPROACHES_CONFIG}"
+fi
 echo "  NUM_PROCS        : ${NUM_PROCS}"
 echo "  BENCHMARK_CONFIG : ${BENCHMARK_CONFIG}"
 if [[ -n "${NUM_RUNS:-}" ]]; then
@@ -207,4 +219,5 @@ python -m validation.veloc.validate \
   --benchmark-config "${BENCHMARK_CONFIG}" \
   ${NUM_RUNS_FLAG} \
   ${RESUME_FLAG} \
+  ${APPROACHES_FLAG} \
   "$@"

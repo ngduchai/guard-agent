@@ -157,7 +157,16 @@ if [ -d "$REPO_ROOT/tests/examples/dmtcp" ]; then
   echo "  $BUILD_DIR/example_refs/dmtcp"
 fi
 
-if [ ! -d "$BUILD_DIR/venv" ]; then
+if [ -d "$BUILD_DIR/venv" ]; then
+  VENV_PY_VER=$("$BUILD_DIR/venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")
+  if [ "$VENV_PY_VER" != "$PY_VER" ]; then
+    echo "Existing venv uses Python $VENV_PY_VER but $PYTHON is $PY_VER — recreating venv ..."
+    rm -rf "$BUILD_DIR/venv"
+    "$PYTHON" -m venv "$BUILD_DIR/venv"
+  else
+    echo "Reusing existing venv (Python $VENV_PY_VER)"
+  fi
+else
   echo "Creating virtualenv in build/venv ..."
   "$PYTHON" -m venv "$BUILD_DIR/venv"
 fi
@@ -165,6 +174,9 @@ fi
 echo "Activating venv and installing dependencies ..."
 # shellcheck source=/dev/null
 . "$BUILD_DIR/venv/bin/activate"
+
+echo "Upgrading pip, setuptools, and wheel ..."
+pip install --upgrade pip setuptools wheel
 
 pip install -q -r "$REPO_ROOT/orchestrator/requirements.txt"
 [ -f "$REPO_ROOT/shared/requirements.txt" ] && pip install -q -r "$REPO_ROOT/shared/requirements.txt" || true
