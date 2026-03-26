@@ -220,16 +220,83 @@ else
   fi
 
   info "Building MANA ..."
+  # ── MPICH ≥ 5.0 compatibility ──────────────────────────────────────
   # MPICH ≥ 5.0 exposes C++ overloaded MPI function declarations in
-  # mpi_proto.h, which breaks MANA's __typeof__(&MPI_Send) pattern.
-  # Defining MPICH_SKIP_MPICXX tells the MPICH headers to suppress the
-  # C++ overloads so the wrappers compile cleanly with mpic++.
-  export CPPFLAGS="${CPPFLAGS:-} -DMPICH_SKIP_MPICXX"
-  export CXXFLAGS="${CXXFLAGS:-} -DMPICH_SKIP_MPICXX"
+  # mpi_proto.h (large-count variants of MPI_Send, MPI_Recv, etc.).
+  # MANA's NEXT_FUNC macro uses __typeof__(&MPI_Send) which fails when
+  # the symbol is overloaded.  We suppress these overloads with:
+  #   - MPICH_SKIP_MPICXX: suppresses the C++ MPI bindings namespace
+  #   - MPICH_NO_LARGE_COUNT: suppresses large-count C++ overloads
+  #
+  # We need the flags to reach *every* compilation unit, including the
+  # mpi-wrappers that are compiled with mpic++.  MANA's mpi-wrappers
+  # Makefile uses its own CXXFLAGS (set by Makefile_config) and does
+  # NOT inherit the environment CXXFLAGS, so setting the env var alone
+  # is insufficient.  We therefore:
+  #   1. Export CPPFLAGS/CXXFLAGS for the top-level configure.
+  #   2. After configure, patch the generated Makefile_config to inject
+  #      the flags into the MPI_CFLAGS / MPI_CXXFLAGS used by mpic++.
+  #   3. As a belt-and-suspenders measure, also patch mpi_nextfunc.h
+  #      to define the macros before any MPI header is included.
+  MPICH_COMPAT_FLAGS="-DMPICH_SKIP_MPICXX -DMPICH_NO_LARGE_COUNT"
+  export CPPFLAGS="${CPPFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+  export CXXFLAGS="${CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+
   MANA_BUILD_OK=true
   if [ -f configure ] && ! ./configure --prefix="${INSTALL_PREFIX}"; then
     MANA_BUILD_OK=false
   fi
+
+  # Patch mpi_nextfunc.h to define MPICH compat macros before MPI headers.
+  # This is the most reliable way to ensure the flags reach all TUs.
+  NEXTFUNC_H="mpi-proxy-split/mpi-wrappers/mpi_nextfunc.h"
+  if $MANA_BUILD_OK && [ -f "${NEXTFUNC_H}" ]; then
+    if ! grep -q 'MPICH_SKIP_MPICXX' "${NEXTFUNC_H}"; then
+      info "Patching ${NEXTFUNC_H} for MPICH >= 5.0 compatibility ..."
+      {
+        echo '/* guard-agent: suppress MPICH C++ overloads that break __typeof__ */'
+        echo '#ifndef MPICH_SKIP_MPICXX'
+        echo '#define MPICH_SKIP_MPICXX'
+        echo '#endif'
+        echo '#ifndef MPICH_NO_LARGE_COUNT'
+        echo '#define MPICH_NO_LARGE_COUNT'
+        echo '#endif'
+        cat "${NEXTFUNC_H}"
+      } > "${NEXTFUNC_H}.tmp" && mv "${NEXTFUNC_H}.tmp" "${NEXTFUNC_H}"
+    fi
+  fi
+
+  # Also patch the generated Makefile_config to add the flags to
+  # MPI_CFLAGS and MPI_CXXFLAGS (used by the mpi-wrappers Makefile).
+  MANA_MKCONFIG="mpi-proxy-split/Makefile_config"
+  if $MANA_BUILD_OK && [ -f "${MANA_MKCONFIG}" ]; then
+    if ! grep -q 'MPICH_SKIP_MPICXX' "${MANA_MKCONFIG}"; then
+      info "Patching ${MANA_MKCONFIG} for MPICH >= 5.0 compatibility ..."
+      sed -i "s/^\(MPI_CFLAGS\s*=\)/\1 ${MPICH_COMPAT_FLAGS} /" "${MANA_MKCONFIG}" 2>/dev/null || true
+      sed -i "s/^\(MPI_CXXFLAGS\s*=\)/\1 ${MPICH_COMPAT_FLAGS} /" "${MANA_MKCONFIG}" 2>/dev/null || true
+      # If MPI_CFLAGS/MPI_CXXFLAGS don't exist, append them.
+      if ! grep -q '^MPI_CFLAGS' "${MANA_MKCONFIG}"; then
+        echo "MPI_CFLAGS = ${MPICH_COMPAT_FLAGS}" >> "${MANA_MKCONFIG}"
+      fi
+      if ! grep -q '^MPI_CXXFLAGS' "${MANA_MKCONFIG}"; then
+        echo "MPI_CXXFLAGS = ${MPICH_COMPAT_FLAGS}" >> "${MANA_MKCONFIG}"
+      fi
+    fi
+  fi
+
+  # Also inject the flags via the MPICH wrapper's own env vars so that
+  # mpic++ passes them to the underlying compiler automatically.
+  export MPICH_CXXFLAGS="${MPICH_CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+  export MPICH_CFLAGS="${MPICH_CFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+  # Cray MPICH uses CRAY_MPICH_* env vars; set them too for portability.
+  export CRAY_MPICH_CXXFLAGS="${CRAY_MPICH_CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+  export CRAY_MPICH_CFLAGS="${CRAY_MPICH_CFLAGS:-} ${MPICH_COMPAT_FLAGS}"
+
+  # Clean any previous failed build artifacts before retrying.
+  if [ -d mpi-proxy-split/mpi-wrappers ]; then
+    make -C mpi-proxy-split/mpi-wrappers clean 2>/dev/null || true
+  fi
+
   if $MANA_BUILD_OK && ! { make -j"$(nproc)" || make; }; then
     MANA_BUILD_OK=false
     echo ""
