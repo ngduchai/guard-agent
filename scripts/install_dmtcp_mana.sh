@@ -259,22 +259,27 @@ else
     #    ambiguous due to #pragma weak.  These are calls where the
     #    wrapper itself calls MPI_Isend/MPI_Irecv (not via NEXT_FUNC).
     #    Replace with PMPI_Isend/PMPI_Irecv to avoid the ambiguity.
+    #
+    #    Pattern: MPI_[A-Z][a-z] matches MPI API functions (MPI_Isend,
+    #    MPI_Recv, MPI_Type_size, MPI_Allreduce, etc.) but NOT
+    #    all-caps macros (MPI_LOGGING, MPI_SUCCESS, MPI_COMM_WORLD).
     WRAPPERS_DIR="mpi-proxy-split/mpi-wrappers"
     if [ -d "${WRAPPERS_DIR}" ]; then
+      # First, revert any incorrectly-patched all-caps MANA macros
+      # from a previous run (e.g. PMPI_LOGGING -> MPI_LOGGING).
       for f in "${WRAPPERS_DIR}"/*.cpp; do
         [ -f "$f" ] || continue
-        # Only patch files that have #pragma weak (i.e. wrapper files).
-        # Replace bare MPI_Xxx( calls with PMPI_Xxx( but NOT inside
-        # strings, comments, or NEXT_FUNC/macro contexts.
-        # We target specific patterns: "= MPI_Xxx(" or "retval = MPI_Xxx("
+        if grep -q 'PMPI_LOGGING' "$f"; then
+          sed -i 's/PMPI_LOGGING/MPI_LOGGING/g' "$f"
+        fi
+      done
+      # Now apply the correct patch.
+      for f in "${WRAPPERS_DIR}"/*.cpp; do
+        [ -f "$f" ] || continue
         if grep -q '#pragma weak' "$f"; then
-          # Replace direct "MPI_Xxx(" calls with "PMPI_Xxx(" but only
-          # when used as a function call (preceded by non-identifier
-          # char).  Skip #pragma weak lines and NEXT_FUNC() contexts.
-          # [^_A-Za-z0-9] prevents matching PMPI_ or DMTCP_MPI_ etc.
           sed -i -E \
-            -e '/^#pragma weak/! s/([^_A-Za-z0-9])MPI_([A-Z][A-Za-z0-9_]*)\(/\1PMPI_\2(/g' \
-            -e '/^#pragma weak/! s/^MPI_([A-Z][A-Za-z0-9_]*)\(/PMPI_\1(/g' \
+            -e '/^#pragma weak/! s/([^_A-Za-z0-9])MPI_([A-Z][a-z][A-Za-z0-9_]*)\(/\1PMPI_\2(/g' \
+            -e '/^#pragma weak/! s/^MPI_([A-Z][a-z][A-Za-z0-9_]*)\(/PMPI_\1(/g' \
             "$f"
         fi
       done
