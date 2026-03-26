@@ -193,7 +193,13 @@ else
     PYTHON3_ABS="$(command -v "${PYTHON3}" 2>/dev/null || echo "${PYTHON3}")"
     PYTHON3_DIR="$(dirname "${PYTHON3_ABS}")"
     export PATH="${PYTHON3_DIR}:${PATH}"
-    if ! command -v python3 &>/dev/null; then
+    # Create a temporary "python3" symlink if python3 is missing OR if it
+    # resolves to a different binary than the one we selected (e.g. the
+    # system python3 is 3.6 but the user asked for python3.10).
+    SYSTEM_PY3="$(command -v python3 2>/dev/null || true)"
+    SYSTEM_PY3_REAL="$(readlink -f "${SYSTEM_PY3}" 2>/dev/null || true)"
+    PYTHON3_ABS_REAL="$(readlink -f "${PYTHON3_ABS}" 2>/dev/null || echo "${PYTHON3_ABS}")"
+    if [[ -z "${SYSTEM_PY3}" ]] || [[ "${SYSTEM_PY3_REAL}" != "${PYTHON3_ABS_REAL}" ]]; then
       TMPBIN="$(mktemp -d)"
       ln -sf "${PYTHON3_ABS}" "${TMPBIN}/python3"
       export PATH="${TMPBIN}:${PATH}"
