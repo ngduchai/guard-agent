@@ -220,77 +220,66 @@ else
   fi
 
   info "Building MANA ..."
-  # ── MPICH ≥ 5.0 compatibility ──────────────────────────────────────
-  # MPICH ≥ 5.0 exposes C++ overloaded MPI function declarations in
-  # mpi_proto.h (large-count variants of MPI_Send, MPI_Recv, etc.).
-  # MANA's NEXT_FUNC macro uses __typeof__(&MPI_Send) which fails when
-  # the symbol is overloaded.  We suppress these overloads with:
-  #   - MPICH_SKIP_MPICXX: suppresses the C++ MPI bindings namespace
-  #   - MPICH_NO_LARGE_COUNT: suppresses large-count C++ overloads
-  #
-  # We need the flags to reach *every* compilation unit, including the
-  # mpi-wrappers that are compiled with mpic++.  MANA's mpi-wrappers
-  # Makefile uses its own CXXFLAGS (set by Makefile_config) and does
-  # NOT inherit the environment CXXFLAGS, so setting the env var alone
-  # is insufficient.  We therefore:
-  #   1. Export CPPFLAGS/CXXFLAGS for the top-level configure.
-  #   2. After configure, patch the generated Makefile_config to inject
-  #      the flags into the MPI_CFLAGS / MPI_CXXFLAGS used by mpic++.
-  #   3. As a belt-and-suspenders measure, also patch mpi_nextfunc.h
-  #      to define the macros before any MPI header is included.
-  MPICH_COMPAT_FLAGS="-DMPICH_SKIP_MPICXX -DMPICH_NO_LARGE_COUNT"
-  export CPPFLAGS="${CPPFLAGS:-} ${MPICH_COMPAT_FLAGS}"
-  export CXXFLAGS="${CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
 
   MANA_BUILD_OK=true
   if [ -f configure ] && ! ./configure --prefix="${INSTALL_PREFIX}"; then
     MANA_BUILD_OK=false
   fi
 
-  # Patch mpi_nextfunc.h to define MPICH compat macros before MPI headers.
-  # This is the most reliable way to ensure the flags reach all TUs.
-  NEXTFUNC_H="mpi-proxy-split/mpi-wrappers/mpi_nextfunc.h"
-  if $MANA_BUILD_OK && [ -f "${NEXTFUNC_H}" ]; then
-    if ! grep -q 'MPICH_SKIP_MPICXX' "${NEXTFUNC_H}"; then
-      info "Patching ${NEXTFUNC_H} for MPICH >= 5.0 compatibility ..."
-      {
-        echo '/* guard-agent: suppress MPICH C++ overloads that break __typeof__ */'
-        echo '#ifndef MPICH_SKIP_MPICXX'
-        echo '#define MPICH_SKIP_MPICXX'
-        echo '#endif'
-        echo '#ifndef MPICH_NO_LARGE_COUNT'
-        echo '#define MPICH_NO_LARGE_COUNT'
-        echo '#endif'
-        cat "${NEXTFUNC_H}"
-      } > "${NEXTFUNC_H}.tmp" && mv "${NEXTFUNC_H}.tmp" "${NEXTFUNC_H}"
+  # ── Clang / icpx compatibility for #pragma weak ambiguity ─────────
+  # On Clang-based compilers (icpx, clang++), #pragma weak MPI_Send =
+  # PMPI_Send creates a second declaration of MPI_Send in the same
+  # translation unit.  Combined with the declaration from mpi_proto.h,
+  # this makes &MPI_Send ambiguous (two candidates with the same
+  # signature).  GCC does not have this problem.
+  #
+  # This breaks two things in MANA:
+  #   1. NEXT_FUNC macro (mpi_nextfunc.h) uses __typeof__(&MPI_##func)
+  #   2. Direct calls like MPI_Isend(...) in wrapper code are ambiguous
+  #
+  # Fix: patch the source files to use PMPI_##func instead of MPI_##func
+  # where the ambiguity occurs.  PMPI_##func always has a single
+  # unambiguous declaration and the exact same signature.
+  if $MANA_BUILD_OK; then
+    # 1. Patch NEXT_FUNC macro: __typeof__(&MPI_##func) -> __typeof__(&PMPI_##func)
+    NEXTFUNC_H="mpi-proxy-split/mpi-wrappers/mpi_nextfunc.h"
+    if [ -f "${NEXTFUNC_H}" ] && grep -q '__typeof__(&MPI_##func)' "${NEXTFUNC_H}"; then
+      info "Patching ${NEXTFUNC_H}: &MPI_##func -> &PMPI_##func ..."
+      sed -i 's/__typeof__(&MPI_##func)/__typeof__(\&PMPI_##func)/g' "${NEXTFUNC_H}"
+    fi
+
+    # 2. Patch record-replay.h LOG_CALL macro: &MPI_##func -> &PMPI_##func
+    RECORD_REPLAY_H="mpi-proxy-split/record-replay.h"
+    if [ -f "${RECORD_REPLAY_H}" ] && grep -q '&MPI_##func' "${RECORD_REPLAY_H}"; then
+      info "Patching ${RECORD_REPLAY_H}: &MPI_##func -> &PMPI_##func ..."
+      sed -i 's/&MPI_##func/\&PMPI_##func/g' "${RECORD_REPLAY_H}"
+    fi
+
+    # 3. Patch direct MPI_Xxx calls in wrapper .cpp files that are
+    #    ambiguous due to #pragma weak.  These are calls where the
+    #    wrapper itself calls MPI_Isend/MPI_Irecv (not via NEXT_FUNC).
+    #    Replace with PMPI_Isend/PMPI_Irecv to avoid the ambiguity.
+    WRAPPERS_DIR="mpi-proxy-split/mpi-wrappers"
+    if [ -d "${WRAPPERS_DIR}" ]; then
+      for f in "${WRAPPERS_DIR}"/*.cpp; do
+        [ -f "$f" ] || continue
+        # Only patch files that have #pragma weak (i.e. wrapper files).
+        # Replace bare MPI_Xxx( calls with PMPI_Xxx( but NOT inside
+        # strings, comments, or NEXT_FUNC/macro contexts.
+        # We target specific patterns: "= MPI_Xxx(" or "retval = MPI_Xxx("
+        if grep -q '#pragma weak' "$f"; then
+          # Replace direct "MPI_Xxx(" calls with "PMPI_Xxx(" but only
+          # when used as a function call (preceded by non-identifier
+          # char).  Skip #pragma weak lines and NEXT_FUNC() contexts.
+          # [^_A-Za-z0-9] prevents matching PMPI_ or DMTCP_MPI_ etc.
+          sed -i -E \
+            -e '/^#pragma weak/! s/([^_A-Za-z0-9])MPI_([A-Z][A-Za-z0-9_]*)\(/\1PMPI_\2(/g' \
+            -e '/^#pragma weak/! s/^MPI_([A-Z][A-Za-z0-9_]*)\(/PMPI_\1(/g' \
+            "$f"
+        fi
+      done
     fi
   fi
-
-  # Also patch the generated Makefile_config to add the flags to
-  # MPI_CFLAGS and MPI_CXXFLAGS (used by the mpi-wrappers Makefile).
-  MANA_MKCONFIG="mpi-proxy-split/Makefile_config"
-  if $MANA_BUILD_OK && [ -f "${MANA_MKCONFIG}" ]; then
-    if ! grep -q 'MPICH_SKIP_MPICXX' "${MANA_MKCONFIG}"; then
-      info "Patching ${MANA_MKCONFIG} for MPICH >= 5.0 compatibility ..."
-      sed -i "s/^\(MPI_CFLAGS\s*=\)/\1 ${MPICH_COMPAT_FLAGS} /" "${MANA_MKCONFIG}" 2>/dev/null || true
-      sed -i "s/^\(MPI_CXXFLAGS\s*=\)/\1 ${MPICH_COMPAT_FLAGS} /" "${MANA_MKCONFIG}" 2>/dev/null || true
-      # If MPI_CFLAGS/MPI_CXXFLAGS don't exist, append them.
-      if ! grep -q '^MPI_CFLAGS' "${MANA_MKCONFIG}"; then
-        echo "MPI_CFLAGS = ${MPICH_COMPAT_FLAGS}" >> "${MANA_MKCONFIG}"
-      fi
-      if ! grep -q '^MPI_CXXFLAGS' "${MANA_MKCONFIG}"; then
-        echo "MPI_CXXFLAGS = ${MPICH_COMPAT_FLAGS}" >> "${MANA_MKCONFIG}"
-      fi
-    fi
-  fi
-
-  # Also inject the flags via the MPICH wrapper's own env vars so that
-  # mpic++ passes them to the underlying compiler automatically.
-  export MPICH_CXXFLAGS="${MPICH_CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
-  export MPICH_CFLAGS="${MPICH_CFLAGS:-} ${MPICH_COMPAT_FLAGS}"
-  # Cray MPICH uses CRAY_MPICH_* env vars; set them too for portability.
-  export CRAY_MPICH_CXXFLAGS="${CRAY_MPICH_CXXFLAGS:-} ${MPICH_COMPAT_FLAGS}"
-  export CRAY_MPICH_CFLAGS="${CRAY_MPICH_CFLAGS:-} ${MPICH_COMPAT_FLAGS}"
 
   # Clean any previous failed build artifacts before retrying.
   if [ -d mpi-proxy-split/mpi-wrappers ]; then
@@ -302,11 +291,12 @@ else
     echo ""
     echo "[WARN]  MANA build failed.  This is typically caused by an"
     echo "        incompatibility between MANA and the system MPI library"
-    echo "        (e.g. MPICH ≥ 5.0 large-count overloaded declarations)."
+    echo "        (e.g. Clang/icpx #pragma weak ambiguity or MPICH >= 5.0"
+    echo "        overloaded declarations)."
     echo "        DMTCP is still installed and works for single-process"
     echo "        checkpointing.  MPI-level transparent checkpointing via"
     echo "        MANA is not available until MANA upstream adds support"
-    echo "        for this MPI version."
+    echo "        for this compiler/MPI combination."
     echo ""
   fi
   if $MANA_BUILD_OK; then
