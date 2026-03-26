@@ -315,11 +315,22 @@ else
 #define PMPI_MANA_Internal MPI_MANA_Internal' "${MPI_WRAPPERS}"
     fi
 
+    # 6. lower-half/switch-context.cpp uses "rex.W\n rdfsbase" and
+    #    "rex.W\n wrfsbase" inline assembly.  The Intel Clang integrated
+    #    assembler does not recognise "rex.W" as a standalone mnemonic.
+    #    Replace with the equivalent ".byte 0x48" REX.W prefix encoding.
+    SWITCH_CTX="mpi-proxy-split/lower-half/switch-context.cpp"
+    if [ -f "${SWITCH_CTX}" ] && grep -q 'rex\.W' "${SWITCH_CTX}"; then
+      info "Patching ${SWITCH_CTX}: rex.W -> .byte 0x48 for icpx asm ..."
+      sed -i 's/rex\.W\\n rdfsbase/.byte 0x48; rdfsbase/g; s/rex\.W\\n wrfsbase/.byte 0x48; wrfsbase/g' "${SWITCH_CTX}"
+    fi
+
     info "Patches applied."
   fi
 
   # Clean any previous failed build artifacts before retrying.
-  if [ -d mpi-proxy-split/mpi-wrappers ]; then
+  if [ -d mpi-proxy-split ]; then
+    make -C mpi-proxy-split clean 2>/dev/null || true
     make -C mpi-proxy-split/mpi-wrappers clean 2>/dev/null || true
   fi
 
