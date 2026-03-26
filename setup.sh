@@ -21,6 +21,25 @@ done
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
+PYTHON="${PYTHON:-python3}"
+
+# ── Python version gate ──────────────────────────────────────────────
+if ! command -v "$PYTHON" &>/dev/null; then
+  echo "ERROR: '$PYTHON' not found. Install Python ≥ 3.9 or set PYTHON=/path/to/python3.x" >&2
+  exit 1
+fi
+
+PY_MAJOR=$("$PYTHON" -c 'import sys; print(sys.version_info.major)')
+PY_MINOR=$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')
+PY_VER="$PY_MAJOR.$PY_MINOR"
+
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 9 ]; }; then
+  echo "ERROR: Python >= 3.9 is required (found $PY_VER via '$PYTHON')." >&2
+  echo "       Install a newer Python or re-run with:  PYTHON=python3.11 ./setup.sh" >&2
+  exit 1
+fi
+
+echo "Using Python $PY_VER ($PYTHON)"
 
 echo "Repository root: $REPO_ROOT"
 echo "Build directory: $BUILD_DIR"
@@ -130,10 +149,17 @@ if [ -d "$REPO_ROOT/tests/data" ]; then
   cp -r "$REPO_ROOT/tests/data" "$BUILD_DIR/data"
   echo "  $BUILD_DIR/data"
 fi
+# Copy DMTCP reference examples to build/example_refs/ (for 3-way comparison).
+if [ -d "$REPO_ROOT/tests/examples/dmtcp" ]; then
+  echo "Copying examples/dmtcp to $BUILD_DIR/example_refs ..."
+  mkdir -p "$BUILD_DIR/example_refs"
+  cp -rL "$REPO_ROOT/tests/examples/dmtcp" "$BUILD_DIR/example_refs/dmtcp"
+  echo "  $BUILD_DIR/example_refs/dmtcp"
+fi
 
 if [ ! -d "$BUILD_DIR/venv" ]; then
   echo "Creating virtualenv in build/venv ..."
-  python3 -m venv "$BUILD_DIR/venv"
+  "$PYTHON" -m venv "$BUILD_DIR/venv"
 fi
 
 echo "Activating venv and installing dependencies ..."
