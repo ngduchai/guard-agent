@@ -248,11 +248,14 @@ else
       sed -i 's/__typeof__(&MPI_##func)/__typeof__(\&PMPI_##func)/g' "${NEXTFUNC_H}"
     fi
 
-    # 2. Patch record-replay.h LOG_CALL macro: &MPI_##func -> &PMPI_##func
+    # 2. Patch record-replay.h GENERATE_FNC_PTR macro: &MPI_##FNC -> &PMPI_##FNC
+    #    The macro is: #define GENERATE_FNC_PTR(FNC)  &MPI_##FNC
+    #    Used by LOG_CALL and FNC_CALL macros.  With Clang, &MPI_Xxx is
+    #    ambiguous due to #pragma weak aliases; &PMPI_Xxx is unambiguous.
     RECORD_REPLAY_H="mpi-proxy-split/record-replay.h"
-    if [ -f "${RECORD_REPLAY_H}" ] && grep -q '&MPI_##func' "${RECORD_REPLAY_H}"; then
-      info "Patching ${RECORD_REPLAY_H}: &MPI_##func -> &PMPI_##func ..."
-      sed -i 's/&MPI_##func/\&PMPI_##func/g' "${RECORD_REPLAY_H}"
+    if [ -f "${RECORD_REPLAY_H}" ] && grep -q '&MPI_##FNC' "${RECORD_REPLAY_H}"; then
+      info "Patching ${RECORD_REPLAY_H}: &MPI_##FNC -> &PMPI_##FNC ..."
+      sed -i 's/&MPI_##FNC/\&PMPI_##FNC/g' "${RECORD_REPLAY_H}"
     fi
 
     # 3. Patch direct MPI_Xxx calls in wrapper .cpp files that are
@@ -283,6 +286,16 @@ else
             "$f"
         fi
       done
+    fi
+
+    # 4. Fix VLA (variable-length array) with initializer in
+    #    mpi_request_wrappers.cpp.  Clang rejects "int arr[n] = {0};"
+    #    when n is not a compile-time constant.  The subsequent loop
+    #    fills every element, so the initializer is unnecessary.
+    REQ_WRAPPERS="mpi-proxy-split/mpi-wrappers/mpi_request_wrappers.cpp"
+    if [ -f "${REQ_WRAPPERS}" ] && grep -q 'was_null\[count\] = {0}' "${REQ_WRAPPERS}"; then
+      info "Patching ${REQ_WRAPPERS}: removing VLA initializer ..."
+      sed -i 's/int was_null\[count\] = {0};/int was_null[count];/' "${REQ_WRAPPERS}"
     fi
   fi
 
