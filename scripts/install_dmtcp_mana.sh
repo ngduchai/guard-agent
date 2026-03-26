@@ -220,14 +220,34 @@ else
   fi
 
   info "Building MANA ..."
-  if [ -f configure ]; then
-    ./configure --prefix="${INSTALL_PREFIX}"
+  # MPICH ≥ 5.0 exposes C++ overloaded MPI function declarations in
+  # mpi_proto.h, which breaks MANA's __typeof__(&MPI_Send) pattern.
+  # Defining MPICH_SKIP_MPICXX tells the MPICH headers to suppress the
+  # C++ overloads so the wrappers compile cleanly with mpic++.
+  export CPPFLAGS="${CPPFLAGS:-} -DMPICH_SKIP_MPICXX"
+  export CXXFLAGS="${CXXFLAGS:-} -DMPICH_SKIP_MPICXX"
+  MANA_BUILD_OK=true
+  if [ -f configure ] && ! ./configure --prefix="${INSTALL_PREFIX}"; then
+    MANA_BUILD_OK=false
   fi
-  make -j"$(nproc)" || make
-  make install 2>/dev/null || \
-    cp -v lib/*.so "${INSTALL_PREFIX}/lib/dmtcp/" 2>/dev/null || \
-    info "MANA build completed; manual install may be needed"
-  ok "MANA built (check ${INSTALL_PREFIX}/lib/dmtcp/ for libmana.so)"
+  if $MANA_BUILD_OK && ! { make -j"$(nproc)" || make; }; then
+    MANA_BUILD_OK=false
+    echo ""
+    echo "[WARN]  MANA build failed.  This is typically caused by an"
+    echo "        incompatibility between MANA and the system MPI library"
+    echo "        (e.g. MPICH ≥ 5.0 large-count overloaded declarations)."
+    echo "        DMTCP is still installed and works for single-process"
+    echo "        checkpointing.  MPI-level transparent checkpointing via"
+    echo "        MANA is not available until MANA upstream adds support"
+    echo "        for this MPI version."
+    echo ""
+  fi
+  if $MANA_BUILD_OK; then
+    make install 2>/dev/null || \
+      cp -v lib/*.so "${INSTALL_PREFIX}/lib/dmtcp/" 2>/dev/null || \
+      info "MANA build completed; manual install may be needed"
+    ok "MANA built (check ${INSTALL_PREFIX}/lib/dmtcp/ for libmana.so)"
+  fi
 fi
 
 # ── 3. Verify ────────────────────────────────────────────────────────────
