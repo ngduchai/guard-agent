@@ -7,6 +7,9 @@
 # Default install prefix: $HOME/.local
 # ($HOME/.local/bin is typically already on PATH on Linux systems.)
 #
+# If python3 is not on PATH (common on HPC nodes), set PYTHON:
+#   PYTHON=/path/to/python3.11 ./scripts/install_dmtcp_mana.sh
+#
 # The script is idempotent — it skips steps that are already done.
 # After installation, a marker file is written so the validation
 # framework can auto-discover DMTCP tools without manual PATH changes.
@@ -105,8 +108,21 @@ else
   # MANA requires Python 3.7+.  On HPC systems python3 may not be on
   # PATH but versioned binaries (python3.9, python3.11, …) or module-
   # loaded interpreters often exist.  Search broadly before giving up.
+  #
+  # If auto-discovery fails, the user can set PYTHON to the full path:
+  #   PYTHON=/path/to/python3.11 ./scripts/install_dmtcp_mana.sh
   PYTHON3=""
   _find_python3() {
+    # 0. Honour the PYTHON env var if set by the user.
+    if [[ -n "${PYTHON:-}" ]]; then
+      if [[ -x "${PYTHON}" ]]; then
+        echo "${PYTHON}"; return
+      elif command -v "${PYTHON}" &>/dev/null; then
+        command -v "${PYTHON}"; return
+      else
+        echo "[WARN]  PYTHON='${PYTHON}' is not executable, ignoring." >&2
+      fi
+    fi
     # 1. Try plain python3.
     if command -v python3 &>/dev/null; then
       echo "python3"; return
@@ -166,29 +182,33 @@ else
     if [[ "${PY_MAJ}" -lt 3 ]] || { [[ "${PY_MAJ}" -eq 3 ]] && [[ "${PY_MIN}" -lt 7 ]]; }; then
       echo ""
       echo "[ERROR] Found ${PYTHON3} (${PY_VER}) but MANA requires Python >= 3.7."
-      echo "        Install or load a newer Python, then re-run this script."
+      echo "        Specify a newer interpreter:"
+      echo "          PYTHON=/path/to/python3.x ./scripts/install_dmtcp_mana.sh"
       echo ""
       exit 1
     fi
     info "Found ${PYTHON3} (${PY_VER})"
-    # Make sure configure can find it — put its directory first on PATH.
-    PYTHON3_DIR="$(dirname "$(command -v "${PYTHON3}" || echo "${PYTHON3}")")"
+    # Make sure configure can find it — put its directory first on PATH
+    # and create a temporary "python3" symlink if needed.
+    PYTHON3_ABS="$(command -v "${PYTHON3}" 2>/dev/null || echo "${PYTHON3}")"
+    PYTHON3_DIR="$(dirname "${PYTHON3_ABS}")"
     export PATH="${PYTHON3_DIR}:${PATH}"
-    # If the binary isn't named "python3", create a temporary symlink so
-    # configure's "checking for python3" succeeds.
-    if [[ "$(basename "${PYTHON3}")" != "python3" ]] && ! command -v python3 &>/dev/null; then
+    if ! command -v python3 &>/dev/null; then
       TMPBIN="$(mktemp -d)"
-      ln -sf "$(command -v "${PYTHON3}" || echo "${PYTHON3}")" "${TMPBIN}/python3"
+      ln -sf "${PYTHON3_ABS}" "${TMPBIN}/python3"
       export PATH="${TMPBIN}:${PATH}"
-      info "Created temporary python3 symlink at ${TMPBIN}/python3"
+      info "Created temporary python3 symlink at ${TMPBIN}/python3 -> ${PYTHON3_ABS}"
     fi
   else
     echo ""
     echo "[ERROR] Python 3.7+ not found anywhere.  MANA requires it."
     echo "        Searched: python3, python3.{7..13}, python, common HPC paths."
-    echo "        On module-based systems, try:"
-    echo "          module load python   # or: module load anaconda"
-    echo "        then re-run this script."
+    echo ""
+    echo "        Set the PYTHON env var to the full path of your interpreter:"
+    echo "          PYTHON=/path/to/python3.x ./scripts/install_dmtcp_mana.sh"
+    echo ""
+    echo "        Or on module-based systems:"
+    echo "          module load python && ./scripts/install_dmtcp_mana.sh"
     echo ""
     exit 1
   fi
