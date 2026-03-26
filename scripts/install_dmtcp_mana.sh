@@ -309,7 +309,7 @@ else
     #    resolves it back to the real function.
     MPI_WRAPPERS="mpi-proxy-split/mpi-wrappers/mpi_wrappers.cpp"
     if [ -f "${MPI_WRAPPERS}" ] && grep -q 'MANA_Internal' "${MPI_WRAPPERS}" \
-       && ! grep -q 'PMPI_MANA_Internal' "${MPI_WRAPPERS}"; then
+       && ! grep -q '#define PMPI_MANA_Internal' "${MPI_WRAPPERS}"; then
       info "Patching ${MPI_WRAPPERS}: adding PMPI_MANA_Internal compat define ..."
       sed -i '1i\/* Clang/icpx compat: MANA_Internal has no PMPI variant */\
 #define PMPI_MANA_Internal MPI_MANA_Internal' "${MPI_WRAPPERS}"
