@@ -102,6 +102,97 @@ else
     rm -rf dmtcp
     ln -sf "${DMTCP_SRC}" dmtcp
   fi
+  # MANA requires Python 3.7+.  On HPC systems python3 may not be on
+  # PATH but versioned binaries (python3.9, python3.11, …) or module-
+  # loaded interpreters often exist.  Search broadly before giving up.
+  PYTHON3=""
+  _find_python3() {
+    # 1. Try plain python3.
+    if command -v python3 &>/dev/null; then
+      echo "python3"; return
+    fi
+    # 2. Try versioned names (python3.7 … python3.13), highest first.
+    local v
+    for v in 13 12 11 10 9 8 7; do
+      if command -v "python3.${v}" &>/dev/null; then
+        echo "python3.${v}"; return
+      fi
+    done
+    # 3. Try plain python and verify it's 3.x.
+    if command -v python &>/dev/null; then
+      local maj
+      maj="$(python -c 'import sys; print(sys.version_info.major)' 2>/dev/null || true)"
+      if [[ "${maj}" == "3" ]]; then
+        echo "python"; return
+      fi
+    fi
+    # 4. Search common HPC/spack/conda prefix paths.
+    local search_dirs=(
+      /usr/bin /usr/local/bin
+      /opt/*/bin
+      "${HOME}/.conda/bin" "${HOME}/miniconda3/bin" "${HOME}/anaconda3/bin"
+    )
+    local d candidate
+    for d in "${search_dirs[@]}"; do
+      for v in 13 12 11 10 9 8 7; do
+        candidate="${d}/python3.${v}"
+        if [[ -x "${candidate}" ]]; then
+          echo "${candidate}"; return
+        fi
+      done
+      candidate="${d}/python3"
+      if [[ -x "${candidate}" ]]; then
+        echo "${candidate}"; return
+      fi
+    done
+    # 5. On module-based systems, try loading a python module.
+    if type module &>/dev/null 2>&1; then
+      local mod
+      for mod in python python3 anaconda; do
+        if module load "${mod}" 2>/dev/null; then
+          if command -v python3 &>/dev/null; then
+            echo "python3"; return
+          fi
+        fi
+      done
+    fi
+    return 1
+  }
+
+  if PYTHON3="$(_find_python3)"; then
+    PY_VER="$("${PYTHON3}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    PY_MAJ="$("${PYTHON3}" -c 'import sys; print(sys.version_info.major)')"
+    PY_MIN="$("${PYTHON3}" -c 'import sys; print(sys.version_info.minor)')"
+    if [[ "${PY_MAJ}" -lt 3 ]] || { [[ "${PY_MAJ}" -eq 3 ]] && [[ "${PY_MIN}" -lt 7 ]]; }; then
+      echo ""
+      echo "[ERROR] Found ${PYTHON3} (${PY_VER}) but MANA requires Python >= 3.7."
+      echo "        Install or load a newer Python, then re-run this script."
+      echo ""
+      exit 1
+    fi
+    info "Found ${PYTHON3} (${PY_VER})"
+    # Make sure configure can find it — put its directory first on PATH.
+    PYTHON3_DIR="$(dirname "$(command -v "${PYTHON3}" || echo "${PYTHON3}")")"
+    export PATH="${PYTHON3_DIR}:${PATH}"
+    # If the binary isn't named "python3", create a temporary symlink so
+    # configure's "checking for python3" succeeds.
+    if [[ "$(basename "${PYTHON3}")" != "python3" ]] && ! command -v python3 &>/dev/null; then
+      TMPBIN="$(mktemp -d)"
+      ln -sf "$(command -v "${PYTHON3}" || echo "${PYTHON3}")" "${TMPBIN}/python3"
+      export PATH="${TMPBIN}:${PATH}"
+      info "Created temporary python3 symlink at ${TMPBIN}/python3"
+    fi
+  else
+    echo ""
+    echo "[ERROR] Python 3.7+ not found anywhere.  MANA requires it."
+    echo "        Searched: python3, python3.{7..13}, python, common HPC paths."
+    echo "        On module-based systems, try:"
+    echo "          module load python   # or: module load anaconda"
+    echo "        then re-run this script."
+    echo ""
+    exit 1
+  fi
+
   info "Building MANA ..."
   if [ -f configure ]; then
     ./configure --prefix="${INSTALL_PREFIX}"
