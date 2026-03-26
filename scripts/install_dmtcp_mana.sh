@@ -241,6 +241,8 @@ else
   # where the ambiguity occurs.  PMPI_##func always has a single
   # unambiguous declaration and the exact same signature.
   if $MANA_BUILD_OK; then
+    info "Applying Clang/icpx compatibility patches ..."
+
     # 1. Patch NEXT_FUNC macro: __typeof__(&MPI_##func) -> __typeof__(&PMPI_##func)
     NEXTFUNC_H="mpi-proxy-split/mpi-wrappers/mpi_nextfunc.h"
     if [ -f "${NEXTFUNC_H}" ] && grep -q '__typeof__(&MPI_##func)' "${NEXTFUNC_H}"; then
@@ -265,7 +267,8 @@ else
     #
     #    Pattern: MPI_[A-Z][a-z] matches MPI API functions (MPI_Isend,
     #    MPI_Recv, MPI_Type_size, MPI_Allreduce, etc.) but NOT
-    #    all-caps macros (MPI_LOGGING, MPI_SUCCESS, MPI_COMM_WORLD).
+    #    all-caps macros (MPI_LOGGING, MPI_SUCCESS, MPI_COMM_WORLD)
+    #    and NOT MANA-internal functions like MPI_MANA_Internal.
     WRAPPERS_DIR="mpi-proxy-split/mpi-wrappers"
     if [ -d "${WRAPPERS_DIR}" ]; then
       # First, revert any incorrectly-patched all-caps MANA macros
@@ -297,6 +300,22 @@ else
       info "Patching ${REQ_WRAPPERS}: removing VLA initializer ..."
       sed -i 's/int was_null\[count\] = {0};/int was_null[count];/' "${REQ_WRAPPERS}"
     fi
+
+    # 5. MPI_MANA_Internal is a MANA-internal function (not part of the
+    #    MPI standard) that has no PMPI_ counterpart.  After Patch 1
+    #    changes &MPI_##func to &PMPI_##func in NEXT_FUNC, the expansion
+    #    NEXT_FUNC(MANA_Internal) would reference the non-existent
+    #    PMPI_MANA_Internal.  Add a compatibility define so the compiler
+    #    resolves it back to the real function.
+    MPI_WRAPPERS="mpi-proxy-split/mpi-wrappers/mpi_wrappers.cpp"
+    if [ -f "${MPI_WRAPPERS}" ] && grep -q 'MANA_Internal' "${MPI_WRAPPERS}" \
+       && ! grep -q 'PMPI_MANA_Internal' "${MPI_WRAPPERS}"; then
+      info "Patching ${MPI_WRAPPERS}: adding PMPI_MANA_Internal compat define ..."
+      sed -i '1i\/* Clang/icpx compat: MANA_Internal has no PMPI variant */\
+#define PMPI_MANA_Internal MPI_MANA_Internal' "${MPI_WRAPPERS}"
+    fi
+
+    info "Patches applied."
   fi
 
   # Clean any previous failed build artifacts before retrying.
