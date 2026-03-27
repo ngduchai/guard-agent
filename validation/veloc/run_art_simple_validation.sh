@@ -42,6 +42,27 @@ fi
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
+# Pre-flight: verify required external tools are available
+# ---------------------------------------------------------------------------
+MISSING_TOOLS=()
+for tool in cmake mpirun; do
+  if ! command -v "$tool" &>/dev/null; then
+    MISSING_TOOLS+=("$tool")
+  fi
+done
+if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
+  echo ""
+  echo "======================================================================" >&2
+  echo "[run] ERROR: Required tool(s) not found: ${MISSING_TOOLS[*]}" >&2
+  echo "" >&2
+  echo "  Ensure these are installed and available in your PATH." >&2
+  echo "  On HPC systems you may need to run:  module load cmake openmpi" >&2
+  echo "  Current PATH: ${PATH}" >&2
+  echo "======================================================================" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Configurable paths and parameters
 # ---------------------------------------------------------------------------
 ORIGINAL_DIR="${ORIGINAL_DIR:-${REPO_ROOT}/build/examples/art_simple}"

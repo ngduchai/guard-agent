@@ -100,6 +100,31 @@ class RunResult:
 
 
 # ---------------------------------------------------------------------------
+# External tool resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_tool(name: str) -> str:
+    """Resolve the full path of an external tool (e.g. ``cmake``, ``mpirun``).
+
+    Uses :func:`shutil.which` to search the current ``PATH``.  If the tool
+    cannot be found, raises :class:`FileNotFoundError` with a helpful message
+    that includes the ``PATH`` value so the user can diagnose the issue on
+    remote / HPC machines where tools may live in non-standard locations.
+    """
+    path = shutil.which(name)
+    if path is None:
+        env_path = os.environ.get("PATH", "(unset)")
+        raise FileNotFoundError(
+            f"Required tool '{name}' was not found on PATH.\n"
+            f"  PATH = {env_path}\n"
+            f"  Hint: ensure '{name}' is installed and available in your shell "
+            f"before activating the virtualenv, or set the full path via the "
+            f"{name.upper()}_PATH environment variable."
+        )
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Build helpers
 # ---------------------------------------------------------------------------
 
@@ -109,6 +134,63 @@ def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -
     proc = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env)
     proc.wait()
     return proc.returncode
+
+
+def _detect_veloc_dir() -> str | None:
+    """Auto-detect the VeloC installation prefix.
+
+    Resolution order:
+    1. ``VELOC_DIR`` environment variable (explicit override).
+    2. Search ``LD_LIBRARY_PATH`` for a directory containing ``libveloc-client.so``
+       and derive the prefix (parent of ``lib`` or ``lib64``).
+    3. Check well-known prefixes: ``~/.local``, ``~/usr``, ``/usr/local``.
+
+    Returns the prefix path (e.g. ``/home/user/.local``) or *None* if VeloC
+    cannot be found.
+    """
+    # 1. Explicit env var
+    env_dir = os.environ.get("VELOC_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        if p.is_dir():
+            print(f"[runner] VELOC_DIR from environment: {p}", flush=True)
+            return str(p)
+
+    # 2. Search LD_LIBRARY_PATH
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    for entry in ld_path.split(":"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        lib_dir = Path(entry)
+        if (lib_dir / "libveloc-client.so").is_file():
+            prefix = lib_dir.parent  # e.g. /home/user/.local/lib64 -> /home/user/.local
+            print(f"[runner] VeloC detected via LD_LIBRARY_PATH: prefix={prefix}", flush=True)
+            return str(prefix)
+
+    # 3. Well-known prefixes
+    home = Path.home()
+    for candidate in [home / ".local", home / "usr", Path("/usr/local")]:
+        for libsub in ["lib", "lib64"]:
+            if (candidate / libsub / "libveloc-client.so").is_file():
+                print(f"[runner] VeloC detected at well-known prefix: {candidate}", flush=True)
+                return str(candidate)
+
+    return None
+
+
+def _veloc_lib_dir(veloc_prefix: str) -> str | None:
+    """Return the library subdirectory (lib or lib64) under a VeloC prefix.
+
+    Checks ``lib64`` first (common on RHEL/SUSE-based HPC systems), then ``lib``.
+    Returns the full path to the library directory, or *None* if neither exists.
+    """
+    p = Path(veloc_prefix)
+    for subdir in ["lib64", "lib"]:
+        candidate = p / subdir
+        if (candidate / "libveloc-client.so").is_file():
+            return str(candidate)
+    return None
 
 
 def configure_and_build(
@@ -122,8 +204,15 @@ def configure_and_build(
     already exist (idempotent).  If *run_install* is True, also runs
     ``cmake --install`` with the install prefix set to *build_dir* so that
     runtime config files (e.g. ``veloc.cfg``) are placed next to the binary.
+
+    Auto-detects the VeloC installation directory and passes it to CMake as
+    ``-DVELOC_DIR=<prefix>`` so that the build can find ``libveloc-client.so``
+    and all its transitive dependencies regardless of the default in the
+    project's ``CMakeLists.txt``.
     """
     build_dir.mkdir(parents=True, exist_ok=True)
+
+    cmake = os.environ.get("CMAKE_PATH") or _resolve_tool("cmake")
 
     cache = build_dir / "CMakeCache.txt"
     makefile = build_dir / "Makefile"
@@ -131,17 +220,32 @@ def configure_and_build(
     configured = cache.exists() and (makefile.exists() or ninja_file.exists())
 
     if not configured:
-        code = _run_cmd(["cmake", "-S", str(source_dir), "-B", str(build_dir)])
+        configure_cmd = [cmake, "-S", str(source_dir), "-B", str(build_dir)]
+
+        # Auto-detect VeloC and pass its prefix to CMake so the generated
+        # CMakeLists.txt can find the library and all its dependencies.
+        veloc_dir = _detect_veloc_dir()
+        if veloc_dir:
+            configure_cmd.append(f"-DVELOC_DIR={veloc_dir}")
+            # Also pass CMAKE_PREFIX_PATH so find_package / find_library
+            # can locate VeloC's transitive dependencies.
+            veloc_lib = _veloc_lib_dir(veloc_dir)
+            if veloc_lib:
+                configure_cmd.append(
+                    f"-DCMAKE_PREFIX_PATH={veloc_dir}"
+                )
+
+        code = _run_cmd(configure_cmd)
         if code != 0:
             raise RuntimeError(f"CMake configuration failed for {source_dir}")
 
-    code = _run_cmd(["cmake", "--build", str(build_dir)])
+    code = _run_cmd([cmake, "--build", str(build_dir)])
     if code != 0:
         raise RuntimeError(f"Build failed for {source_dir}")
 
     if run_install:
         code = _run_cmd(
-            ["cmake", "--install", str(build_dir), "--prefix", str(build_dir)]
+            [cmake, "--install", str(build_dir), "--prefix", str(build_dir)]
         )
         if code != 0:
             raise RuntimeError(f"Install step failed for {source_dir}")
@@ -226,7 +330,8 @@ def run_once(
     stdout_path = output_dir / "stdout.txt"
     stderr_path = output_dir / "stderr.txt"
 
-    cmd = ["mpirun", "-np", str(num_procs), str(exe_path), *app_args]
+    mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
+    cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
     print(f"[runner] starting MPI run (cwd={cwd}): {' '.join(cmd)}", flush=True)
 
     t0 = time.monotonic()
@@ -490,7 +595,8 @@ def run_with_failure_injection(
         injection_flag_path = attempt_dir / "injection_success.flag"
 
         exe_path = _find_executable(build_dir, executable_name)
-        cmd = ["mpirun", "-np", str(num_procs), str(exe_path), *app_args]
+        mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
+        cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
         print(
             f"[runner] attempt {attempt}: starting MPI run (cwd={attempt_dir}): "
             f"{' '.join(cmd)}",
