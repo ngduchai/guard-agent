@@ -398,8 +398,21 @@ def _start_failure_injector(
     executable_name: str,
     injection_flag_path: Path,
     delay_seconds: float,
+    nodes: str | None = None,
+    hostfile: str | None = None,
 ) -> subprocess.Popen:
-    """Launch the failure_injector.py subprocess."""
+    """Launch the failure_injector.py subprocess.
+
+    Parameters
+    ----------
+    nodes:
+        Comma-separated list of hostnames participating in the MPI job.
+        Passed as ``--nodes`` to the injector so it can target processes
+        across multiple nodes via SSH.
+    hostfile:
+        Path to a hostfile (one hostname per line).  Passed as
+        ``--hostfile`` to the injector.  Ignored when *nodes* is given.
+    """
     script_path = Path(__file__).with_name("failure_injector.py")
     cmd = [
         sys.executable,
@@ -409,6 +422,10 @@ def _start_failure_injector(
         "--flag-path", str(injection_flag_path),
         "--delay-seconds", str(delay_seconds),
     ]
+    if nodes:
+        cmd.extend(["--nodes", nodes])
+    elif hostfile:
+        cmd.extend(["--hostfile", str(hostfile)])
     print(f"[runner] starting failure injector: {' '.join(cmd)}", flush=True)
     return subprocess.Popen(cmd)
 
@@ -537,6 +554,8 @@ def run_with_failure_injection(
     memory_monitor_fn: "callable | None" = None,
     memory_stop_event: "threading.Event | None" = None,
     memory_samples_holder: "list | None" = None,
+    injection_nodes: str | None = None,
+    injection_hostfile: str | None = None,
 ) -> RunResult:
     """Retry loop: inject failures until the resilient app completes successfully.
 
@@ -552,6 +571,18 @@ def run_with_failure_injection(
         accepted even if no failure was injected — this happens when the
         injection delay is longer than the total runtime.  The returned
         :class:`RunResult` will have ``injected=False`` in that case.
+
+    injection_nodes:
+        Comma-separated list of hostnames where MPI rank processes may be
+        running.  Forwarded to the failure injector so it can target
+        processes across multiple nodes via SSH.  When ``None`` the
+        injector auto-discovers nodes from SLURM/PBS environment variables
+        or falls back to localhost.
+
+    injection_hostfile:
+        Path to a hostfile (one hostname per line) used by the failure
+        injector for multi-node targeting.  Ignored when *injection_nodes*
+        is provided.
 
     Returns a :class:`RunResult` for the final successful attempt, with
     ``injected`` reflecting whether a failure was actually injected and
@@ -653,6 +684,8 @@ def run_with_failure_injection(
             executable_name=executable_name,
             injection_flag_path=injection_flag_path,
             delay_seconds=injection_delay,
+            nodes=injection_nodes,
+            hostfile=injection_hostfile,
         )
 
         mpi_return = mpi_proc.wait()
