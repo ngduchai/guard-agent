@@ -204,6 +204,25 @@ def _dmtcp_checkpoint(
 # Checkpoint size measurement
 # ---------------------------------------------------------------------------
 
+def _prepare_dmtcp_env(env: dict | None) -> dict:
+    """Prepare environment variables for DMTCP-launched processes.
+
+    Ensures ``HWLOC_COMPONENTS=-linuxio`` is set so that hwloc (used by
+    Open MPI for topology discovery) does not enumerate block devices
+    like ``/dev/nvme*``.  Without this, DMTCP's file-connection handler
+    crashes with "Unimplemented file type" when it intercepts the
+    ``openat`` call on the block device.
+    """
+    run_env = dict(os.environ if env is None else env)
+    # Disable hwloc Linux I/O component to avoid block-device enumeration.
+    hwloc = run_env.get("HWLOC_COMPONENTS", "")
+    if "-linuxio" not in hwloc:
+        run_env["HWLOC_COMPONENTS"] = (
+            f"{hwloc},-linuxio" if hwloc else "-linuxio"
+        )
+    return run_env
+
+
 def measure_checkpoint_size(ckpt_dir: Path) -> int | None:
     """Sum the sizes of all ``ckpt_*.dmtcp`` files in *ckpt_dir*."""
     total = 0
@@ -251,15 +270,24 @@ def dmtcp_run_once(
 
     start_coordinator(coord_port, ckpt_dir, tool_paths)
 
+    # Prepare environment with HWLOC_COMPONENTS=-linuxio to prevent
+    # hwloc from opening block devices (e.g. /dev/nvme*) which causes
+    # DMTCP to crash with "Unimplemented file type".
+    run_env = _prepare_dmtcp_env(env)
+
+    # Launch mpirun with dmtcp_launch wrapping only the application,
+    # NOT mpirun itself.  Wrapping mpirun causes DMTCP to intercept
+    # mpirun's internal hwloc/libudev file operations on block devices.
     cmd = [
+        "mpirun", "-np", str(num_procs),
         tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
-        "mpirun", "-np", str(num_procs), str(exe_path), *app_args,
+        str(exe_path), *app_args,
     ]
     print(f"[dmtcp] starting MPI run (cwd={cwd}): {' '.join(cmd)}", flush=True)
 
     t0 = time.monotonic()
     with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
-        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=env)
+        proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=run_env)
 
         mem_thread = None
         if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
@@ -360,9 +388,18 @@ def dmtcp_run_with_failure_injection(
     # ── Phase 1: initial launch ──────────────────────────────────────────
     start_coordinator(coord_port, ckpt_dir, tool_paths)
 
+    # Prepare environment with HWLOC_COMPONENTS=-linuxio to prevent
+    # hwloc from opening block devices (e.g. /dev/nvme*) which causes
+    # DMTCP to crash with "Unimplemented file type".
+    run_env = _prepare_dmtcp_env(env)
+
+    # Launch mpirun with dmtcp_launch wrapping only the application,
+    # NOT mpirun itself.  Wrapping mpirun causes DMTCP to intercept
+    # mpirun's internal hwloc/libudev file operations on block devices.
     cmd = [
+        "mpirun", "-np", str(num_procs),
         tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
-        "mpirun", "-np", str(num_procs), str(exe_path), *app_args,
+        str(exe_path), *app_args,
     ]
     print(
         f"[dmtcp] attempt: starting MPI run (cwd={cwd}): {' '.join(cmd)}",
@@ -371,7 +408,7 @@ def dmtcp_run_with_failure_injection(
 
     t0 = time.monotonic()
     with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
-        mpi_proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=env)
+        mpi_proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=run_env)
 
         mem_thread = None
         if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
@@ -474,7 +511,7 @@ def dmtcp_run_with_failure_injection(
     t_restart = time.monotonic()
     with restart_stdout.open("wb") as out_f, restart_stderr.open("wb") as err_f:
         restart_proc = subprocess.Popen(
-            restart_cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=env
+            restart_cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=run_env
         )
 
         mem_thread_restart = None

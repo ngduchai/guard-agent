@@ -41,14 +41,26 @@ if(DMTCP_STATIC_MPI)
         # ---------------------------------------------------------------
 
         # Find the corresponding shared libmpi.so
+        # NOTE: We cannot use find_library() here because it may return
+        # libmpi.a again (cache variable, or .a preferred on some systems).
+        # Instead, glob for libmpi.so* directly in the same directory.
         get_filename_component(_MPI_LIB_DIR "${MPI_CXX_STATIC_LIB}" DIRECTORY)
-        find_library(_MPI_SHARED_LIB
-            NAMES mpi
-            HINTS "${_MPI_LIB_DIR}"
-            PATH_SUFFIXES lib lib64
-            NO_DEFAULT_PATH)
+        file(GLOB _MPI_SHARED_CANDIDATES "${_MPI_LIB_DIR}/libmpi.so*")
+        # Filter out libmpicxx.so* and libmpifort.so*
+        set(_MPI_SHARED_LIB "")
+        foreach(_cand IN LISTS _MPI_SHARED_CANDIDATES)
+            get_filename_component(_cname "${_cand}" NAME)
+            if(_cname MATCHES "^libmpi\\.so")
+                set(_MPI_SHARED_LIB "${_cand}")
+                break()
+            endif()
+        endforeach()
         if(NOT _MPI_SHARED_LIB)
-            find_library(_MPI_SHARED_LIB NAMES mpi)
+            # Fallback: try the MPI imported target's location
+            get_target_property(_MPI_IMPORTED_LOC MPI::MPI_CXX IMPORTED_LOCATION)
+            if(_MPI_IMPORTED_LOC AND _MPI_IMPORTED_LOC MATCHES "\\.so")
+                set(_MPI_SHARED_LIB "${_MPI_IMPORTED_LOC}")
+            endif()
         endif()
 
         set(_MPI_TRANSITIVE_DEPS "")
