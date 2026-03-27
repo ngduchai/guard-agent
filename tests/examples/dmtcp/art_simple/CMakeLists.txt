@@ -7,6 +7,7 @@ project(art_simple_main)
 
 find_package(HDF5 REQUIRED)
 find_package(MPI REQUIRED)
+find_package(Threads REQUIRED)
 
 option(DMTCP_STATIC_MPI "Link MPI statically for MANA compatibility" ON)
 
@@ -69,8 +70,10 @@ if(DMTCP_STATIC_MPI)
             message(STATUS "DMTCP: found hwloc: ${_HWLOC_LIB}")
         endif()
 
+        # System libraries required by static MPICH: pthreads, dl, rt.
         target_link_libraries(art_simple_main HDF5::HDF5
-            ${MPI_CXX_STATIC_LIB} ${_MPI_TRANSITIVE_DEPS})
+            ${MPI_CXX_STATIC_LIB} ${_MPI_TRANSITIVE_DEPS}
+            Threads::Threads ${CMAKE_DL_LIBS} rt)
     else()
         message(WARNING
             "DMTCP: static libmpi.a not found; falling back to dynamic MPI. "
