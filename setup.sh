@@ -136,6 +136,9 @@ fi
 # Copy examples into build for test/demonstration (self-contained runs from build/)
 if [ -d "$REPO_ROOT/tests/examples/original" ]; then
   echo "Copying examples/original to $BUILD_DIR/examples ..."
+  if [ -d "$BUILD_DIR/examples" ]; then
+    rm -rf "$BUILD_DIR/examples"
+  fi
   cp -r "$REPO_ROOT/tests/examples/original" "$BUILD_DIR/examples"
   echo "  $BUILD_DIR/examples"
 fi
