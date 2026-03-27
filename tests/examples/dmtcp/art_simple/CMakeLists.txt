@@ -35,10 +35,9 @@ if(DMTCP_STATIC_MPI)
         # that libmpi.so would normally pull in via DT_NEEDED must be
         # specified explicitly on the link line.
         #
-        # Neither MPI_CXX_LIBRARIES nor `mpicxx -show` reliably lists
-        # these transitive deps (the wrapper only shows -lmpi/-lmpicxx).
-        # Instead, we inspect the actual libmpi.so with `readelf -d` to
-        # extract its NEEDED entries, then resolve each to a full path.
+        # We use `ldd` on the shared libmpi.so to get fully-resolved paths
+        # to all transitive dependencies, then link them alongside the
+        # static archive.
         # ---------------------------------------------------------------
 
         # Find the corresponding shared libmpi.so
@@ -55,61 +54,81 @@ if(DMTCP_STATIC_MPI)
         set(_MPI_TRANSITIVE_DEPS "")
 
         if(_MPI_SHARED_LIB)
-            message(STATUS "DMTCP: inspecting shared lib for NEEDED: ${_MPI_SHARED_LIB}")
+            message(STATUS "DMTCP: inspecting shared lib with ldd: ${_MPI_SHARED_LIB}")
 
-            # Use readelf to extract DT_NEEDED entries from libmpi.so
+            # Use ldd to get fully-resolved paths to all dependencies
             execute_process(
-                COMMAND readelf -d "${_MPI_SHARED_LIB}"
-                OUTPUT_VARIABLE _READELF_OUTPUT
+                COMMAND ldd "${_MPI_SHARED_LIB}"
+                OUTPUT_VARIABLE _LDD_OUTPUT
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 ERROR_QUIET
-                RESULT_VARIABLE _READELF_RC)
+                RESULT_VARIABLE _LDD_RC)
 
-            if(_READELF_RC EQUAL 0)
-                # Extract library names from lines like:
-                #  0x0000000000000001 (NEEDED)  Shared library: [libpmix.so.2]
-                string(REGEX MATCHALL "\\[lib[^\]]+\\.so[^\]]*\\]" _NEEDED_MATCHES "${_READELF_OUTPUT}")
+            if(_LDD_RC EQUAL 0)
+                # ldd output lines look like:
+                #   libpmix.so.2 => /usr/lib64/libpmix.so.2 (0x00007f...)
+                #   /lib64/ld-linux-x86-64.so.2 (0x00007f...)
+                #   linux-vdso.so.1 (0x00007f...)
+                string(REPLACE "\n" ";" _LDD_LINES "${_LDD_OUTPUT}")
 
-                set(_NEEDED_LIBS "")
-                foreach(_match IN LISTS _NEEDED_MATCHES)
-                    # Strip brackets: [libfoo.so.2] -> libfoo.so.2
-                    string(REGEX REPLACE "^\\[(.*)\\]$" "\\1" _soname "${_match}")
-                    # Extract base library name: libfoo.so.2 -> foo
-                    string(REGEX REPLACE "^lib(.+)\\.so.*$" "\\1" _libname "${_soname}")
-                    # Skip mpi/mpicxx themselves and standard C/C++ runtime
-                    if(_libname MATCHES "^(mpi|mpicxx|stdc\\+\\+|gcc_s|c|m|pthread)$")
-                        continue()
+                foreach(_line IN LISTS _LDD_LINES)
+                    # Match lines with "=> /path/to/lib.so"
+                    if(_line MATCHES "=>[ \t]+(/[^ \t]+)")
+                        set(_resolved_path "${CMAKE_MATCH_1}")
+                        # Extract library base name for filtering
+                        get_filename_component(_fname "${_resolved_path}" NAME)
+                        # Skip mpi/mpicxx, standard C/C++ runtime, linker, vdso
+                        if(_fname MATCHES "^lib(mpi|mpicxx|stdc\\+\\+|gcc_s|c|m|pthread|dl|rt)\\.")
+                            continue()
+                        endif()
+                        if(_fname MATCHES "^ld-linux" OR _fname MATCHES "^linux-vdso")
+                            continue()
+                        endif()
+                        list(APPEND _MPI_TRANSITIVE_DEPS "${_resolved_path}")
                     endif()
-                    list(APPEND _NEEDED_LIBS "${_libname}")
                 endforeach()
 
-                list(REMOVE_DUPLICATES _NEEDED_LIBS)
-                message(STATUS "DMTCP: libmpi.so NEEDED libs: ${_NEEDED_LIBS}")
-
-                # Resolve each library name to a full path
-                foreach(_libname IN LISTS _NEEDED_LIBS)
-                    find_library(_dep_${_libname}
-                        NAMES ${_libname}
-                        HINTS "${_MPI_LIB_DIR}" "${_MPI_LIB_DIR}/.."
-                        PATH_SUFFIXES lib lib64
-                    )
-                    if(_dep_${_libname})
-                        list(APPEND _MPI_TRANSITIVE_DEPS "${_dep_${_libname}}")
-                        message(STATUS "DMTCP:   resolved ${_libname} -> ${_dep_${_libname}}")
-                    else()
-                        # Fall back to -l flag; the linker will search system paths
-                        list(APPEND _MPI_TRANSITIVE_DEPS "${_libname}")
-                        message(STATUS "DMTCP:   ${_libname} -> using -l fallback")
-                    endif()
+                list(REMOVE_DUPLICATES _MPI_TRANSITIVE_DEPS)
+                message(STATUS "DMTCP: ldd resolved deps (${_MPI_SHARED_LIB}):")
+                foreach(_dep IN LISTS _MPI_TRANSITIVE_DEPS)
+                    message(STATUS "DMTCP:   ${_dep}")
                 endforeach()
             else()
-                message(WARNING "DMTCP: readelf failed on ${_MPI_SHARED_LIB}")
+                message(WARNING "DMTCP: ldd failed on ${_MPI_SHARED_LIB}, "
+                    "falling back to readelf approach")
+
+                # Fallback: use readelf -d to extract NEEDED entries
+                execute_process(
+                    COMMAND readelf -d "${_MPI_SHARED_LIB}"
+                    OUTPUT_VARIABLE _READELF_OUTPUT
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET
+                    RESULT_VARIABLE _READELF_RC)
+
+                if(_READELF_RC EQUAL 0)
+                    string(REGEX MATCHALL "\\[lib[^\]]+\\.so[^\]]*\\]"
+                        _NEEDED_MATCHES "${_READELF_OUTPUT}")
+                    foreach(_match IN LISTS _NEEDED_MATCHES)
+                        string(REGEX REPLACE "^\\[(.*)\\]$" "\\1" _soname "${_match}")
+                        string(REGEX REPLACE "^lib(.+)\\.so.*$" "\\1" _libname "${_soname}")
+                        if(_libname MATCHES "^(mpi|mpicxx|stdc\\+\\+|gcc_s|c|m|pthread)$")
+                            continue()
+                        endif()
+                        find_library(_dep_${_libname} NAMES ${_libname}
+                            HINTS "${_MPI_LIB_DIR}")
+                        if(_dep_${_libname})
+                            list(APPEND _MPI_TRANSITIVE_DEPS "${_dep_${_libname}}")
+                        else()
+                            list(APPEND _MPI_TRANSITIVE_DEPS "${_libname}")
+                        endif()
+                    endforeach()
+                endif()
             endif()
         else()
             message(WARNING "DMTCP: could not find shared libmpi.so to inspect")
         endif()
 
-        message(STATUS "DMTCP: transitive deps: ${_MPI_TRANSITIVE_DEPS}")
+        message(STATUS "DMTCP: total transitive deps: ${_MPI_TRANSITIVE_DEPS}")
 
         # Apply any linker flags from FindMPI
         if(MPI_CXX_LINK_FLAGS)
