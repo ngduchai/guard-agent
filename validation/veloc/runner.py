@@ -330,6 +330,21 @@ def run_once(
     stdout_path = output_dir / "stdout.txt"
     stderr_path = output_dir / "stderr.txt"
 
+    # Ensure LD_LIBRARY_PATH includes the VeloC library directory so that
+    # libveloc-client.so can find its transitive dependencies (libveloc-modules,
+    # liber, libredset, libshuffile, libkvtree, librankstr, libaxl, etc.) at
+    # runtime.  This is especially important on Cray/PALS systems where mpirun
+    # may not forward the login-node environment to compute nodes.
+    run_env = dict(env) if env else dict(os.environ)
+    veloc_dir = _detect_veloc_dir()
+    if veloc_dir:
+        veloc_lib = _veloc_lib_dir(veloc_dir)
+        if veloc_lib:
+            existing_ld = run_env.get("LD_LIBRARY_PATH", "")
+            if veloc_lib not in existing_ld.split(":"):
+                run_env["LD_LIBRARY_PATH"] = f"{veloc_lib}:{existing_ld}" if existing_ld else veloc_lib
+                print(f"[runner] added {veloc_lib} to LD_LIBRARY_PATH for MPI run", flush=True)
+
     mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
     cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
     print(f"[runner] starting MPI run (cwd={cwd}): {' '.join(cmd)}", flush=True)
@@ -337,7 +352,7 @@ def run_once(
     t0 = time.monotonic()
     with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
         proc = subprocess.Popen(
-            cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=env
+            cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=run_env
         )
 
         # Start memory monitoring thread if requested.
@@ -603,10 +618,22 @@ def run_with_failure_injection(
             flush=True,
         )
 
+        # Ensure LD_LIBRARY_PATH includes VeloC library directory for MPI runs
+        # (same logic as in run_once).
+        run_env = dict(os.environ)
+        _veloc_prefix = _detect_veloc_dir()
+        if _veloc_prefix:
+            _vlib = _veloc_lib_dir(_veloc_prefix)
+            if _vlib:
+                _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
+                if _vlib not in _existing_ld.split(":"):
+                    run_env["LD_LIBRARY_PATH"] = f"{_vlib}:{_existing_ld}" if _existing_ld else _vlib
+
         t0 = time.monotonic()
         with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
             mpi_proc = subprocess.Popen(
-                cmd, cwd=str(attempt_dir), stdout=out_f, stderr=err_f
+                cmd, cwd=str(attempt_dir), stdout=out_f, stderr=err_f,
+                env=run_env,
             )
 
         # Start per-attempt memory monitoring if requested.
