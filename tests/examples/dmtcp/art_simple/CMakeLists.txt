@@ -151,8 +151,75 @@ if(DMTCP_STATIC_MPI)
             endif()
         endif()
 
-        target_link_libraries(art_simple_main HDF5::HDF5
-            ${MPI_CXX_STATIC_LIB} ${_MPI_TRANSITIVE_DEPS}
+        # ---------------------------------------------------------------
+        # Link HDF5 WITHOUT its transitive MPI dependency.
+        #
+        # On systems where HDF5 is built with parallel (MPI) support,
+        # the HDF5::HDF5 imported target includes libmpi.so in its
+        # INTERFACE_LINK_LIBRARIES.  This causes the dynamic libmpi.so
+        # to appear on the link line AFTER our static libmpi.a, which
+        # makes the final binary dynamically linked against MPI —
+        # defeating the purpose of static MPI linking for MANA.
+        #
+        # To fix this, we extract HDF5's include directories and library
+        # path manually, and link libhdf5 directly without going through
+        # the imported target.  We also use --whole-archive for libmpi.a
+        # so all MPI symbols are available when libhdf5.so resolves them
+        # at load time.
+        # ---------------------------------------------------------------
+
+        # Extract HDF5 include directories from the imported target.
+        set(_HDF5_INCLUDE_DIRS "")
+        if(TARGET hdf5-shared)
+            get_target_property(_HDF5_INCLUDE_DIRS hdf5-shared INTERFACE_INCLUDE_DIRECTORIES)
+        elseif(TARGET HDF5::HDF5)
+            get_target_property(_HDF5_INCLUDE_DIRS HDF5::HDF5 INTERFACE_INCLUDE_DIRECTORIES)
+        endif()
+        if(NOT _HDF5_INCLUDE_DIRS)
+            set(_HDF5_INCLUDE_DIRS "${HDF5_INCLUDE_DIRS}")
+        endif()
+        if(_HDF5_INCLUDE_DIRS)
+            target_include_directories(art_simple_main PRIVATE ${_HDF5_INCLUDE_DIRS})
+        endif()
+
+        # Extract HDF5 library path.  We need the actual .so/.a path,
+        # not the imported target (which would drag in libmpi.so).
+        set(_HDF5_LIBRARIES "")
+        if(TARGET hdf5-shared)
+            get_target_property(_HDF5_LOC hdf5-shared IMPORTED_LOCATION)
+            if(_HDF5_LOC)
+                list(APPEND _HDF5_LIBRARIES "${_HDF5_LOC}")
+            endif()
+        endif()
+        if(NOT _HDF5_LIBRARIES AND HDF5_C_LIBRARIES)
+            # Filter out any MPI libraries from HDF5's library list
+            foreach(_hdf5_lib IN LISTS HDF5_C_LIBRARIES)
+                get_filename_component(_hdf5_lib_name "${_hdf5_lib}" NAME)
+                if(NOT _hdf5_lib_name MATCHES "^libmpi")
+                    list(APPEND _HDF5_LIBRARIES "${_hdf5_lib}")
+                endif()
+            endforeach()
+        endif()
+        if(NOT _HDF5_LIBRARIES AND HDF5_LIBRARIES)
+            foreach(_hdf5_lib IN LISTS HDF5_LIBRARIES)
+                get_filename_component(_hdf5_lib_name "${_hdf5_lib}" NAME)
+                if(NOT _hdf5_lib_name MATCHES "^libmpi")
+                    list(APPEND _HDF5_LIBRARIES "${_hdf5_lib}")
+                endif()
+            endforeach()
+        endif()
+
+        message(STATUS "DMTCP: HDF5 includes: ${_HDF5_INCLUDE_DIRS}")
+        message(STATUS "DMTCP: HDF5 libraries (MPI-filtered): ${_HDF5_LIBRARIES}")
+
+        # Use --whole-archive for libmpi.a so all MPI symbols are
+        # included in the binary.  This ensures that when libhdf5.so
+        # (which depends on libmpi.so at runtime) loads, the MPI symbols
+        # are already resolved from the static archive.
+        target_link_libraries(art_simple_main
+            -Wl,--whole-archive ${MPI_CXX_STATIC_LIB} -Wl,--no-whole-archive
+            ${_HDF5_LIBRARIES}
+            ${_MPI_TRANSITIVE_DEPS}
             Threads::Threads ${CMAKE_DL_LIBS} rt)
     else()
         message(WARNING
