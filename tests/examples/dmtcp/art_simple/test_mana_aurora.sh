@@ -40,14 +40,14 @@
 
 set -euo pipefail
 
+# ── Locate repo root (resolve BEFORE any cd) ─────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+
 # If running under PBS, cd to the submission directory
 if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
     cd "${PBS_O_WORKDIR}"
 fi
-
-# ── Locate repo root ─────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 # ── Configuration ─────────────────────────────────────────────────────────
 DATA_PATH="${DATA_PATH:-${REPO_ROOT}/build/data/tooth_preprocessed.h5}"
