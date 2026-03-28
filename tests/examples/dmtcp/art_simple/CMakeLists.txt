@@ -8,6 +8,7 @@ project(art_simple_main)
 find_package(HDF5 REQUIRED)
 find_package(MPI REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
 option(DMTCP_STATIC_MPI "Link MPI statically for MANA compatibility" ON)
 
