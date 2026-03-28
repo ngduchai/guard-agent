@@ -240,10 +240,29 @@ if(DMTCP_STATIC_MPI)
         set_target_properties(art_simple_main PROPERTIES
             LINK_FLAGS "${_existing_link_flags} -Wl,--whole-archive ${MPI_CXX_STATIC_LIB} -Wl,--no-whole-archive")
 
-        target_link_libraries(art_simple_main
-            HDF5::HDF5
-            ${_MPI_TRANSITIVE_DEPS}
-            Threads::Threads ${CMAKE_DL_LIBS} rt)
+        # ---------------------------------------------------------------
+        # Prefer static HDF5 (libhdf5.a) over shared (libhdf5.so).
+        #
+        # Even after stripping MPI from HDF5's INTERFACE_LINK_LIBRARIES,
+        # the shared libhdf5.so still has libmpi.so in its DT_NEEDED
+        # entries.  The dynamic linker will load libmpi.so at runtime,
+        # which conflicts with MANA's split-process architecture.
+        #
+        # Using the static hdf5-static target avoids this entirely.
+        # ---------------------------------------------------------------
+        if(TARGET hdf5-static)
+            message(STATUS "DMTCP: using static HDF5 (hdf5-static) to avoid runtime libmpi.so dependency")
+            target_link_libraries(art_simple_main
+                hdf5-static
+                ${_MPI_TRANSITIVE_DEPS}
+                Threads::Threads ${CMAKE_DL_LIBS} rt)
+        else()
+            message(STATUS "DMTCP: hdf5-static not available, falling back to HDF5::HDF5 (shared)")
+            target_link_libraries(art_simple_main
+                HDF5::HDF5
+                ${_MPI_TRANSITIVE_DEPS}
+                Threads::Threads ${CMAKE_DL_LIBS} rt)
+        endif()
     else()
         message(WARNING
             "DMTCP: static libmpi.a not found; falling back to dynamic MPI. "
