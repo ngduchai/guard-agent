@@ -170,6 +170,10 @@ if(DMTCP_STATIC_MPI)
         # Helper function: strip MPI-related entries from a target's
         # INTERFACE_LINK_LIBRARIES.  Uses function() instead of macro()
         # to get proper variable scoping for recursion.
+        #
+        # NOTE: HDF5's config-mode package wraps MPI in generator
+        # expressions like:  $<$<BOOL:ON>:MPI::MPI_C>
+        # We must match these as well as plain "MPI::MPI_C" strings.
         function(_strip_mpi_from_target _target)
             if(NOT TARGET ${_target})
                 return()
@@ -181,13 +185,14 @@ if(DMTCP_STATIC_MPI)
             message(STATUS "DMTCP: inspecting ${_target} INTERFACE_LINK_LIBRARIES: ${_iface_libs}")
             set(_filtered_libs "")
             foreach(_lib IN LISTS _iface_libs)
-                # Skip MPI imported targets
+                # Skip MPI imported targets (plain)
                 if(_lib MATCHES "^MPI::")
                     message(STATUS "DMTCP: stripping ${_lib} from ${_target}")
                     continue()
                 endif()
-                # Skip direct libmpi paths (libmpi.so, libmpi.a, etc.)
-                if(_lib MATCHES "libmpi\\." OR _lib MATCHES "/libmpi[^a-zA-Z]")
+                # Skip generator expressions containing MPI targets or libmpi
+                # e.g. $<$<BOOL:ON>:MPI::MPI_C>  or  $<...:libmpi.so>
+                if(_lib MATCHES "MPI::MPI" OR _lib MATCHES "libmpi[^a-zA-Z]")
                     message(STATUS "DMTCP: stripping ${_lib} from ${_target}")
                     continue()
                 endif()
