@@ -227,7 +227,7 @@ cleanup() {
     echo ""
     echo "[cleanup] Stopping coordinator on port ${COORD_PORT} ..."
     "${DMTCP_COMMAND}" -h "${COORD_HOST}" --port "${COORD_PORT}" --quit 2>/dev/null || true
-    pkill -f "dmtcp_coordinator.*--port ${COORD_PORT}" 2>/dev/null || true
+    pkill -f "dmtcp_coordinator.*${COORD_PORT}" 2>/dev/null || true
     pkill -f "art_simple_main" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -241,9 +241,12 @@ mkdir -p "${CKPT_DIR}" "${OUTPUT_DIR}"
 sleep 0.5
 
 echo "[coord] Starting MANA coordinator on port ${COORD_PORT} (host: ${COORD_HOST}) ..."
-"${MANA_START_COORD}" --coord-host "${COORD_HOST}" --port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
+# Note: dmtcp_coordinator does NOT accept --coord-host; it binds to all interfaces.
+# --coord-host is only for clients (dmtcp_command, mana_launch, mana_restart).
+# The coordinator uses --coord-port (or -p), NOT --port.
+"${MANA_START_COORD}" --coord-port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
     echo "[coord] mana_start_coordinator failed, trying manual start..."
-    "${DMTCP_COORDINATOR}" --daemon --coord-host "${COORD_HOST}" --port "${COORD_PORT}" \
+    "${DMTCP_COORDINATOR}" --daemon --coord-port "${COORD_PORT}" \
         --ckptdir "${CKPT_DIR}" 2>&1 || true
 }
 sleep 1
