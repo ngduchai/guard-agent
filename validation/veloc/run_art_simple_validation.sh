@@ -42,6 +42,29 @@ fi
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
+# Auto-detect DMTCP tools and add to PATH if available
+# ---------------------------------------------------------------------------
+# The Python dmtcp_runner.py also discovers DMTCP tools independently, but
+# adding them to PATH here ensures the pre-flight check below can verify
+# their presence and any shell-level DMTCP commands work.
+if [[ -f "${HOME}/.local/share/guard-agent/dmtcp_prefix" ]]; then
+  _DMTCP_PREFIX="$(cat "${HOME}/.local/share/guard-agent/dmtcp_prefix")"
+  if [[ -d "${_DMTCP_PREFIX}/bin" ]]; then
+    export PATH="${_DMTCP_PREFIX}/bin:${PATH}"
+  fi
+elif [[ -x "${HOME}/.local/bin/dmtcp_launch" ]]; then
+  export PATH="${HOME}/.local/bin:${PATH}"
+fi
+
+# Prevent hwloc from enumerating block devices (e.g. /dev/nvme*) which
+# causes DMTCP to crash with "Unimplemented file type".  The Python
+# dmtcp_runner also sets this per-subprocess, but exporting here ensures
+# it is inherited by all child processes.
+if [[ "${HWLOC_COMPONENTS:-}" != *"-linuxio"* ]]; then
+  export HWLOC_COMPONENTS="${HWLOC_COMPONENTS:+${HWLOC_COMPONENTS},}-linuxio"
+fi
+
+# ---------------------------------------------------------------------------
 # Pre-flight: verify required external tools are available
 # ---------------------------------------------------------------------------
 MISSING_TOOLS=()
@@ -60,6 +83,16 @@ if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
   echo "  Current PATH: ${PATH}" >&2
   echo "======================================================================" >&2
   exit 1
+fi
+
+# Check for DMTCP tools (optional – warn if not found but don't fail;
+# the Python framework will skip DMTCP approach gracefully).
+if ! command -v dmtcp_launch &>/dev/null; then
+  echo ""
+  echo "[run] WARNING: DMTCP tools not found in PATH." >&2
+  echo "  DMTCP approach correctness/benchmark checks will be skipped." >&2
+  echo "  To install: ./scripts/install_dmtcp_mana.sh" >&2
+  echo ""
 fi
 
 # ---------------------------------------------------------------------------

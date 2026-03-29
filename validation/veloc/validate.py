@@ -485,8 +485,15 @@ def _stage_correctness(
     res_exe: str,
     orig_app_args: list[str],
     res_app_args: list[str],
+    approaches: list[ApproachConfig] | None = None,
+    build_root: Path | None = None,
 ) -> list[CompareResult]:
-    """Run baseline + resilient, compare outputs. Returns a list of CompareResult."""
+    """Run baseline + resilient + approaches, compare outputs.
+
+    Returns a list of CompareResult.  When *approaches* is provided, each
+    enabled approach is built, run with and without failure injection, and
+    its output is compared against the baseline using the same comparator.
+    """
     print("\n" + "=" * 70, flush=True)
     print("[validate] STAGE 1: Correctness Validation", flush=True)
     print("=" * 70, flush=True)
@@ -561,26 +568,28 @@ def _stage_correctness(
     baseline_file = baseline_out / args.output_file_name
     resilient_file = resilient_out / args.output_file_name
     print(
-        f"\n[validate] Comparing outputs (failure-prone):\n"
+        f"\n[validate] Comparing outputs (VeloC, failure-prone):\n"
         f"  baseline:  {baseline_file}\n"
         f"  resilient: {resilient_file}",
         flush=True,
     )
     result1 = comparator.compare(baseline_file, resilient_file)
-    print(f"[validate] Test 1 (failure-prone): {result1}", flush=True)
+    result1.method = f"{result1.method} [VeloC, failure-prone]"
+    print(f"[validate] Test 1 (VeloC, failure-prone): {result1}", flush=True)
     results.append(result1)
 
     # Test 2: baseline vs resilient (failure-free)
     resilient_clean_file = resilient_clean_out / args.output_file_name
     if resilient_clean_file.exists():
         print(
-            f"\n[validate] Comparing outputs (failure-free):\n"
+            f"\n[validate] Comparing outputs (VeloC, failure-free):\n"
             f"  baseline:  {baseline_file}\n"
             f"  resilient: {resilient_clean_file}",
             flush=True,
         )
         result2 = comparator.compare(baseline_file, resilient_clean_file)
-        print(f"[validate] Test 2 (failure-free): {result2}", flush=True)
+        result2.method = f"{result2.method} [VeloC, failure-free]"
+        print(f"[validate] Test 2 (VeloC, failure-free): {result2}", flush=True)
         results.append(result2)
     else:
         print(
@@ -588,6 +597,162 @@ def _stage_correctness(
             f"{resilient_clean_file} not found.",
             flush=True,
         )
+
+    # --- Approach correctness checks ---
+    if approaches:
+        from .dmtcp_runner import (
+            check_dmtcp_available,
+            dmtcp_run_once,
+            dmtcp_run_with_failure_injection,
+        )
+
+        effective_build_root = build_root if build_root else output_dir / "build"
+        test_num = len(results)
+
+        for approach in approaches:
+            print(
+                f"\n[validate] --- Approach correctness: {approach.label} "
+                f"(type={approach.approach_type}) ---",
+                flush=True,
+            )
+
+            # Verify tools are available.
+            if approach.approach_type == "dmtcp":
+                if not check_dmtcp_available(approach.install_prefix):
+                    print(
+                        f"[validate] WARNING: skipping approach {approach.name!r} – "
+                        "DMTCP tools not found in PATH.",
+                        flush=True,
+                    )
+                    continue
+            else:
+                print(
+                    f"[validate] WARNING: unknown approach type "
+                    f"{approach.approach_type!r} for {approach.name!r}; skipping.",
+                    flush=True,
+                )
+                continue
+
+            # Build approach codebase.
+            a_build = effective_build_root / approach.name
+            print(
+                f"[validate] Building {approach.name} codebase: "
+                f"{approach.codebase_dir} -> {a_build}",
+                flush=True,
+            )
+            configure_and_build(approach.codebase_dir, a_build)
+
+            a_exe = approach.executable_name or res_exe
+            # Use dedicated coordinator ports for correctness checks.
+            coord_port_base = 7900
+
+            # --- Approach run with failure injection ---
+            approach_fi_out = output_dir / "correctness" / f"{approach.name}_failure_injection"
+            ckpt_dir_fi = approach_fi_out / "dmtcp_ckpt"
+            print(
+                f"\n[validate] Running {approach.label} with failure injection...",
+                flush=True,
+            )
+            fi_result = dmtcp_run_with_failure_injection(
+                build_dir=a_build,
+                executable_name=a_exe,
+                num_procs=args.num_procs,
+                app_args=res_app_args,
+                output_dir=approach_fi_out,
+                ckpt_dir=ckpt_dir_fi,
+                coord_port=coord_port_base,
+                injection_delay=args.injection_delay,
+                run_cwd=approach_fi_out,
+                install_prefix=approach.install_prefix,
+            )
+
+            # Compare approach output (failure-prone) against baseline.
+            test_num += 1
+            approach_fi_file = approach_fi_out / args.output_file_name
+            if approach_fi_file.exists():
+                print(
+                    f"\n[validate] Comparing outputs ({approach.label}, failure-prone):\n"
+                    f"  baseline:  {baseline_file}\n"
+                    f"  approach:  {approach_fi_file}",
+                    flush=True,
+                )
+                fi_compare = comparator.compare(baseline_file, approach_fi_file)
+                fi_compare.method = f"{fi_compare.method} [{approach.label}, failure-prone]"
+                print(
+                    f"[validate] Test {test_num} ({approach.label}, failure-prone): "
+                    f"{fi_compare}",
+                    flush=True,
+                )
+                results.append(fi_compare)
+            else:
+                print(
+                    f"[validate] WARNING: {approach.label} failure-prone output not found: "
+                    f"{approach_fi_file}",
+                    flush=True,
+                )
+                results.append(CompareResult(
+                    passed=False,
+                    method=f"{approach.label} (failure-prone)",
+                    message=f"Output file not found: {approach_fi_file}",
+                ))
+
+            # --- Approach run without failure injection (failure-free check) ---
+            approach_clean_out = output_dir / "correctness" / f"{approach.name}_clean"
+            ckpt_dir_clean = approach_clean_out / "dmtcp_ckpt"
+            print(
+                f"\n[validate] Running {approach.label} without failure injection "
+                f"(failure-free check)...",
+                flush=True,
+            )
+            clean_result_a = dmtcp_run_once(
+                build_dir=a_build,
+                executable_name=a_exe,
+                num_procs=args.num_procs,
+                app_args=res_app_args,
+                output_dir=approach_clean_out,
+                ckpt_dir=ckpt_dir_clean,
+                coord_port=coord_port_base + 1,
+                run_cwd=approach_clean_out,
+                install_prefix=approach.install_prefix,
+            )
+            if not clean_result_a.succeeded:
+                print(
+                    f"[validate] WARNING: {approach.label} failure-free run exited "
+                    f"with code {clean_result_a.exit_code}",
+                    flush=True,
+                )
+
+            # Compare approach output (failure-free) against baseline.
+            test_num += 1
+            approach_clean_file = approach_clean_out / args.output_file_name
+            if approach_clean_file.exists():
+                print(
+                    f"\n[validate] Comparing outputs ({approach.label}, failure-free):\n"
+                    f"  baseline:  {baseline_file}\n"
+                    f"  approach:  {approach_clean_file}",
+                    flush=True,
+                )
+                clean_compare = comparator.compare(baseline_file, approach_clean_file)
+                clean_compare.method = (
+                    f"{clean_compare.method} [{approach.label}, failure-free]"
+                )
+                print(
+                    f"[validate] Test {test_num} ({approach.label}, failure-free): "
+                    f"{clean_compare}",
+                    flush=True,
+                )
+                results.append(clean_compare)
+            else:
+                print(
+                    f"[validate] WARNING: {approach.label} failure-free output not found: "
+                    f"{approach_clean_file}",
+                    flush=True,
+                )
+                results.append(CompareResult(
+                    passed=False,
+                    method=f"{approach.label} (failure-free)",
+                    message=f"Output file not found: {approach_clean_file}",
+                ))
 
     return results
 
@@ -867,6 +1032,8 @@ def main(argv: list[str] | None = None) -> int:
                     res_exe=res_exe,
                     orig_app_args=orig_app_args,
                     res_app_args=res_app_args,
+                    approaches=approaches if approaches else None,
+                    build_root=build_root,
                 )
             except Exception as exc:
                 _fail(

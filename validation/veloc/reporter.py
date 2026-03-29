@@ -853,7 +853,7 @@ def write_summary_report(
     overall_status = "✅ PASS" if passed == total else "❌ FAIL"
 
     lines: list[str] = [
-        "# VeloC Validation Summary Report",
+        "# Validation Summary Report",
         "",
         f"Generated: {now}",
         "",
