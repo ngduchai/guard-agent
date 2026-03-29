@@ -28,6 +28,7 @@
 #   CHECKPOINT_DELAY   – seconds before checkpoint (default: 10)
 #   TIMEOUT            – max seconds per phase (default: 300)
 #   COORD_PORT         – coordinator port (default: 7901)
+#   COORD_HOST         – coordinator hostname (default: $(hostname))
 #   SKIP_BUILD         – set to 1 to skip the rebuild step
 # ============================================================================
 #PBS -l select=1
@@ -54,6 +55,7 @@ NUM_PROCS="${NUM_PROCS:-1}"
 CHECKPOINT_DELAY="${CHECKPOINT_DELAY:-10}"
 TIMEOUT="${TIMEOUT:-300}"
 COORD_PORT="${COORD_PORT:-7901}"
+COORD_HOST="${COORD_HOST:-$(hostname)}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
 # App arguments: <hdf5_input> <center> <num_outer_iter> <num_iter> <beg_index> <num_sino>
@@ -99,6 +101,7 @@ echo "[config] TIMEOUT         : ${TIMEOUT}s"
 echo "[config] BUILD_DIR       : ${BUILD_DIR}"
 echo "[config] CKPT_DIR        : ${CKPT_DIR}"
 echo "[config] COORD_PORT      : ${COORD_PORT}"
+echo "[config] COORD_HOST      : ${COORD_HOST}"
 echo "[config] APP_ARGS        : ${APP_ARGS}"
 echo ""
 
@@ -223,7 +226,7 @@ fi
 cleanup() {
     echo ""
     echo "[cleanup] Stopping coordinator on port ${COORD_PORT} ..."
-    "${DMTCP_COMMAND}" --port "${COORD_PORT}" --quit 2>/dev/null || true
+    "${DMTCP_COMMAND}" -h "${COORD_HOST}" --port "${COORD_PORT}" --quit 2>/dev/null || true
     pkill -f "dmtcp_coordinator.*--port ${COORD_PORT}" 2>/dev/null || true
     pkill -f "art_simple_main" 2>/dev/null || true
 }
@@ -234,18 +237,18 @@ rm -rf "${CKPT_DIR}" "${OUTPUT_DIR}"
 mkdir -p "${CKPT_DIR}" "${OUTPUT_DIR}"
 
 # ── Step 2: Start MANA coordinator ───────────────────────────────────────
-"${DMTCP_COMMAND}" --port "${COORD_PORT}" --quit 2>/dev/null || true
+"${DMTCP_COMMAND}" -h "${COORD_HOST}" --port "${COORD_PORT}" --quit 2>/dev/null || true
 sleep 0.5
 
-echo "[coord] Starting MANA coordinator on port ${COORD_PORT} ..."
-"${MANA_START_COORD}" --port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
+echo "[coord] Starting MANA coordinator on port ${COORD_PORT} (host: ${COORD_HOST}) ..."
+"${MANA_START_COORD}" --coord-host "${COORD_HOST}" --port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
     echo "[coord] mana_start_coordinator failed, trying manual start..."
-    "${DMTCP_COORDINATOR}" --daemon --port "${COORD_PORT}" \
+    "${DMTCP_COORDINATOR}" --daemon --coord-host "${COORD_HOST}" --port "${COORD_PORT}" \
         --ckptdir "${CKPT_DIR}" 2>&1 || true
 }
 sleep 1
 
-if "${DMTCP_COMMAND}" --port "${COORD_PORT}" --status 2>/dev/null; then
+if "${DMTCP_COMMAND}" -h "${COORD_HOST}" --port "${COORD_PORT}" --status 2>/dev/null; then
     echo "[coord] Coordinator is running."
 else
     echo "WARNING: Could not verify coordinator status" >&2
@@ -256,7 +259,7 @@ echo ""
 export HWLOC_COMPONENTS="-linuxio"
 
 # ── Step 4: Launch app under MANA ────────────────────────────────────────
-LAUNCH_CMD="mpiexec -np ${NUM_PROCS} ${MANA_LAUNCH} --verbose --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip ${EXE} ${APP_ARGS}"
+LAUNCH_CMD="mpiexec -np ${NUM_PROCS} ${MANA_LAUNCH} --verbose --coord-host ${COORD_HOST} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip ${EXE} ${APP_ARGS}"
 
 echo "[launch] Command:"
 echo "  ${LAUNCH_CMD}"
@@ -314,7 +317,7 @@ fi
 
 echo "[ckpt] Triggering MANA/DMTCP checkpoint ..."
 CKPT_START=$(date +%s%N)
-if timeout "${TIMEOUT}" "${DMTCP_COMMAND}" --port "${COORD_PORT}" --checkpoint; then
+if timeout "${TIMEOUT}" "${DMTCP_COMMAND}" -h "${COORD_HOST}" --port "${COORD_PORT}" --checkpoint; then
     CKPT_END=$(date +%s%N)
     CKPT_MS=$(( (CKPT_END - CKPT_START) / 1000000 ))
     echo "[ckpt] Checkpoint completed in ${CKPT_MS}ms"
@@ -347,7 +350,7 @@ if [[ -z "${CKPT_FILES}" ]]; then
 fi
 
 echo "[restart] Restarting from checkpoint ..."
-RESTART_CMD="mpiexec -np ${NUM_PROCS} ${MANA_RESTART} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip"
+RESTART_CMD="mpiexec -np ${NUM_PROCS} ${MANA_RESTART} --coord-host ${COORD_HOST} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip"
 echo "[restart] Command: ${RESTART_CMD}"
 
 timeout "${TIMEOUT}" ${RESTART_CMD} \
