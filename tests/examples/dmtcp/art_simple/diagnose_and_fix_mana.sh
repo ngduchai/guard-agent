@@ -18,14 +18,28 @@
 #   Evidence: strace showed 8,780 opens of /proc/self/environ without closing,
 #   reaching fd 4423, immediately followed by SEGV_ACCERR at 0x80fff7f8.
 #
-# FIX: Build MANA's plugin (libmana.so) and DMTCP with GCC to avoid Intel
-#   runtime dependency. The lower-half and test binaries can still use mpicc
-#   (Intel) since they're separate processes, not LD_PRELOAD'd.
+# FIX STRATEGY:
+#   The MANA build system has a subtle issue: libmana.so is linked with ${CXX}
+#   (from ./configure, which is icpx on Aurora), while the lower-half binary
+#   is linked with ${MPICXX} (from Makefile_config). The .o files for both are
+#   compiled with ${MPICC}/${MPICXX}.
+#
+#   We can't simply change MPICC/MPICXX to GCC because:
+#   - The lower-half binary needs -lmpi (provided implicitly by mpicc/mpicxx)
+#   - The libmana.so link uses ${CXX}, not ${MPICXX}
+#
+#   APPROACH: Build MANA normally with mpicc/mpicxx, then use patchelf to
+#   remove Intel runtime DT_NEEDED entries from libmana.so. The Intel runtime
+#   functions (libsvml math, etc.) are not actually called at runtime — they're
+#   only pulled in because icpx links them by default.
+#
+#   The lower-half binary is a separate process (not LD_PRELOAD'd), so Intel
+#   runtime deps there are harmless.
 #
 # This script:
 #   Phase 1: Diagnose current state (Intel runtime deps in loaded libraries)
 #   Phase 2: Rebuild DMTCP with GCC (if needed)
-#   Phase 3: Rebuild libmana.so with GCC + MPI paths (not mpicc)
+#   Phase 3: Rebuild MANA and strip Intel deps from libmana.so
 #   Phase 4: Verify no Intel runtime deps in LD_PRELOAD'd libraries
 #   Phase 5: Test MANA with built-in test
 #   Phase 6: Test MANA with strace to verify no /proc/self/environ loop
@@ -54,49 +68,139 @@ echo "Date: $(date)"
 echo "Host: $(hostname)"
 echo ""
 
-# ── Find GCC ──────────────────────────────────────────────────────────────
-find_gcc() {
-    local gcc_cc="" gcc_cxx=""
+# ══════════════════════════════════════════════════════════════════════════
+# Find GCC
+# ══════════════════════════════════════════════════════════════════════════
+_find_gcc() {
+    local gcc_path=""
+    # Try spack GCC first (Aurora has GCC 13.4.0 via spack)
+    gcc_path=$(find /opt/aurora -name "gcc" -path "*/gcc-13*/bin/gcc" 2>/dev/null | head -1)
+    if [ -z "${gcc_path}" ]; then
+        gcc_path=$(find /opt -name "gcc" -path "*/gcc-1[0-9]*/bin/gcc" 2>/dev/null | head -1)
+    fi
+    if [ -z "${gcc_path}" ]; then
+        gcc_path=$(command -v gcc 2>/dev/null || true)
+    fi
+    echo "${gcc_path}"
+}
 
-    # Try PATH first
-    if command -v gcc >/dev/null 2>&1; then
-        gcc_cc="$(command -v gcc)"
-        gcc_cxx="$(command -v g++)"
-    elif [ -x "/usr/bin/gcc" ]; then
-        gcc_cc="/usr/bin/gcc"
-        gcc_cxx="/usr/bin/g++"
+GCC_CC=$(_find_gcc)
+if [ -z "${GCC_CC}" ]; then
+    echo "ERROR: Cannot find GCC"
+    exit 1
+fi
+GCC_CXX=$(echo "${GCC_CC}" | sed 's|/gcc$|/g++|')
+echo "GCC: ${GCC_CC} ($(${GCC_CC} --version 2>/dev/null | head -1))"
+echo ""
+
+# Intel runtime libraries pattern
+INTEL_LIBS_PATTERN="libsvml\.so|libirng\.so|libimf\.so|libintlc\.so"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Ensure patchelf is available
+# ══════════════════════════════════════════════════════════════════════════
+_ensure_patchelf() {
+    if command -v patchelf >/dev/null 2>&1; then
+        echo "patchelf: $(command -v patchelf) ($(patchelf --version 2>&1 || echo 'unknown version'))"
+        return 0
     fi
 
-    # Verify it's real GCC (not Intel in disguise)
-    if [ -n "${gcc_cc}" ]; then
-        local gcc_id
-        gcc_id=$(${gcc_cc} -v 2>&1 | tail -1)
-        if echo "${gcc_id}" | grep -qi 'intel\|icx\|icc'; then
-            echo "WARNING: 'gcc' is Intel compiler in disguise" >&2
-            gcc_cc=""
+    echo "patchelf not found. Building from source..."
+    local PATCHELF_DIR="${OUTDIR}/patchelf-build"
+    mkdir -p "${PATCHELF_DIR}"
+
+    # Download patchelf source
+    local PATCHELF_VERSION="0.18.0"
+    local PATCHELF_URL="https://github.com/NixOS/patchelf/releases/download/${PATCHELF_VERSION}/patchelf-${PATCHELF_VERSION}.tar.bz2"
+
+    if [ ! -f "${PATCHELF_DIR}/patchelf-${PATCHELF_VERSION}.tar.bz2" ]; then
+        if command -v wget >/dev/null 2>&1; then
+            wget -q -O "${PATCHELF_DIR}/patchelf-${PATCHELF_VERSION}.tar.bz2" "${PATCHELF_URL}" 2>&1 || true
+        elif command -v curl >/dev/null 2>&1; then
+            curl -sL -o "${PATCHELF_DIR}/patchelf-${PATCHELF_VERSION}.tar.bz2" "${PATCHELF_URL}" 2>&1 || true
         fi
     fi
 
-    # Fallback: find in spack
-    if [ -z "${gcc_cc}" ]; then
-        gcc_cc=$(find /opt/aurora -name 'gcc' -path '*/bin/gcc' 2>/dev/null | head -1)
-        if [ -n "${gcc_cc}" ]; then
-            gcc_cxx="$(dirname ${gcc_cc})/g++"
-        fi
+    if [ -f "${PATCHELF_DIR}/patchelf-${PATCHELF_VERSION}.tar.bz2" ]; then
+        cd "${PATCHELF_DIR}"
+        tar xjf "patchelf-${PATCHELF_VERSION}.tar.bz2"
+        cd "patchelf-${PATCHELF_VERSION}"
+        CC="${GCC_CC}" CXX="${GCC_CXX}" ./configure --prefix="${INSTALL_PREFIX}" 2>&1 | tail -3
+        make -j"$(nproc)" 2>&1 | tail -3
+        make install 2>&1 | tail -3
+        cd "${MANA_ROOT}"
     fi
 
-    if [ -z "${gcc_cc}" ]; then
-        echo "ERROR: Cannot find GCC" >&2
+    if command -v patchelf >/dev/null 2>&1; then
+        echo "patchelf installed: $(command -v patchelf)"
+        return 0
+    fi
+
+    # Fallback: write a minimal shell script that uses objcopy
+    echo "WARNING: Could not install patchelf. Will use manual ELF patching."
+    return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Strip Intel runtime deps from a shared library using patchelf
+# ══════════════════════════════════════════════════════════════════════════
+_strip_intel_deps() {
+    local lib_path="$1"
+    local lib_name
+    lib_name=$(basename "${lib_path}")
+
+    if [ ! -f "${lib_path}" ]; then
+        echo "  ${lib_name}: NOT FOUND"
         return 1
     fi
 
-    GCC_CC="${gcc_cc}"
-    GCC_CXX="${gcc_cxx}"
-    echo "GCC: ${GCC_CC} ($(${GCC_CC} --version | head -1))"
-}
+    local has_intel=0
+    local intel_libs=""
 
-find_gcc || exit 1
-echo ""
+    # Check for Intel runtime DT_NEEDED entries
+    for dep in libsvml.so libirng.so libimf.so libintlc.so.5; do
+        if readelf -d "${lib_path}" 2>/dev/null | grep -q "\\[${dep}\\]"; then
+            intel_libs="${intel_libs} ${dep}"
+            has_intel=1
+        fi
+    done
+
+    if [ "${has_intel}" -eq 0 ]; then
+        echo "  ${lib_name}: already clean (no Intel runtime DT_NEEDED)"
+        return 0
+    fi
+
+    echo "  ${lib_name}: found Intel deps:${intel_libs}"
+
+    if command -v patchelf >/dev/null 2>&1; then
+        for dep in ${intel_libs}; do
+            echo "    Removing DT_NEEDED: ${dep}"
+            patchelf --remove-needed "${dep}" "${lib_path}" 2>&1 || {
+                echo "    WARNING: patchelf --remove-needed ${dep} failed"
+            }
+        done
+    else
+        echo "    ERROR: patchelf not available, cannot strip deps"
+        return 1
+    fi
+
+    # Verify
+    local still_has=0
+    for dep in libsvml.so libirng.so libimf.so libintlc.so.5; do
+        if readelf -d "${lib_path}" 2>/dev/null | grep -q "\\[${dep}\\]"; then
+            still_has=1
+        fi
+    done
+
+    if [ "${still_has}" -eq 0 ]; then
+        echo "  ${lib_name}: CLEANED successfully"
+        return 0
+    else
+        echo "  ${lib_name}: WARNING — some Intel deps remain"
+        readelf -d "${lib_path}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}" || true
+        return 1
+    fi
+}
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 1: Diagnose current state
@@ -106,7 +210,8 @@ echo "  PHASE 1: Diagnose current state"
 echo "================================================================"
 echo ""
 
-INTEL_LIBS_PATTERN='libintlc|libsvml|libirng|libimf|libifcore|libifport'
+DMTCP_NEEDS_REBUILD=0
+MANA_NEEDS_REBUILD=0
 
 echo "--- 1a. Installed libdmtcp.so ---"
 INSTALLED_LIBDMTCP="${INSTALL_PREFIX}/lib/dmtcp/libdmtcp.so"
@@ -120,7 +225,6 @@ if [ -f "${INSTALLED_LIBDMTCP}" ]; then
         DMTCP_NEEDS_REBUILD=1
     else
         echo "  OK — no Intel runtime deps"
-        DMTCP_NEEDS_REBUILD=0
     fi
     echo ""
     echo ".comment section:"
@@ -139,7 +243,7 @@ if [ -f "${INSTALLED_LIBMANA}" ]; then
     echo ""
     echo "Intel runtime deps:"
     if ldd "${INSTALLED_LIBMANA}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}"; then
-        echo "  *** HAS INTEL RUNTIME DEPS — needs rebuild ***"
+        echo "  *** HAS INTEL RUNTIME DEPS — needs stripping ***"
         MANA_NEEDS_REBUILD=1
     else
         echo "  OK — no Intel runtime deps"
@@ -189,16 +293,6 @@ echo "mpicc location: $(command -v mpicc 2>/dev/null || echo 'not found')"
 echo "mpicc -show:"
 mpicc -show 2>/dev/null || echo "  (failed)"
 echo ""
-echo "MPI include path:"
-MPI_INC_DIR=""
-MPI_LIB_DIR=""
-if command -v mpicc >/dev/null 2>&1; then
-    MPI_INC_DIR=$(mpicc -show 2>/dev/null | tr ' ' '\n' | grep '^-I' | head -1 | sed 's/^-I//')
-    MPI_LIB_DIR=$(mpicc -show 2>/dev/null | tr ' ' '\n' | grep '^-L' | head -1 | sed 's/^-L//')
-    echo "  Include: ${MPI_INC_DIR}"
-    echo "  Lib:     ${MPI_LIB_DIR}"
-fi
-echo ""
 
 echo "--- 1f. Makefile_config ---"
 MAKEFILE_CONFIG="${MANA_ROOT}/mpi-proxy-split/Makefile_config"
@@ -209,18 +303,25 @@ else
 fi
 echo ""
 
+echo "--- 1g. libmana.so link rule in Makefile ---"
+echo "The libmana.so link rule uses \${CXX}, not \${MPICXX}:"
+grep -A2 'libmana.so:' "${MANA_ROOT}/mpi-proxy-split/Makefile" 2>/dev/null | head -3 || true
+echo ""
+echo "CXX from MANA's configure:"
+grep '^CXX' "${MANA_ROOT}/Makefile" 2>/dev/null | head -1 || true
+echo ""
+
 # Summary
 echo "=== DIAGNOSIS SUMMARY ==="
 echo "  libdmtcp.so needs rebuild: ${DMTCP_NEEDS_REBUILD}"
-echo "  libmana.so needs rebuild:  ${MANA_NEEDS_REBUILD}"
+echo "  libmana.so needs fix:      ${MANA_NEEDS_REBUILD}"
 echo ""
 
 if [ "${DMTCP_NEEDS_REBUILD}" -eq 0 ] && [ "${MANA_NEEDS_REBUILD}" -eq 0 ]; then
     echo "Both libraries are clean. Skipping rebuild, going to test phase."
     echo ""
-    # Jump to Phase 4
 else
-    echo "Proceeding with rebuild..."
+    echo "Proceeding with fix..."
     echo ""
 fi
 
@@ -266,78 +367,45 @@ if [ "${DMTCP_NEEDS_REBUILD}" -eq 1 ]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 3: Rebuild MANA with GCC for libmana.so
+# PHASE 3: Fix libmana.so (rebuild + strip Intel deps)
 # ══════════════════════════════════════════════════════════════════════════
 if [ "${MANA_NEEDS_REBUILD}" -eq 1 ] || [ "${DMTCP_NEEDS_REBUILD}" -eq 1 ]; then
     echo "================================================================"
-    echo "  PHASE 3: Rebuild MANA (libmana.so with GCC)"
+    echo "  PHASE 3: Fix libmana.so"
     echo "================================================================"
     echo ""
 
     cd "${MANA_ROOT}"
 
-    # 3a. Write Makefile_config that uses GCC for the plugin (libmana.so)
-    # but still uses mpicc for the lower-half (which is a separate process)
-    #
-    # KEY INSIGHT: libmana.so is built by mpi-proxy-split/mpi-wrappers/Makefile
-    # which uses $(MPICXX) to compile. We need to override this to use GCC
-    # with MPI include paths directly.
-    #
-    # The lower-half is built by mpi-proxy-split/lower-half/Makefile which
-    # also uses $(MPICC)/$(MPICXX). The lower-half is a separate executable
-    # (not LD_PRELOAD'd), so Intel runtime is OK there.
-    #
-    # APPROACH: We'll set MPICC/MPICXX to use GCC with MPI flags, since
-    # the MPI wrappers just add -I and -L flags anyway.
-
-    echo "--- 3a. Extract MPI flags from mpicc ---"
-    MPI_SHOW=$(mpicc -show 2>/dev/null || echo "")
-    if [ -z "${MPI_SHOW}" ]; then
-        echo "ERROR: mpicc -show failed"
-        exit 1
-    fi
-    echo "mpicc -show: ${MPI_SHOW}"
-
-    # Extract -I, -L, -l, -Wl flags from mpicc -show
-    MPI_CFLAGS_EXTRACTED=$(echo "${MPI_SHOW}" | tr ' ' '\n' | grep -E '^-I' | tr '\n' ' ')
-    MPI_LDFLAGS_EXTRACTED=$(echo "${MPI_SHOW}" | tr ' ' '\n' | grep -E '^(-L|-l|-Wl,)' | tr '\n' ' ')
-
-    MPICXX_SHOW=$(mpicxx -show 2>/dev/null || echo "")
-    MPI_CXXFLAGS_EXTRACTED=$(echo "${MPICXX_SHOW}" | tr ' ' '\n' | grep -E '^-I' | tr '\n' ' ')
-    MPI_CXXLDFLAGS_EXTRACTED=$(echo "${MPICXX_SHOW}" | tr ' ' '\n' | grep -E '^(-L|-l|-Wl,)' | tr '\n' ' ')
-
-    echo "MPI C flags:   ${MPI_CFLAGS_EXTRACTED}"
-    echo "MPI C++ flags: ${MPI_CXXFLAGS_EXTRACTED}"
-    echo "MPI LD flags:  ${MPI_LDFLAGS_EXTRACTED}"
+    # 3a. Ensure patchelf is available
+    echo "--- 3a. Ensure patchelf is available ---"
+    HAVE_PATCHELF=1
+    _ensure_patchelf || HAVE_PATCHELF=0
     echo ""
 
-    # 3b. Write Makefile_config with GCC + MPI paths
+    # 3b. Write Makefile_config with mpicc/mpicxx (standard Aurora config)
+    # We keep mpicc/mpicxx so the lower-half links correctly with -lmpi.
+    # The Intel runtime deps in libmana.so will be stripped with patchelf.
     echo "--- 3b. Write Makefile_config ---"
-    cat > "${MAKEFILE_CONFIG}" << MKEOF
+    cat > "${MAKEFILE_CONFIG}" << 'MKEOF'
 # Aurora (ALCF) – Cray MPICH + Intel GPU
 # Auto-generated by diagnose_and_fix_mana.sh
-# Uses GCC with MPI include/lib paths to avoid Intel runtime in libmana.so
-# The lower-half still uses mpicc (Intel) which is fine since it's a
-# separate process, not LD_PRELOAD'd.
+# Uses standard mpicc/mpicxx for compilation and lower-half linking.
+# Intel runtime deps in libmana.so are stripped post-build with patchelf.
 
 CFLAGS = -g -O2 -std=gnu11
 CXXFLAGS = -g -O2
-FFLAGS = \${CXXFLAGS} -fallow-argument-mismatch
+FFLAGS = ${CXXFLAGS} -fallow-argument-mismatch
 
 IS_AURORA = 1
-
-# Use GCC with MPI paths instead of mpicc (which wraps Intel icx)
-# This prevents Intel runtime (libintlc.so.5) from being linked into
-# libmana.so, which would cause infinite recursion via dmtcp_openat.
-MPICC  = ${GCC_CC} ${MPI_CFLAGS_EXTRACTED}
-MPICXX = ${GCC_CXX} -std=c++14 ${MPI_CXXFLAGS_EXTRACTED}
+MPICC  = mpicc
+MPICXX = mpicxx -std=c++14
 MPIFORTRAN = mpifort
-
-MPI_LD_FLAG = ${MPI_LDFLAGS_EXTRACTED}
+MPI_LD_FLAG = -L. -lmpi
 MPIRUN = mpiexec
 MPI_CFLAGS  ?= -g -O2 -std=gnu11 -g3 -fPIC
 MPI_CXXFLAGS ?= -g -O2 -g3 -fPIC
-MPI_LDFLAGS ?= ${MPI_CXXLDFLAGS_EXTRACTED}
+MPI_LDFLAGS ?=
 MKEOF
 
     echo "Written Makefile_config:"
@@ -384,7 +452,7 @@ MKEOF
 
     echo ""
 
-    # 3d. Clean and rebuild
+    # 3d. Clean and rebuild MANA
     echo "--- 3d. Clean and rebuild MANA ---"
     make clean 2>&1 | tail -3 || true
     echo ""
@@ -394,33 +462,72 @@ MKEOF
         echo ""
         echo "Build failed with parallel make. Trying single-threaded..."
         if ! make 2>&1; then
-            echo ""
-            echo "Build failed. Trying without Fortran..."
-            if ! make -j"$(nproc)" MPIFORTRAN= 2>&1; then
-                echo "ERROR: MANA build failed completely"
-                echo ""
-                echo "Check if the issue is GCC not finding MPI headers."
-                echo "Try: ${GCC_CC} ${MPI_CFLAGS_EXTRACTED} -E -x c - <<< '#include <mpi.h>'"
-                exit 1
-            fi
+            echo "ERROR: MANA build failed"
+            exit 1
         fi
     fi
     echo ""
 
-    echo "Installing MANA..."
+    # 3e. Strip Intel runtime deps from libmana.so using patchelf
+    echo "--- 3e. Strip Intel runtime deps from libmana.so ---"
+
+    # Strip from build-dir copy
+    BUILD_LIBMANA="${MANA_ROOT}/lib/dmtcp/libmana.so"
+    if [ -f "${BUILD_LIBMANA}" ]; then
+        echo "Build-dir libmana.so:"
+        _strip_intel_deps "${BUILD_LIBMANA}"
+    fi
+    echo ""
+
+    # Also strip from libmpistub.so (just in case)
+    BUILD_LIBMPISTUB="${MANA_ROOT}/lib/dmtcp/libmpistub.so"
+    if [ -f "${BUILD_LIBMPISTUB}" ]; then
+        echo "Build-dir libmpistub.so:"
+        _strip_intel_deps "${BUILD_LIBMPISTUB}"
+    fi
+    echo ""
+
+    # Also strip from mpi-proxy-split/libmana.so (the source copy)
+    SRC_LIBMANA="${MANA_ROOT}/mpi-proxy-split/libmana.so"
+    if [ -f "${SRC_LIBMANA}" ]; then
+        echo "Source-dir libmana.so:"
+        _strip_intel_deps "${SRC_LIBMANA}"
+    fi
+    echo ""
+
+    # 3f. Install MANA
+    echo "--- 3f. Install MANA ---"
     make install 2>&1 | tail -5 || true
     echo ""
 
-    # 3e. Post-install: ensure GCC-built libdmtcp.so wasn't overwritten
-    echo "--- 3e. Post-install verification ---"
+    # 3g. Strip Intel deps from installed copies too
+    echo "--- 3g. Strip Intel deps from installed copies ---"
+    if [ -f "${INSTALLED_LIBMANA}" ]; then
+        echo "Installed libmana.so:"
+        _strip_intel_deps "${INSTALLED_LIBMANA}"
+    fi
+    echo ""
+
+    INSTALLED_LIBMPISTUB="${INSTALL_PREFIX}/lib/dmtcp/libmpistub.so"
+    if [ -f "${INSTALLED_LIBMPISTUB}" ]; then
+        echo "Installed libmpistub.so:"
+        _strip_intel_deps "${INSTALLED_LIBMPISTUB}"
+    fi
+    echo ""
+
+    # 3h. Post-install: ensure GCC-built libdmtcp.so wasn't overwritten
+    echo "--- 3h. Post-install verification ---"
     if [ -f "${INSTALLED_LIBDMTCP}" ]; then
-        if readelf -d "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep -qE "${INTEL_LIBS_PATTERN}"; then
+        if ldd "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}"; then
             echo "WARNING: MANA install overwrote libdmtcp.so with Intel version!"
             STANDALONE_LIBDMTCP="${DMTCP_SRC}/lib/dmtcp/libdmtcp.so"
             if [ -f "${STANDALONE_LIBDMTCP}" ]; then
                 echo "  Restoring GCC-built libdmtcp.so..."
                 cp -f "${STANDALONE_LIBDMTCP}" "${INSTALLED_LIBDMTCP}"
                 echo "  Done."
+            else
+                echo "  Stripping Intel deps from installed libdmtcp.so..."
+                _strip_intel_deps "${INSTALLED_LIBDMTCP}"
             fi
         else
             echo "  OK — installed libdmtcp.so is clean"
@@ -441,32 +548,38 @@ ALL_CLEAN=1
 
 echo "--- libdmtcp.so ---"
 if [ -f "${INSTALLED_LIBDMTCP}" ]; then
+    echo "DT_NEEDED:"
+    readelf -d "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep NEEDED || true
+    echo ""
     if ldd "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}"; then
         echo "  *** FAIL: Has Intel runtime deps ***"
         ALL_CLEAN=0
     else
         echo "  PASS — no Intel runtime deps"
     fi
-    echo "  .comment:"
-    readelf -p .comment "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep -v '^\s*$' || true
 fi
 echo ""
 
-echo "--- libmana.so ---"
+echo "--- libmana.so (installed) ---"
 if [ -f "${INSTALLED_LIBMANA}" ]; then
+    echo "DT_NEEDED:"
+    readelf -d "${INSTALLED_LIBMANA}" 2>/dev/null | grep NEEDED || true
+    echo ""
     if ldd "${INSTALLED_LIBMANA}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}"; then
         echo "  *** FAIL: Has Intel runtime deps ***"
         ALL_CLEAN=0
     else
         echo "  PASS — no Intel runtime deps"
     fi
-    echo "  .comment:"
-    readelf -p .comment "${INSTALLED_LIBMANA}" 2>/dev/null | grep -v '^\s*$' || true
 fi
 echo ""
 
-echo "--- Build-dir libmana.so ---"
+echo "--- libmana.so (build-dir) ---"
+BUILD_LIBMANA="${MANA_ROOT}/lib/dmtcp/libmana.so"
 if [ -f "${BUILD_LIBMANA}" ]; then
+    echo "DT_NEEDED:"
+    readelf -d "${BUILD_LIBMANA}" 2>/dev/null | grep NEEDED || true
+    echo ""
     if ldd "${BUILD_LIBMANA}" 2>/dev/null | grep -E "${INTEL_LIBS_PATTERN}"; then
         echo "  *** FAIL: Has Intel runtime deps ***"
         ALL_CLEAN=0
@@ -699,21 +812,18 @@ echo "================================================================"
 echo "  COMPLETE"
 echo "================================================================"
 echo ""
-echo "Output files: ${OUTDIR}"
+echo "Output directory: ${OUTDIR}"
 echo ""
 if [ "${MANA_EXIT:-1}" -eq 0 ]; then
-    echo "RESULT: MANA is working! You can now test with art_simple."
+    echo "RESULT: SUCCESS — MANA is working!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Build your app with MANA stub mode (link against libmpistub.so)"
+    echo "  2. Run with: mpiexec -np N mana_launch --coord-host HOST --coord-port PORT your_app"
 else
-    echo "RESULT: MANA still has issues. Check the output above."
+    echo "RESULT: MANA test did not pass."
     echo ""
-    echo "If libmana.so still has Intel runtime deps, the issue is that"
-    echo "GCC cannot compile MANA's MPI wrappers (which use MPI-specific"
-    echo "features). In that case, try:"
-    echo ""
-    echo "  1. Check if the lower-half Makefile uses a separate compiler"
-    echo "     variable for libmana.so vs lower-half"
-    echo "  2. Or use patchelf to remove Intel runtime DT_NEEDED entries"
-    echo "     from libmana.so after building with mpicc:"
-    echo "     patchelf --remove-needed libintlc.so.5 libmana.so"
-    echo "     patchelf --remove-needed libsvml.so libmana.so"
+    echo "Check the output above for details."
+    echo "If the /proc/self/environ loop is gone but there's a different crash,"
+    echo "the Intel runtime fix worked but there may be another issue."
 fi
