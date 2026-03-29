@@ -2,7 +2,7 @@
 # Install DMTCP and the MANA MPI plugin from source.
 #
 # Usage:
-#   ./scripts/install_dmtcp_mana.sh [--prefix PREFIX]
+#   ./scripts/install_dmtcp_mana.sh [--prefix PREFIX] [--force-rebuild-mana]
 #
 # Default install prefix: $HOME/.local
 # ($HOME/.local/bin is typically already on PATH on Linux systems.)
@@ -17,15 +17,19 @@ set -euo pipefail
 
 # ── Parse arguments ───────────────────────────────────────────────────────
 INSTALL_PREFIX="${HOME}/.local"
+FORCE_REBUILD_MANA=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)
       INSTALL_PREFIX="$2"; shift 2 ;;
     --prefix=*)
       INSTALL_PREFIX="${1#--prefix=}"; shift ;;
+    --force-rebuild-mana)
+      FORCE_REBUILD_MANA=true; shift ;;
     -h|--help)
-      echo "Usage: $0 [--prefix PREFIX]"
+      echo "Usage: $0 [--prefix PREFIX] [--force-rebuild-mana]"
       echo "  Default prefix: \$HOME/.local"
+      echo "  --force-rebuild-mana  Force rebuild even if libmana.so exists"
       exit 0 ;;
     *)
       echo "Unknown option: $1" >&2; exit 1 ;;
@@ -78,7 +82,34 @@ fi
 MANA_SRC="${SRC_DIR}/mana"
 MANA_LIB="${INSTALL_PREFIX}/lib/dmtcp/libmana.so"
 
-if [ -f "${MANA_LIB}" ]; then
+# Check if MANA needs a rebuild for the current platform.
+# If libmana.so exists but Makefile_config doesn't match the current platform,
+# we need to rebuild.  This handles the case where MANA was installed before
+# platform-specific patches were added to this script.
+MANA_NEEDS_REBUILD=false
+if [ -f "${MANA_LIB}" ] && [ -d "${MANA_SRC}" ]; then
+  _MAKEFILE_CFG="${MANA_SRC}/mpi-proxy-split/Makefile_config"
+  if [ -f "${_MAKEFILE_CFG}" ]; then
+    _CUR_HOST="$(hostname 2>/dev/null || echo unknown)"
+    _ON_AURORA=false
+    if [[ "${_CUR_HOST}" =~ ^x[0-9]+c[0-9]+s[0-9]+b[0-9]+n[0-9]+ ]] || \
+       [[ "${_CUR_HOST}" =~ ^aurora-uan- ]] || \
+       [[ -n "${CRAY_MPICH_DIR:-}" ]]; then
+      _ON_AURORA=true
+    fi
+    if [[ "${_ON_AURORA}" == "true" ]] && ! grep -q 'IS_AURORA' "${_MAKEFILE_CFG}"; then
+      info "MANA installed but Makefile_config missing Aurora config — will rebuild"
+      MANA_NEEDS_REBUILD=true
+    fi
+  fi
+fi
+
+if $FORCE_REBUILD_MANA && [ -d "${MANA_SRC}" ]; then
+  info "Forced MANA rebuild requested"
+  MANA_NEEDS_REBUILD=true
+fi
+
+if [ -f "${MANA_LIB}" ] && ! $MANA_NEEDS_REBUILD; then
   skip "MANA already installed at ${MANA_LIB}"
 elif [[ "${ARCH}" != "x86_64" ]]; then
   echo ""
@@ -356,7 +387,8 @@ AURORA_MAKEFILE_CONFIG_EOF
   MPI_CXXFLAGS?= -g -O2 -g3 -fPIC
   MPI_LDFLAGS?=
 default2: default
-else ifeq (${IS_PERLMUTTER}, 1)
+else
+ifeq (${IS_PERLMUTTER}, 1)
   MPICC = cc
   MPICXX = CC -std=c++14
   MPIFORTRAN = ftn
@@ -376,6 +408,7 @@ else
   MPI_CXXFLAGS?= -g -O2 -g3 -fPIC
   MPI_FFLAGS =  -fallow-argument-mismatch -g3
   MPI_LDFLAGS?=
+endif
 endif
 AURORA_MAKEFILE_CONFIG_EOF2
 
