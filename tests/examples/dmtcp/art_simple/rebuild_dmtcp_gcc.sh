@@ -144,11 +144,55 @@ else
 fi
 echo ""
 
-# ── Step 4: Rebuild MANA ─────────────────────────────────────────────
-echo "=== Step 4: Rebuild MANA ==="
+# ── Step 4: Reconfigure MANA's embedded DMTCP with GCC ───────────────
+# CRITICAL: MANA has its own embedded DMTCP at mana/dmtcp/ which was
+# originally configured with CXX=icpx CC=icx FC=ifx. When MANA runs
+# 'make install', it does 'cd ./dmtcp && make DESTDIR= install', which
+# installs this Intel-built libdmtcp.so to ~/.local/lib/dmtcp/,
+# OVERWRITING the clean GCC-built one from Step 3.
+#
+# Fix: Reconfigure mana/dmtcp/ with GCC before building MANA.
+echo "=== Step 4: Reconfigure MANA's embedded DMTCP with GCC ==="
 echo ""
 
 cd "${MANA_ROOT}"
+
+MANA_DMTCP="${MANA_ROOT}/dmtcp"
+if [ -d "${MANA_DMTCP}" ]; then
+    echo "Found MANA's embedded DMTCP at: ${MANA_DMTCP}"
+    
+    # Show current config (for diagnostics)
+    if [ -f "${MANA_DMTCP}/config.log" ]; then
+        echo "Current config (before fix):"
+        grep -E "^\s*\$ .*configure" "${MANA_DMTCP}/config.log" 2>/dev/null | head -3 || true
+        echo ""
+    fi
+    
+    cd "${MANA_DMTCP}"
+    echo "Cleaning MANA's embedded DMTCP..."
+    make distclean 2>/dev/null || make clean 2>/dev/null || true
+    
+    echo "Reconfiguring MANA's embedded DMTCP with GCC..."
+    CC="${GCC_CC}" CXX="${GCC_CXX}" ./configure \
+        --prefix="${INSTALL_PREFIX}" \
+        --disable-dlsym-wrapper 2>&1 | tail -5
+    echo ""
+    
+    # Verify the reconfiguration
+    echo "Verifying MANA's embedded DMTCP config:"
+    grep -E "^\s*\$ .*configure" "${MANA_DMTCP}/config.log" 2>/dev/null | head -3 || true
+    echo ""
+    
+    cd "${MANA_ROOT}"
+else
+    echo "WARNING: MANA's embedded DMTCP not found at ${MANA_DMTCP}"
+    echo "MANA's 'make install' may overwrite the GCC-built libdmtcp.so!"
+fi
+echo ""
+
+# ── Step 5: Rebuild MANA ─────────────────────────────────────────────
+echo "=== Step 5: Rebuild MANA ==="
+echo ""
 
 # Write Aurora Makefile_config with all required settings
 # MANA is built with MPI wrappers (mpicc/mpicxx/mpifort) which use Intel compilers,
@@ -242,8 +286,55 @@ echo "Installing MANA..."
 make install 2>&1 | tail -5 || true
 echo ""
 
-# ── Step 5: Verify ───────────────────────────────────────────────────
-echo "=== Step 5: Verification ==="
+# ── Step 6: Post-install: ensure GCC-built libdmtcp.so is in place ───
+# Belt-and-suspenders: if MANA's install somehow still overwrote
+# libdmtcp.so with an Intel-linked copy, copy the standalone GCC-built
+# one back.
+echo "=== Step 6: Post-install libdmtcp.so verification ==="
+echo ""
+
+INSTALLED_LIBDMTCP="${INSTALL_PREFIX}/lib/dmtcp/libdmtcp.so"
+STANDALONE_LIBDMTCP="${DMTCP_SRC}/lib/dmtcp/libdmtcp.so"
+
+if [ -f "${INSTALLED_LIBDMTCP}" ]; then
+    if readelf -d "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep -qE 'libintlc|libsvml|libirng|libimf'; then
+        echo "WARNING: Installed libdmtcp.so STILL has Intel runtime deps!"
+        echo "  MANA's install likely overwrote it."
+        if [ -f "${STANDALONE_LIBDMTCP}" ]; then
+            echo "  Copying standalone GCC-built libdmtcp.so back..."
+            cp -f "${STANDALONE_LIBDMTCP}" "${INSTALLED_LIBDMTCP}"
+            echo "  Done. Re-checking:"
+            readelf -d "${INSTALLED_LIBDMTCP}" 2>/dev/null | grep NEEDED || true
+        else
+            echo "  ERROR: Standalone GCC-built libdmtcp.so not found at ${STANDALONE_LIBDMTCP}"
+            echo "  Cannot fix automatically."
+        fi
+    else
+        echo "  OK - installed libdmtcp.so has no Intel runtime deps"
+    fi
+else
+    echo "  WARNING: ${INSTALLED_LIBDMTCP} not found"
+fi
+echo ""
+
+# Also check MANA's local copy (mana/lib/dmtcp/libdmtcp.so)
+MANA_LOCAL_LIBDMTCP="${MANA_ROOT}/lib/dmtcp/libdmtcp.so"
+if [ -f "${MANA_LOCAL_LIBDMTCP}" ]; then
+    if readelf -d "${MANA_LOCAL_LIBDMTCP}" 2>/dev/null | grep -qE 'libintlc|libsvml|libirng|libimf'; then
+        echo "WARNING: MANA's local libdmtcp.so has Intel runtime deps!"
+        if [ -f "${STANDALONE_LIBDMTCP}" ]; then
+            echo "  Copying standalone GCC-built libdmtcp.so..."
+            cp -f "${STANDALONE_LIBDMTCP}" "${MANA_LOCAL_LIBDMTCP}"
+            echo "  Done."
+        fi
+    else
+        echo "  OK - MANA's local libdmtcp.so has no Intel runtime deps"
+    fi
+fi
+echo ""
+
+# ── Step 7: Verify ───────────────────────────────────────────────────
+echo "=== Step 7: Final Verification ==="
 echo ""
 
 echo "--- Checking installed libdmtcp.so (DT_NEEDED) ---"
@@ -280,8 +371,8 @@ else
 fi
 echo ""
 
-# ── Step 6: Quick DMTCP test ─────────────────────────────────────────
-echo "=== Step 6: Quick DMTCP test ==="
+# ── Step 8: Quick DMTCP test ─────────────────────────────────────────
+echo "=== Step 8: Quick DMTCP test ==="
 echo ""
 
 export HWLOC_COMPONENTS="-linuxio"
