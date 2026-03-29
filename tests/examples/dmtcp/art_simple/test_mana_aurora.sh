@@ -4,23 +4,22 @@
 #
 # Purpose:
 #   Test MANA (MPI-Agnostic Network-Agnostic) transparent checkpoint/restart
-#   with the statically-linked art_simple binary on ALCF Aurora.
+#   with art_simple on ALCF Aurora.
 #
 # Prerequisites:
-#   - art_simple_main built with DMTCP_STATIC_MPI=ON (no libmpi.so dependency)
-#   - MANA installed via scripts/install_dmtcp_mana.sh
+#   - MANA fully built (libmana.so + lower-half + libmpistub.so must exist)
+#     Install via: ./scripts/install_dmtcp_mana.sh
+#   - art_simple_main built with -DDMTCP_USE_MANA_STUB=ON
 #   - HDF5 input data file (tooth_preprocessed.h5)
 #
 # Usage:
 #   Option A – Interactive (on a compute node allocation):
 #     qsub -I -l select=1 -l walltime=00:30:00 -A <project> -q debug
+#     cd ~/diaspora/guard-agent
 #     bash tests/examples/dmtcp/art_simple/test_mana_aurora.sh
 #
 #   Option B – Batch submission:
 #     qsub tests/examples/dmtcp/art_simple/test_mana_aurora.sh
-#
-#   Option C – Direct run on a compute node (already allocated):
-#     bash tests/examples/dmtcp/art_simple/test_mana_aurora.sh
 #
 # Environment variables (all optional):
 #   DATA_PATH          – HDF5 input file
@@ -29,7 +28,7 @@
 #   CHECKPOINT_DELAY   – seconds before checkpoint (default: 10)
 #   TIMEOUT            – max seconds per phase (default: 300)
 #   COORD_PORT         – coordinator port (default: 7901)
-#   SKIP_COORDINATOR   – set to 1 if coordinator is already running
+#   SKIP_BUILD         – set to 1 to skip the rebuild step
 # ============================================================================
 #PBS -l select=1
 #PBS -l walltime=00:30:00
@@ -55,10 +54,9 @@ NUM_PROCS="${NUM_PROCS:-1}"
 CHECKPOINT_DELAY="${CHECKPOINT_DELAY:-10}"
 TIMEOUT="${TIMEOUT:-300}"
 COORD_PORT="${COORD_PORT:-7901}"
-SKIP_COORDINATOR="${SKIP_COORDINATOR:-0}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 
 # App arguments: <hdf5_input> <center> <num_outer_iter> <num_iter> <beg_index> <num_sino>
-# Medium workload to ensure app runs long enough for checkpoint
 APP_ARGS="${DATA_PATH} 294.078 5 2 0 2"
 
 # Working directories
@@ -68,56 +66,32 @@ CKPT_DIR="${REPO_ROOT}/build/test_mana/ckpt"
 
 # ── Locate MANA ──────────────────────────────────────────────────────────
 if [[ -n "${MANA_ROOT:-}" ]]; then
-    MANA_BIN="${MANA_ROOT}/bin"
+    : # use provided MANA_ROOT
 elif [[ -d "${HOME}/.local/share/guard-agent/dmtcp-src/mana" ]]; then
     MANA_ROOT="${HOME}/.local/share/guard-agent/dmtcp-src/mana"
-    MANA_BIN="${MANA_ROOT}/bin"
-elif [[ -x "${HOME}/.local/bin/mana_launch" ]]; then
-    MANA_BIN="${HOME}/.local/bin"
-    MANA_ROOT="${HOME}/.local"
 else
-    MANA_BIN="$(dirname "$(which mana_launch 2>/dev/null)" 2>/dev/null || true)"
-    MANA_ROOT="$(dirname "${MANA_BIN}" 2>/dev/null || true)"
-fi
-
-if [[ -z "${MANA_BIN}" ]] || [[ ! -x "${MANA_BIN}/mana_launch" ]]; then
-    echo "ERROR: mana_launch not found. Install MANA first:" >&2
-    echo "  ./scripts/install_dmtcp_mana.sh" >&2
-    echo "" >&2
-    echo "Searched:" >&2
-    echo "  \$MANA_ROOT/bin" >&2
-    echo "  ~/.local/share/guard-agent/dmtcp-src/mana/bin" >&2
-    echo "  ~/.local/bin" >&2
-    echo "  \$PATH" >&2
+    echo "ERROR: MANA not found. Install via: ./scripts/install_dmtcp_mana.sh" >&2
     exit 1
 fi
 
+MANA_BIN="${MANA_ROOT}/bin"
+MANA_LIB="${MANA_ROOT}/lib/dmtcp"
+DMTCP_LAUNCH="${MANA_BIN}/dmtcp_launch"
+DMTCP_COMMAND="${MANA_BIN}/dmtcp_command"
+DMTCP_COORDINATOR="${MANA_BIN}/dmtcp_coordinator"
+DMTCP_RESTART="${MANA_BIN}/dmtcp_restart"
 MANA_LAUNCH="${MANA_BIN}/mana_launch"
 MANA_START_COORD="${MANA_BIN}/mana_start_coordinator"
 MANA_RESTART="${MANA_BIN}/mana_restart"
-
-# Also need dmtcp_command for checkpoint triggering
-DMTCP_COMMAND="${MANA_BIN}/dmtcp_command"
-if [[ ! -x "${DMTCP_COMMAND}" ]]; then
-    # Try the DMTCP install prefix
-    if [[ -f "${HOME}/.local/share/guard-agent/dmtcp_prefix" ]]; then
-        DMTCP_PREFIX="$(cat "${HOME}/.local/share/guard-agent/dmtcp_prefix")"
-        DMTCP_COMMAND="${DMTCP_PREFIX}/bin/dmtcp_command"
-    elif [[ -x "${HOME}/.local/bin/dmtcp_command" ]]; then
-        DMTCP_COMMAND="${HOME}/.local/bin/dmtcp_command"
-    fi
-fi
+LIBMANA="${MANA_LIB}/libmana.so"
+LOWER_HALF="${MANA_BIN}/lower-half"
+LIBMPISTUB="${MANA_LIB}/libmpistub.so"
 
 echo "============================================================"
 echo "  MANA Checkpoint/Restart Test for art_simple on Aurora"
 echo "============================================================"
 echo ""
 echo "[config] MANA_ROOT       : ${MANA_ROOT}"
-echo "[config] MANA_BIN        : ${MANA_BIN}"
-echo "[config] mana_launch     : ${MANA_LAUNCH}"
-echo "[config] mana_coordinator: ${MANA_START_COORD}"
-echo "[config] mana_restart    : ${MANA_RESTART}"
-echo "[config] dmtcp_command   : ${DMTCP_COMMAND}"
 echo "[config] DATA_PATH       : ${DATA_PATH}"
 echo "[config] NUM_PROCS       : ${NUM_PROCS}"
 echo "[config] CKPT_DELAY      : ${CHECKPOINT_DELAY}s"
@@ -128,36 +102,122 @@ echo "[config] COORD_PORT      : ${COORD_PORT}"
 echo "[config] APP_ARGS        : ${APP_ARGS}"
 echo ""
 
-# ── Verify prerequisites ─────────────────────────────────────────────────
-if [[ ! -x "${BUILD_DIR}/art_simple_main" ]]; then
-    echo "ERROR: Executable not found: ${BUILD_DIR}/art_simple_main" >&2
-    echo "  Build it first with:" >&2
-    echo "    cd ${BUILD_DIR}" >&2
-    echo "    cmake ~/diaspora/guard-agent/build/example_refs/dmtcp/art_simple -DDMTCP_STATIC_MPI=ON" >&2
-    echo "    make" >&2
-    exit 1
-fi
+# ── Pre-flight: check MANA components ────────────────────────────────────
+MANA_READY=true
+MISSING=()
 
-# Verify no libmpi.so dependency
-if ldd "${BUILD_DIR}/art_simple_main" 2>/dev/null | grep -q "libmpi\.so"; then
-    echo "WARNING: art_simple_main still links libmpi.so dynamically!" >&2
-    echo "  MANA requires static MPI linking. Rebuild with -DDMTCP_STATIC_MPI=ON" >&2
-    echo "  Continuing anyway, but MANA may crash..." >&2
-    echo ""
-fi
-
-if [[ ! -f "${DATA_PATH}" ]]; then
-    echo "ERROR: HDF5 data file not found: ${DATA_PATH}" >&2
-    echo "  Copy or symlink tooth_preprocessed.h5 to that location." >&2
-    exit 1
-fi
-
-for tool in "${MANA_LAUNCH}" "${MANA_START_COORD}" "${DMTCP_COMMAND}"; do
-    if [[ ! -x "${tool}" ]]; then
-        echo "ERROR: Required tool not found or not executable: ${tool}" >&2
-        exit 1
+for comp in "${LIBMANA}:libmana.so" "${LOWER_HALF}:lower-half" "${LIBMPISTUB}:libmpistub.so" "${DMTCP_LAUNCH}:dmtcp_launch"; do
+    path="${comp%%:*}"
+    name="${comp##*:}"
+    if [[ -e "${path}" ]]; then
+        echo "[check] ✓ ${name}: ${path}"
+    else
+        echo "[check] ✗ ${name}: MISSING (${path})"
+        MANA_READY=false
+        MISSING+=("${name}")
     fi
 done
+echo ""
+
+if [[ "${MANA_READY}" != "true" ]]; then
+    echo "ERROR: MANA is not fully built. Missing: ${MISSING[*]}" >&2
+    echo "  Rebuild MANA: cd ${MANA_ROOT} && make -j\$(nproc) && make install" >&2
+    exit 1
+fi
+
+# ── Pre-flight: check data file ──────────────────────────────────────────
+if [[ ! -f "${DATA_PATH}" ]]; then
+    echo "ERROR: HDF5 data file not found: ${DATA_PATH}" >&2
+    exit 1
+fi
+
+# ── Step 0: Rebuild with MANA stub if needed ─────────────────────────────
+EXE="${BUILD_DIR}/art_simple_main"
+
+_needs_rebuild() {
+    if [[ ! -x "${EXE}" ]]; then
+        echo "[build] Executable not found, need to build"
+        return 0
+    fi
+    # Check if the binary has real MPI symbols (it shouldn't for MANA)
+    local mpi_init_count
+    mpi_init_count=$(nm "${EXE}" 2>/dev/null | grep -c ' T .*MPI_Init' || true)
+    if [[ "${mpi_init_count}" -gt 0 ]]; then
+        echo "[build] Binary has ${mpi_init_count} MPI_Init symbols (statically linked MPI)"
+        echo "[build] MANA requires linking against libmpistub, not real MPI"
+        return 0
+    fi
+    # Check if it links against libmpistub
+    if ldd "${EXE}" 2>/dev/null | grep -q 'libmpistub'; then
+        echo "[build] Binary correctly links against libmpistub"
+        return 1
+    fi
+    # Check if it links against real libmpi
+    if ldd "${EXE}" 2>/dev/null | grep -q 'libmpi\.so'; then
+        echo "[build] Binary links against real libmpi.so (not compatible with MANA)"
+        return 0
+    fi
+    echo "[build] Cannot determine MPI linkage, rebuilding to be safe"
+    return 0
+}
+
+if [[ "${SKIP_BUILD}" != "1" ]] && _needs_rebuild; then
+    echo "[build] Rebuilding art_simple_main with MANA stub ..."
+    echo ""
+
+    # Source directory (where CMakeLists.txt and source files are)
+    SRC_DIR="${REPO_ROOT}/build/example_refs/dmtcp/art_simple"
+    if [[ ! -f "${SRC_DIR}/CMakeLists.txt" ]]; then
+        # Try the git-tracked location
+        SRC_DIR="${REPO_ROOT}/tests/examples/dmtcp/art_simple"
+    fi
+    if [[ ! -f "${SRC_DIR}/CMakeLists.txt" ]]; then
+        echo "ERROR: CMakeLists.txt not found in ${SRC_DIR}" >&2
+        exit 1
+    fi
+
+    # Check that source files exist (they may be in a different location)
+    if [[ ! -f "${SRC_DIR}/main.cc" ]]; then
+        # Source files might be in the build output directory
+        EXAMPLE_SRC="${REPO_ROOT}/build/examples_output/resilient_art_simple"
+        if [[ -f "${EXAMPLE_SRC}/main.cc" ]]; then
+            echo "[build] Copying source files from ${EXAMPLE_SRC} ..."
+            cp -v "${EXAMPLE_SRC}/main.cc" "${EXAMPLE_SRC}/art_simple.cc" \
+                  "${EXAMPLE_SRC}/art_simple.h" "${SRC_DIR}/" 2>/dev/null || true
+        fi
+    fi
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
+
+    echo "[build] cmake -DDMTCP_USE_MANA_STUB=ON -DMANA_ROOT=${MANA_ROOT} ${SRC_DIR}"
+    cmake -DDMTCP_USE_MANA_STUB=ON -DMANA_ROOT="${MANA_ROOT}" "${SRC_DIR}"
+    echo ""
+    echo "[build] make -j$(nproc)"
+    make -j"$(nproc)"
+    echo ""
+
+    # Verify the build
+    if [[ ! -x "${EXE}" ]]; then
+        echo "ERROR: Build failed, executable not found: ${EXE}" >&2
+        exit 1
+    fi
+
+    echo "[build] Verifying linkage ..."
+    echo "  nm MPI_Init count: $(nm "${EXE}" 2>/dev/null | grep -c ' T .*MPI_Init' || echo 0)"
+    echo "  ldd | grep mpi:"
+    ldd "${EXE}" 2>/dev/null | grep -i mpi || echo "    (no MPI shared libs)"
+    echo ""
+
+    cd "${REPO_ROOT}"
+fi
+
+if [[ ! -x "${EXE}" ]]; then
+    echo "ERROR: Executable not found: ${EXE}" >&2
+    echo "  Build with: cd ${BUILD_DIR} && cmake -DDMTCP_USE_MANA_STUB=ON -DMANA_ROOT=${MANA_ROOT} <src_dir> && make" >&2
+    exit 1
+fi
 
 # ── Cleanup function ─────────────────────────────────────────────────────
 cleanup() {
@@ -174,56 +234,29 @@ rm -rf "${CKPT_DIR}" "${OUTPUT_DIR}"
 mkdir -p "${CKPT_DIR}" "${OUTPUT_DIR}"
 
 # ── Step 2: Start MANA coordinator ───────────────────────────────────────
-# Kill any existing coordinator on this port
 "${DMTCP_COMMAND}" --port "${COORD_PORT}" --quit 2>/dev/null || true
 sleep 0.5
 
-if [[ "${SKIP_COORDINATOR}" == "1" ]]; then
-    echo "[coord] SKIP_COORDINATOR=1, assuming coordinator already running on port ${COORD_PORT}"
-else
-    echo "[coord] Starting MANA coordinator on port ${COORD_PORT} ..."
-    # mana_start_coordinator is a wrapper that starts dmtcp_coordinator
-    # with the MANA plugin loaded
-    "${MANA_START_COORD}" --port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
-        echo "[coord] mana_start_coordinator failed, trying manual start..."
-        # Fallback: start coordinator manually with MANA plugin
-        MANA_PLUGIN="${MANA_ROOT}/lib/dmtcp/libmana.so"
-        if [[ ! -f "${MANA_PLUGIN}" ]]; then
-            # Try finding it in the build tree
-            MANA_PLUGIN="$(find "${MANA_ROOT}" -name 'libmana.so' -type f 2>/dev/null | head -1)"
-        fi
-        if [[ -n "${MANA_PLUGIN}" ]] && [[ -f "${MANA_PLUGIN}" ]]; then
-            echo "[coord] Using MANA plugin: ${MANA_PLUGIN}"
-            "${MANA_BIN}/dmtcp_coordinator" --daemon --port "${COORD_PORT}" \
-                --ckptdir "${CKPT_DIR}" 2>&1 || true
-        else
-            echo "ERROR: Cannot find libmana.so plugin" >&2
-            exit 1
-        fi
-    }
-    sleep 1
-fi
+echo "[coord] Starting MANA coordinator on port ${COORD_PORT} ..."
+"${MANA_START_COORD}" --port "${COORD_PORT}" --ckptdir "${CKPT_DIR}" 2>&1 || {
+    echo "[coord] mana_start_coordinator failed, trying manual start..."
+    "${DMTCP_COORDINATOR}" --daemon --port "${COORD_PORT}" \
+        --ckptdir "${CKPT_DIR}" 2>&1 || true
+}
+sleep 1
 
-# Verify coordinator is running
 if "${DMTCP_COMMAND}" --port "${COORD_PORT}" --status 2>/dev/null; then
     echo "[coord] Coordinator is running."
 else
-    echo "WARNING: Could not verify coordinator status (may still be starting)" >&2
+    echo "WARNING: Could not verify coordinator status" >&2
 fi
 echo ""
 
 # ── Step 3: Set environment ──────────────────────────────────────────────
-# Disable hwloc Linux I/O to prevent block device enumeration crashes
 export HWLOC_COMPONENTS="-linuxio"
 
 # ── Step 4: Launch app under MANA ────────────────────────────────────────
-# MANA launch procedure:
-#   mpiexec -np N mana_launch [--ckptdir DIR] [--coord-port PORT] ./app args
-#
-# On Aurora, use mpiexec (Cray MPICH launcher).
-# mana_launch wraps the application with MANA's split-process architecture.
-
-LAUNCH_CMD="mpiexec -np ${NUM_PROCS} ${MANA_LAUNCH} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip ${BUILD_DIR}/art_simple_main ${APP_ARGS}"
+LAUNCH_CMD="mpiexec -np ${NUM_PROCS} ${MANA_LAUNCH} --verbose --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip ${EXE} ${APP_ARGS}"
 
 echo "[launch] Command:"
 echo "  ${LAUNCH_CMD}"
@@ -242,7 +275,6 @@ echo "[launch] Wrapper PID: ${APP_PID}"
 echo "[ckpt] Waiting ${CHECKPOINT_DELAY}s before triggering checkpoint ..."
 sleep "${CHECKPOINT_DELAY}"
 
-# Check if app is still running
 if ! kill -0 "${APP_PID}" 2>/dev/null; then
     WAIT_EXIT=0
     wait "${APP_PID}" || WAIT_EXIT=$?
@@ -255,10 +287,21 @@ if ! kill -0 "${APP_PID}" 2>/dev/null; then
     echo "--- stderr ---"
     cat "${OUTPUT_DIR}/stderr_initial.txt" 2>/dev/null || true
     echo ""
-    if [[ "${WAIT_EXIT}" -eq 0 ]]; then
+    if [[ "${WAIT_EXIT}" -eq 139 ]]; then
+        echo "============================================================"
+        echo "  RESULT: SIGSEGV (signal 11)"
+        echo ""
+        echo "  Check that the binary was built with -DDMTCP_USE_MANA_STUB=ON"
+        echo "  and links against libmpistub.so (not libmpi.a or libmpi.so)."
+        echo ""
+        echo "  Verify with:"
+        echo "    nm ${EXE} | grep -c 'MPI_Init'  # should be 0"
+        echo "    ldd ${EXE} | grep mpi  # should show libmpistub.so"
+        echo "============================================================"
+    elif [[ "${WAIT_EXIT}" -eq 0 ]]; then
         echo "============================================================"
         echo "  App completed successfully WITHOUT checkpoint."
-        echo "  Increase CHECKPOINT_DELAY or workload size to test ckpt."
+        echo "  Increase CHECKPOINT_DELAY or workload size."
         echo "============================================================"
     else
         echo "============================================================"
@@ -276,116 +319,54 @@ if timeout "${TIMEOUT}" "${DMTCP_COMMAND}" --port "${COORD_PORT}" --checkpoint; 
     CKPT_MS=$(( (CKPT_END - CKPT_START) / 1000000 ))
     echo "[ckpt] Checkpoint completed in ${CKPT_MS}ms"
 else
-    echo "[ckpt] WARNING: Checkpoint command failed or timed out!"
-    echo "[ckpt] stderr from initial run:"
-    tail -20 "${OUTPUT_DIR}/stderr_initial.txt" 2>/dev/null || true
+    echo "[ckpt] WARNING: Checkpoint failed or timed out!"
 fi
 
-# List checkpoint files
 echo "[ckpt] Checkpoint files:"
-find "${CKPT_DIR}" -name "ckpt_*.dmtcp" -exec ls -lh {} \; 2>/dev/null || echo "  (none found)"
+find "${CKPT_DIR}" -name "ckpt_*.dmtcp" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
 echo ""
 
-# ── Step 6: Kill the app (simulate failure) ───────────────────────────────
-echo "[kill] Killing app process (simulating failure) ..."
+# ── Step 6: Kill the app ─────────────────────────────────────────────────
+echo "[kill] Killing app process ..."
 ART_PID=$(pgrep -f "art_simple_main" 2>/dev/null | head -1 || true)
 if [[ -n "${ART_PID}" ]]; then
-    echo "[kill] Found art_simple_main PID: ${ART_PID}"
     kill -9 "${ART_PID}" 2>/dev/null || true
 else
-    echo "[kill] art_simple_main not found, killing wrapper PID ${APP_PID}"
     kill -9 "${APP_PID}" 2>/dev/null || true
 fi
-
 wait "${APP_PID}" 2>/dev/null || true
 sleep 2
-echo "[kill] Process terminated."
+echo "[kill] Done."
 echo ""
 
-# ── Step 7: Restart from checkpoint ──────────────────────────────────────
+# ── Step 7: Restart ──────────────────────────────────────────────────────
 CKPT_FILES=$(find "${CKPT_DIR}" -name "ckpt_*.dmtcp" 2>/dev/null | head -1 || true)
-RESTART_SCRIPT=$(find "${CKPT_DIR}" -name "dmtcp_restart_script*.sh" 2>/dev/null | head -1 || true)
-
-if [[ -z "${CKPT_FILES}" ]] && [[ -z "${RESTART_SCRIPT}" ]]; then
-    echo "============================================================"
-    echo "  RESULT: FAILED – No checkpoint files found!"
-    echo "  The checkpoint did not produce any files."
-    echo ""
-    echo "  Possible causes:"
-    echo "    - MANA plugin not loaded correctly"
-    echo "    - Coordinator not running"
-    echo "    - App crashed before checkpoint"
-    echo ""
-    echo "  Initial run stderr:"
-    cat "${OUTPUT_DIR}/stderr_initial.txt" 2>/dev/null || true
-    echo "============================================================"
+if [[ -z "${CKPT_FILES}" ]]; then
+    echo "RESULT: FAILED – No checkpoint files found!"
     exit 1
 fi
 
 echo "[restart] Restarting from checkpoint ..."
-
-# MANA restart: use mana_restart which wraps dmtcp_restart with the
-# MANA plugin for MPI re-initialization
-if [[ -x "${MANA_RESTART}" ]]; then
-    RESTART_CMD="mpiexec -np ${NUM_PROCS} ${MANA_RESTART} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip"
-else
-    # Fallback to restart script
-    RESTART_CMD="bash ${RESTART_SCRIPT}"
-fi
-
+RESTART_CMD="mpiexec -np ${NUM_PROCS} ${MANA_RESTART} --coord-port ${COORD_PORT} --ckptdir ${CKPT_DIR} --no-gzip"
 echo "[restart] Command: ${RESTART_CMD}"
-RESTART_START=$(date +%s)
 
 timeout "${TIMEOUT}" ${RESTART_CMD} \
     > "${OUTPUT_DIR}/stdout_restart.txt" \
     2> "${OUTPUT_DIR}/stderr_restart.txt"
 RESTART_EXIT=$?
 
-RESTART_END=$(date +%s)
-RESTART_ELAPSED=$((RESTART_END - RESTART_START))
-
-echo ""
-echo "[restart] Restart completed: exit=${RESTART_EXIT}, elapsed=${RESTART_ELAPSED}s"
-
-# ── Step 8: Report results ───────────────────────────────────────────────
-echo ""
-echo "============================================================"
-echo "  RESULTS"
-echo "============================================================"
-echo ""
-echo "--- Initial run stdout (last 20 lines) ---"
-tail -20 "${OUTPUT_DIR}/stdout_initial.txt" 2>/dev/null || echo "(empty)"
-echo ""
-echo "--- Initial run stderr (last 20 lines) ---"
-tail -20 "${OUTPUT_DIR}/stderr_initial.txt" 2>/dev/null || echo "(empty)"
 echo ""
 echo "--- Restart stdout (last 20 lines) ---"
-tail -20 "${OUTPUT_DIR}/stdout_restart.txt" 2>/dev/null || echo "(empty)"
-echo ""
+tail -20 "${OUTPUT_DIR}/stdout_restart.txt" 2>/dev/null || true
 echo "--- Restart stderr (last 20 lines) ---"
-tail -20 "${OUTPUT_DIR}/stderr_restart.txt" 2>/dev/null || echo "(empty)"
-echo ""
-
-# Check for output file
-for d in "${OUTPUT_DIR}" "${BUILD_DIR}" "."; do
-    if [[ -f "${d}/recon.h5" ]]; then
-        echo "[output] recon.h5 found in ${d} – reconstruction completed!"
-        break
-    fi
-done
+tail -20 "${OUTPUT_DIR}/stderr_restart.txt" 2>/dev/null || true
 
 if [[ "${RESTART_EXIT}" -eq 0 ]]; then
     echo ""
-    echo "============================================================"
-    echo "  RESULT: SUCCESS"
-    echo "  MANA checkpoint/restart works on Aurora!"
-    echo "============================================================"
+    echo "RESULT: SUCCESS – MANA checkpoint/restart works!"
 else
     echo ""
-    echo "============================================================"
-    echo "  RESULT: FAILED (restart exit code: ${RESTART_EXIT})"
-    echo "  Check stderr output above for details."
-    echo "============================================================"
+    echo "RESULT: FAILED (restart exit=${RESTART_EXIT})"
 fi
 
 exit "${RESTART_EXIT}"

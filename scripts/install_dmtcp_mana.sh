@@ -226,6 +226,163 @@ else
     MANA_BUILD_OK=false
   fi
 
+  # ── Aurora (ALCF) platform detection for Makefile_config ───────────
+  # MANA's Makefile_config only has platform detection for Perlmutter.
+  # On Aurora (Cray MPICH 5.0 + Intel oneAPI), we need to set the
+  # correct MPI compiler wrappers and library flags.
+  #
+  # Aurora hostnames:
+  #   Compute nodes: x4NNNcNsNbNnN (e.g. x4310c5s0b0n0)
+  #   Login nodes:   aurora-uan-NNNN (e.g. aurora-uan-0011)
+  MAKEFILE_CONFIG="mpi-proxy-split/Makefile_config"
+  if [ -f "${MAKEFILE_CONFIG}" ] && ! grep -q 'IS_AURORA' "${MAKEFILE_CONFIG}"; then
+    _HOSTNAME="$(hostname 2>/dev/null || echo unknown)"
+    IS_AURORA=false
+    if [[ "${_HOSTNAME}" =~ ^x[0-9]+c[0-9]+s[0-9]+b[0-9]+n[0-9]+ ]] || \
+       [[ "${_HOSTNAME}" =~ ^aurora-uan- ]]; then
+      IS_AURORA=true
+    fi
+    # Also check for Cray MPICH environment (works even if hostname pattern changes)
+    if [[ "${IS_AURORA}" != "true" ]] && [[ -n "${CRAY_MPICH_DIR:-}" ]]; then
+      IS_AURORA=true
+    fi
+
+    if [[ "${IS_AURORA}" == "true" ]]; then
+      info "Detected Aurora (ALCF) platform, patching Makefile_config ..."
+      # Determine MPI library path from Cray MPICH
+      _MPI_LIB_DIR=""
+      if [[ -n "${CRAY_MPICH_DIR:-}" ]]; then
+        _MPI_LIB_DIR="${CRAY_MPICH_DIR}/lib"
+      elif [[ -d "/opt/cray/pe/mpich" ]]; then
+        # Find the latest MPICH version
+        _MPI_LIB_DIR="$(find /opt/cray/pe/mpich -name 'libmpi.so' -exec dirname {} \; 2>/dev/null | head -1)"
+      fi
+      # Get MPI link flags from the compiler wrapper
+      _MPI_LINK_FLAGS=""
+      if command -v mpicxx &>/dev/null; then
+        # Cray mpicxx --cray-print-opts=libs gives the link flags
+        _MPI_LINK_FLAGS="$(mpicxx --cray-print-opts=libs 2>/dev/null || true)"
+      fi
+      if [[ -z "${_MPI_LINK_FLAGS}" ]] && [[ -n "${_MPI_LIB_DIR}" ]]; then
+        _MPI_LINK_FLAGS="-L${_MPI_LIB_DIR} -lmpi"
+      fi
+      if [[ -z "${_MPI_LINK_FLAGS}" ]]; then
+        _MPI_LINK_FLAGS="-lmpi"
+      fi
+
+      # Insert Aurora detection block before the 'else' clause
+      # We add it after the Perlmutter block
+      sed -i '/^ifeq (\${IS_PERLMUTTER}, 1)/i\
+# Mark the platform as Aurora for ALCF Aurora compute/login nodes.\
+AURORA_HOST := $(shell hostname 2>/dev/null)\
+ifneq ($(findstring aurora-uan,$(AURORA_HOST)),)\
+IS_AURORA = 1\
+endif\
+# Aurora compute nodes: x4NNNcNsNbNnN pattern\
+ifneq ($(shell echo $(AURORA_HOST) | grep -c "^x[0-9]"),0)\
+IS_AURORA = 1\
+endif\
+# Also detect via CRAY_MPICH_DIR environment variable\
+ifdef CRAY_MPICH_DIR\
+IS_AURORA = 1\
+endif\
+' "${MAKEFILE_CONFIG}"
+
+      # Now add the Aurora-specific settings block
+      sed -i '/^ifeq (\${IS_PERLMUTTER}, 1)/i\
+ifeq (${IS_AURORA}, 1)\
+  MPICC = mpicc\
+  MPICXX = mpicxx -std=c++14\
+  MPIFORTRAN = mpifort\
+  MPI_LD_FLAG = '"${_MPI_LINK_FLAGS}"'\
+  MPIRUN = mpiexec\
+  MPI_CFLAGS?= -g -O2 -std=gnu11 -g3 -fPIC\
+  MPI_CXXFLAGS?= -g -O2 -g3 -fPIC\
+  MPI_LDFLAGS?=\
+default2: default\
+else\
+' "${MAKEFILE_CONFIG}"
+
+      # Close the Aurora else block by adding 'endif' before the Perlmutter block
+      # Actually, we need to restructure: Aurora if/else wraps the Perlmutter block
+      # Let's use a simpler approach: just add an endif after the Perlmutter endif
+      # Wait, this is getting complex with nested ifeq. Let me use a different approach.
+
+      # Revert the above sed attempts and use a clean rewrite approach
+      git checkout -- "${MAKEFILE_CONFIG}" 2>/dev/null || true
+
+      # Write a new Makefile_config with Aurora support
+      cat > "${MAKEFILE_CONFIG}" << 'AURORA_MAKEFILE_CONFIG_EOF'
+CFLAGS = -g -O2 -std=gnu11
+CXXFLAGS = -g -O2
+FFLAGS = ${CXXFLAGS}  -fallow-argument-mismatch
+
+PLATFORM=${shell echo $$HOST}
+HOSTNAME_FULL := $(shell hostname 2>/dev/null)
+
+# ── Platform detection ──────────────────────────────────────────────
+# Aurora (ALCF): compute nodes x4NNNcNsNbNnN, login nodes aurora-uan-NNNN
+ifneq ($(findstring aurora-uan,$(HOSTNAME_FULL)),)
+IS_AURORA = 1
+endif
+ifneq ($(shell echo $(HOSTNAME_FULL) | grep -c "^x[0-9]"),0)
+IS_AURORA = 1
+endif
+ifdef CRAY_MPICH_DIR
+IS_AURORA = 1
+endif
+
+# Perlmutter (NERSC): compute nodes nid0XXXXX, login nodes loginNN
+ifeq ($(findstring nid0,$(PLATFORM)),nid0)
+IS_PERLMUTTER = 1
+endif
+ifeq ($(findstring login,$(PLATFORM)),login)
+IS_PERLMUTTER = 1
+endif
+
+# ── Platform-specific settings ──────────────────────────────────────
+ifeq (${IS_AURORA}, 1)
+  MPICC = mpicc
+  MPICXX = mpicxx -std=c++14
+  MPIFORTRAN = mpifort
+AURORA_MAKEFILE_CONFIG_EOF
+
+      # Add the MPI_LD_FLAG with the detected link flags
+      echo "  MPI_LD_FLAG = ${_MPI_LINK_FLAGS}" >> "${MAKEFILE_CONFIG}"
+
+      cat >> "${MAKEFILE_CONFIG}" << 'AURORA_MAKEFILE_CONFIG_EOF2'
+  MPIRUN = mpiexec
+  MPI_CFLAGS?= -g -O2 -std=gnu11 -g3 -fPIC
+  MPI_CXXFLAGS?= -g -O2 -g3 -fPIC
+  MPI_LDFLAGS?=
+default2: default
+else ifeq (${IS_PERLMUTTER}, 1)
+  MPICC = cc
+  MPICXX = CC -std=c++14
+  MPIFORTRAN = ftn
+  MPI_LD_FLAG = -lmpich
+  MPIRUN = srun
+  MPI_CFLAGS?= -g -O2 -std=gnu11 -g3 -fPIC
+  MPI_CXXFLAGS?= -g -O2 -g3 -fPIC
+  MPI_LDFLAGS?= -dynamic
+default2: default
+else
+  MPICC = mpicc
+  MPICXX = mpic++ -std=c++14
+  MPIFORTRAN = mpifort
+  MPIRUN = mpirun
+  MPI_LD_FLAG = -L$$HOME/mpich-static/usr/lib64 -lmpi -L$$HOME/local_install/lib -llzma -lz -lm -lxml2
+  MPI_CFLAGS?= -g -O2 -std=gnu11 -g3 -fPIC
+  MPI_CXXFLAGS?= -g -O2 -g3 -fPIC
+  MPI_FFLAGS =  -fallow-argument-mismatch -g3
+  MPI_LDFLAGS?=
+endif
+AURORA_MAKEFILE_CONFIG_EOF2
+
+      ok "Makefile_config patched for Aurora"
+    fi
+  fi
+
   # ── Clang / icpx compatibility for #pragma weak ambiguity ─────────
   # On Clang-based compilers (icpx, clang++), #pragma weak MPI_Send =
   # PMPI_Send creates a second declaration of MPI_Send in the same
