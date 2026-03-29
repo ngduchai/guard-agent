@@ -56,11 +56,55 @@ skip() { echo "[SKIP]  $*"; }
 info() { echo "[INFO]  $*"; }
 
 # ── 1. Build DMTCP ───────────────────────────────────────────────────────
+# IMPORTANT: DMTCP *must* be built with GCC, not Intel icx/icpx.
+# Intel's compiler links libintlc.so.5 whose __intel_cpu_features_init_body
+# calls openat() during initialization. Since libdmtcp.so wraps openat()
+# (dmtcp_openat), this creates an infinite recursion loop when libdmtcp.so
+# is LD_PRELOAD'd, causing the process to hang in a CPU busy loop.
 DMTCP_SRC="${SRC_DIR}/dmtcp"
 DMTCP_BIN="${INSTALL_PREFIX}/bin/dmtcp_launch"
 
+# Find GCC (must not be Intel compiler masquerading as gcc)
+_find_gcc() {
+  local _cc=""
+  for _candidate in gcc /usr/bin/gcc; do
+    if command -v "${_candidate}" >/dev/null 2>&1; then
+      # Verify it's real GCC, not Intel
+      if "${_candidate}" -v 2>&1 | grep -qi 'gcc version'; then
+        _cc="${_candidate}"
+        break
+      fi
+    fi
+  done
+  echo "${_cc}"
+}
+
+DMTCP_CC="$(_find_gcc)"
+DMTCP_CXX=""
+if [ -n "${DMTCP_CC}" ]; then
+  DMTCP_CXX="$(dirname "${DMTCP_CC}")/g++"
+  [ -x "${DMTCP_CXX}" ] || DMTCP_CXX="g++"
+fi
+
 if [ -x "${DMTCP_BIN}" ]; then
-  skip "DMTCP already installed at ${DMTCP_BIN}"
+  # Check if existing DMTCP was built with Intel compiler (has Intel runtime deps)
+  if ldd "${INSTALL_PREFIX}/lib/dmtcp/libdmtcp.so" 2>/dev/null | grep -q 'libintlc'; then
+    info "Existing DMTCP was built with Intel compiler (links libintlc.so)"
+    info "This causes a hang due to Intel runtime ↔ DMTCP openat wrapper recursion"
+    if [ -n "${DMTCP_CC}" ]; then
+      info "Rebuilding DMTCP with GCC: ${DMTCP_CC}"
+      cd "${DMTCP_SRC}"
+      make distclean 2>/dev/null || make clean 2>/dev/null || true
+      CC="${DMTCP_CC}" CXX="${DMTCP_CXX}" ./configure --prefix="${INSTALL_PREFIX}"
+      make -j"$(nproc)"
+      make install
+      ok "DMTCP rebuilt with GCC"
+    else
+      info "WARNING: GCC not found; cannot rebuild DMTCP. It may hang at runtime."
+    fi
+  else
+    skip "DMTCP already installed at ${DMTCP_BIN}"
+  fi
 else
   if [ ! -d "${DMTCP_SRC}" ]; then
     info "Cloning DMTCP ..."
@@ -68,7 +112,13 @@ else
   fi
   info "Building DMTCP ..."
   cd "${DMTCP_SRC}"
-  ./configure --prefix="${INSTALL_PREFIX}"
+  if [ -n "${DMTCP_CC}" ]; then
+    info "Using GCC: ${DMTCP_CC}"
+    CC="${DMTCP_CC}" CXX="${DMTCP_CXX}" ./configure --prefix="${INSTALL_PREFIX}"
+  else
+    info "WARNING: GCC not found; using default compiler (may cause issues with Intel)"
+    ./configure --prefix="${INSTALL_PREFIX}"
+  fi
   make -j"$(nproc)"
   make install
   ok "DMTCP installed to ${INSTALL_PREFIX}"
