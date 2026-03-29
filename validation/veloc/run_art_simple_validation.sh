@@ -267,7 +267,7 @@ python -m validation.veloc.validate \
   --hdf5-dataset data \
   --output-file-name recon.h5 \
   --max-attempts 10 \
-  --injection-delay 10.0 \
+  --injection-delay 5.0 \
   --install-resilient \
   --veloc-config-name veloc.cfg \
   --benchmark-config "${BENCHMARK_CONFIG}" \
