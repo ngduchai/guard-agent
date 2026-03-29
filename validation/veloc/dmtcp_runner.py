@@ -223,18 +223,31 @@ def _prepare_dmtcp_env(env: dict | None) -> dict:
     return run_env
 
 
+def _find_ckpt_files(ckpt_dir: Path) -> list[str]:
+    """Recursively find all ``ckpt_*.dmtcp`` files under *ckpt_dir*.
+
+    DMTCP may write checkpoint files directly in *ckpt_dir* or in
+    subdirectories.  This helper walks the entire tree so that files
+    are found regardless of the directory layout.
+    """
+    found: list[str] = []
+    for root, _dirs, files in os.walk(ckpt_dir):
+        for fname in files:
+            if fname.startswith("ckpt_") and fname.endswith(".dmtcp"):
+                found.append(str(Path(root) / fname))
+    return sorted(found)
+
+
 def measure_checkpoint_size(ckpt_dir: Path) -> int | None:
     """Sum the sizes of all ``ckpt_*.dmtcp`` files in *ckpt_dir*."""
     total = 0
     count = 0
-    for root, _dirs, files in os.walk(ckpt_dir):
-        for fname in files:
-            if fname.startswith("ckpt_") and fname.endswith(".dmtcp"):
-                try:
-                    total += (Path(root) / fname).stat().st_size
-                    count += 1
-                except OSError:
-                    pass
+    for fpath in _find_ckpt_files(ckpt_dir):
+        try:
+            total += Path(fpath).stat().st_size
+            count += 1
+        except OSError:
+            pass
     return total if count > 0 else None
 
 
@@ -407,27 +420,39 @@ def dmtcp_run_with_failure_injection(
     )
 
     t0 = time.monotonic()
-    with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
+    # Open stdout/stderr files outside the `with` block so they remain
+    # open for the entire lifetime of the child process.  The previous
+    # code used a `with` block that closed the file handles immediately
+    # after Popen, which could cause the child to lose its output FDs.
+    out_f = stdout_path.open("wb")
+    err_f = stderr_path.open("wb")
+    try:
         mpi_proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, env=run_env)
+    except Exception:
+        out_f.close()
+        err_f.close()
+        raise
 
-        mem_thread = None
-        if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
-            memory_stop_event.clear()
-            memory_samples_holder[0] = []
-            mem_thread = threading.Thread(
-                target=memory_monitor_fn,
-                args=(mpi_proc.pid, memory_samples_holder, memory_stop_event),
-                daemon=True,
-            )
-            mem_thread.start()
+    mem_thread = None
+    if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
+        memory_stop_event.clear()
+        memory_samples_holder[0] = []
+        mem_thread = threading.Thread(
+            target=memory_monitor_fn,
+            args=(mpi_proc.pid, memory_samples_holder, memory_stop_event),
+            daemon=True,
+        )
+        mem_thread.start()
 
     # ── Phase 2: wait, checkpoint, kill ──────────────────────────────────
     print(f"[dmtcp] waiting {injection_delay}s before checkpoint ...", flush=True)
     time.sleep(injection_delay)
 
-    # Check if app already finished.
+    # Check if app already finished before we could checkpoint.
     poll = mpi_proc.poll()
     if poll is not None:
+        out_f.close()
+        err_f.close()
         elapsed = time.monotonic() - t0
         if mem_thread is not None and memory_stop_event is not None:
             memory_stop_event.set()
@@ -459,10 +484,12 @@ def dmtcp_run_with_failure_injection(
 
     # Kill one MPI rank.
     rank_pid = _find_rank_pid(executable_name)
+    killed = False
     if rank_pid is not None:
         print(f"[dmtcp] killing rank pid={rank_pid} (SIGKILL)", flush=True)
         try:
             os.kill(rank_pid, signal.SIGKILL)
+            killed = True
         except ProcessLookupError:
             print("[dmtcp] rank already dead", flush=True)
     else:
@@ -470,6 +497,8 @@ def dmtcp_run_with_failure_injection(
 
     # Wait for mpirun to exit.
     mpi_proc.wait()
+    out_f.close()
+    err_f.close()
     t_kill = time.monotonic()
 
     # Stop memory monitor for initial phase.
@@ -484,16 +513,65 @@ def dmtcp_run_with_failure_injection(
     )
 
     # ── Phase 3: restart from checkpoint ─────────────────────────────────
-    ckpt_files = sorted(glob.glob(str(ckpt_dir / "ckpt_*.dmtcp")))
+    # Search recursively — DMTCP may place checkpoint files in
+    # subdirectories of the checkpoint directory.
+    ckpt_files = _find_ckpt_files(ckpt_dir)
     restart_script = ckpt_dir / "dmtcp_restart_script.sh"
 
     if not ckpt_files and not restart_script.exists():
+        # If the app completed normally (all ranks exited) and we never
+        # managed to kill a rank, DMTCP may have cleaned up checkpoint
+        # files on normal exit.  Treat this as "completed without
+        # injection" rather than a fatal error.
+        exit_code = mpi_proc.returncode
+        stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+
+        # Log diagnostic information.
+        print(
+            f"[dmtcp] WARNING: no checkpoint files found in {ckpt_dir}",
+            flush=True,
+        )
+        try:
+            ckpt_contents = list(ckpt_dir.rglob("*"))
+            print(
+                f"[dmtcp]   ckpt_dir contents ({len(ckpt_contents)} items): "
+                f"{[str(p.relative_to(ckpt_dir)) for p in ckpt_contents[:20]]}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+        if not killed:
+            # App finished before we could inject failure — the
+            # checkpoint was taken but DMTCP cleaned up on normal exit.
+            print(
+                "[dmtcp] App completed before failure could be injected. "
+                "Returning result as non-injected run.",
+                flush=True,
+            )
+            stop_coordinator(coord_port, tool_paths)
+            elapsed = t_kill - t0
+            return RunResult(
+                exit_code=exit_code,
+                stdout=stdout_text,
+                stderr=stderr_text,
+                elapsed_s=elapsed,
+                injected=False,
+                num_attempts=1,
+                output_dir=output_dir,
+                last_attempt_elapsed_s=elapsed,
+                memory_samples_bytes=all_mem_samples,
+            )
+
+        # We did kill a rank but still no checkpoint files — this is a
+        # genuine error.
         stop_coordinator(coord_port, tool_paths)
         raise ValidationError(
             "DMTCP: no checkpoint files found after checkpoint command. "
             "Cannot restart.",
-            stdout=stdout_path.read_text(encoding="utf-8", errors="replace"),
-            stderr=stderr_path.read_text(encoding="utf-8", errors="replace"),
+            stdout=stdout_text,
+            stderr=stderr_text,
             exit_code=-1,
             output_dir=output_dir,
         )
