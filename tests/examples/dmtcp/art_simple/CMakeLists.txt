@@ -127,37 +127,41 @@ if(DMTCP_USE_MANA_STUB)
     target_include_directories(art_simple_main PRIVATE ${MPI_CXX_INCLUDE_DIRS})
     target_compile_options(art_simple_main PRIVATE ${MPI_CXX_COMPILE_OPTIONS})
 
-    # Strip MPI from all HDF5 targets to prevent libmpi.so from sneaking in
+    # In MANA stub mode, use SHARED HDF5 (hdf5-shared).
+    #
+    # Why shared, not static?
+    #   - libhdf5.a contains H5FDmpio.c.o which calls MPI functions like
+    #     MPI_Aint_diff, MPI_Type_create_struct, etc.
+    #   - libmpistub.so only provides the common MPI API subset; it does NOT
+    #     provide every MPI function that HDF5's parallel I/O driver uses.
+    #   - With shared HDF5, libhdf5.so has libmpi.so in its DT_NEEDED, so
+    #     the dynamic linker loads the real MPI at runtime.  MANA's
+    #     split-process model (lower-half) provides the real MPI, so this
+    #     is correct and expected.
+    #
+    # The critical requirement for MANA is that the APPLICATION BINARY
+    # itself links against libmpistub.so (not libmpi.a or libmpi.so).
+    # HDF5 as a shared library loading real MPI is fine — MANA intercepts
+    # those calls through its plugin mechanism.
+    #
+    # We strip MPI from HDF5's INTERFACE_LINK_LIBRARIES so that CMake
+    # doesn't add -lmpi to the app's direct link line.  HDF5's own
+    # DT_NEEDED will still pull in libmpi.so at runtime.
     foreach(_hdf5_target
             HDF5::HDF5
             hdf5-shared
-            hdf5-static
             hdf5::hdf5-shared
-            hdf5::hdf5-static
             HDF5::HDF5_C
             HDF5::HDF5_CXX)
         _strip_mpi_from_target(${_hdf5_target})
     endforeach()
 
-    # Link against libmpistub.so (NOT libmpi.a or libmpi.so)
-    # Use static HDF5 to avoid libhdf5.so pulling in libmpi.so via DT_NEEDED
-    if(TARGET hdf5-static)
-        message(STATUS "DMTCP: using static HDF5 (hdf5-static) to avoid runtime libmpi.so dependency")
-        target_link_libraries(art_simple_main
-            hdf5-static
-            ${MANA_MPISTUB_LIB}
-            Threads::Threads ${CMAKE_DL_LIBS} rt)
-    else()
-        message(STATUS "DMTCP: hdf5-static not available, falling back to HDF5::HDF5 (shared)")
-        message(WARNING
-            "Using shared HDF5 with MANA stub mode. If libhdf5.so has libmpi.so "
-            "in DT_NEEDED, the app may still load real MPI at runtime, which "
-            "conflicts with MANA. Consider installing static HDF5.")
-        target_link_libraries(art_simple_main
-            HDF5::HDF5
-            ${MANA_MPISTUB_LIB}
-            Threads::Threads ${CMAKE_DL_LIBS} rt)
-    endif()
+    # Link: shared HDF5 + libmpistub.so
+    message(STATUS "DMTCP: using shared HDF5 (hdf5-shared) — its DT_NEEDED libmpi.so is handled by MANA")
+    target_link_libraries(art_simple_main
+        hdf5-shared
+        ${MANA_MPISTUB_LIB}
+        Threads::Threads ${CMAKE_DL_LIBS} rt)
 
     message(STATUS "")
     message(STATUS "  Build with: make")
