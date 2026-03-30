@@ -602,6 +602,8 @@ def _stage_correctness(
     if approaches:
         from .dmtcp_runner import (
             check_dmtcp_available,
+            check_mana_available,
+            detect_mana_root,
             dmtcp_run_once,
             dmtcp_run_with_failure_injection,
         )
@@ -634,13 +636,34 @@ def _stage_correctness(
                 continue
 
             # Build approach codebase.
+            # If MANA is available, build with MANA stub for MPI checkpoint
+            # support.  Without MANA, plain DMTCP cannot checkpoint MPI apps.
             a_build = effective_build_root / approach.name
+            cmake_extra: list[str] = []
+            mana_root = detect_mana_root()
+            if mana_root is not None:
+                cmake_extra = [
+                    "-DDMTCP_USE_MANA_STUB=ON",
+                    f"-DMANA_ROOT={mana_root}",
+                ]
+                print(
+                    f"[validate] MANA detected at {mana_root}; building with MANA stub",
+                    flush=True,
+                )
+            elif check_mana_available():
+                print(
+                    "[validate] WARNING: MANA tools found but MANA_ROOT not detected; "
+                    "building without MANA stub (checkpoint may fail for MPI apps)",
+                    flush=True,
+                )
             print(
                 f"[validate] Building {approach.name} codebase: "
                 f"{approach.codebase_dir} -> {a_build}",
                 flush=True,
             )
-            configure_and_build(approach.codebase_dir, a_build)
+            configure_and_build(
+                approach.codebase_dir, a_build, cmake_extra_args=cmake_extra or None,
+            )
 
             a_exe = approach.executable_name or res_exe
             # Use dedicated coordinator ports for correctness checks.

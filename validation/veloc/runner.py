@@ -197,6 +197,7 @@ def configure_and_build(
     source_dir: Path,
     build_dir: Path,
     run_install: bool = False,
+    cmake_extra_args: list[str] | None = None,
 ) -> None:
     """Configure (via CMake) and build the example.
 
@@ -209,6 +210,9 @@ def configure_and_build(
     ``-DVELOC_DIR=<prefix>`` so that the build can find ``libveloc-client.so``
     and all its transitive dependencies regardless of the default in the
     project's ``CMakeLists.txt``.
+
+    *cmake_extra_args* are appended to the ``cmake -S ... -B ...`` command.
+    For DMTCP/MANA builds, pass ``["-DDMTCP_USE_MANA_STUB=ON", "-DMANA_ROOT=..."]``.
     """
     build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,6 +238,9 @@ def configure_and_build(
                 configure_cmd.append(
                     f"-DCMAKE_PREFIX_PATH={veloc_dir}"
                 )
+
+        if cmake_extra_args:
+            configure_cmd.extend(cmake_extra_args)
 
         code = _run_cmd(configure_cmd)
         if code != 0:

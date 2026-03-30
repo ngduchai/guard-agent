@@ -37,8 +37,12 @@ from .runner import RunResult, ValidationError, configure_and_build, _find_execu
 # ---------------------------------------------------------------------------
 
 _DMTCP_TOOLS = ["dmtcp_launch", "dmtcp_coordinator", "dmtcp_command", "dmtcp_restart"]
+_MANA_TOOLS = ["mana_launch", "mana_restart"]
 
 _MARKER_FILE = Path.home() / ".local" / "share" / "guard-agent" / "dmtcp_prefix"
+
+# Default MANA source directory (written by install_dmtcp_mana.sh).
+_MANA_SRC_DIR = Path.home() / ".local" / "share" / "guard-agent" / "dmtcp-src" / "mana"
 
 
 def _resolve_dmtcp_bin(install_prefix: str | None = None) -> Path | None:
@@ -87,6 +91,29 @@ def _resolve_dmtcp_bin(install_prefix: str | None = None) -> Path | None:
     return None
 
 
+def _resolve_mana_bin() -> Path | None:
+    """Find the MANA bin/ directory.
+
+    MANA tools (``mana_launch``, ``mana_restart``) live in the MANA
+    source/build tree, not in the DMTCP install prefix.
+    """
+    candidate = _MANA_SRC_DIR / "bin"
+    if candidate.exists() and (candidate / "mana_launch").exists():
+        return candidate
+    # Fall back to PATH.
+    path_result = shutil.which("mana_launch")
+    if path_result:
+        return Path(path_result).parent
+    return None
+
+
+def detect_mana_root() -> Path | None:
+    """Return the MANA source root if available, else None."""
+    if _MANA_SRC_DIR.is_dir() and (_MANA_SRC_DIR / "bin" / "mana_launch").exists():
+        return _MANA_SRC_DIR
+    return None
+
+
 def check_dmtcp_available(install_prefix: str | None = None) -> bool:
     """Return True if all required DMTCP tools can be found."""
     bin_dir = _resolve_dmtcp_bin(install_prefix)
@@ -95,10 +122,20 @@ def check_dmtcp_available(install_prefix: str | None = None) -> bool:
     return all((bin_dir / t).exists() for t in _DMTCP_TOOLS)
 
 
+def check_mana_available() -> bool:
+    """Return True if MANA tools (mana_launch, mana_restart) are available."""
+    mana_bin = _resolve_mana_bin()
+    if mana_bin is None:
+        return False
+    return all((mana_bin / t).exists() for t in _MANA_TOOLS)
+
+
 def require_dmtcp(install_prefix: str | None = None) -> dict[str, str]:
     """Locate all DMTCP tools and return a name → path mapping.
 
-    Raises ``RuntimeError`` if any tool is missing.
+    Also includes MANA tools if available (keyed as ``mana_launch``,
+    ``mana_restart``).  Raises ``RuntimeError`` if core DMTCP tools are
+    missing.
     """
     bin_dir = _resolve_dmtcp_bin(install_prefix)
     if bin_dir is None:
@@ -120,6 +157,15 @@ def require_dmtcp(install_prefix: str | None = None) -> dict[str, str]:
             f"DMTCP tools not found in {bin_dir}: {', '.join(missing)}. "
             "Install DMTCP+MANA via scripts/install_dmtcp_mana.sh"
         )
+
+    # Optionally add MANA tools if available.
+    mana_bin = _resolve_mana_bin()
+    if mana_bin is not None:
+        for t in _MANA_TOOLS:
+            p = mana_bin / t
+            if p.exists():
+                tool_paths[t] = str(p)
+
     return tool_paths
 
 
@@ -267,6 +313,77 @@ def measure_checkpoint_size(ckpt_dir: Path) -> int | None:
 # Clean run (no failure injection)
 # ---------------------------------------------------------------------------
 
+def _build_launch_cmd(
+    tool_paths: dict[str, str],
+    num_procs: int,
+    coord_port: int,
+    exe_path: Path,
+    app_args: list[str],
+    ckpt_dir: Path | None = None,
+) -> list[str]:
+    """Build the mpirun + launcher command.
+
+    Uses ``mana_launch`` if available in *tool_paths* (required for MPI
+    checkpoint/restart), otherwise falls back to plain ``dmtcp_launch``.
+    """
+    import socket
+    use_mana = "mana_launch" in tool_paths
+    if use_mana:
+        coord_host = socket.gethostname()
+        launcher_args = [
+            tool_paths["mana_launch"],
+            "--coord-host", coord_host,
+            "--coord-port", str(coord_port),
+        ]
+        if ckpt_dir is not None:
+            launcher_args.extend(["--ckptdir", str(ckpt_dir)])
+        launcher_args.append("--no-gzip")
+    else:
+        launcher_args = [
+            tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
+        ]
+
+    return [
+        "mpirun", "-np", str(num_procs),
+        *launcher_args,
+        str(exe_path), *app_args,
+    ]
+
+
+def _build_restart_cmd(
+    tool_paths: dict[str, str],
+    num_procs: int,
+    coord_port: int,
+    ckpt_dir: Path,
+    ckpt_files: list[str],
+) -> list[str]:
+    """Build the restart command.
+
+    Uses ``mana_restart`` if available (wraps restart in mpirun),
+    otherwise falls back to plain ``dmtcp_restart`` with checkpoint files.
+    """
+    import socket
+    use_mana = "mana_restart" in tool_paths
+    if use_mana:
+        coord_host = socket.gethostname()
+        return [
+            "mpirun", "-np", str(num_procs),
+            tool_paths["mana_restart"],
+            "--coord-host", coord_host,
+            "--coord-port", str(coord_port),
+            "--ckptdir", str(ckpt_dir),
+            "--no-gzip",
+        ]
+    else:
+        restart_script = ckpt_dir / "dmtcp_restart_script.sh"
+        if restart_script.exists():
+            return ["bash", str(restart_script)]
+        return [
+            tool_paths["dmtcp_restart"], "--coord-port", str(coord_port),
+            *ckpt_files,
+        ]
+
+
 def dmtcp_run_once(
     build_dir: Path,
     executable_name: str,
@@ -300,14 +417,9 @@ def dmtcp_run_once(
     # DMTCP to crash with "Unimplemented file type".
     run_env = _prepare_dmtcp_env(env)
 
-    # Launch mpirun with dmtcp_launch wrapping only the application,
-    # NOT mpirun itself.  Wrapping mpirun causes DMTCP to intercept
-    # mpirun's internal hwloc/libudev file operations on block devices.
-    cmd = [
-        "mpirun", "-np", str(num_procs),
-        tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
-        str(exe_path), *app_args,
-    ]
+    cmd = _build_launch_cmd(
+        tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
+    )
     print(f"[dmtcp] starting MPI run (cwd={cwd}): {' '.join(cmd)}", flush=True)
 
     t0 = time.monotonic()
@@ -374,7 +486,7 @@ def _find_rank_pid(executable_name: str) -> int | None:
         except ValueError:
             continue
         cmd = parts[2]
-        if executable_name in cmd and "mpirun" not in cmd and "python" not in cmd and "dmtcp" not in cmd:
+        if executable_name in cmd and "mpirun" not in cmd and "python" not in cmd and "dmtcp" not in cmd and "mana_launch" not in cmd:
             return pid
     return None
 
@@ -426,14 +538,9 @@ def dmtcp_run_with_failure_injection(
     # DMTCP to crash with "Unimplemented file type".
     run_env = _prepare_dmtcp_env(env)
 
-    # Launch mpirun with dmtcp_launch wrapping only the application,
-    # NOT mpirun itself.  Wrapping mpirun causes DMTCP to intercept
-    # mpirun's internal hwloc/libudev file operations on block devices.
-    cmd = [
-        "mpirun", "-np", str(num_procs),
-        tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
-        str(exe_path), *app_args,
-    ]
+    cmd = _build_launch_cmd(
+        tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
+    )
     print(
         f"[dmtcp] attempt: starting MPI run (cwd={cwd}): {' '.join(cmd)}",
         flush=True,
@@ -707,13 +814,9 @@ def dmtcp_run_with_failure_injection(
             output_dir=output_dir,
         )
 
-    if restart_script.exists():
-        restart_cmd = ["bash", str(restart_script)]
-    else:
-        restart_cmd = [
-            tool_paths["dmtcp_restart"], "--coord-port", str(coord_port),
-            *ckpt_files,
-        ]
+    restart_cmd = _build_restart_cmd(
+        tool_paths, num_procs, coord_port, ckpt_dir, ckpt_files,
+    )
 
     print(f"[dmtcp] restarting: {' '.join(restart_cmd[:5])} ...", flush=True)
 

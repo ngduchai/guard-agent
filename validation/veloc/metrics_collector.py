@@ -768,6 +768,17 @@ def run_benchmark_sweep(
     configure_and_build(resilient_source_dir, resilient_build_dir, run_install=install_resilient)
 
     # Build approach codebases and resolve their build dirs.
+    # If MANA is available, build DMTCP approaches with MANA stub so
+    # that MPI checkpointing works correctly.
+    from .dmtcp_runner import detect_mana_root
+    mana_root = detect_mana_root()
+    mana_cmake_args: list[str] | None = None
+    if mana_root is not None:
+        mana_cmake_args = [
+            "-DDMTCP_USE_MANA_STUB=ON",
+            f"-DMANA_ROOT={mana_root}",
+        ]
+
     approach_build_dirs: dict[str, Path] = {}
     for approach in verified_approaches:
         # Use legacy dmtcp_build_dir if it was passed directly, otherwise
@@ -777,7 +788,8 @@ def run_benchmark_sweep(
         else:
             a_build = build_root / approach.name
         print(f"[metrics] building {approach.name} codebase...", flush=True)
-        configure_and_build(approach.codebase_dir, a_build)
+        extra_args = mana_cmake_args if approach.approach_type == "dmtcp" else None
+        configure_and_build(approach.codebase_dir, a_build, cmake_extra_args=extra_args)
         approach_build_dirs[approach.name] = a_build
 
     total_scenarios = len(scenarios)
