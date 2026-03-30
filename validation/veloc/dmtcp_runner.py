@@ -196,20 +196,36 @@ def start_coordinator(
 ) -> subprocess.Popen:
     """Start a ``dmtcp_coordinator`` daemon on *port*.
 
+    When MANA tools are available, uses ``mana_start_coordinator`` which
+    writes a ``~/.mana.rc`` status file that ``mana_launch`` requires
+    to find the coordinator host and port.
+
     Parameters
     ----------
     ckpt_interval:
         If set, pass ``--interval <seconds>`` to the coordinator so that
-        it triggers automatic periodic checkpoints.  This ensures at
-        least one checkpoint is taken during the stable computation
-        phase of short-running applications.
+        it triggers automatic periodic checkpoints.
     """
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    coordinator = (tool_paths or {}).get("dmtcp_coordinator", "dmtcp_coordinator")
-    # MANA's fork of DMTCP uses --coord-port; upstream DMTCP uses --port.
-    # Detect which one to use by checking if MANA tools are present.
     use_mana = "mana_launch" in (tool_paths or {})
     port_flag = "--coord-port" if use_mana else "--port"
+
+    if use_mana:
+        # Use mana_start_coordinator which creates ~/.mana.rc (required
+        # by mana_launch to discover the coordinator).  It internally
+        # calls dmtcp_coordinator with --status-file and --exit-on-last.
+        mana_bin = Path((tool_paths or {})["mana_launch"]).parent
+        mana_start = str(mana_bin / "mana_start_coordinator")
+        cmd = [mana_start, port_flag, str(port), "--ckptdir", str(ckpt_dir)]
+        if ckpt_interval is not None and ckpt_interval > 0:
+            cmd.extend(["--interval", str(ckpt_interval)])
+        print(f"[dmtcp] starting coordinator: {' '.join(cmd)}", flush=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.wait()
+        time.sleep(0.5)
+        return proc
+
+    coordinator = (tool_paths or {}).get("dmtcp_coordinator", "dmtcp_coordinator")
     cmd = [
         coordinator,
         "--daemon",
