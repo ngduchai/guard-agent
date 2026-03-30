@@ -176,6 +176,23 @@ else
     info "Cloning CRIU ..."
     git clone --depth 1 https://github.com/checkpoint-restore/criu.git "${CRIU_SRC}"
   fi
+  # Ensure kernel headers are available. HPC compute nodes often lack
+  # the full kernel-headers package. Provide missing headers from the
+  # kernel source bundled with CRIU or download them.
+  _KHEADERS="${INSTALL_PREFIX}/include/linux"
+  mkdir -p "${_KHEADERS}"
+  for _hdr in netlink_diag.h unix_diag.h packet_diag.h; do
+    if [ ! -f "/usr/include/linux/${_hdr}" ] && [ ! -f "${_KHEADERS}/${_hdr}" ]; then
+      _KERNEL_VER="$(uname -r | sed 's/-.*//')"
+      info "Missing /usr/include/linux/${_hdr}, fetching from kernel source..."
+      curl -sSfL "https://raw.githubusercontent.com/torvalds/linux/v${_KERNEL_VER}/include/uapi/linux/${_hdr}" \
+        -o "${_KHEADERS}/${_hdr}" 2>/dev/null || \
+      curl -sSfL "https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/${_hdr}" \
+        -o "${_KHEADERS}/${_hdr}" 2>/dev/null || \
+      echo "[WARN]  Could not fetch ${_hdr}"
+    fi
+  done
+
   info "Building CRIU ..."
   cd "${CRIU_SRC}"
   make clean 2>/dev/null || true
@@ -184,7 +201,7 @@ else
     DESTDIR="" \
     CC="${GCC_CC}" \
     LD="${GCC_CC}" \
-    USERCFLAGS="-I${INSTALL_PREFIX}/include" \
+    USERCFLAGS="-I${INSTALL_PREFIX}/include -I/usr/include" \
     USERLDFLAGS="-L${INSTALL_PREFIX}/lib -L${INSTALL_PREFIX}/lib64"
   make install PREFIX="${INSTALL_PREFIX}" DESTDIR=""
   ok "CRIU installed to ${INSTALL_PREFIX}"
