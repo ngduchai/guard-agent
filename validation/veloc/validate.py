@@ -627,6 +627,15 @@ def _stage_correctness(
                         flush=True,
                     )
                     continue
+            elif approach.approach_type == "criu":
+                from .criu_runner import check_criu_available
+                if not check_criu_available():
+                    print(
+                        f"[validate] WARNING: skipping approach {approach.name!r} – "
+                        "CRIU not found. Install via: ./scripts/install_criu.sh",
+                        flush=True,
+                    )
+                    continue
             else:
                 print(
                     f"[validate] WARNING: unknown approach type "
@@ -636,34 +645,41 @@ def _stage_correctness(
                 continue
 
             # Build approach codebase.
-            # If MANA is available, build with MANA stub for MPI checkpoint
-            # support.  Without MANA, plain DMTCP cannot checkpoint MPI apps.
-            a_build = effective_build_root / approach.name
-            cmake_extra: list[str] = []
-            mana_root = detect_mana_root()
-            if mana_root is not None:
-                cmake_extra = [
-                    "-DDMTCP_USE_MANA_STUB=ON",
-                    f"-DMANA_ROOT={mana_root}",
-                ]
+            # CRIU uses the original (unmodified) binary — no special build.
+            # DMTCP uses MANA stub if available.
+            if approach.approach_type == "criu":
+                a_build = effective_build_root / "original"
                 print(
-                    f"[validate] MANA detected at {mana_root}; building with MANA stub",
+                    f"[validate] CRIU uses original binary (no special build needed)",
                     flush=True,
                 )
-            elif check_mana_available():
+            else:
+                a_build = effective_build_root / approach.name
+                cmake_extra: list[str] = []
+                mana_root = detect_mana_root()
+                if mana_root is not None:
+                    cmake_extra = [
+                        "-DDMTCP_USE_MANA_STUB=ON",
+                        f"-DMANA_ROOT={mana_root}",
+                    ]
+                    print(
+                        f"[validate] MANA detected at {mana_root}; building with MANA stub",
+                        flush=True,
+                    )
+                elif check_mana_available():
+                    print(
+                        "[validate] WARNING: MANA tools found but MANA_ROOT not detected; "
+                        "building without MANA stub (checkpoint may fail for MPI apps)",
+                        flush=True,
+                    )
                 print(
-                    "[validate] WARNING: MANA tools found but MANA_ROOT not detected; "
-                    "building without MANA stub (checkpoint may fail for MPI apps)",
+                    f"[validate] Building {approach.name} codebase: "
+                    f"{approach.codebase_dir} -> {a_build}",
                     flush=True,
                 )
-            print(
-                f"[validate] Building {approach.name} codebase: "
-                f"{approach.codebase_dir} -> {a_build}",
-                flush=True,
-            )
-            configure_and_build(
-                approach.codebase_dir, a_build, cmake_extra_args=cmake_extra or None,
-            )
+                configure_and_build(
+                    approach.codebase_dir, a_build, cmake_extra_args=cmake_extra or None,
+                )
 
             a_exe = approach.executable_name or res_exe
             # Use dedicated coordinator ports for correctness checks.
@@ -721,23 +737,36 @@ def _stage_correctness(
 
             # --- Approach run with failure injection ---
             approach_fi_out = output_dir / "correctness" / f"{approach.name}_failure_injection"
-            ckpt_dir_fi = approach_fi_out / "dmtcp_ckpt"
+            ckpt_dir_fi = approach_fi_out / f"{approach.name}_ckpt"
             print(
                 f"\n[validate] Running {approach.label} with failure injection...",
                 flush=True,
             )
-            fi_result = dmtcp_run_with_failure_injection(
-                build_dir=a_build,
-                executable_name=a_exe,
-                num_procs=args.num_procs,
-                app_args=approach_app_args,
-                output_dir=approach_fi_out,
-                ckpt_dir=ckpt_dir_fi,
-                coord_port=coord_port_base,
-                injection_delay=args.injection_delay,
-                run_cwd=approach_fi_out,
-                install_prefix=approach.install_prefix,
-            )
+            if approach.approach_type == "criu":
+                from .criu_runner import criu_run_with_failure_injection
+                fi_result = criu_run_with_failure_injection(
+                    build_dir=a_build,
+                    executable_name=a_exe,
+                    num_procs=args.num_procs,
+                    app_args=approach_app_args,
+                    output_dir=approach_fi_out,
+                    ckpt_dir=ckpt_dir_fi,
+                    injection_delay=args.injection_delay,
+                    run_cwd=approach_fi_out,
+                )
+            else:
+                fi_result = dmtcp_run_with_failure_injection(
+                    build_dir=a_build,
+                    executable_name=a_exe,
+                    num_procs=args.num_procs,
+                    app_args=approach_app_args,
+                    output_dir=approach_fi_out,
+                    ckpt_dir=ckpt_dir_fi,
+                    coord_port=coord_port_base,
+                    injection_delay=args.injection_delay,
+                    run_cwd=approach_fi_out,
+                    install_prefix=approach.install_prefix,
+                )
 
             # Compare approach output (failure-prone) against baseline.
             test_num += 1
@@ -793,23 +822,35 @@ def _stage_correctness(
 
             # --- Approach run without failure injection (failure-free check) ---
             approach_clean_out = output_dir / "correctness" / f"{approach.name}_clean"
-            ckpt_dir_clean = approach_clean_out / "dmtcp_ckpt"
+            ckpt_dir_clean = approach_clean_out / f"{approach.name}_ckpt"
             print(
                 f"\n[validate] Running {approach.label} without failure injection "
                 f"(failure-free check)...",
                 flush=True,
             )
-            clean_result_a = dmtcp_run_once(
-                build_dir=a_build,
-                executable_name=a_exe,
-                num_procs=args.num_procs,
-                app_args=approach_app_args,
-                output_dir=approach_clean_out,
-                ckpt_dir=ckpt_dir_clean,
-                coord_port=coord_port_base + 1,
-                run_cwd=approach_clean_out,
-                install_prefix=approach.install_prefix,
-            )
+            if approach.approach_type == "criu":
+                from .criu_runner import criu_run_once
+                clean_result_a = criu_run_once(
+                    build_dir=a_build,
+                    executable_name=a_exe,
+                    num_procs=args.num_procs,
+                    app_args=approach_app_args,
+                    output_dir=approach_clean_out,
+                    ckpt_dir=ckpt_dir_clean,
+                    run_cwd=approach_clean_out,
+                )
+            else:
+                clean_result_a = dmtcp_run_once(
+                    build_dir=a_build,
+                    executable_name=a_exe,
+                    num_procs=args.num_procs,
+                    app_args=approach_app_args,
+                    output_dir=approach_clean_out,
+                    ckpt_dir=ckpt_dir_clean,
+                    coord_port=coord_port_base + 1,
+                    run_cwd=approach_clean_out,
+                    install_prefix=approach.install_prefix,
+                )
             if not clean_result_a.succeeded:
                 print(
                     f"[validate] WARNING: {approach.label} failure-free run exited "

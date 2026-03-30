@@ -470,6 +470,53 @@ def _run_scenario_once(
         # DMTCP checkpoint size.
         ckpt_size: int | None = dmtcp_measure_checkpoint_size(ckpt_dir)
 
+    elif codebase == "criu":
+        # ── CRIU run ──────────────────────────────────────────────────
+        from .criu_runner import (
+            criu_run_once,
+            criu_run_with_failure_injection,
+            measure_checkpoint_size as criu_measure_checkpoint_size,
+        )
+        ckpt_dir = run_output_dir / "criu_ckpt"
+
+        if scenario.inject_failures:
+            result = criu_run_with_failure_injection(
+                build_dir=build_dir,
+                executable_name=executable_name,
+                num_procs=scenario.num_procs,
+                app_args=scenario.app_args,
+                output_dir=run_output_dir,
+                ckpt_dir=ckpt_dir,
+                injection_delay=scenario.injection_delay,
+                run_cwd=run_output_dir,
+                memory_monitor_fn=_monitor_memory_samples,
+                memory_stop_event=mem_stop_event,
+                memory_samples_holder=mem_samples_holder,
+            )
+        else:
+            result = criu_run_once(
+                build_dir=build_dir,
+                executable_name=executable_name,
+                num_procs=scenario.num_procs,
+                app_args=scenario.app_args,
+                output_dir=run_output_dir,
+                ckpt_dir=ckpt_dir,
+                run_cwd=run_output_dir,
+                memory_monitor_fn=_monitor_memory_samples,
+                memory_stop_event=mem_stop_event,
+                memory_samples_holder=mem_samples_holder,
+            )
+            if not result.succeeded:
+                raise ValidationError(
+                    f"CRIU benchmark run failed for scenario={scenario.name!r}, "
+                    f"run={run_index}, exit code={result.exit_code}",
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    exit_code=result.exit_code,
+                    output_dir=run_output_dir,
+                )
+        ckpt_size = criu_measure_checkpoint_size(ckpt_dir)
+
     elif scenario.inject_failures and codebase == "resilient":
         # ── Resilient run with failure injection ───────────────────────
         # Memory is monitored per-attempt inside run_with_failure_injection;
@@ -756,6 +803,16 @@ def run_benchmark_sweep(
                     "DMTCP tools not found.",
                     flush=True,
                 )
+        elif approach.approach_type == "criu":
+            from .criu_runner import check_criu_available
+            if check_criu_available():
+                verified_approaches.append(approach)
+            else:
+                print(
+                    f"[metrics] WARNING: approach {approach.name!r} skipped – "
+                    "CRIU not found. Install via: ./scripts/install_criu.sh",
+                    flush=True,
+                )
         else:
             print(
                 f"[metrics] WARNING: unknown approach type {approach.approach_type!r} "
@@ -795,15 +852,20 @@ def run_benchmark_sweep(
 
     approach_build_dirs: dict[str, Path] = {}
     for approach in verified_approaches:
-        # Use legacy dmtcp_build_dir if it was passed directly, otherwise
-        # create a build dir under the output build root.
-        if approach.approach_type == "dmtcp" and dmtcp_build_dir is not None and not extra_approaches:
+        if approach.approach_type == "criu":
+            # CRIU uses the original (unmodified) binary — no special build.
+            a_build = original_build_dir
+            print(f"[metrics] {approach.name} reuses original build (no special build)", flush=True)
+        elif approach.approach_type == "dmtcp" and dmtcp_build_dir is not None and not extra_approaches:
             a_build = dmtcp_build_dir
+            print(f"[metrics] building {approach.name} codebase...", flush=True)
+            extra_args = mana_cmake_args if approach.approach_type == "dmtcp" else None
+            configure_and_build(approach.codebase_dir, a_build, cmake_extra_args=extra_args)
         else:
             a_build = build_root / approach.name
-        print(f"[metrics] building {approach.name} codebase...", flush=True)
-        extra_args = mana_cmake_args if approach.approach_type == "dmtcp" else None
-        configure_and_build(approach.codebase_dir, a_build, cmake_extra_args=extra_args)
+            print(f"[metrics] building {approach.name} codebase...", flush=True)
+            extra_args = mana_cmake_args if approach.approach_type == "dmtcp" else None
+            configure_and_build(approach.codebase_dir, a_build, cmake_extra_args=extra_args)
         approach_build_dirs[approach.name] = a_build
 
     total_scenarios = len(scenarios)
