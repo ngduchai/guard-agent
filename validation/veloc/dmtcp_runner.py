@@ -507,8 +507,10 @@ def dmtcp_run_with_failure_injection(
         mem_thread.join(timeout=5.0)
         all_mem_samples.extend(memory_samples_holder[0])
 
+    exit_code = mpi_proc.returncode
     print(
-        f"[dmtcp] initial phase done (elapsed={t_kill - t0:.2f}s). Restarting ...",
+        f"[dmtcp] initial phase done (exit={exit_code}, killed={killed}, "
+        f"elapsed={t_kill - t0:.2f}s).",
         flush=True,
     )
 
@@ -523,13 +525,13 @@ def dmtcp_run_with_failure_injection(
         # managed to kill a rank, DMTCP may have cleaned up checkpoint
         # files on normal exit.  Treat this as "completed without
         # injection" rather than a fatal error.
-        exit_code = mpi_proc.returncode
         stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
         stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
 
         # Log diagnostic information.
         print(
-            f"[dmtcp] WARNING: no checkpoint files found in {ckpt_dir}",
+            f"[dmtcp] WARNING: no checkpoint files found in {ckpt_dir} "
+            f"(exit_code={exit_code})",
             flush=True,
         )
         try:
@@ -541,6 +543,14 @@ def dmtcp_run_with_failure_injection(
             )
         except Exception:
             pass
+        # Show stderr tail for debugging DMTCP issues.
+        stderr_tail = stderr_text.strip().splitlines()[-5:]
+        if stderr_tail:
+            print(
+                f"[dmtcp]   stderr (last {len(stderr_tail)} lines):\n"
+                + "\n".join(f"    {line}" for line in stderr_tail),
+                flush=True,
+            )
 
         if not killed:
             # App finished before we could inject failure — the
