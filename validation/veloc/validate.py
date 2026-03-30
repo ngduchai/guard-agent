@@ -669,6 +669,55 @@ def _stage_correctness(
             # Use dedicated coordinator ports for correctness checks.
             coord_port_base = 7900
 
+            # Determine app args and comparator for this approach.
+            # If the approach has custom app_args (e.g. more iterations for
+            # longer runtime), use those and run a separate baseline.
+            approach_app_args = approach.app_args if approach.app_args else res_app_args
+            approach_comparator = comparator
+            if approach.ssim_threshold is not None:
+                approach_comparator = make_comparator(
+                    method=args.comparison_method,
+                    plugin_path=Path(args.custom_comparator) if args.custom_comparator else None,
+                    dataset=args.hdf5_dataset,
+                    ssim_threshold=approach.ssim_threshold,
+                    atol=args.numeric_atol,
+                    rtol=args.numeric_rtol,
+                    ignore_patterns=args.text_ignore_patterns,
+                )
+                print(
+                    f"[validate] Using approach-specific SSIM threshold: "
+                    f"{approach.ssim_threshold}",
+                    flush=True,
+                )
+
+            # If approach uses different app_args, run a separate baseline.
+            approach_baseline_file = baseline_file
+            if approach.app_args:
+                approach_baseline_dir = (
+                    output_dir / "correctness" / f"{approach.name}_baseline"
+                )
+                approach_baseline_dir.mkdir(parents=True, exist_ok=True)
+                print(
+                    f"[validate] Running separate baseline for {approach.label} "
+                    f"(custom app_args with num_iter={approach_app_args[2]})...",
+                    flush=True,
+                )
+                from .runner import run_once
+                baseline_result_a = run_once(
+                    build_dir=effective_build_root / "original",
+                    executable_name=args.executable_name,
+                    num_procs=args.num_procs,
+                    app_args=approach_app_args,
+                    output_dir=approach_baseline_dir,
+                )
+                approach_baseline_file = approach_baseline_dir / args.output_file_name
+                if not approach_baseline_file.exists():
+                    print(
+                        f"[validate] WARNING: approach baseline output not found: "
+                        f"{approach_baseline_file}",
+                        flush=True,
+                    )
+
             # --- Approach run with failure injection ---
             approach_fi_out = output_dir / "correctness" / f"{approach.name}_failure_injection"
             ckpt_dir_fi = approach_fi_out / "dmtcp_ckpt"
@@ -680,7 +729,7 @@ def _stage_correctness(
                 build_dir=a_build,
                 executable_name=a_exe,
                 num_procs=args.num_procs,
-                app_args=res_app_args,
+                app_args=approach_app_args,
                 output_dir=approach_fi_out,
                 ckpt_dir=ckpt_dir_fi,
                 coord_port=coord_port_base,
@@ -695,11 +744,13 @@ def _stage_correctness(
             if approach_fi_file.exists():
                 print(
                     f"\n[validate] Comparing outputs ({approach.label}, failure-prone):\n"
-                    f"  baseline:  {baseline_file}\n"
+                    f"  baseline:  {approach_baseline_file}\n"
                     f"  approach:  {approach_fi_file}",
                     flush=True,
                 )
-                fi_compare = comparator.compare(baseline_file, approach_fi_file)
+                fi_compare = approach_comparator.compare(
+                    approach_baseline_file, approach_fi_file,
+                )
                 fi_compare.method = f"{fi_compare.method} [{approach.label}, failure-prone]"
                 print(
                     f"[validate] Test {test_num} ({approach.label}, failure-prone): "
@@ -751,7 +802,7 @@ def _stage_correctness(
                 build_dir=a_build,
                 executable_name=a_exe,
                 num_procs=args.num_procs,
-                app_args=res_app_args,
+                app_args=approach_app_args,
                 output_dir=approach_clean_out,
                 ckpt_dir=ckpt_dir_clean,
                 coord_port=coord_port_base + 1,
@@ -771,11 +822,13 @@ def _stage_correctness(
             if approach_clean_file.exists():
                 print(
                     f"\n[validate] Comparing outputs ({approach.label}, failure-free):\n"
-                    f"  baseline:  {baseline_file}\n"
+                    f"  baseline:  {approach_baseline_file}\n"
                     f"  approach:  {approach_clean_file}",
                     flush=True,
                 )
-                clean_compare = comparator.compare(baseline_file, approach_clean_file)
+                clean_compare = approach_comparator.compare(
+                    approach_baseline_file, approach_clean_file,
+                )
                 clean_compare.method = (
                     f"{clean_compare.method} [{approach.label}, failure-free]"
                 )

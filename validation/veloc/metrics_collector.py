@@ -63,6 +63,8 @@ class ApproachConfig:
     codebase_dir: Path
     executable_name: str | None = None # None = use main --executable-name
     install_prefix: str | None = None  # for DMTCP: None = auto-discover
+    app_args: list[str] | None = None  # override app args for correctness tests
+    ssim_threshold: float | None = None  # override SSIM threshold (e.g. 0.95 for MANA)
 
 
 @dataclass
@@ -256,6 +258,16 @@ def load_approaches_config(
         codebase_dir = Path(entry["codebase_dir"])
         if not codebase_dir.is_absolute():
             codebase_dir = repo_root / codebase_dir
+        # Expand env vars in app_args (e.g. ${DATA_PATH:-default}).
+        raw_app_args = entry.get("app_args")
+        if raw_app_args is not None:
+            def _expand_approach_arg(arg: str) -> str:
+                def _sub(m: re.Match) -> str:
+                    return os.environ.get(m.group(1), m.group(2))
+                arg = re.sub(r"\$\{(\w+):-([^}]*)\}", _sub, arg)
+                return os.path.expandvars(arg)
+            raw_app_args = [_expand_approach_arg(str(a)) for a in raw_app_args]
+
         approaches.append(
             ApproachConfig(
                 name=entry["name"],
@@ -265,6 +277,8 @@ def load_approaches_config(
                 codebase_dir=codebase_dir,
                 executable_name=entry.get("executable_name"),
                 install_prefix=entry.get("install_prefix"),
+                app_args=raw_app_args,
+                ssim_threshold=entry.get("ssim_threshold"),
             )
         )
     return approaches
