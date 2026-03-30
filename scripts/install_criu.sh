@@ -120,6 +120,8 @@ else
         git submodule update --init --recursive 2>/dev/null || true
         mkdir -p build_dir && cd build_dir
         cmake .. -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+          -DCMAKE_C_COMPILER="${GCC_CC}" \
+          -DCMAKE_CXX_COMPILER="${GCC_CXX}" \
           -Dprotobuf_BUILD_TESTS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
         make -j"$(nproc)"
         make install
