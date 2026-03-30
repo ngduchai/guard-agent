@@ -124,6 +124,57 @@ else
   ok "DMTCP installed to ${INSTALL_PREFIX}"
 fi
 
+# ── 1b. Patch procselfmaps.cpp for Aurora GPU memory mappings ────────────
+# Aurora's /proc/self/maps contains "anon_inode:i915.gem" entries whose
+# names start with 'a', not '/', '[', or '('.  DMTCP's parser only handles
+# the latter three, causing a JASSERT assertion failure (exit code 99)
+# during checkpoint.  Fix: accept any non-newline character as the start
+# of a memory-mapping name.
+#
+# This patch is applied to both the standalone DMTCP source and (later)
+# MANA's embedded DMTCP submodule.
+_patch_procselfmaps() {
+  local psmap="$1"
+  if [ ! -f "${psmap}" ]; then
+    return
+  fi
+  if grep -q "data\[dataIdx\] == '/'" "${psmap}" 2>/dev/null; then
+    info "Patching ${psmap} for anon_inode:* support ..."
+    python3 -c "
+import sys
+path = sys.argv[1]
+with open(path, 'r') as f:
+    content = f.read()
+old = \"if (data[dataIdx] == '/' || data[dataIdx] == '[' || data[dataIdx] == '(') {\"
+new = \"if (data[dataIdx] != '\\\\n') { // patched: handle anon_inode:* and other non-standard names\"
+if old in content:
+    content = content.replace(old, new)
+    with open(path, 'w') as f:
+        f.write(content)
+    print('[OK]    Patched successfully')
+else:
+    print('[SKIP]  Pattern not found (may already be patched)')
+" "${psmap}"
+  else
+    skip "procselfmaps.cpp already patched: ${psmap}"
+  fi
+}
+
+DMTCP_PSMAP="${DMTCP_SRC}/src/procselfmaps.cpp"
+_patch_procselfmaps "${DMTCP_PSMAP}"
+
+# If the patch was applied after the initial build, rebuild and reinstall.
+if [ -f "${DMTCP_PSMAP}" ] && grep -q "anon_inode" "${DMTCP_PSMAP}" 2>/dev/null; then
+  # Check if the installed library is older than the patched source.
+  if [ "${DMTCP_PSMAP}" -nt "${INSTALL_PREFIX}/lib/dmtcp/libdmtcp.so" ] 2>/dev/null; then
+    info "Rebuilding DMTCP after procselfmaps.cpp patch ..."
+    cd "${DMTCP_SRC}"
+    make -j"$(nproc)"
+    make install
+    ok "DMTCP reinstalled with procselfmaps.cpp patch"
+  fi
+fi
+
 # ── 2. Build MANA (MPI-Agnostic Network-Agnostic checkpoint plugin) ─────
 # MANA's MPI proxy-split currently requires x86_64 (uses asm/prctl.h for
 # ARCH_SET_FS/ARCH_SET_GS).  On other architectures, DMTCP is installed
@@ -186,6 +237,12 @@ else
     rm -rf dmtcp
     ln -sf "${DMTCP_SRC}" dmtcp
   fi
+  # Patch MANA's embedded DMTCP copy for Aurora anon_inode entries.
+  # (If the submodule is a symlink to our standalone DMTCP, this is a no-op
+  # because _patch_procselfmaps was already applied above.)
+  MANA_DMTCP_PSMAP="${PWD}/dmtcp/src/procselfmaps.cpp"
+  _patch_procselfmaps "${MANA_DMTCP_PSMAP}"
+
   # MANA requires Python 3.7+.  On HPC systems python3 may not be on
   # PATH but versioned binaries (python3.9, python3.11, …) or module-
   # loaded interpreters often exist.  Search broadly before giving up.
