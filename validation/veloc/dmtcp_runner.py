@@ -411,11 +411,12 @@ def dmtcp_run_with_failure_injection(
     all_mem_samples: list[int] = []
 
     # ── Phase 1: initial launch ──────────────────────────────────────────
-    # Use periodic checkpoints via --interval so that at least one
-    # checkpoint is taken during the stable computation phase.  The
-    # interval is set to max(1, injection_delay // 2) so that a
-    # checkpoint is very likely to exist by the time we want to kill.
-    ckpt_interval = max(1, int(injection_delay // 2))
+    # Always use the minimum periodic checkpoint interval (1s) so that
+    # short-running applications get at least one checkpoint before they
+    # finish.  The previous formula ``max(1, injection_delay // 2)``
+    # produced intervals larger than the application runtime for long
+    # injection delays, causing zero checkpoint files.
+    ckpt_interval = 1
     start_coordinator(
         coord_port, ckpt_dir, tool_paths, ckpt_interval=ckpt_interval,
     )
@@ -463,17 +464,89 @@ def dmtcp_run_with_failure_injection(
         )
         mem_thread.start()
 
-    # ── Phase 2: wait for checkpoint, then kill ───────────────────────────
-    # The coordinator was started with --interval so periodic checkpoints
-    # are triggered automatically.  We wait for the injection delay, then
-    # verify that at least one checkpoint file exists before killing.
-    # If no periodic checkpoint has landed yet, we trigger one manually
-    # and poll for files to appear.
-    print(
-        f"[dmtcp] waiting {injection_delay}s (periodic ckpt interval={ckpt_interval}s) ...",
-        flush=True,
-    )
-    time.sleep(injection_delay)
+    # ── Phase 2: secure a checkpoint, then wait for injection delay ─────
+    # Strategy: decouple "getting a checkpoint" from "waiting for the
+    # injection delay".  First, eagerly obtain a checkpoint (via both the
+    # periodic --interval 1 and an explicit manual trigger).  Once
+    # checkpoint files exist, wait for the remaining injection_delay to
+    # elapse, then proceed to kill a rank.  This ensures short-running
+    # applications get checkpointed before they finish.
+    _CKPT_INIT_GRACE = 1.0   # seconds for DMTCP to initialise
+    _CKPT_POLL_TIMEOUT = 30.0
+    _CKPT_POLL_INTERVAL = 0.5
+
+    # Brief grace period for DMTCP processes to register with the
+    # coordinator before we attempt the first checkpoint.
+    _grace_deadline = time.monotonic() + _CKPT_INIT_GRACE
+    while time.monotonic() < _grace_deadline:
+        if mpi_proc.poll() is not None:
+            break
+        time.sleep(0.25)
+
+    # Trigger a manual checkpoint immediately (don't rely solely on the
+    # periodic interval which may race with app completion).
+    ckpt_ready = False
+    if mpi_proc.poll() is None:
+        print(
+            f"[dmtcp] triggering early checkpoint "
+            f"(injection_delay={injection_delay}s, periodic interval={ckpt_interval}s) ...",
+            flush=True,
+        )
+        _dmtcp_checkpoint(coord_port, tool_paths)
+
+        # Poll for checkpoint files to appear on disk.
+        poll_deadline = time.monotonic() + _CKPT_POLL_TIMEOUT
+        while time.monotonic() < poll_deadline:
+            if _find_ckpt_files(ckpt_dir):
+                ckpt_ready = True
+                print(
+                    f"[dmtcp] checkpoint files ready "
+                    f"({time.monotonic() - t0:.1f}s after launch)",
+                    flush=True,
+                )
+                break
+            if mpi_proc.poll() is not None:
+                print(
+                    f"[dmtcp] app exited (code={mpi_proc.returncode}) "
+                    f"while waiting for checkpoint files",
+                    flush=True,
+                )
+                break
+            time.sleep(_CKPT_POLL_INTERVAL)
+
+    # If first attempt didn't produce files and app is still alive, retry.
+    if not ckpt_ready and mpi_proc.poll() is None:
+        print("[dmtcp] retrying manual checkpoint ...", flush=True)
+        _dmtcp_checkpoint(coord_port, tool_paths)
+        retry_deadline = time.monotonic() + 10.0
+        while time.monotonic() < retry_deadline:
+            if _find_ckpt_files(ckpt_dir):
+                ckpt_ready = True
+                print(
+                    f"[dmtcp] checkpoint files ready on retry "
+                    f"({time.monotonic() - t0:.1f}s after launch)",
+                    flush=True,
+                )
+                break
+            if mpi_proc.poll() is not None:
+                break
+            time.sleep(_CKPT_POLL_INTERVAL)
+
+    # Wait for the remaining injection_delay to elapse (preserving the
+    # intended delay semantics for benchmarking).
+    elapsed_so_far = time.monotonic() - t0
+    remaining = injection_delay - elapsed_so_far
+    if remaining > 0 and mpi_proc.poll() is None:
+        print(
+            f"[dmtcp] checkpoint secured; waiting {remaining:.1f}s "
+            f"remaining of {injection_delay}s injection delay ...",
+            flush=True,
+        )
+        wait_until = time.monotonic() + remaining
+        while time.monotonic() < wait_until:
+            if mpi_proc.poll() is not None:
+                break
+            time.sleep(min(0.5, wait_until - time.monotonic()))
 
     # Check if app already finished before we could inject.
     poll = mpi_proc.poll()
@@ -485,8 +558,6 @@ def dmtcp_run_with_failure_injection(
             memory_stop_event.set()
             mem_thread.join(timeout=5.0)
             all_mem_samples.extend(memory_samples_holder[0])
-        # Even though the app finished, periodic checkpoints may have
-        # produced files we can use.
         early_ckpt = _find_ckpt_files(ckpt_dir)
         stop_coordinator(coord_port, tool_paths)
         stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
@@ -507,52 +578,6 @@ def dmtcp_run_with_failure_injection(
             last_attempt_elapsed_s=elapsed,
             memory_samples_bytes=all_mem_samples,
         )
-
-    # Check for checkpoint files produced by periodic --interval.
-    ckpt_files_before_kill = _find_ckpt_files(ckpt_dir)
-    if ckpt_files_before_kill:
-        print(
-            f"[dmtcp] found {len(ckpt_files_before_kill)} checkpoint file(s) "
-            f"from periodic interval",
-            flush=True,
-        )
-    else:
-        # No periodic checkpoint yet — trigger one manually and wait
-        # for files to appear (up to 30s).
-        print("[dmtcp] no periodic checkpoint files yet; triggering manual checkpoint ...", flush=True)
-        ckpt_ok = _dmtcp_checkpoint(coord_port, tool_paths)
-        if not ckpt_ok:
-            print("[dmtcp] WARNING: manual checkpoint command failed", flush=True)
-
-        # Poll for checkpoint files to appear (the coordinator writes
-        # them asynchronously after the checkpoint command returns).
-        _CKPT_POLL_TIMEOUT = 30.0
-        _CKPT_POLL_INTERVAL = 0.5
-        poll_start = time.monotonic()
-        while time.monotonic() - poll_start < _CKPT_POLL_TIMEOUT:
-            ckpt_files_before_kill = _find_ckpt_files(ckpt_dir)
-            if ckpt_files_before_kill:
-                print(
-                    f"[dmtcp] checkpoint files appeared after "
-                    f"{time.monotonic() - poll_start:.1f}s",
-                    flush=True,
-                )
-                break
-            # Also check if the app died during checkpoint.
-            if mpi_proc.poll() is not None:
-                print(
-                    f"[dmtcp] app exited (code={mpi_proc.returncode}) "
-                    f"while waiting for checkpoint files",
-                    flush=True,
-                )
-                break
-            time.sleep(_CKPT_POLL_INTERVAL)
-        else:
-            print(
-                f"[dmtcp] WARNING: no checkpoint files after "
-                f"{_CKPT_POLL_TIMEOUT}s polling",
-                flush=True,
-            )
 
     # Kill one MPI rank (only if checkpoint files exist).
     rank_pid = _find_rank_pid(executable_name)
