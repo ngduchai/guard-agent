@@ -69,7 +69,16 @@ if [ -z "${GCC_CC}" ]; then
   echo "[ERROR] GCC not found. CRIU requires GCC to build." >&2
   exit 1
 fi
+# Resolve to absolute path so sed substitution works.
+GCC_CC="$(command -v "${GCC_CC}" 2>/dev/null || echo "${GCC_CC}")"
 GCC_CXX="$(echo "${GCC_CC}" | sed 's|/gcc$|/g++|')"
+# Verify g++ exists; fall back to plain g++ if sed didn't work.
+if [ ! -x "${GCC_CXX}" ]; then
+  GCC_CXX="$(dirname "${GCC_CC}")/g++"
+fi
+if [ ! -x "${GCC_CXX}" ]; then
+  GCC_CXX="g++"
+fi
 GCC_DIR="$(dirname "${GCC_CC}")"
 info "Using GCC: ${GCC_CC} ($(${GCC_CC} --version 2>/dev/null | head -1))"
 
