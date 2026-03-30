@@ -709,6 +709,7 @@ def _stage_correctness(
                     num_procs=args.num_procs,
                     app_args=approach_app_args,
                     output_dir=approach_baseline_dir,
+                    run_cwd=approach_baseline_dir,
                 )
                 approach_baseline_file = approach_baseline_dir / args.output_file_name
                 if not approach_baseline_file.exists():

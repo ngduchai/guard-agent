@@ -217,8 +217,16 @@ def start_coordinator(
         mana_bin = Path((tool_paths or {})["mana_launch"]).parent
         mana_start = str(mana_bin / "mana_start_coordinator")
         cmd = [mana_start, port_flag, str(port), "--ckptdir", str(ckpt_dir)]
+        # Do NOT pass --interval to MANA coordinator.  MANA's split-process
+        # architecture needs time to initialise; aggressive periodic
+        # checkpoints during startup crash the processes.  We rely on
+        # manual checkpoint triggers instead (via dmtcp_command).
         if ckpt_interval is not None and ckpt_interval > 0:
-            cmd.extend(["--interval", str(ckpt_interval)])
+            print(
+                f"[dmtcp] NOTE: skipping --interval {ckpt_interval} for MANA "
+                f"(using manual checkpoint triggers only)",
+                flush=True,
+            )
         print(f"[dmtcp] starting coordinator: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         proc.wait()
@@ -620,7 +628,10 @@ def dmtcp_run_with_failure_injection(
     # checkpoint files exist, wait for the remaining injection_delay to
     # elapse, then proceed to kill a rank.  This ensures short-running
     # applications get checkpointed before they finish.
-    _CKPT_INIT_GRACE = 1.0   # seconds for DMTCP to initialise
+    # MANA's split-process architecture needs more time to initialise
+    # than plain DMTCP (lower-half setup, MPI init, coordinator connect).
+    use_mana = "mana_launch" in tool_paths
+    _CKPT_INIT_GRACE = 5.0 if use_mana else 1.0
     _CKPT_POLL_TIMEOUT = 30.0
     _CKPT_POLL_INTERVAL = 0.5
 
