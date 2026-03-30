@@ -176,6 +176,57 @@ else
     info "Cloning CRIU ..."
     git clone --depth 1 https://github.com/checkpoint-restore/criu.git "${CRIU_SRC}"
   fi
+  # ── 2a. Build libnet (CRIU dependency for socket checkpoint/restore) ──
+  LIBNET_SRC="${SRC_DIR}/libnet"
+  LIBNET_LIB="${INSTALL_PREFIX}/lib/libnet.so"
+  if [ -f "${LIBNET_LIB}" ] || [ -f "${INSTALL_PREFIX}/lib/libnet.a" ]; then
+    skip "libnet already installed"
+  else
+    if [ ! -d "${LIBNET_SRC}" ]; then
+      info "Cloning libnet ..."
+      git clone --depth 1 https://github.com/libnet/libnet.git "${LIBNET_SRC}"
+    fi
+    info "Building libnet ..."
+    cd "${LIBNET_SRC}"
+    if [ -f CMakeLists.txt ]; then
+      mkdir -p build_dir && cd build_dir
+      cmake .. -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+        -DCMAKE_C_COMPILER="${GCC_CC}"
+      make -j"$(nproc)"
+      make install
+      cd ..
+    elif [ -f configure ] || [ -f autogen.sh ]; then
+      [ -f autogen.sh ] && ./autogen.sh
+      ./configure --prefix="${INSTALL_PREFIX}" CC="${GCC_CC}"
+      make -j"$(nproc)"
+      make install
+    fi
+    ok "libnet installed to ${INSTALL_PREFIX}"
+  fi
+
+  # ── 2b. Build libnl-3 if missing ──────────────────────────────────────
+  if ! pkg-config --exists libnl-3.0 2>/dev/null; then
+    LIBNL_SRC="${SRC_DIR}/libnl"
+    LIBNL_LIB="${INSTALL_PREFIX}/lib/libnl-3.so"
+    if [ -f "${LIBNL_LIB}" ]; then
+      skip "libnl-3 already installed"
+    else
+      if [ ! -d "${LIBNL_SRC}" ]; then
+        info "Cloning libnl ..."
+        git clone --depth 1 --branch libnl3_9_0 https://github.com/thom311/libnl.git "${LIBNL_SRC}"
+      fi
+      info "Building libnl ..."
+      cd "${LIBNL_SRC}"
+      [ -f autogen.sh ] && ./autogen.sh
+      ./configure --prefix="${INSTALL_PREFIX}" CC="${GCC_CC}" --disable-cli
+      make -j"$(nproc)"
+      make install
+      ok "libnl-3 installed to ${INSTALL_PREFIX}"
+    fi
+  fi
+
+  export PKG_CONFIG_PATH="${INSTALL_PREFIX}/lib/pkgconfig:${INSTALL_PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+
   # Ensure kernel headers are available. HPC compute nodes often lack
   # the full kernel-headers package. Provide missing headers from the
   # kernel source bundled with CRIU or download them.
