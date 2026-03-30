@@ -567,6 +567,24 @@ def dmtcp_run_with_failure_injection(
             f"elapsed={elapsed:.2f}s, ckpt_files={len(early_ckpt)})",
             flush=True,
         )
+        # Diagnose common DMTCP failures on Aurora / GPU-equipped nodes.
+        if poll == 99 and len(early_ckpt) == 0:
+            print(
+                "[dmtcp] ERROR: exit code 99 with zero checkpoint files "
+                "indicates a DMTCP JASSERT assertion failure during\n"
+                "[dmtcp]   checkpointing.  On Aurora (Intel GPU nodes), "
+                "this is typically caused by:\n"
+                "[dmtcp]   1. procselfmaps.cpp parser crash on "
+                "'anon_inode:i915.gem' entries in /proc/self/maps\n"
+                "[dmtcp]   2. Intel compiler runtime (libintlc.so) "
+                "infinite recursion in DMTCP's openat() wrapper\n"
+                "[dmtcp]   Fix: rebuild DMTCP with the procselfmaps "
+                "patch and GCC:\n"
+                "[dmtcp]     bash tests/examples/dmtcp/art_simple/"
+                "diagnose_and_fix_mana.sh --force\n"
+                "[dmtcp]   or re-run:  ./scripts/install_dmtcp_mana.sh",
+                flush=True,
+            )
         return RunResult(
             exit_code=poll,
             stdout=stdout_text,
