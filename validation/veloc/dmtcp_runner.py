@@ -158,13 +158,27 @@ def require_dmtcp(install_prefix: str | None = None) -> dict[str, str]:
             "Install DMTCP+MANA via scripts/install_dmtcp_mana.sh"
         )
 
-    # Optionally add MANA tools if available.
+    # If MANA is available, prefer ALL tools from MANA's bin directory.
+    # MANA has its own embedded DMTCP build (mana/dmtcp/) and the tools
+    # must match — mixing standalone DMTCP tools with MANA's launcher
+    # causes version mismatches and protocol errors.
     mana_bin = _resolve_mana_bin()
     if mana_bin is not None:
-        for t in _MANA_TOOLS:
-            p = mana_bin / t
-            if p.exists():
-                tool_paths[t] = str(p)
+        all_mana_tools = _DMTCP_TOOLS + _MANA_TOOLS
+        mana_has_all = all((mana_bin / t).exists() for t in all_mana_tools)
+        if mana_has_all:
+            for t in all_mana_tools:
+                tool_paths[t] = str(mana_bin / t)
+            print(
+                f"[dmtcp] using MANA tools from {mana_bin}",
+                flush=True,
+            )
+        else:
+            # MANA partially available — add what we can.
+            for t in _MANA_TOOLS:
+                p = mana_bin / t
+                if p.exists():
+                    tool_paths[t] = str(p)
 
     return tool_paths
 
@@ -192,10 +206,14 @@ def start_coordinator(
     """
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     coordinator = (tool_paths or {}).get("dmtcp_coordinator", "dmtcp_coordinator")
+    # MANA's fork of DMTCP uses --coord-port; upstream DMTCP uses --port.
+    # Detect which one to use by checking if MANA tools are present.
+    use_mana = "mana_launch" in (tool_paths or {})
+    port_flag = "--coord-port" if use_mana else "--port"
     cmd = [
         coordinator,
         "--daemon",
-        "--port", str(port),
+        port_flag, str(port),
         "--ckptdir", str(ckpt_dir),
     ]
     if ckpt_interval is not None and ckpt_interval > 0:
@@ -215,12 +233,14 @@ def stop_coordinator(
 ) -> None:
     """Send a quit command to the coordinator on *port*."""
     dmtcp_command = (tool_paths or {}).get("dmtcp_command", "dmtcp_command")
+    use_mana = "mana_launch" in (tool_paths or {})
+    port_flag = "--coord-port" if use_mana else "--port"
+    cmd = [dmtcp_command, port_flag, str(port), "--quit"]
+    if use_mana:
+        import socket
+        cmd = [dmtcp_command, "-h", socket.gethostname(), port_flag, str(port), "--quit"]
     try:
-        subprocess.run(
-            [dmtcp_command, "--port", str(port), "--quit"],
-            timeout=10,
-            capture_output=True,
-        )
+        subprocess.run(cmd, timeout=10, capture_output=True)
     except Exception:
         pass
 
@@ -232,10 +252,16 @@ def _dmtcp_checkpoint(
 ) -> bool:
     """Trigger a checkpoint and wait for it to complete."""
     dmtcp_command = (tool_paths or {}).get("dmtcp_command", "dmtcp_command")
+    use_mana = "mana_launch" in (tool_paths or {})
+    port_flag = "--coord-port" if use_mana else "--port"
+    cmd = [dmtcp_command, port_flag, str(port), "--checkpoint"]
+    if use_mana:
+        import socket
+        cmd = [dmtcp_command, "-h", socket.gethostname(), port_flag, str(port), "--checkpoint"]
     print(f"[dmtcp] triggering checkpoint on port {port} ...", flush=True)
     try:
         result = subprocess.run(
-            [dmtcp_command, "--port", str(port), "--checkpoint"],
+            cmd,
             timeout=timeout,
             capture_output=True,
             text=True,
