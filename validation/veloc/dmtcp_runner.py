@@ -449,23 +449,20 @@ def _build_restart_cmd(
     """
     import socket
     use_mana = "mana_restart" in tool_paths
+    # Prefer the auto-generated restart script — it contains the exact
+    # flags that match the checkpoint context.  Using mana_restart
+    # directly causes flag incompatibilities (it adds -j and other flags
+    # that lower-half --restore → dmtcp_restart doesn't accept).
+    restart_script = ckpt_dir / "dmtcp_restart_script.sh"
+    if restart_script.exists():
+        return ["bash", str(restart_script)]
     if use_mana:
-        # mana_restart reads host/port from ~/.mana.rc (written by
-        # mana_start_coordinator).  Do NOT pass --coord-host or
-        # --coord-port here — mana_restart passes all flags through to
-        # lower-half --restore → dmtcp_restart, which only understands
-        # -h/-p (not --coord-host/--coord-port).  Passing unrecognized
-        # flags causes dmtcp_restart to print help and exit 99.
-        # Only pass --ckptdir (not --no-gzip, which is a launch-only flag).
         return [
             "mpirun", "-np", str(num_procs),
             tool_paths["mana_restart"],
             "--ckptdir", str(ckpt_dir),
         ]
     else:
-        restart_script = ckpt_dir / "dmtcp_restart_script.sh"
-        if restart_script.exists():
-            return ["bash", str(restart_script)]
         return [
             tool_paths["dmtcp_restart"], "--coord-port", str(coord_port),
             *ckpt_files,
