@@ -312,7 +312,11 @@ def _dmtcp_checkpoint(
 # Checkpoint size measurement
 # ---------------------------------------------------------------------------
 
-def _prepare_dmtcp_env(env: dict | None) -> dict:
+def _prepare_dmtcp_env(
+    env: dict | None,
+    app_args: list[str] | None = None,
+    use_mana: bool = False,
+) -> dict:
     """Prepare environment variables for DMTCP-launched processes.
 
     Ensures ``HWLOC_COMPONENTS=-linuxio`` is set so that hwloc (used by
@@ -320,6 +324,11 @@ def _prepare_dmtcp_env(env: dict | None) -> dict:
     like ``/dev/nvme*``.  Without this, DMTCP's file-connection handler
     crashes with "Unimplemented file type" when it intercepts the
     ``openat`` call on the block device.
+
+    When *use_mana* is True and *app_args* are provided, sets
+    ``MANA_NUM_OUTER_ITER`` and ``MANA_CENTER`` environment variables as
+    a workaround for MANA's ``deepCopyStack`` bug that corrupts
+    ``argv[3]`` in the upper-half application.
     """
     run_env = dict(os.environ if env is None else env)
     # Disable hwloc Linux I/O component to avoid block-device enumeration.
@@ -327,6 +336,19 @@ def _prepare_dmtcp_env(env: dict | None) -> dict:
     if "-linuxio" not in hwloc:
         run_env["HWLOC_COMPONENTS"] = (
             f"{hwloc},-linuxio" if hwloc else "-linuxio"
+        )
+    # Workaround: MANA's lower-half corrupts argv[3] during
+    # split-process stack setup.  Pass the values that would be at
+    # argv[2] (center) and argv[3] (num_outer_iter) via env vars so the
+    # patched app can use them instead of the corrupted argv.
+    if use_mana and app_args and len(app_args) >= 3:
+        # app_args order: <filename> <center> <num_outer_iter> ...
+        run_env["MANA_CENTER"] = str(app_args[1])        # argv[2]
+        run_env["MANA_NUM_OUTER_ITER"] = str(app_args[2])  # argv[3]
+        print(
+            f"[dmtcp] MANA argv workaround: "
+            f"MANA_CENTER={app_args[1]}, MANA_NUM_OUTER_ITER={app_args[2]}",
+            flush=True,
         )
     return run_env
 
@@ -465,7 +487,8 @@ def dmtcp_run_once(
     # Prepare environment with HWLOC_COMPONENTS=-linuxio to prevent
     # hwloc from opening block devices (e.g. /dev/nvme*) which causes
     # DMTCP to crash with "Unimplemented file type".
-    run_env = _prepare_dmtcp_env(env)
+    use_mana = "mana_launch" in tool_paths
+    run_env = _prepare_dmtcp_env(env, app_args=app_args, use_mana=use_mana)
 
     cmd = _build_launch_cmd(
         tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
@@ -586,7 +609,8 @@ def dmtcp_run_with_failure_injection(
     # Prepare environment with HWLOC_COMPONENTS=-linuxio to prevent
     # hwloc from opening block devices (e.g. /dev/nvme*) which causes
     # DMTCP to crash with "Unimplemented file type".
-    run_env = _prepare_dmtcp_env(env)
+    use_mana = "mana_launch" in tool_paths
+    run_env = _prepare_dmtcp_env(env, app_args=app_args, use_mana=use_mana)
 
     cmd = _build_launch_cmd(
         tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
