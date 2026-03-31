@@ -912,6 +912,13 @@ def dmtcp_run_with_failure_injection(
             output_dir=output_dir,
         )
 
+    # Restart the coordinator — MANA's mana_start_coordinator uses
+    # --exit-on-last, so it exits when the crashed MPI job disconnects.
+    # A fresh coordinator is needed for mana_restart.
+    stop_coordinator(coord_port, tool_paths)
+    time.sleep(0.5)
+    start_coordinator(coord_port, ckpt_dir, tool_paths)
+
     restart_cmd = _build_restart_cmd(
         tool_paths, num_procs, coord_port, ckpt_dir, ckpt_files,
     )
