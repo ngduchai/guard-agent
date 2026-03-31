@@ -571,7 +571,14 @@ def _find_rank_pid(executable_name: str) -> int | None:
         except ValueError:
             continue
         cmd = parts[2]
-        if executable_name in cmd and "mpirun" not in cmd and "python" not in cmd and "dmtcp" not in cmd and "mana_launch" not in cmd:
+        if (executable_name in cmd
+                and "mpirun" not in cmd
+                and "python" not in cmd
+                and "mana_launch" not in cmd
+                and "dmtcp_launch" not in cmd
+                and "dmtcp_command" not in cmd
+                and "dmtcp_coordinator" not in cmd
+                and "dmtcp_restart" not in cmd):
             return pid
     return None
 
