@@ -337,17 +337,23 @@ def _prepare_dmtcp_env(
         run_env["HWLOC_COMPONENTS"] = (
             f"{hwloc},-linuxio" if hwloc else "-linuxio"
         )
-    # Workaround: MANA's lower-half corrupts argv[3] during
-    # split-process stack setup.  Pass the values that would be at
-    # argv[2] (center) and argv[3] (num_outer_iter) via env vars so the
-    # patched app can use them instead of the corrupted argv.
-    if use_mana and app_args and len(app_args) >= 3:
-        # app_args order: <filename> <center> <num_outer_iter> ...
-        run_env["MANA_CENTER"] = str(app_args[1])        # argv[2]
-        run_env["MANA_NUM_OUTER_ITER"] = str(app_args[2])  # argv[3]
+    # Workaround: MANA's lower-half corrupts argv[3] pointer during
+    # split-process stack setup (deepCopyStack bug in copy-stack.c).
+    # Write correct arg values to a config file that the patched app
+    # reads at startup.  Env vars don't propagate through Cray PALS.
+    if use_mana and app_args and len(app_args) >= 5:
+        # app_args order: <filename> <center> <num_outer_iter> <num_iter> <beg_index> <num_sino>
+        cfg_path = "/tmp/mana_argv_override.conf"
+        with open(cfg_path, "w") as f:
+            f.write(f"center={app_args[1]}\n")
+            f.write(f"num_outer_iter={app_args[2]}\n")
+            f.write(f"num_iter={app_args[3]}\n")
+            f.write(f"beg_index={app_args[4]}\n")
+            if len(app_args) >= 6:
+                f.write(f"nslices={app_args[5]}\n")
         print(
-            f"[dmtcp] MANA argv workaround: "
-            f"MANA_CENTER={app_args[1]}, MANA_NUM_OUTER_ITER={app_args[2]}",
+            f"[dmtcp] MANA argv workaround: wrote {cfg_path} "
+            f"(num_outer_iter={app_args[2]})",
             flush=True,
         )
     return run_env
