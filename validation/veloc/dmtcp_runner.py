@@ -556,7 +556,7 @@ def _find_rank_pid(executable_name: str) -> int | None:
     """Search the process table for a rank process matching *executable_name*."""
     try:
         out = subprocess.check_output(
-            ["ps", "-o", "pid,ppid,cmd", "--no-headers"],
+            ["ps", "-e", "-o", "pid,ppid,cmd", "--no-headers"],
             text=True,
         )
     except Exception:
