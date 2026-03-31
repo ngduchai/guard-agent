@@ -456,11 +456,11 @@ def _build_restart_cmd(
         # lower-half --restore → dmtcp_restart, which only understands
         # -h/-p (not --coord-host/--coord-port).  Passing unrecognized
         # flags causes dmtcp_restart to print help and exit 99.
+        # Only pass --ckptdir (not --no-gzip, which is a launch-only flag).
         return [
             "mpirun", "-np", str(num_procs),
             tool_paths["mana_restart"],
             "--ckptdir", str(ckpt_dir),
-            "--no-gzip",
         ]
     else:
         restart_script = ckpt_dir / "dmtcp_restart_script.sh"
