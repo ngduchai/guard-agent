@@ -211,16 +211,21 @@ def start_coordinator(
     port_flag = "--coord-port" if use_mana else "--port"
 
     if use_mana:
-        # Use mana_start_coordinator which creates ~/.mana.rc (required
-        # by mana_launch to discover the coordinator).  It internally
-        # calls dmtcp_coordinator with --status-file and --exit-on-last.
+        # Start coordinator directly (not via mana_start_coordinator)
+        # WITHOUT --exit-on-last so it survives rank kills during
+        # failure injection.  Write ~/.mana.rc manually so mana_launch
+        # and mana_restart can discover the coordinator.
+        import socket
         mana_bin = Path((tool_paths or {})["mana_launch"]).parent
-        mana_start = str(mana_bin / "mana_start_coordinator")
-        cmd = [mana_start, port_flag, str(port), "--ckptdir", str(ckpt_dir)]
-        # Do NOT pass --interval to MANA coordinator.  MANA's split-process
-        # architecture needs time to initialise; aggressive periodic
-        # checkpoints during startup crash the processes.  We rely on
-        # manual checkpoint triggers instead (via dmtcp_command).
+        coordinator = str(mana_bin / "dmtcp_coordinator")
+        coord_host = socket.gethostname()
+        cmd = [
+            coordinator,
+            "--daemon",
+            port_flag, str(port),
+            "--ckptdir", str(ckpt_dir),
+            "-q", "-q",
+        ]
         if ckpt_interval is not None and ckpt_interval > 0:
             print(
                 f"[dmtcp] NOTE: skipping --interval {ckpt_interval} for MANA "
@@ -228,9 +233,19 @@ def start_coordinator(
                 flush=True,
             )
         print(f"[dmtcp] starting coordinator: {' '.join(cmd)}", flush=True)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd)
         proc.wait()
         time.sleep(0.5)
+        # Write ~/.mana.rc so mana_launch/mana_restart can find the coordinator
+        rc_path = Path.home() / ".mana.rc"
+        with open(rc_path, "w") as f:
+            f.write(f"Host: {coord_host}\n")
+            f.write(f"Port: {port}\n")
+            f.write("\n")
+        print(
+            f"[dmtcp] wrote {rc_path} (Host: {coord_host}, Port: {port})",
+            flush=True,
+        )
         return proc
 
     coordinator = (tool_paths or {}).get("dmtcp_coordinator", "dmtcp_coordinator")
@@ -914,12 +929,16 @@ def dmtcp_run_with_failure_injection(
             output_dir=output_dir,
         )
 
-    # Restart the coordinator — MANA's mana_start_coordinator uses
-    # --exit-on-last, so it exits when the crashed MPI job disconnects.
-    # A fresh coordinator is needed for mana_restart.
-    stop_coordinator(coord_port, tool_paths)
-    time.sleep(0.5)
-    start_coordinator(coord_port, ckpt_dir, tool_paths)
+    # For MANA, do NOT restart the coordinator — the checkpoint is tied
+    # to the coordinator's computation ID.  A new coordinator has a
+    # different ID, causing mana_restart to reject the checkpoint.
+    # Instead, start the coordinator WITHOUT --exit-on-last so it
+    # survives the rank kill.  For plain DMTCP, restart is fine.
+    use_mana_restart = "mana_restart" in tool_paths
+    if not use_mana_restart:
+        stop_coordinator(coord_port, tool_paths)
+        time.sleep(0.5)
+        start_coordinator(coord_port, ckpt_dir, tool_paths)
 
     restart_cmd = _build_restart_cmd(
         tool_paths, num_procs, coord_port, ckpt_dir, ckpt_files,
