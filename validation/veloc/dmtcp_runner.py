@@ -450,12 +450,15 @@ def _build_restart_cmd(
     import socket
     use_mana = "mana_restart" in tool_paths
     if use_mana:
-        coord_host = socket.gethostname()
+        # mana_restart reads host/port from ~/.mana.rc (written by
+        # mana_start_coordinator).  Do NOT pass --coord-host or
+        # --coord-port here — mana_restart passes all flags through to
+        # lower-half --restore → dmtcp_restart, which only understands
+        # -h/-p (not --coord-host/--coord-port).  Passing unrecognized
+        # flags causes dmtcp_restart to print help and exit 99.
         return [
             "mpirun", "-np", str(num_procs),
             tool_paths["mana_restart"],
-            "--coord-host", coord_host,
-            "--coord-port", str(coord_port),
             "--ckptdir", str(ckpt_dir),
             "--no-gzip",
         ]
