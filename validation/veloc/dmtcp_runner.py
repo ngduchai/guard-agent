@@ -449,20 +449,22 @@ def _build_restart_cmd(
     """
     import socket
     use_mana = "mana_restart" in tool_paths
-    # Prefer the auto-generated restart script — it contains the exact
-    # flags that match the checkpoint context.  Using mana_restart
-    # directly causes flag incompatibilities (it adds -j and other flags
-    # that lower-half --restore → dmtcp_restart doesn't accept).
-    restart_script = ckpt_dir / "dmtcp_restart_script.sh"
-    if restart_script.exists():
-        return ["bash", str(restart_script)]
     if use_mana:
+        # MANA restart MUST go through mpirun to provide MPI context.
+        # The restart script calls dmtcp_restart directly (no mpirun),
+        # causing SIGSEGV because the restored lower-half process has
+        # no PMI/MPI runtime environment.
+        # Only pass --restartdir (not --ckptdir, --no-gzip, or
+        # --coord-host/--coord-port which are not valid restart flags).
         return [
             "mpirun", "-np", str(num_procs),
             tool_paths["mana_restart"],
-            "--ckptdir", str(ckpt_dir),
+            "--restartdir", str(ckpt_dir),
         ]
     else:
+        restart_script = ckpt_dir / "dmtcp_restart_script.sh"
+        if restart_script.exists():
+            return ["bash", str(restart_script)]
         return [
             tool_paths["dmtcp_restart"], "--coord-port", str(coord_port),
             *ckpt_files,
