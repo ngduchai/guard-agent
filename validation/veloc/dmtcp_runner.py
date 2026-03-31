@@ -465,16 +465,19 @@ def _build_restart_cmd(
     import socket
     use_mana = "mana_restart" in tool_paths
     if use_mana:
-        # MANA restart MUST go through mpirun to provide MPI context.
-        # The restart script calls dmtcp_restart directly (no mpirun),
-        # causing SIGSEGV because the restored lower-half process has
-        # no PMI/MPI runtime environment.
-        # Only pass --restartdir (not --ckptdir, --no-gzip, or
-        # --coord-host/--coord-port which are not valid restart flags).
+        # Use dmtcp_restart DIRECTLY (not mana_restart/lower-half --restore).
+        # lower-half --restore calls MPI_Init() before restoring the
+        # checkpoint, which conflicts with the checkpointed MPI state
+        # and causes a deadlock.  dmtcp_restart restores the full process
+        # image including the already-initialized MPI state.
+        import socket
+        coord_host = socket.gethostname()
         return [
-            "mpirun", "-np", str(num_procs),
-            tool_paths["mana_restart"],
-            "--restartdir", str(ckpt_dir),
+            tool_paths["dmtcp_restart"],
+            "-j",
+            "-h", coord_host,
+            "-p", str(coord_port),
+            *ckpt_files,
         ]
     else:
         restart_script = ckpt_dir / "dmtcp_restart_script.sh"
