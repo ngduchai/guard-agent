@@ -337,26 +337,33 @@ def _prepare_dmtcp_env(
         run_env["HWLOC_COMPONENTS"] = (
             f"{hwloc},-linuxio" if hwloc else "-linuxio"
         )
-    # Workaround: MANA's lower-half corrupts argv[3] pointer during
-    # split-process stack setup (deepCopyStack bug in copy-stack.c).
-    # Write correct arg values to a config file that the patched app
-    # reads at startup.  Env vars don't propagate through Cray PALS.
-    if use_mana and app_args and len(app_args) >= 5:
-        # app_args order: <filename> <center> <num_outer_iter> <num_iter> <beg_index> <num_sino>
-        cfg_path = "/tmp/mana_argv_override.conf"
-        with open(cfg_path, "w") as f:
-            f.write(f"center={app_args[1]}\n")
-            f.write(f"num_outer_iter={app_args[2]}\n")
-            f.write(f"num_iter={app_args[3]}\n")
-            f.write(f"beg_index={app_args[4]}\n")
-            if len(app_args) >= 6:
-                f.write(f"nslices={app_args[5]}\n")
-        print(
-            f"[dmtcp] MANA argv workaround: wrote {cfg_path} "
-            f"(num_outer_iter={app_args[2]})",
-            flush=True,
-        )
+    # MANA argv workaround env flag (config file is written by caller).
+    if use_mana:
+        run_env["MANA_ACTIVE"] = "1"
     return run_env
+
+
+def _write_mana_argv_override(cwd: Path, app_args: list[str]) -> None:
+    """Write a config file with correct arg values for MANA.
+
+    MANA's ``deepCopyStack`` corrupts ``argv[3]``.  The patched DMTCP
+    app reads overrides from ``mana_argv_override.conf`` in its CWD.
+    """
+    if len(app_args) < 5:
+        return
+    cfg_path = cwd / "mana_argv_override.conf"
+    with open(cfg_path, "w") as f:
+        f.write(f"center={app_args[1]}\n")
+        f.write(f"num_outer_iter={app_args[2]}\n")
+        f.write(f"num_iter={app_args[3]}\n")
+        f.write(f"beg_index={app_args[4]}\n")
+        if len(app_args) >= 6:
+            f.write(f"nslices={app_args[5]}\n")
+    print(
+        f"[dmtcp] MANA argv workaround: wrote {cfg_path} "
+        f"(num_outer_iter={app_args[2]})",
+        flush=True,
+    )
 
 
 def _find_ckpt_files(ckpt_dir: Path) -> list[str]:
@@ -490,11 +497,10 @@ def dmtcp_run_once(
 
     start_coordinator(coord_port, ckpt_dir, tool_paths)
 
-    # Prepare environment with HWLOC_COMPONENTS=-linuxio to prevent
-    # hwloc from opening block devices (e.g. /dev/nvme*) which causes
-    # DMTCP to crash with "Unimplemented file type".
     use_mana = "mana_launch" in tool_paths
     run_env = _prepare_dmtcp_env(env, app_args=app_args, use_mana=use_mana)
+    if use_mana:
+        _write_mana_argv_override(cwd, app_args)
 
     cmd = _build_launch_cmd(
         tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
@@ -617,6 +623,8 @@ def dmtcp_run_with_failure_injection(
     # DMTCP to crash with "Unimplemented file type".
     use_mana = "mana_launch" in tool_paths
     run_env = _prepare_dmtcp_env(env, app_args=app_args, use_mana=use_mana)
+    if use_mana:
+        _write_mana_argv_override(cwd, app_args)
 
     cmd = _build_launch_cmd(
         tool_paths, num_procs, coord_port, exe_path, app_args, ckpt_dir,
