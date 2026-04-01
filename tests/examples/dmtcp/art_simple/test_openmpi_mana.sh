@@ -36,8 +36,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Configuration ────────────────────────────────────────────────────────
-OPENMPI_PREFIX="${OPENMPI_PREFIX:-${HOME}/.local}"
 MANA_ROOT="${MANA_ROOT:-${HOME}/.local/share/guard-agent/dmtcp-src/mana}"
+
+# Auto-detect OpenMPI prefix from MANA lower-half's ldd output
+_auto_detect_openmpi() {
+    local _lower_half="${MANA_ROOT}/bin/lower-half"
+    if [[ -x "${_lower_half}" ]]; then
+        local _libmpi_path
+        _libmpi_path="$(ldd "${_lower_half}" 2>/dev/null | grep 'libmpi\.so' | awk '{print $3}' | head -1)"
+        if [[ -n "${_libmpi_path}" ]] && [[ -f "${_libmpi_path}" ]]; then
+            local _prefix
+            _prefix="$(dirname "$(dirname "${_libmpi_path}")")"
+            if [[ -x "${_prefix}/bin/mpirun" ]]; then
+                echo "${_prefix}"
+                return
+            fi
+        fi
+    fi
+    for _candidate in "${HOME}/.local/openmpi" "${HOME}/.local"; do
+        if [[ -x "${_candidate}/bin/mpirun" ]]; then
+            echo "${_candidate}"; return
+        fi
+    done
+    echo "${HOME}/.local"
+}
+
+if [[ -z "${OPENMPI_PREFIX:-}" ]]; then
+    OPENMPI_PREFIX="$(_auto_detect_openmpi)"
+    echo "[AUTO] Detected OpenMPI at: ${OPENMPI_PREFIX}"
+fi
 COORD_PORT="${COORD_PORT:-7908}"
 COORD_HOST="$(hostname)"
 

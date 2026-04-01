@@ -29,10 +29,53 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-OPENMPI_PREFIX="${OPENMPI_PREFIX:-${HOME}/.local}"
 MANA_ROOT="${MANA_ROOT:-${HOME}/.local/share/guard-agent/dmtcp-src/mana}"
 INSTALL_PREFIX="${HOME}/.local"
 COORD_PORT="${COORD_PORT:-7907}"
+
+# ── Auto-detect OpenMPI prefix ──────────────────────────────────────────
+# If OPENMPI_PREFIX is not set, try to detect it from MANA's lower-half
+# binary (which already links against OpenMPI), or search common locations.
+_auto_detect_openmpi() {
+    # 1. Check MANA lower-half's ldd for libmpi path
+    local _lower_half="${MANA_ROOT}/bin/lower-half"
+    if [[ -x "${_lower_half}" ]]; then
+        local _libmpi_path
+        _libmpi_path="$(ldd "${_lower_half}" 2>/dev/null | grep 'libmpi\.so' | awk '{print $3}' | head -1)"
+        if [[ -n "${_libmpi_path}" ]] && [[ -f "${_libmpi_path}" ]]; then
+            # e.g. /home/ndhai/.local/openmpi/lib/libmpi.so.40 -> /home/ndhai/.local/openmpi
+            local _lib_dir
+            _lib_dir="$(dirname "${_libmpi_path}")"
+            local _prefix
+            _prefix="$(dirname "${_lib_dir}")"
+            if [[ -x "${_prefix}/bin/mpicc" ]]; then
+                echo "${_prefix}"
+                return
+            fi
+        fi
+    fi
+    # 2. Search common locations
+    for _candidate in "${HOME}/.local/openmpi" "${HOME}/.local" "/usr/local"; do
+        if [[ -x "${_candidate}/bin/mpicc" ]]; then
+            # Verify it's actually OpenMPI (not Cray wrapper)
+            if "${_candidate}/bin/mpicc" --showme:version 2>/dev/null | grep -qi 'open.mpi\|ompi'; then
+                echo "${_candidate}"
+                return
+            fi
+        fi
+    done
+    echo ""
+}
+
+if [[ -z "${OPENMPI_PREFIX:-}" ]]; then
+    OPENMPI_PREFIX="$(_auto_detect_openmpi)"
+    if [[ -z "${OPENMPI_PREFIX}" ]]; then
+        echo "ERROR: Could not auto-detect OpenMPI installation." >&2
+        echo "       Set OPENMPI_PREFIX=/path/to/openmpi" >&2
+        exit 1
+    fi
+    echo "[AUTO] Detected OpenMPI at: ${OPENMPI_PREFIX}"
+fi
 
 echo "============================================================"
 echo "  Rebuild MANA + DMTCP against OpenMPI"
