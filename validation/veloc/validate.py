@@ -666,6 +666,24 @@ def _stage_correctness(
                         f"[validate] MANA detected at {mana_root}; building with MANA stub",
                         flush=True,
                     )
+                    # If MANA's lower-half links against OpenMPI, we must
+                    # build the app with OpenMPI's compilers too (not Cray's).
+                    from .dmtcp_runner import _resolve_mpirun_for_mana
+                    mpirun_path = _resolve_mpirun_for_mana()
+                    if mpirun_path != "mpirun":
+                        ompi_bin = Path(mpirun_path).parent
+                        ompi_mpicc = ompi_bin / "mpicc"
+                        ompi_mpicxx = ompi_bin / "mpicxx"
+                        if ompi_mpicc.exists() and ompi_mpicxx.exists():
+                            cmake_extra.extend([
+                                f"-DCMAKE_C_COMPILER={ompi_mpicc}",
+                                f"-DCMAKE_CXX_COMPILER={ompi_mpicxx}",
+                            ])
+                            print(
+                                f"[validate] Using OpenMPI compilers: "
+                                f"{ompi_mpicc}, {ompi_mpicxx}",
+                                flush=True,
+                            )
                 elif check_mana_available():
                     print(
                         "[validate] WARNING: MANA tools found but MANA_ROOT not detected; "

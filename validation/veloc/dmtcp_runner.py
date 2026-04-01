@@ -107,6 +107,57 @@ def _resolve_mana_bin() -> Path | None:
     return None
 
 
+def _resolve_mpirun_for_mana() -> str:
+    """Find the correct ``mpirun`` for MANA's lower-half.
+
+    MANA's lower-half links against a specific MPI library (e.g. OpenMPI
+    or Cray MPICH).  The application must be launched with the matching
+    ``mpirun``.  On HPC systems where multiple MPI implementations
+    coexist (e.g. Aurora has both Cray MPICH and user-built OpenMPI),
+    using the wrong ``mpirun`` causes silent failures.
+
+    Strategy:
+      1. Check MANA lower-half's ldd output for OpenMPI libmpi path
+      2. If OpenMPI found, use the mpirun from that OpenMPI installation
+      3. Fall back to PATH ``mpirun``
+    """
+    mana_bin = _resolve_mana_bin()
+    if mana_bin is None:
+        return "mpirun"
+
+    lower_half = mana_bin / "lower-half"
+    if not lower_half.exists():
+        return "mpirun"
+
+    try:
+        ldd_out = subprocess.check_output(
+            ["ldd", str(lower_half)], text=True, stderr=subprocess.DEVNULL,
+        )
+        # Look for libmpi.so and extract its path
+        for line in ldd_out.splitlines():
+            if "libmpi" in line and "=>" in line:
+                # Format: "libmpi.so.40 => /home/user/.local/lib/libmpi.so.40 (0x...)"
+                parts = line.strip().split("=>")
+                if len(parts) >= 2:
+                    lib_path = parts[1].strip().split()[0]
+                    # Derive the bin/ directory from the lib path
+                    # e.g. /home/user/.local/lib/libmpi.so -> /home/user/.local/bin/mpirun
+                    lib_dir = Path(lib_path).parent
+                    prefix = lib_dir.parent  # e.g. /home/user/.local
+                    candidate = prefix / "bin" / "mpirun"
+                    if candidate.exists():
+                        print(
+                            f"[dmtcp] MANA lower-half links to {lib_path}, "
+                            f"using mpirun: {candidate}",
+                            flush=True,
+                        )
+                        return str(candidate)
+    except (subprocess.CalledProcessError, OSError):
+        pass
+
+    return "mpirun"
+
+
 def detect_mana_root() -> Path | None:
     """Return the MANA source root if available, else None."""
     if _MANA_SRC_DIR.is_dir() and (_MANA_SRC_DIR / "bin" / "mana_launch").exists():
@@ -443,8 +494,9 @@ def _build_launch_cmd(
             tool_paths["dmtcp_launch"], "--coord-port", str(coord_port),
         ]
 
+    mpirun = _resolve_mpirun_for_mana() if use_mana else "mpirun"
     return [
-        "mpirun", "-np", str(num_procs),
+        mpirun, "-np", str(num_procs),
         *launcher_args,
         str(exe_path), *app_args,
     ]
