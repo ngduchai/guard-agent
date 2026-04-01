@@ -383,6 +383,24 @@ echo ""
 echo "=== Phase 4: Restart from checkpoint ==="
 echo ""
 
+# Stop the old coordinator — it's still serving the original (now-dead)
+# computation and will reject restart attempts with "not in RESTARTING
+# or CHECKPOINTED state".  A fresh coordinator allows dmtcp_restart to
+# start a new computation from the checkpoint files.
+echo "Stopping old coordinator..."
+"${DMTCP_COMMAND}" -h "${COORD_HOST}" --coord-port "${COORD_PORT}" --quit 2>/dev/null || true
+sleep 1
+
+# Kill any leftover MANA/DMTCP processes from the crashed run
+pkill -9 -f "lower-half.*art_simple" 2>/dev/null || true
+sleep 0.5
+
+echo "Starting fresh coordinator for restart..."
+"${DMTCP_COORD}" --daemon --coord-port "${COORD_PORT}" \
+    --ckptdir "${CKPT_DIR}" -q -q
+sleep 1
+echo "[OK] Fresh coordinator started on port ${COORD_PORT}"
+
 # Collect checkpoint files
 CKPT_FILE_LIST=$(find "${CKPT_DIR}" -name "ckpt_*.dmtcp" -type f 2>/dev/null | sort)
 CKPT_FILE_ARRAY=()

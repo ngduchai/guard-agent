@@ -984,16 +984,23 @@ def dmtcp_run_with_failure_injection(
             output_dir=output_dir,
         )
 
-    # For MANA, do NOT restart the coordinator — the checkpoint is tied
-    # to the coordinator's computation ID.  A new coordinator has a
-    # different ID, causing mana_restart to reject the checkpoint.
-    # Instead, start the coordinator WITHOUT --exit-on-last so it
-    # survives the rank kill.  For plain DMTCP, restart is fine.
-    use_mana_restart = "mana_restart" in tool_paths
-    if not use_mana_restart:
-        stop_coordinator(coord_port, tool_paths)
-        time.sleep(0.5)
-        start_coordinator(coord_port, ckpt_dir, tool_paths)
+    # Always restart the coordinator before dmtcp_restart.  The old
+    # coordinator is still serving the original (now-dead) computation
+    # and rejects restart attempts with "not in RESTARTING state".
+    # dmtcp_restart -j (join mode) starts a new computation on the
+    # fresh coordinator, which is the correct flow.
+    stop_coordinator(coord_port, tool_paths)
+    time.sleep(0.5)
+    # Kill any leftover lower-half/MANA processes from the crashed run.
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", f"lower-half.*{executable_name}"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+    time.sleep(0.5)
+    start_coordinator(coord_port, ckpt_dir, tool_paths)
 
     restart_cmd = _build_restart_cmd(
         tool_paths, num_procs, coord_port, ckpt_dir, ckpt_files,
