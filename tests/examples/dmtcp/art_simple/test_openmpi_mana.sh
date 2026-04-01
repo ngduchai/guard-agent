@@ -344,7 +344,10 @@ else
     ps -e -o pid,ppid,cmd --no-headers 2>/dev/null | grep -E "dmtcp|mana|lower-half" || echo "(none)"
 fi
 
-# Wait for mpirun to exit
+# Wait for mpirun to exit.
+# Disable set -e temporarily — the background mpirun dying can trigger
+# unexpected shell errors when bash processes job notifications.
+set +e
 echo "Waiting for mpirun to crash..."
 MPI_TIMEOUT=$((SECONDS + 30))
 while kill -0 "${MPI_PID}" 2>/dev/null && [[ $SECONDS -lt $MPI_TIMEOUT ]]; do
@@ -353,10 +356,11 @@ done
 
 if kill -0 "${MPI_PID}" 2>/dev/null; then
     echo "[WARN] mpirun still running after 30s, force killing..."
-    kill -9 "${MPI_PID}" 2>/dev/null || true
+    kill -9 "${MPI_PID}" 2>/dev/null
 fi
-wait "${MPI_PID}" 2>/dev/null || true
+wait "${MPI_PID}" 2>/dev/null
 MPI_EXIT=$?
+set -e
 echo "[OK] mpirun exited (code=${MPI_EXIT})"
 
 echo ""
@@ -396,6 +400,7 @@ RESTART_CMD=(
 echo "Restart command: ${RESTART_CMD[*]:0:5} ..."
 echo ""
 
+set +e
 "${RESTART_CMD[@]}" \
     > "${RUN_DIR}/stdout_restart.txt" 2> "${RUN_DIR}/stderr_restart.txt" &
 RESTART_PID=$!
@@ -419,8 +424,9 @@ while [[ $SECONDS -lt $RESTART_DEADLINE ]]; do
     sleep 2
 done
 
-wait "${RESTART_PID}" 2>/dev/null || true
+wait "${RESTART_PID}" 2>/dev/null
 RESTART_EXIT=$?
+set -e
 
 if $RESTORE_DONE; then
     echo "[OK] Restart completed (exit=${RESTART_EXIT})"
