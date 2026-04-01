@@ -169,9 +169,12 @@ nslices=4
 ARGVEOF
 echo "[OK] Wrote ${RUN_DIR}/mana_argv_override.conf"
 
-# ── Phase 0: Kill any stale coordinator ──────────────────────────────────
+# ── Phase 0: Clean up stale processes from previous runs ─────────────────
 "${DMTCP_COMMAND}" -h "${COORD_HOST}" --coord-port "${COORD_PORT}" --quit 2>/dev/null || true
-sleep 0.5
+# Kill any leftover art_simple/lower-half processes from previous test runs
+pkill -9 -f "art_simple_main" 2>/dev/null || true
+pkill -9 -f "lower-half" 2>/dev/null || true
+sleep 1
 
 # ══════════════════════════════════════════════════════════════════════════
 # Phase 1: Launch app under MANA + OpenMPI
@@ -320,12 +323,17 @@ echo ""
 echo "=== Phase 3: Kill one rank (failure injection) ==="
 echo ""
 
-# Find rank processes
-echo "Looking for rank processes..."
+# Find rank processes — only those with PIDs HIGHER than our mpirun PID
+# (children spawned by our mpirun, not stale processes from previous runs)
+echo "Looking for rank processes (children of mpirun PID ${MPI_PID})..."
+echo "--- all art_simple processes ---"
+ps -e -o pid,ppid,cmd --no-headers 2>/dev/null | grep "art_simple" | grep -v grep || echo "(none)"
+echo ""
+
 RANK_PIDS=$(ps -e -o pid,ppid,cmd --no-headers 2>/dev/null | \
     grep "art_simple" | \
-    grep -v "mpirun\|python\|grep\|mana_launch\|dmtcp_launch\|dmtcp_command\|dmtcp_coordinator\|dmtcp_restart" | \
-    awk '{print $1}')
+    grep -v "mpirun\|python\|grep\|mana_launch\|dmtcp_launch\|dmtcp_command\|dmtcp_coordinator\|dmtcp_restart\|lower-half" | \
+    awk -v min_pid="${MPI_PID}" '$1 > min_pid {print $1}')
 
 # Disable set -e BEFORE the kill — the background mpirun dying can
 # trigger unexpected shell errors when bash processes job notifications.
