@@ -327,6 +327,10 @@ RANK_PIDS=$(ps -e -o pid,ppid,cmd --no-headers 2>/dev/null | \
     grep -v "mpirun\|python\|grep\|mana_launch\|dmtcp_launch\|dmtcp_command\|dmtcp_coordinator\|dmtcp_restart" | \
     awk '{print $1}')
 
+# Disable set -e BEFORE the kill — the background mpirun dying can
+# trigger unexpected shell errors when bash processes job notifications.
+set +e
+
 if [[ -n "${RANK_PIDS}" ]]; then
     RANK_COUNT=$(echo "${RANK_PIDS}" | wc -l)
     echo "Found ${RANK_COUNT} rank process(es): ${RANK_PIDS}"
@@ -334,7 +338,8 @@ if [[ -n "${RANK_PIDS}" ]]; then
     # Kill the first rank
     TARGET_PID=$(echo "${RANK_PIDS}" | head -1)
     echo "Killing rank PID ${TARGET_PID} (SIGKILL)..."
-    kill -9 "${TARGET_PID}" 2>/dev/null || echo "[WARN] Could not kill PID ${TARGET_PID}"
+    kill -9 "${TARGET_PID}" 2>/dev/null
+    echo "[OK] Kill signal sent"
 else
     echo "[WARN] No rank processes found via ps"
     echo "--- ps output (art_simple) ---"
@@ -343,11 +348,6 @@ else
     echo "--- all dmtcp/mana processes ---"
     ps -e -o pid,ppid,cmd --no-headers 2>/dev/null | grep -E "dmtcp|mana|lower-half" || echo "(none)"
 fi
-
-# Wait for mpirun to exit.
-# Disable set -e temporarily — the background mpirun dying can trigger
-# unexpected shell errors when bash processes job notifications.
-set +e
 echo "Waiting for mpirun to crash..."
 MPI_TIMEOUT=$((SECONDS + 30))
 while kill -0 "${MPI_PID}" 2>/dev/null && [[ $SECONDS -lt $MPI_TIMEOUT ]]; do
