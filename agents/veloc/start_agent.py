@@ -341,6 +341,63 @@ def _print_rag_update(ev: dict[str, Any]) -> None:
     _hr("─", _PURPLE)
 
 
+# ---------------------------------------------------------------------------
+# Strategy proposal renderer
+# ---------------------------------------------------------------------------
+
+def _print_strategy_proposal(ev: dict[str, Any]) -> None:
+    """Render the checkpointing strategy proposal in the terminal."""
+    _hr("═", _CYAN)
+    print(f"{_CYAN}{_BOLD}  Checkpointing Strategy Proposal{_RESET}")
+    _hr("─", _CYAN)
+
+    mode = ev.get("veloc_mode", "?")
+    mode_rationale = ev.get("veloc_mode_rationale", "")
+    variables = ev.get("critical_variables", [])
+    placements = ev.get("checkpoint_placement", [])
+    risks = ev.get("risks", [])
+
+    print(f"  {_DIM}VeloC Mode:{_RESET} {mode}")
+    if mode_rationale:
+        print(f"  {_DIM}Rationale :{_RESET} {mode_rationale}")
+
+    if variables:
+        print(f"\n  {_BOLD}Critical Variables ({len(variables)}):{_RESET}")
+        for v in variables:
+            name = v.get("name", "?")
+            vtype = v.get("type", "?")
+            vfile = v.get("file", "?")
+            vline = v.get("line", "?")
+            print(f"    {_CYAN}*{_RESET} {_BOLD}{name}{_RESET} ({vtype})  {_DIM}@ {vfile}:{vline}{_RESET}")
+            evidence = v.get("evidence", "")
+            if evidence:
+                print(f"      {_DIM}Evidence : {evidence}{_RESET}")
+            rationale = v.get("rationale", "")
+            if rationale:
+                print(f"      {_DIM}Rationale: {rationale}{_RESET}")
+
+    if placements:
+        print(f"\n  {_BOLD}Checkpoint Placement ({len(placements)}):{_RESET}")
+        for p in placements:
+            pfile = p.get("file", "?")
+            pline = p.get("line", "?")
+            loop_var = p.get("loop_variable", "?")
+            print(f"    {_CYAN}*{_RESET} {_DIM}{pfile}:{pline}{_RESET}  loop var: {_BOLD}{loop_var}{_RESET}")
+            evidence = p.get("evidence", "")
+            if evidence:
+                print(f"      {_DIM}Evidence : {evidence}{_RESET}")
+            rationale = p.get("rationale", "")
+            if rationale:
+                print(f"      {_DIM}Rationale: {rationale}{_RESET}")
+
+    if risks:
+        print(f"\n  {_BOLD}Risks ({len(risks)}):{_RESET}")
+        for r in risks:
+            print(f"    {_YELLOW}!{_RESET} {r}")
+
+    _hr("═", _CYAN)
+
+
 def _print_final_ask(question: str) -> None:
     _hr("─", _YELLOW)
     print(f"{_YELLOW}{_BOLD}  ⚠ Agent needs more information:{_RESET}")
@@ -521,6 +578,9 @@ async def _handle_single_interaction() -> None:
 
             elif etype == "rag_update":
                 _print_rag_update(event)
+
+            elif etype == "strategy_proposal":
+                _print_strategy_proposal(event)
 
         if _error_event is not None:
             _print_final_error(_error_event.get("message", "Unknown error"))

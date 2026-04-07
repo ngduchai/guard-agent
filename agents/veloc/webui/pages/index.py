@@ -418,6 +418,50 @@ def index_html() -> str:
     .kb-result-meta { font-size: 10px; color: var(--muted); margin-top: 1px; }
     .kb-result-snippet { font-size: 11px; color: rgba(216,180,254,0.75); margin-top: 2px; white-space: pre-wrap; }
     .kb-disabled { opacity: 0.5; font-style: italic; }
+
+    /* ── Strategy proposal collapsible blocks ── */
+    .strategy-block {
+      margin-top: 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(34,211,238,0.4);
+      background: rgba(34,211,238,0.05);
+      padding: 0;
+      font-size: 11px;
+    }
+    .strategy-block summary {
+      cursor: pointer;
+      padding: 6px 10px;
+      color: rgba(103,232,249,0.95);
+      font-size: 12px;
+      font-weight: 600;
+      outline: none;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .strategy-block summary::-webkit-details-marker { display: none; }
+    .strategy-block-body {
+      padding: 6px 10px 8px;
+      font-size: 11px;
+      opacity: 0.9;
+      border-top: 1px solid rgba(34,211,238,0.2);
+    }
+    .strategy-block-row {
+      display: flex; gap: 6px; font-size: 11px; color: var(--muted);
+      margin-top: 3px;
+    }
+    .strategy-block-row strong { color: rgba(103,232,249,0.8); }
+    .strategy-var-item, .strategy-placement-item {
+      margin-top: 4px; padding: 4px 6px; border-radius: 6px;
+      background: rgba(34,211,238,0.06); border: 1px solid rgba(34,211,238,0.2);
+      font-size: 11px;
+    }
+    .strategy-var-name { font-weight: 600; color: rgba(165,243,252,0.9); }
+    .strategy-evidence { font-size: 10px; color: var(--muted); margin-top: 2px; }
+    .strategy-rationale { font-size: 10px; color: rgba(165,243,252,0.7); margin-top: 1px; font-style: italic; }
+    .strategy-risk { font-size: 11px; color: rgba(250,204,21,0.85); margin-top: 2px; }
+
     /* Legacy insight-box kept for any remaining references */
     .insight-box {
       font-size: 12px;
@@ -1315,6 +1359,45 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
       _ragAppend(html);
     }
 
+    function renderStrategyProposal(ev) {
+      const variables = Array.isArray(ev.critical_variables) ? ev.critical_variables : [];
+      const placements = Array.isArray(ev.checkpoint_placement) ? ev.checkpoint_placement : [];
+      const mode = ev.veloc_mode || '?';
+      const modeRationale = ev.veloc_mode_rationale || '';
+      const risks = Array.isArray(ev.risks) ? ev.risks : [];
+
+      const varsHtml = variables.map(v => `
+        <div class="strategy-var-item">
+          <div class="strategy-var-name">${escapeHtml(v.name || '?')} <span style="opacity:0.6;font-weight:normal;">(${escapeHtml(v.type || '?')})</span> <span style="font-size:10px;opacity:0.5;">@ ${escapeHtml(v.file || '?')}:${v.line || '?'}</span></div>
+          ${v.evidence ? `<div class="strategy-evidence">Evidence: ${escapeHtml(v.evidence)}</div>` : ''}
+          ${v.rationale ? `<div class="strategy-rationale">${escapeHtml(v.rationale)}</div>` : ''}
+        </div>`).join('');
+
+      const placementsHtml = placements.map(p => `
+        <div class="strategy-placement-item">
+          <div class="strategy-var-name">${escapeHtml(p.file || '?')}:${p.line || '?'} <span style="opacity:0.6;font-weight:normal;">loop var: ${escapeHtml(p.loop_variable || '?')}</span></div>
+          ${p.evidence ? `<div class="strategy-evidence">Evidence: ${escapeHtml(p.evidence)}</div>` : ''}
+          ${p.rationale ? `<div class="strategy-rationale">${escapeHtml(p.rationale)}</div>` : ''}
+        </div>`).join('');
+
+      const risksHtml = risks.length > 0
+        ? risks.map(r => `<div class="strategy-risk">&#9888; ${escapeHtml(r)}</div>`).join('')
+        : '';
+
+      const html = `
+        <details class="strategy-block" open>
+          <summary>&#9881; Checkpointing Strategy Proposal</summary>
+          <div class="strategy-block-body">
+            <div class="strategy-block-row"><strong>VeloC Mode:</strong> ${escapeHtml(mode)}</div>
+            ${modeRationale ? `<div class="strategy-block-row"><strong>Mode Rationale:</strong> ${escapeHtml(modeRationale)}</div>` : ''}
+            ${variables.length > 0 ? `<div style="margin-top:6px;font-weight:600;font-size:11px;color:rgba(103,232,249,0.9);">Critical Variables (${variables.length})</div>${varsHtml}` : ''}
+            ${placements.length > 0 ? `<div style="margin-top:6px;font-weight:600;font-size:11px;color:rgba(103,232,249,0.9);">Checkpoint Placement (${placements.length})</div>${placementsHtml}` : ''}
+            ${risksHtml ? `<div style="margin-top:6px;font-weight:600;font-size:11px;color:rgba(250,204,21,0.85);">Risks</div>${risksHtml}` : ''}
+          </div>
+        </details>`;
+      appendAgentBubble(html);
+    }
+
     function renderFinalDone(result) {
       const status = result.status || 'error';
       outputMode.textContent = status === 'success' ? 'Success' :
@@ -1561,6 +1644,10 @@ and tolerate up to 2 node failures. Help me transform it into a resilient deploy
 
         case 'rag_update':
           renderRAGUpdate(ev);
+          break;
+
+        case 'strategy_proposal':
+          renderStrategyProposal(ev);
           break;
 
         case 'done':

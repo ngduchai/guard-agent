@@ -116,6 +116,97 @@ def get_veloc_guide(section: str = "", list_sections: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Strategy proposal tool
+# ---------------------------------------------------------------------------
+
+_VALID_VELOC_MODES = frozenset({"memory_based", "file_based"})
+
+
+def propose_strategy(
+    critical_variables: list[dict],
+    checkpoint_placement: list[dict],
+    veloc_mode: str,
+    veloc_mode_rationale: str = "",
+    risks: list[str] | None = None,
+) -> str:
+    """Validate and record the agent's checkpointing strategy before code modification.
+
+    The agent MUST call this after exploring the codebase but BEFORE any
+    write_file, execute_script, or get_veloc_guide call.  It forces the LLM to
+    articulate its analysis with specific code evidence.
+
+    Args:
+        critical_variables: List of dicts, each requiring:
+            name (str), type (str), file (str), line (int),
+            evidence (str), rationale (str).
+        checkpoint_placement: List of dicts, each requiring:
+            file (str), line (int), loop_variable (str),
+            evidence (str), rationale (str).
+        veloc_mode: One of "memory_based" or "file_based".
+        veloc_mode_rationale: Why this mode was chosen.
+        risks: Optional list of identified risks.
+
+    Returns:
+        JSON string: {"accepted": true, "summary": "..."} on success,
+        {"accepted": false, "error": "..."} on validation failure.
+    """
+    errors: list[str] = []
+
+    # --- Validate critical_variables ---
+    if not critical_variables:
+        errors.append("critical_variables must not be empty.")
+    else:
+        _cv_required = ("name", "type", "file", "evidence", "rationale")
+        for i, var in enumerate(critical_variables):
+            if not isinstance(var, dict):
+                errors.append(f"critical_variables[{i}]: must be an object.")
+                continue
+            for key in _cv_required:
+                val = var.get(key, "")
+                if not isinstance(val, str) or not val.strip():
+                    errors.append(f"critical_variables[{i}].{key}: required non-empty string.")
+            line = var.get("line")
+            if not isinstance(line, int) or line < 1:
+                errors.append(f"critical_variables[{i}].line: required positive integer.")
+
+    # --- Validate checkpoint_placement ---
+    if not checkpoint_placement:
+        errors.append("checkpoint_placement must not be empty.")
+    else:
+        _cp_required = ("file", "loop_variable", "evidence", "rationale")
+        for i, pl in enumerate(checkpoint_placement):
+            if not isinstance(pl, dict):
+                errors.append(f"checkpoint_placement[{i}]: must be an object.")
+                continue
+            for key in _cp_required:
+                val = pl.get(key, "")
+                if not isinstance(val, str) or not val.strip():
+                    errors.append(f"checkpoint_placement[{i}].{key}: required non-empty string.")
+            line = pl.get("line")
+            if not isinstance(line, int) or line < 1:
+                errors.append(f"checkpoint_placement[{i}].line: required positive integer.")
+
+    # --- Validate veloc_mode ---
+    if veloc_mode not in _VALID_VELOC_MODES:
+        errors.append(f"veloc_mode must be one of {sorted(_VALID_VELOC_MODES)}, got '{veloc_mode}'.")
+
+    # --- Validate veloc_mode_rationale ---
+    if not isinstance(veloc_mode_rationale, str) or not veloc_mode_rationale.strip():
+        errors.append("veloc_mode_rationale: required non-empty string explaining the mode choice.")
+
+    if errors:
+        return json.dumps({"accepted": False, "error": "; ".join(errors)})
+
+    n_vars = len(critical_variables)
+    n_placements = len(checkpoint_placement)
+    summary = (
+        f"Strategy accepted: {n_vars} critical variable(s), "
+        f"{n_placements} checkpoint placement(s), mode={veloc_mode}."
+    )
+    return json.dumps({"accepted": True, "summary": summary})
+
+
+# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
@@ -163,19 +254,19 @@ If you apply an insight from the knowledge base and it does **not** work as expe
 All file paths you use with the filesystem tools must be relative to this root.
 {rag_section}
 ## Your tools
+
+### Always available (no gate)
 - `list_directory(dir_path)` – list files and subdirectories.
 - `read_file(file_path)` – read a source file.
-- `write_file(file_path, contents)` – write a file (creates parent dirs).
 - `remove_file(file_path)` – delete a file **or an empty directory** inside BUILD_DIR.
   Returns `removed` (True/False), `kind` ("file" or "directory"), and, on failure, an `error` message.
   Only paths inside BUILD_DIR may be removed; any other path returns an error.
   Non-empty directories are rejected — remove their contents first, or use `execute_script` with `rm -rf`.
-- `execute_script(script_path, timeout)` – execute a bash script that already exists inside BUILD_DIR.
-  Returns `returncode`, `stdout`, `stderr`, and `timed_out`.
-  The script runs with `cwd=BUILD_DIR`, `HOME=BUILD_DIR`, and a restricted `PATH`.
-  It **cannot** access or modify files outside BUILD_DIR.
-  Use `write_file` first to create the script, then `execute_script` to run it.
-  Set `timeout` (seconds, default 120) to a larger value for long builds or MPI runs.
+- `propose_strategy(...)` – **MANDATORY GATE.** You must call this tool after analysing the codebase to declare your checkpointing strategy with specific code evidence. See the Workflow section for details.
+
+### Gated tools (locked until `propose_strategy` succeeds)
+The following tools are **blocked** until you call `propose_strategy` and it returns `{{"accepted": true}}`.
+Any attempt to call them before that will return an error.
 - `get_veloc_guide(list_sections, section)` – return the local VeloC reference guide as Markdown.
   The guide contains the **complete C API** (all function signatures, parameters, return codes),
   the **C++ `veloc::client_t` API**, the **INI configuration file specification** (all keys and defaults),
@@ -187,6 +278,13 @@ All file paths you use with the filesystem tools must be relative to this root.
   3. Or call `get_veloc_guide()` (no args) to get the entire guide at once.
   **You MUST call this tool before writing any VeloC code or configuration** to ensure you use
   correct API signatures, parameter order, and configuration keys.
+- `write_file(file_path, contents)` – write a file (creates parent dirs).
+- `execute_script(script_path, timeout)` – execute a bash script that already exists inside BUILD_DIR.
+  Returns `returncode`, `stdout`, `stderr`, and `timed_out`.
+  The script runs with `cwd=BUILD_DIR`, `HOME=BUILD_DIR`, and a restricted `PATH`.
+  It **cannot** access or modify files outside BUILD_DIR.
+  Use `write_file` first to create the script, then `execute_script` to run it.
+  Set `timeout` (seconds, default 120) to a larger value for long builds or MPI runs.
 
 ## Step-by-step transparency protocol (MANDATORY)
 You MUST break your work into clear, named steps. Before executing each step, you MUST emit a step-summary block in your response text using this exact JSON format (on its own line, no markdown fences):
@@ -207,16 +305,34 @@ Rules:
 - The resiliency support must be **TRANSPARENT** to the user: **DO NOT** change the original application's existing command-line parameters or behaviour. The only permitted addition is an **optional** `--veloc-cfg <path>` argument (or equivalent) for the VeloC configuration file path, which must default to `veloc.cfg` in the current working directory when omitted.
 
 ## Workflow
+
+**IMPORTANT — Tool gating:**
+`write_file`, `execute_script`, and `get_veloc_guide` are **locked** until you call `propose_strategy` and it returns `{{"accepted": true}}`. You MUST analyse the codebase and propose your strategy BEFORE consulting the VeloC guide, writing any code, or running any scripts. This ensures your analysis comes from the actual code, not from prior knowledge.
+
 1. **Understand the request.** If the user's prompt is missing the code path, target environment, or resilience requirements, ask for the missing information.
 2. **Explore the codebase.** Use `list_directory` and `read_file` to understand the structure of the code given by user; if the code location is not clear, ask the user for the path relative to the project root.
-3. **Identify critical state.** From your understanding of the codebase, identify the critical data structures and variables that must be checkpointed across executions.
-4. **Identify optimal checkpoint timing.** Determine when to checkpoint to minimise overhead while maximising resilience (e.g. applying the Young-Daly formula).
-5. **Consult the VeloC guide.** Before writing any VeloC code or configuration, retrieve the relevant parts of the guide:
+3. **Identify critical state.** From the code you read, identify the critical data structures and variables that must be checkpointed. **You must reference specific code evidence:**
+   - For each variable: note the file, line number, allocation/declaration site, and how it is used (MPI buffers, loop-accumulated state, expensive-to-recompute data).
+   - Explain HOW you found each variable — what patterns in the code led you to it.
+   - Do NOT rely on general knowledge — base your analysis on what you actually read.
+4. **Identify optimal checkpoint timing.** From the code you read, determine when and where to checkpoint:
+   - Identify the main computation loop(s): file, line numbers, iterator variable, loop bounds.
+   - Note what happens inside the loop: MPI calls, expensive operations, state updates.
+   - Explain WHY this loop is the right checkpoint boundary.
+5. **Propose strategy (MANDATORY GATE).** Call `propose_strategy` with your complete analysis:
+   - `critical_variables`: for each variable, provide `name`, `type`, `file`, `line`, `evidence` (how you found it — reference specific code), and `rationale` (why it must be checkpointed).
+   - `checkpoint_placement`: for each checkpoint location, provide `file`, `line`, `loop_variable`, `evidence` (what makes this loop the right spot — reference specific code), and `rationale` (timing strategy reasoning).
+   - `veloc_mode`: `"memory_based"` or `"file_based"`.
+   - `veloc_mode_rationale`: why you chose this mode based on your analysis of the state.
+   - `risks`: any concerns you identified from the code.
+   If the tool rejects your strategy (validation error), fix the issues and call it again.
+   **After this step succeeds, `get_veloc_guide`, `write_file`, and `execute_script` are unlocked.**
+6. **Consult the VeloC guide.** Now that your strategy is accepted, retrieve the relevant parts of the guide:
    - Call `get_veloc_guide(list_sections=true)` to discover all available section headings.
    - Then call `get_veloc_guide(section="<heading>")` for each section you need (e.g. `"C API Reference"`, `"Configuration File Reference"`, `"Complete Code Examples"`).
    - Alternatively, call `get_veloc_guide()` (no arguments) to get the entire guide at once.
-   Use the retrieved content to select the correct API mode (memory-based vs. file-based), verify all function signatures and parameter order, and choose the right configuration keys.
-6. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file, using the API signatures and configuration keys from the guide retrieved in the previous step. Use `write_file` to save all modified sources and the config.
+   Use the retrieved content to verify API signatures and parameter order, and choose the right configuration keys.
+7. **Inject VeloC.** Modify the source files to add VeloC checkpoint/restart calls and write a `veloc.cfg` configuration file, using the API signatures and configuration keys from the guide retrieved in the previous step. Use `write_file` to save all modified sources and the config.
    **Optional `veloc.cfg` path argument (REQUIRED):** The modified executable **must** accept the path to `veloc.cfg` as an optional command-line argument so that users can supply a custom config location without changing the binary. Implement it as follows:
    - Add an optional positional or named argument (e.g. `--veloc-cfg <path>` for C++ with a simple loop over `argv`, or a positional last argument) that the user may pass when launching the program.
    - If the argument is **not** provided, default to the string `"veloc.cfg"` (i.e. the file is looked up in the current working directory at runtime).
@@ -224,7 +340,7 @@ Rules:
    - **Do not** remove or rename any of the original application's existing command-line arguments; only append this new optional one.
    - Document the new argument in a comment near `main()` so it is easy to discover.
    - In the validation script, explicitly test both cases: (a) run without the argument (config file named `veloc.cfg` placed in the working directory) and (b) run with `--veloc-cfg <explicit_path>` pointing to the same config file at a different path, and verify both succeed.
-7. **Validate.** This step is **REQUIRED**. Based on your understanding of the application's structure and output, design and write a validation script tailored to this specific application that:
+8. **Validate.** This step is **REQUIRED**. Based on your understanding of the application's structure and output, design and write a validation script tailored to this specific application that:
    - Builds both the original and the resilient version.
    - Runs the resilient version with a simulated failure (e.g. kill the process mid-run, then restart it).
    - Compares the output of the resilient run against the baseline to confirm correctness.
@@ -238,9 +354,9 @@ Rules:
    Inspect the returned `returncode`, `stdout`, and `stderr`. If validation fails, analyse the error, fix the code, and run again.
    If the script needs more than 120 s (e.g. for a large MPI job), pass a larger `timeout` value.
    Only ask the user for input if the script requires information you genuinely cannot determine (e.g. unknown MPI rank count, missing dataset path).
-8. **Clean-up** remove **ALL** temporary/intermediate files you created throughout the execution using `remove_file`, keep the original implementation and your generated resilient code intact.
+9. **Clean-up** remove **ALL** temporary/intermediate files you created throughout the execution using `remove_file`, keep the original implementation and your generated resilient code intact.
     Clean not only temporary/intermediate files created in the original codebase and the generated codebase, but also **ALL** files and directories you created within the project root.
-9. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
+10. **Report.** Return **ONLY** JSON object (no markdown fences) with one of these shapes:
    - `{{"status": "ask", "assistant_question": "..."}}` – need more information.
    - `{{"status": "success", "summary": "..."}}` – task completed successfully.
    - `{{"status": "error", "error_message": "..."}}` – unrecoverable error.
@@ -251,6 +367,11 @@ Rules:
 # Tool registry
 # ---------------------------------------------------------------------------
 
+# Gate: tools listed here are blocked until propose_strategy has been called
+# and accepted.  Reset at the start of each _stream_agent_loop invocation.
+_strategy_proposed: bool = False
+_GATED_TOOLS = frozenset({"write_file", "execute_script", "get_veloc_guide"})
+
 # Map tool name → Python callable.  Add new tools here to expose them to the LLM.
 _TOOLS: Dict[str, Callable] = {
     "list_directory": list_directory,
@@ -259,6 +380,7 @@ _TOOLS: Dict[str, Callable] = {
     "remove_file": remove_file,
     "execute_script": execute_script,
     "get_veloc_guide": get_veloc_guide,
+    "propose_strategy": propose_strategy,
     # RAG / knowledge base tools
     "query_knowledge_base": query_knowledge_base,
     "store_insight": store_insight,
@@ -425,6 +547,154 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
                 },
             },
         },
+        # ── Strategy proposal tool (mandatory gate) ────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_strategy",
+                "description": (
+                    "Propose a checkpointing strategy BEFORE modifying any code. "
+                    "You MUST call this tool after exploring the codebase (steps 1-4) "
+                    "and before any write_file, execute_script, or get_veloc_guide call. "
+                    "It records your analysis of critical variables and checkpoint placement "
+                    "with specific code evidence (file paths, line numbers, patterns found). "
+                    "If you call write_file, execute_script, or get_veloc_guide without "
+                    "calling propose_strategy first, those tools will be rejected with an error."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "critical_variables": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "string",
+                                        "description": "Variable name (e.g. 'recon', 'theta').",
+                                    },
+                                    "type": {
+                                        "type": "string",
+                                        "description": "C/C++ type (e.g. 'double*', 'float*', 'int').",
+                                    },
+                                    "file": {
+                                        "type": "string",
+                                        "description": "Source file where this variable is declared/allocated.",
+                                    },
+                                    "line": {
+                                        "type": "integer",
+                                        "description": "Line number of the allocation or declaration.",
+                                    },
+                                    "evidence": {
+                                        "type": "string",
+                                        "description": (
+                                            "How you identified this variable as critical. "
+                                            "Reference specific code you read: allocation site, "
+                                            "MPI calls that use it, loops that modify it. "
+                                            "E.g. 'allocated with malloc at line 45, used as "
+                                            "MPI_Allreduce send buffer at line 72, accumulated "
+                                            "across iterations in loop at lines 40-80'."
+                                        ),
+                                    },
+                                    "rationale": {
+                                        "type": "string",
+                                        "description": (
+                                            "Why this variable must be checkpointed. "
+                                            "E.g. 'holds iteratively refined reconstruction; "
+                                            "losing it means restarting from scratch'."
+                                        ),
+                                    },
+                                },
+                                "required": ["name", "type", "file", "line", "evidence", "rationale"],
+                            },
+                            "description": (
+                                "List of critical variables/data structures that must be "
+                                "checkpointed, each with code evidence explaining HOW you "
+                                "found it and WHY it is critical."
+                            ),
+                        },
+                        "checkpoint_placement": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "file": {
+                                        "type": "string",
+                                        "description": "Source file containing the checkpoint location.",
+                                    },
+                                    "line": {
+                                        "type": "integer",
+                                        "description": "Line number of the loop start or insertion point.",
+                                    },
+                                    "loop_variable": {
+                                        "type": "string",
+                                        "description": "Iterator variable name (e.g. 'iter', 't', 'i').",
+                                    },
+                                    "evidence": {
+                                        "type": "string",
+                                        "description": (
+                                            "What makes this location suitable. Reference the code "
+                                            "structure: loop bounds, MPI calls inside the loop, "
+                                            "expensive operations. E.g. 'main computation loop at "
+                                            "lines 40-80 in solver.c, iterates over iter from 0 to "
+                                            "num_iters, contains MPI_Allreduce at line 72 and "
+                                            "matrix multiply at lines 55-68'."
+                                        ),
+                                    },
+                                    "rationale": {
+                                        "type": "string",
+                                        "description": (
+                                            "Why this is the optimal checkpoint location. "
+                                            "E.g. 'checkpoint at end of loop body after all "
+                                            "computation completes; loop iterator provides "
+                                            "monotonically increasing version number'."
+                                        ),
+                                    },
+                                },
+                                "required": ["file", "line", "loop_variable", "evidence", "rationale"],
+                            },
+                            "description": (
+                                "List of checkpoint placement points with code evidence "
+                                "explaining HOW you found the loop and WHY this location "
+                                "is optimal."
+                            ),
+                        },
+                        "veloc_mode": {
+                            "type": "string",
+                            "enum": ["memory_based", "file_based"],
+                            "description": (
+                                "VeloC checkpoint mode. Use 'memory_based' for state that "
+                                "can be registered with VELOC_Mem_protect (contiguous arrays, "
+                                "scalars), or 'file_based' for complex/non-contiguous state."
+                            ),
+                        },
+                        "veloc_mode_rationale": {
+                            "type": "string",
+                            "description": (
+                                "Why you chose this VeloC mode based on your analysis of "
+                                "the state. E.g. 'all critical state is contiguous heap "
+                                "arrays — memory-based mode is simpler and more efficient'."
+                            ),
+                        },
+                        "risks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Identified risks or concerns from your analysis. "
+                                "E.g. 'large array may slow checkpoint', 'MPI communicator "
+                                "must be duplicated before VeloC init'."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "critical_variables",
+                        "checkpoint_placement",
+                        "veloc_mode",
+                        "veloc_mode_rationale",
+                    ],
+                },
+            },
+        },
         # ── RAG / knowledge base tools ────────────────────────────────────────
         {
             "type": "function",
@@ -577,12 +847,37 @@ def _build_tool_schemas() -> List[Dict[str, Any]]:
 
 def _dispatch_tool(name: str, arguments_json: str) -> str:
     """Call the named tool with the given JSON arguments and return the result as JSON."""
+    global _strategy_proposed
+
+    # Gate: block write_file/execute_script/get_veloc_guide until
+    # propose_strategy has been called and accepted.
+    if name in _GATED_TOOLS and not _strategy_proposed:
+        return json.dumps({
+            "error": (
+                f"{name} is locked: you must call propose_strategy first to "
+                "articulate your checkpointing strategy with specific code evidence "
+                "(critical variables with file/line/evidence, checkpoint placement "
+                "with file/line/evidence, VeloC mode with rationale, and risks) "
+                "before you can use this tool. Call propose_strategy now."
+            ),
+        })
+
     fn = _TOOLS.get(name)
     if fn is None:
         return json.dumps({"error": f"Unknown tool: {name}"})
     try:
         kwargs = json.loads(arguments_json) if arguments_json else {}
         result = fn(**kwargs)
+
+        # Unlock gated tools after a successful propose_strategy call.
+        if name == "propose_strategy":
+            try:
+                parsed = json.loads(result) if isinstance(result, str) else result
+                if parsed.get("accepted"):
+                    _strategy_proposed = True
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+
         return result if isinstance(result, str) else json.dumps(result)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
@@ -816,6 +1111,10 @@ async def _stream_agent_loop(
         Optional :class:`MetricsCollector` instance.  When provided, per-turn
         latency, token counts, tool call timing, and step timing are recorded.
     """
+    # Reset the strategy gate so each session starts with gated tools locked.
+    global _strategy_proposed
+    _strategy_proposed = False
+
     client = get_llm_client()
     model = get_settings().llm_model
     tool_schemas = _build_tool_schemas()
@@ -1062,6 +1361,26 @@ async def _stream_agent_loop(
                             insight_id=_rag_result.get("id", args_display.get("insight_id", "")),
                             confidence=_rag_result.get("confidence"),
                         )
+
+            # ── Emit strategy_proposal event when strategy is accepted ───────
+            if tc.function.name == "propose_strategy":
+                try:
+                    _strat_result = json.loads(result_str)
+                except (json.JSONDecodeError, ValueError):
+                    _strat_result = {}
+                if _strat_result.get("accepted"):
+                    _strat_ev: Dict[str, Any] = {
+                        "type": "strategy_proposal",
+                        "turn": turn,
+                        "critical_variables": args_display.get("critical_variables", []),
+                        "checkpoint_placement": args_display.get("checkpoint_placement", []),
+                        "veloc_mode": args_display.get("veloc_mode", ""),
+                        "veloc_mode_rationale": args_display.get("veloc_mode_rationale", ""),
+                        "risks": args_display.get("risks", []),
+                    }
+                    if _tc_step is not None:
+                        _strat_ev["step"] = _tc_step
+                    yield _strat_ev
 
     # Exceeded max_turns.
     yield {

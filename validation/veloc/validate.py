@@ -341,9 +341,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     corr_grp.add_argument(
         "--injection-delay",
-        type=float,
-        default=5.0,
-        help="Seconds to wait before injecting a failure into the MPI run.",
+        default="auto",
+        help=(
+            "Seconds to wait before injecting a failure into the MPI run. "
+            "Default 'auto': compute from baseline runtime (1/3 of elapsed time, "
+            "clamped to [5, 300] seconds). Pass a float to override."
+        ),
     )
     corr_grp.add_argument(
         "--comparison-method",
@@ -501,9 +504,9 @@ def _stage_correctness(
     baseline_out = output_dir / "correctness" / "baseline"
     resilient_out = output_dir / "correctness" / "resilient"
 
-    # --- Baseline run ---
+    # --- Baseline run (ground truth output + execution time) ---
     print("\n[validate] Running baseline (original) application...", flush=True)
-    run_baseline(
+    baseline_result = run_baseline(
         source_dir=original_src,
         build_dir=original_build,
         output_dir=baseline_out,
@@ -511,6 +514,24 @@ def _stage_correctness(
         num_procs=args.num_procs,
         app_args=orig_app_args,
     )
+
+    # --- Determine injection delay ---
+    if args.injection_delay == "auto":
+        # Use 1/3 of baseline runtime so at least one checkpoint is written
+        injection_delay = max(5.0, min(baseline_result.elapsed_s / 3.0, 300.0))
+        print(
+            f"[validate] Baseline completed in {baseline_result.elapsed_s:.1f}s. "
+            f"Using adaptive injection delay: {injection_delay:.1f}s "
+            f"(1/3 of baseline runtime, clamped to [5, 300]s)",
+            flush=True,
+        )
+    else:
+        injection_delay = float(args.injection_delay)
+        print(
+            f"[validate] Baseline completed in {baseline_result.elapsed_s:.1f}s. "
+            f"Using manual injection delay: {injection_delay:.1f}s",
+            flush=True,
+        )
 
     # --- Resilient run with failure injection ---
     print("\n[validate] Running resilient application with failure injection...", flush=True)
@@ -522,7 +543,7 @@ def _stage_correctness(
         num_procs=args.num_procs,
         app_args=res_app_args,
         max_attempts=args.max_attempts,
-        injection_delay=args.injection_delay,
+        injection_delay=injection_delay,
         run_install=args.install_resilient,
         success_output_filename=args.output_file_name,
         veloc_config_name=args.veloc_config_name,
@@ -769,7 +790,7 @@ def _stage_correctness(
                     app_args=approach_app_args,
                     output_dir=approach_fi_out,
                     ckpt_dir=ckpt_dir_fi,
-                    injection_delay=args.injection_delay,
+                    injection_delay=injection_delay,
                     run_cwd=approach_fi_out,
                 )
             else:
@@ -781,7 +802,7 @@ def _stage_correctness(
                     output_dir=approach_fi_out,
                     ckpt_dir=ckpt_dir_fi,
                     coord_port=coord_port_base,
-                    injection_delay=args.injection_delay,
+                    injection_delay=injection_delay,
                     run_cwd=approach_fi_out,
                     install_prefix=approach.install_prefix,
                 )
@@ -970,10 +991,12 @@ def _stage_benchmarks(
         )
         # Use resilient args for the sweep (they may differ from original args).
         # When benchmark_num_runs is None (NUM_RUNS not set), fall back to 3.
+        # Resolve injection delay for benchmarking fallback.
+        _bench_delay = 10.0 if args.injection_delay == "auto" else float(args.injection_delay)
         scenarios = default_scenario(
             num_procs=args.num_procs,
             app_args=res_app_args,
-            injection_delay=args.injection_delay,
+            injection_delay=_bench_delay,
             max_attempts=args.max_attempts,
             num_runs=args.benchmark_num_runs if args.benchmark_num_runs is not None else 3,
         )
