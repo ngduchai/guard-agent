@@ -62,7 +62,7 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set OPENAI_API_KEY or ANTHROPIC_API_KEY
+# Edit .env: set ARGO_API_KEY (preferred) or OPENAI_API_KEY
 cd ..
 PYTHONPATH=orchestrator:. python -m uvicorn orchestrator.main:app --reload
 ```
@@ -77,7 +77,7 @@ After running `./setup.sh`, use the scripts in `build/` to run the examples. All
 
 | Example | Command | Description |
 |--------|---------|-------------|
-| Transform request | `./build/run_transform_request.sh` | Send a sample transform request to the orchestrator API. **Requires the orchestrator to be running** (see below). Set `OPENAI_API_KEY` in the environment used to start the orchestrator for LLM plans. |
+| Transform request | `./build/run_transform_request.sh` | Send a sample transform request to the orchestrator API. **Requires the orchestrator to be running** (see below). Set `ARGO_API_KEY` (preferred) or `OPENAI_API_KEY` in the environment used to start the orchestrator for LLM plans. |
 | Start orchestrator | `./build/run_orchestrator.sh` | Start the orchestrator API on port 8000 (for use with the transform request example). |
 | List tools (API) | `curl http://127.0.0.1:8000/v1/tools` | List resilience tools exposed by the orchestrator (with orchestrator running). |
 
@@ -116,8 +116,10 @@ The deploy agent and orchestrator use **only SDK-hosted tools** from the [OpenAI
 
 | Context | Variable | Description |
 |--------|----------|-------------|
-| Orchestrator | `OPENAI_API_KEY` | OpenAI API key for the orchestrator LLM. |
+| Orchestrator | `ARGO_API_KEY` | Argo API key (OpenAI-compatible endpoint). |
+| Orchestrator | `OPENAI_API_KEY` | OpenAI API key for the orchestrator LLM (if using the real OpenAI endpoint). |
 | Orchestrator | `ORCHESTRATOR_LLM_MODEL` | Model name (e.g. `gpt-4o`, default `gpt-4o`). |
 | Orchestrator | `ENVIRONMENT_TYPE` | Optional; e.g. `hpc`, `cloud`. |
-| Deployment agent | `OPENAI_API_KEY` | OpenAI API key (used by build scripts from `build/api_key`). |
+| Deployment agent | `ARGO_API_KEY` | Argo API key (used by build scripts, or copied into `build/api_key`). |
+| Deployment agent | `OPENAI_API_KEY` | OpenAI API key (used by build scripts from `build/api_key` / runtime, if applicable). |
 | Optional | `OPENAI_VECTOR_STORE_IDS` | Comma-separated vector store IDs to enable FileSearchTool for the agent/orchestrator. |
