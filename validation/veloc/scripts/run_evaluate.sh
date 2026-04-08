@@ -168,22 +168,9 @@ echo "  Ground truth execution time captured."
 echo "  Injection delay: ${INJECTION_DELAY}s"
 echo ""
 
-# --- Phase 1: Baseline ---
+# --- Phase 1: Guard-agent ---
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Phase 1: Baseline (OpenCode without guard-agent)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-set +e
-"$SCRIPT_DIR/run_iterative.sh" --baseline $MAX_ITERS_FLAG \
-  --injection-delay "$INJECTION_DELAY" \
-  --ground-truth-dir "$GROUND_TRUTH_DIR" \
-  "$APP_NAME"
-BASELINE_EXIT=$?
-set -e
-echo ""
-
-# --- Phase 2: Guard-agent ---
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Phase 2: Guard-agent (OpenCode with guard-agent MCP)"
+echo "  Phase 1: Guard-agent (OpenCode with guard-agent MCP)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 set +e
 "$SCRIPT_DIR/run_iterative.sh" $MAX_ITERS_FLAG \
@@ -191,6 +178,19 @@ set +e
   --ground-truth-dir "$GROUND_TRUTH_DIR" \
   "$APP_NAME"
 GUARDAGENT_EXIT=$?
+set -e
+echo ""
+
+# --- Phase 2: Without guard-agent ---
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Phase 2: Without guard-agent (OpenCode alone)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+set +e
+"$SCRIPT_DIR/run_iterative.sh" --baseline $MAX_ITERS_FLAG \
+  --injection-delay "$INJECTION_DELAY" \
+  --ground-truth-dir "$GROUND_TRUTH_DIR" \
+  "$APP_NAME"
+BASELINE_EXIT=$?
 set -e
 echo ""
 
@@ -203,7 +203,7 @@ echo ""
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║  Evaluation complete: $APP_NAME"
-echo "║  Baseline exit:     $BASELINE_EXIT $([ $BASELINE_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
 echo "║  Guard-agent exit:  $GUARDAGENT_EXIT $([ $GUARDAGENT_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
+echo "║  Baseline exit:     $BASELINE_EXIT $([ $BASELINE_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
 echo "║  Report: build/validation_output/comparison_${APP_NAME}.md"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
