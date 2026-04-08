@@ -189,10 +189,10 @@ if [ -d "$REPO_ROOT/tests/ecp/vanillas" ]; then
   done
 fi
 
-# --- OpenCode MCP config for each test app ---
+# --- OpenCode MCP config + AGENTS.md for each test app ---
 GUARD_AGENT_BIN="$BUILD_DIR/venv/bin/guard-agent"
 echo ""
-echo "Writing opencode.json (MCP config) into each test app ..."
+echo "Writing opencode.json and AGENTS.md into each test app ..."
 for app_dir in "$TESTS_DIR"/*/; do
   [ -d "$app_dir" ] || continue
   cat > "$app_dir/opencode.json" << OCEOF
@@ -202,12 +202,24 @@ for app_dir in "$TESTS_DIR"/*/; do
     "guard-agent": {
       "type": "local",
       "command": ["$GUARD_AGENT_BIN", "serve"],
-      "enabled": true
+      "enabled": true,
+      "timeout": 600000
     }
+  },
+  "experimental": {
+    "mcp_timeout": 600000
   }
 }
 OCEOF
-  echo "  $(basename "$app_dir")/opencode.json"
+  cat > "$app_dir/AGENTS.md" << 'AGENTSEOF'
+# Rules
+
+- After injecting VeloC checkpointing, you MUST call `validate_injection` to verify the injection works.
+- If `validate_injection` fails, fix the code and call it again. Repeat until it passes.
+- The task is NOT done until `validate_injection` returns `passed: true`.
+- In veloc.cfg, use relative paths (./veloc_scratch, ./veloc_persistent). Do NOT use /tmp/.
+AGENTSEOF
+  echo "  $(basename "$app_dir")/"
 done
 
 # --- Test data (HDF5 files, etc.) ---
@@ -378,8 +390,49 @@ RUNWEB
 chmod +x "$BUILD_DIR/run_deploy_webui.sh"
 echo "  $BUILD_DIR/run_deploy_webui.sh"
 
-# Validation runner — validates agent-modified code against original
-cat > "$BUILD_DIR/run_validate.sh" << 'RUNVALIDATE'
+# Validation scripts — thin wrappers that delegate to the git-tracked
+# scripts in validation/veloc/scripts/.  This ensures setup.sh --clean
+# always produces wrappers that use the latest version of the scripts.
+
+cat > "$BUILD_DIR/run_validate.sh" << 'WRAPPER'
+#!/usr/bin/env bash
+# Wrapper — real script lives in validation/veloc/scripts/
+exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_validate.sh" "$@"
+WRAPPER
+chmod +x "$BUILD_DIR/run_validate.sh"
+echo "  $BUILD_DIR/run_validate.sh"
+
+cat > "$BUILD_DIR/run_compare.sh" << 'WRAPPER'
+#!/usr/bin/env bash
+# Wrapper — real script lives in validation/veloc/scripts/
+exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_compare.sh" "$@"
+WRAPPER
+chmod +x "$BUILD_DIR/run_compare.sh"
+echo "  $BUILD_DIR/run_compare.sh"
+
+cat > "$BUILD_DIR/run_iterative.sh" << 'WRAPPER'
+#!/usr/bin/env bash
+# Wrapper — real script lives in validation/veloc/scripts/
+exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_iterative.sh" "$@"
+WRAPPER
+chmod +x "$BUILD_DIR/run_iterative.sh"
+echo "  $BUILD_DIR/run_iterative.sh"
+
+cat > "$BUILD_DIR/run_evaluate.sh" << 'WRAPPER'
+#!/usr/bin/env bash
+# Wrapper — real script lives in validation/veloc/scripts/
+exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_evaluate.sh" "$@"
+WRAPPER
+chmod +x "$BUILD_DIR/run_evaluate.sh"
+echo "  $BUILD_DIR/run_evaluate.sh"
+
+# NOTE: The inline heredoc scripts that used to live here (run_validate.sh,
+# run_compare.sh, run_iterative.sh, run_evaluate.sh) have been moved to
+# validation/veloc/scripts/ and are now git-tracked.  The wrappers above
+# delegate to those scripts via exec.
+#
+# Old inline code removed — see git history for reference.
+if false; then cat << 'RUNVALIDATE'
 #!/usr/bin/env bash
 set -e
 
@@ -966,23 +1019,23 @@ echo "║  Baseline (no guard-agent) vs Guard-agent (with MCP tools)"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 echo ""
 
-# --- Phase 1: Baseline ---
+# --- Phase 1: Guard-agent ---
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Phase 1: Baseline (OpenCode without guard-agent)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-set +e
-"$SCRIPT_DIR/run_iterative.sh" --baseline "$APP_NAME" $MAX_ITERS_FLAG
-BASELINE_EXIT=$?
-set -e
-echo ""
-
-# --- Phase 2: Guard-agent ---
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Phase 2: Guard-agent (OpenCode with guard-agent MCP)"
+echo "  Phase 1: Guard-agent (OpenCode with guard-agent MCP)"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 set +e
 "$SCRIPT_DIR/run_iterative.sh" "$APP_NAME" $MAX_ITERS_FLAG
 GUARDAGENT_EXIT=$?
+set -e
+echo ""
+
+# --- Phase 2: Baseline ---
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Phase 2: Baseline (OpenCode without guard-agent)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+set +e
+"$SCRIPT_DIR/run_iterative.sh" --baseline "$APP_NAME" $MAX_ITERS_FLAG
+BASELINE_EXIT=$?
 set -e
 echo ""
 
@@ -995,13 +1048,12 @@ echo ""
 
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║  Evaluation complete: $APP_NAME"
-echo "║  Baseline exit:     $BASELINE_EXIT $([ $BASELINE_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
 echo "║  Guard-agent exit:  $GUARDAGENT_EXIT $([ $GUARDAGENT_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
+echo "║  Baseline exit:     $BASELINE_EXIT $([ $BASELINE_EXIT -eq 0 ] && echo '(PASS)' || echo '(FAIL)')"
 echo "║  Report: build/validation_output/comparison_${APP_NAME}.md"
 echo "╚══════════════════════════════════════════════════════════════════════╝"
 RUNEVALUATE
-chmod +x "$BUILD_DIR/run_evaluate.sh"
-echo "  $BUILD_DIR/run_evaluate.sh"
+fi  # end dead code block
 
 # ── Print summary ────────────────────────────────────────────────────────────
 echo ""
