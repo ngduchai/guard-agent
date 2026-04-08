@@ -349,6 +349,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     corr_grp.add_argument(
+        "--ground-truth-dir",
+        default=None,
+        help=(
+            "Path to a directory containing pre-computed ground truth output "
+            "from a previous baseline run.  When provided, the correctness "
+            "stage skips rebuilding/re-running the original application and "
+            "reuses the output files and elapsed time from this directory.  "
+            "The directory must contain the expected output file and a "
+            "ground_truth_meta.json with {\"elapsed_s\": <float>}."
+        ),
+    )
+    corr_grp.add_argument(
         "--comparison-method",
         choices=("hash", "ssim", "numeric-tolerance", "text-diff", "custom"),
         default="ssim",
@@ -501,35 +513,55 @@ def _stage_correctness(
     print("[validate] STAGE 1: Correctness Validation", flush=True)
     print("=" * 70, flush=True)
 
-    baseline_out = output_dir / "correctness" / "baseline"
     resilient_out = output_dir / "correctness" / "resilient"
 
-    # --- Baseline run (ground truth output + execution time) ---
-    print("\n[validate] Running baseline (original) application...", flush=True)
-    baseline_result = run_baseline(
-        source_dir=original_src,
-        build_dir=original_build,
-        output_dir=baseline_out,
-        executable_name=orig_exe,
-        num_procs=args.num_procs,
-        app_args=orig_app_args,
-    )
+    # --- Baseline / ground truth ---
+    ground_truth_dir = Path(args.ground_truth_dir) if args.ground_truth_dir else None
+
+    if ground_truth_dir and ground_truth_dir.exists():
+        # Reuse pre-computed ground truth from Phase 0.
+        baseline_out = ground_truth_dir
+        import json as _json
+        meta_path = ground_truth_dir / "ground_truth_meta.json"
+        if meta_path.exists():
+            meta = _json.loads(meta_path.read_text())
+            baseline_elapsed = float(meta["elapsed_s"])
+        else:
+            baseline_elapsed = 30.0  # conservative fallback
+        print(
+            f"\n[validate] Reusing ground truth from {ground_truth_dir} "
+            f"(elapsed={baseline_elapsed:.1f}s)",
+            flush=True,
+        )
+    else:
+        # Run baseline from scratch.
+        baseline_out = output_dir / "correctness" / "baseline"
+        print("\n[validate] Running baseline (original) application...", flush=True)
+        baseline_result = run_baseline(
+            source_dir=original_src,
+            build_dir=original_build,
+            output_dir=baseline_out,
+            executable_name=orig_exe,
+            num_procs=args.num_procs,
+            app_args=orig_app_args,
+        )
+        baseline_elapsed = baseline_result.elapsed_s
 
     # --- Determine injection delay ---
     if args.injection_delay == "auto":
         # Use 1/3 of baseline runtime so at least one checkpoint is written
-        injection_delay = max(5.0, min(baseline_result.elapsed_s / 3.0, 300.0))
+        injection_delay = max(5.0, min(baseline_elapsed / 3.0, 300.0))
         print(
-            f"[validate] Baseline completed in {baseline_result.elapsed_s:.1f}s. "
-            f"Using adaptive injection delay: {injection_delay:.1f}s "
-            f"(1/3 of baseline runtime, clamped to [5, 300]s)",
+            f"[validate] Baseline runtime: {baseline_elapsed:.1f}s. "
+            f"Adaptive injection delay: {injection_delay:.1f}s "
+            f"(1/3 of runtime, clamped to [5, 300]s)",
             flush=True,
         )
     else:
         injection_delay = float(args.injection_delay)
         print(
-            f"[validate] Baseline completed in {baseline_result.elapsed_s:.1f}s. "
-            f"Using manual injection delay: {injection_delay:.1f}s",
+            f"[validate] Baseline runtime: {baseline_elapsed:.1f}s. "
+            f"Manual injection delay: {injection_delay:.1f}s",
             flush=True,
         )
 

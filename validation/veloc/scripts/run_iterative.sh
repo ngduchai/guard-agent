@@ -32,13 +32,17 @@ export PYTHONPATH="${REPO_ROOT}"
 # --- Parse args ---
 USE_BASELINE=false
 MAX_ITERS=5
+INJECTION_DELAY=""
+GROUND_TRUTH_DIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --baseline)   USE_BASELINE=true; shift ;;
-    --max-iters)  MAX_ITERS="$2"; shift 2 ;;
-    -*)           echo "Unknown option: $1" >&2; exit 1 ;;
-    *)            break ;;
+    --baseline)          USE_BASELINE=true; shift ;;
+    --max-iters)         MAX_ITERS="$2"; shift 2 ;;
+    --injection-delay)   INJECTION_DELAY="$2"; shift 2 ;;
+    --ground-truth-dir)  GROUND_TRUTH_DIR="$2"; shift 2 ;;
+    -*)                  echo "Unknown option: $1" >&2; exit 1 ;;
+    *)                   break ;;
   esac
 done
 
@@ -189,9 +193,15 @@ except Exception as e:
   echo "[iter $ITER] Running correctness validation..."
   VALIDATE_START=$(date +%s.%N)
 
+  # Build extra flags for validate.sh
+  EXTRA_VALIDATE_FLAGS=""
+  [ -n "$INJECTION_DELAY" ] && EXTRA_VALIDATE_FLAGS="$EXTRA_VALIDATE_FLAGS --injection-delay $INJECTION_DELAY"
+  [ -n "$GROUND_TRUTH_DIR" ] && EXTRA_VALIDATE_FLAGS="$EXTRA_VALIDATE_FLAGS --ground-truth-dir $GROUND_TRUTH_DIR"
+
   set +e
   "$SCRIPT_DIR/run_validate.sh" $VALIDATE_FLAG "$APP_NAME" \
     --skip-benchmarks --skip-report \
+    $EXTRA_VALIDATE_FLAGS \
     > "$ITER_LOG/validate_stdout.txt" 2> "$ITER_LOG/validate_stderr.txt"
   VALIDATE_EXIT=$?
   set -e
