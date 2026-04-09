@@ -68,6 +68,7 @@ class BenchmarkPipeline:
         self._state_path = output_dir / "pipeline_state.json"
         self._state = _load_state(self._state_path)
         self._results: dict[str, PipelineResult] = {}
+        self._reload_results()
 
     # -----------------------------------------------------------------------
     # Reference phase
@@ -77,13 +78,19 @@ class BenchmarkPipeline:
         self,
         apps: list[str] | None = None,
         skip_completed: bool = True,
+        fresh: bool = False,
     ) -> dict[str, ReferenceResult]:
         """Run reference validation for all (or selected) apps.
 
         Parameters
         ----------
         apps : list of app names, or None for all discovered apps.
-        skip_completed : if True, skip apps already validated in a prior run.
+        skip_completed : if True, skip apps whose reference phase already
+            passed in a prior run.  Individual *steps* within a partially-
+            completed app are always resumed (builds, golden output, etc.)
+            unless *fresh* is set.
+        fresh : if True, discard all cached steps and re-validate from
+            scratch (builds, runs, comparisons).
 
         Returns
         -------
@@ -92,13 +99,18 @@ class BenchmarkPipeline:
         targets = self._resolve_targets(apps)
         results: dict[str, ReferenceResult] = {}
 
-        for cfg in targets:
-            if skip_completed and self._is_phase_done("reference", cfg.name):
-                print(f"[pipeline] skipping {cfg.name} (already validated)")
+        completed = self._count_completed("reference")
+        total = len(targets)
+        if completed and not fresh:
+            print(f"[pipeline] Resuming: {completed}/{total} apps already validated")
+
+        for i, cfg in enumerate(targets, 1):
+            if skip_completed and not fresh and self._is_phase_done("reference", cfg.name):
+                print(f"[pipeline] ({i}/{total}) skipping {cfg.name} (already validated)")
                 continue
 
             print(f"\n{'='*60}")
-            print(f"[pipeline] Reference validation: {cfg.name}")
+            print(f"[pipeline] ({i}/{total}) Reference validation: {cfg.name}")
             print(f"{'='*60}")
 
             van = self._registry.vanilla_path(cfg.name)
@@ -112,7 +124,7 @@ class BenchmarkPipeline:
                 continue
 
             work = self._output / "work" / cfg.name
-            ref_result = validate_reference(van, ckpt, cfg, work)
+            ref_result = validate_reference(van, ckpt, cfg, work, fresh=fresh)
             results[cfg.name] = ref_result
 
             # Update pipeline result
@@ -121,7 +133,7 @@ class BenchmarkPipeline:
             else:
                 self._results[cfg.name].reference = ref_result
 
-            # Persist state
+            # Only mark as fully done if all 6 checks passed
             self._mark_phase_done("reference", cfg.name, ref_result.model_dump())
             self._save()
 
@@ -236,6 +248,64 @@ class BenchmarkPipeline:
     # Internals
     # -----------------------------------------------------------------------
 
+    def status(self) -> dict[str, dict]:
+        """Return a summary of completed/pending work per app."""
+        summary: dict[str, dict] = {}
+        for cfg in self._registry:
+            ref_state = self._state.get("reference", {}).get(cfg.name)
+            if ref_state:
+                passed_all = (
+                    ref_state.get("vanilla_build_success")
+                    and ref_state.get("golden_run_success")
+                    and ref_state.get("vanilla_no_recovery_verified")
+                    and ref_state.get("checkpointed_build_success")
+                    and ref_state.get("checkpointed_recovery_verified")
+                )
+                summary[cfg.name] = {
+                    "reference": "PASS" if passed_all else "PARTIAL",
+                    "category": cfg.category,
+                }
+            else:
+                summary[cfg.name] = {
+                    "reference": "PENDING",
+                    "category": cfg.category,
+                }
+            # Tool evaluations
+            tool_state = self._state.get("tools", {}).get(cfg.name, {})
+            if tool_state:
+                summary[cfg.name]["tools"] = list(tool_state.keys())
+        return summary
+
+    def clear(self, app_name: str | None = None) -> None:
+        """Clear persisted state so apps are re-validated on next run.
+
+        If *app_name* is given, only clear that app.  Otherwise clear all.
+        """
+        if app_name:
+            for phase in ("reference", "tools"):
+                self._state.get(phase, {}).pop(app_name, None)
+            self._results.pop(app_name, None)
+        else:
+            self._state.clear()
+            self._results.clear()
+        self._save()
+
+    # -----------------------------------------------------------------------
+    # Internals
+    # -----------------------------------------------------------------------
+
+    def _reload_results(self) -> None:
+        """Reconstruct _results from persisted state."""
+        for app_name, ref_data in self._state.get("reference", {}).items():
+            cfg = self._registry.get(app_name)
+            if cfg is None:
+                continue
+            try:
+                ref = ReferenceResult(**ref_data)
+                self._results[cfg.name] = PipelineResult(app=cfg, reference=ref)
+            except Exception:
+                pass  # stale/corrupt state entry, will be re-validated
+
     def _resolve_targets(self, apps: list[str] | None) -> list[AppConfig]:
         if apps is None:
             return list(self._registry)
@@ -243,6 +313,9 @@ class BenchmarkPipeline:
 
     def _is_phase_done(self, phase: str, app_name: str) -> bool:
         return app_name in self._state.get(phase, {})
+
+    def _count_completed(self, phase: str) -> int:
+        return len(self._state.get(phase, {}))
 
     def _mark_phase_done(self, phase: str, app_name: str, data: dict) -> None:
         self._state.setdefault(phase, {})[app_name] = data

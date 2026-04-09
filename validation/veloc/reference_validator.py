@@ -273,13 +273,38 @@ def verify_recovery(
     return result.succeeded, result
 
 
+def _step_done(work_dir: Path, step: str) -> bool:
+    """Check if a validation step was completed in a previous run."""
+    marker = work_dir / ".steps" / step
+    return marker.is_file()
+
+
+def _mark_step(work_dir: Path, step: str) -> None:
+    """Mark a validation step as completed."""
+    marker = work_dir / ".steps" / step
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
+def _clear_steps(work_dir: Path) -> None:
+    """Remove all step markers (for fresh re-validation)."""
+    steps_dir = work_dir / ".steps"
+    if steps_dir.is_dir():
+        shutil.rmtree(steps_dir)
+
+
 def validate_reference(
     vanilla_dir: Path,
     checkpointed_dir: Path,
     app_config: AppConfig,
     work_dir: Path | None = None,
+    fresh: bool = False,
 ) -> ReferenceResult:
     """Run the full reference validation pipeline for one app.
+
+    Steps are individually cached in ``work_dir/.steps/`` so that a
+    partially-completed validation resumes from where it left off.
+    Pass ``fresh=True`` to discard cached steps and re-validate from scratch.
 
     Steps:
     1. Build vanilla
@@ -295,51 +320,76 @@ def validate_reference(
         work_dir = Path(tempfile.mkdtemp(prefix=f"ref_{app_config.name}_"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    result = ReferenceResult(app_name=app_config.name)
+    if fresh:
+        _clear_steps(work_dir)
 
-    # Step 1: Build vanilla
+    result = ReferenceResult(app_name=app_config.name)
     van_build = work_dir / "vanilla_build"
-    success, output = _build_app(vanilla_dir, van_build, app_config.build.cmd)
-    result.vanilla_build_success = success
-    if not success:
-        result.error_message = f"Vanilla build failed: {output[-500:]}"
-        result.elapsed_seconds = time.monotonic() - start
-        return result
+    ckpt_build = work_dir / "checkpointed_build"
+    golden_path = work_dir / "golden_stdout.txt"
+
+    # Step 1: Build vanilla (skip if build dir exists from a prior run)
+    if _step_done(work_dir, "vanilla_build"):
+        print(f"  [resume] reusing vanilla build")
+        result.vanilla_build_success = True
+    else:
+        success, output = _build_app(vanilla_dir, van_build, app_config.build.cmd)
+        result.vanilla_build_success = success
+        if not success:
+            result.error_message = f"Vanilla build failed: {output[-500:]}"
+            result.elapsed_seconds = time.monotonic() - start
+            return result
+        _mark_step(work_dir, "vanilla_build")
 
     # Step 2: Run vanilla (error-free) → golden output
-    golden = _run_app(
-        build_dir=van_build,
-        run_cmd=app_config.run.cmd,
-        timeout=app_config.run.timeout,
-        mpi_ranks=app_config.mpi_ranks,
-    )
-    result.golden_run_success = golden.succeeded
-    if not golden.succeeded:
-        result.error_message = f"Golden run failed (exit {golden.exit_code}): {golden.stderr[-500:]}"
-        result.elapsed_seconds = time.monotonic() - start
-        return result
+    if _step_done(work_dir, "golden_run") and golden_path.is_file():
+        print(f"  [resume] reusing golden output")
+        result.golden_run_success = True
+        result.golden_output_path = str(golden_path)
+    else:
+        golden = _run_app(
+            build_dir=van_build,
+            run_cmd=app_config.run.cmd,
+            timeout=app_config.run.timeout,
+            mpi_ranks=app_config.mpi_ranks,
+        )
+        result.golden_run_success = golden.succeeded
+        if not golden.succeeded:
+            result.error_message = f"Golden run failed (exit {golden.exit_code}): {golden.stderr[-500:]}"
+            result.elapsed_seconds = time.monotonic() - start
+            return result
+        golden_path.write_text(golden.stdout)
+        result.golden_output_path = str(golden_path)
+        _mark_step(work_dir, "golden_run")
 
-    # Save golden output
-    golden_path = work_dir / "golden_stdout.txt"
-    golden_path.write_text(golden.stdout)
-    result.golden_output_path = str(golden_path)
+    golden_stdout = golden_path.read_text()
 
     # Step 3: Build checkpointed
-    ckpt_build = work_dir / "checkpointed_build"
-    success, output = _build_app(checkpointed_dir, ckpt_build, app_config.build.cmd)
-    result.checkpointed_build_success = success
-    if not success:
-        result.error_message = f"Checkpointed build failed: {output[-500:]}"
-        result.elapsed_seconds = time.monotonic() - start
-        return result
+    if _step_done(work_dir, "checkpointed_build"):
+        print(f"  [resume] reusing checkpointed build")
+        result.checkpointed_build_success = True
+    else:
+        success, output = _build_app(checkpointed_dir, ckpt_build, app_config.build.cmd)
+        result.checkpointed_build_success = success
+        if not success:
+            result.error_message = f"Checkpointed build failed: {output[-500:]}"
+            result.elapsed_seconds = time.monotonic() - start
+            return result
+        _mark_step(work_dir, "checkpointed_build")
 
     # Step 4: Verify vanilla has no recovery
-    result.vanilla_no_recovery_verified = verify_no_recovery(
-        vanilla_dir=van_build,
-        app_config=app_config,
-        golden_stdout=golden.stdout,
-        work_dir=work_dir,
-    )
+    if _step_done(work_dir, "no_recovery"):
+        print(f"  [resume] reusing no-recovery result")
+        result.vanilla_no_recovery_verified = True
+    else:
+        result.vanilla_no_recovery_verified = verify_no_recovery(
+            vanilla_dir=van_build,
+            app_config=app_config,
+            golden_stdout=golden_stdout,
+            work_dir=work_dir,
+        )
+        if result.vanilla_no_recovery_verified:
+            _mark_step(work_dir, "no_recovery")
 
     # Step 5: Verify checkpointed has recovery
     recovered, recovery_run = verify_recovery(
@@ -352,7 +402,7 @@ def validate_reference(
     # Step 6: Compare checkpointed output vs golden
     if recovered:
         result.output_match = _compare_outputs(
-            golden_stdout=golden.stdout,
+            golden_stdout=golden_stdout,
             test_stdout=recovery_run.stdout,
             method=app_config.comparison.method,
             tolerance=app_config.comparison.tolerance,
