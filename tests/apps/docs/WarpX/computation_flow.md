@@ -46,3 +46,11 @@ flowchart TD
 - **Back-transformed diagnostics**: For boosted-frame simulations, data is transformed back to the lab frame and written at specified z-positions.
 - **Particle output**: Optional per-species particle dumps in formats including AMReX native, openPMD-HDF5, or openPMD-ADIOS.
 - **Input file read**: Simulation parameters read from an input file at initialization.
+
+## Output Format
+Checkpoint directories (`chk00000/`) contain AMReX MultiFab data (fields) + particle data per species. Diagnostic output includes field energy and particle counts:
+```
+STEP 100 ends. TIME = 5.00e-10  DT = 5.00e-12
+Max |E| = 1.234e+06  Max |B| = 4.567e-03
+```
+**How to compare**: use AMReX `fcompare` on checkpoint directories for field data; extract `Max |E|` from stdout for quick numeric comparison with tolerance ~1e-4.

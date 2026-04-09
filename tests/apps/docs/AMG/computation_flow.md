@@ -70,3 +70,10 @@ PCG iteration:
 - Final output: prints iteration count, final residual norm, convergence factor, and timing breakdown to stdout
 - No intermediate file output in the default configuration
 - Problem setup parameters specified via command-line arguments
+
+## Output Format
+```
+Iterations = 22
+Final Relative Residual Norm = 9.58e-09
+```
+**How to compare**: extract `Final Relative Residual Norm`; numeric comparison with tolerance ~1e-6.

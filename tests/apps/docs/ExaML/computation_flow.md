@@ -9,22 +9,28 @@ ExaML (Exascale Maximum Likelihood) performs phylogenetic tree inference using m
 flowchart TD
     A[MPI_Init + Parse alignment] --> B[Initialize random tree]
     B --> C[ML search loop]
-    C --> D[Evaluate likelihood]
-    D --> D1[Per-partition likelihood on local columns]
-    D1 --> D2[MPI_Allreduce sum likelihood]
-    D --> E[SPR rearrangements]
+    C --> D[Evaluate per-partition likelihood on local columns]
+    D --> D2["MPI_Allreduce sum log-likelihoods"]
+    D2 --> E[SPR rearrangements]
     E --> F[Optimize branch lengths]
     F --> G{Improved?}
-    G -->|Yes| C
-    G -->|No| H[Checkpoint tree]
-    H --> I[Output best tree + MPI_Finalize]
+    G -->|Yes| H[Write checkpoint]
+    H --> C
+    G -->|No| I[Output best tree + MPI_Finalize]
 ```
 
 ## MPI Communication
-- **Data parallel**: alignment columns distributed across ranks via cyclic assignment
-- **Collective**: `MPI_Allreduce` to sum per-site log-likelihoods across ranks
+- **Data parallel**: alignment columns distributed cyclically across ranks
+- **Collective**: `MPI_Allreduce` to sum per-site log-likelihoods
 - **Broadcast**: `MPI_Bcast` for tree topology updates after SPR moves
 
 ## I/O Points
-- Checkpoint files: tree topology + model parameters written periodically
-- Final output: best tree in Newick format + log-likelihood score
+- Checkpoint: `ExaML_binaryCheckpoint.*` with tree + model params
+- Final: best tree in Newick format + log-likelihood score
+
+## Output Format
+```
+Final GAMMA-based Score of best tree: -12345.678901
+Tree written to ExaML_result.T1
+```
+**How to compare**: extract the `Final GAMMA-based Score`; numeric comparison with tolerance ~1e-2 (ML scores can vary slightly across restarts due to rounding).

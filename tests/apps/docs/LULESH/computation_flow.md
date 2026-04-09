@@ -8,28 +8,36 @@ LULESH (Livermore Unstructured Lagrangian Explicit Shock Hydrodynamics) simulate
 ```mermaid
 flowchart TD
     A[MPI_Init + Initialize mesh] --> B[Time step loop]
-    B --> C[CalcForceForNodes]
-    C --> C1[CalcVolumeForceForElems]
-    C1 --> C2[CalcHourglassControlForElems]
-    C --> D[CalcAccelerationForNodes]
+    B --> C[CalcVolumeForceForElems]
+    C --> C2[CalcHourglassControlForElems]
+    C2 --> D[CalcAccelerationForNodes]
     D --> E[ApplyAccelerationBoundaryConditions]
     E --> F[CalcVelocityForNodes]
     F --> G[CalcPositionForNodes]
-    G --> H[CalcLagrangeElements]
-    H --> H1[CalcKinematicsForElems]
-    H1 --> H2[CalcMonotonicQForElems]
-    H --> I[CalcTimeConstraintsForElems]
-    I --> J[MPI_Allreduce for dt]
+    G --> H[CalcKinematicsForElems]
+    H --> H2[CalcMonotonicQForElems]
+    H2 --> I[CalcTimeConstraintsForElems]
+    I --> J["MPI_Allreduce for global dt"]
     J --> K{More timesteps?}
     K -->|Yes| B
-    K -->|No| L[MPI_Finalize + Output]
+    K -->|No| L[Output results + MPI_Finalize]
 ```
 
 ## MPI Communication Pattern
-- **Halo exchange**: `MPI_Isend`/`MPI_Irecv`/`MPI_Wait` on 26 neighbors (face + edge + corner) for nodal fields (positions, velocities, forces)
-- **Global reduction**: `MPI_Allreduce(MPI_MIN)` for computing the global time step constraint
-- **Decomposition**: 3D block decomposition, number of ranks must be a perfect cube (1, 8, 27, 64, ...)
+- **Halo exchange**: `MPI_Isend`/`MPI_Irecv`/`MPI_Wait` on 26 neighbors for nodal fields
+- **Global reduction**: `MPI_Allreduce(MPI_MIN)` for the global time step constraint
+- **Decomposition**: 3D block decomposition, ranks must be a perfect cube
 
 ## I/O Points
-- Final output: prints energy, relative volume, and iteration count to stdout
-- No intermediate file output in the default configuration
+- Final output: energy, relative volume, iteration count to stdout
+
+## Output Format
+Stdout prints per-iteration and final summary lines:
+```
+Run completed:
+   Problem size        =  30
+   MPI tasks           =  8
+   Iteration count     =  50
+   Final Origin Energy = 2.025075e+04
+```
+**How to compare**: extract the `Final Origin Energy` value; numeric comparison with tolerance ~1e-6.

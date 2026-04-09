@@ -50,3 +50,10 @@ flowchart TD
 - **Lyman-alpha statistics**: Optional output of flux power spectrum and other Lyman-alpha forest statistics at specified redshifts.
 - **Particle output**: Dark matter particle positions and velocities for halo finding or analysis.
 - **Initial conditions**: Read from external files (e.g., transfer function, initial particle displacements from Zel'dovich approximation or N-GenIC).
+
+## Output Format
+Checkpoint directories (`chk00000/`) contain Header + per-level MultiFab data + particle binary. Stdout prints:
+```
+STEP = 100  TIME = 0.50  DT = 0.005
+```
+**How to compare**: use AMReX `fcompare` tool on checkpoint directories; or extract `TIME` and compare with tolerance.

@@ -31,3 +31,9 @@ flowchart TD
 - Graphics output: optional periodic output of mesh and solution fields for visualization (via OpenGL or file)
 - Checkpoint output: native checkpoint files written periodically
 - Final output: prints conservation metrics, timing, and cell counts to stdout
+
+## Output Format
+```
+Step 100: mass=1.0000000  mass_diff=0.00e+00  energy=4.567890e+02
+```
+**How to compare**: extract `mass` and `energy` from final step; numeric comparison with tolerance ~1e-6. Mass conservation should be exact.

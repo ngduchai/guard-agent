@@ -31,3 +31,10 @@ flowchart TD
 - Input: reads graph from file (Matrix Market, binary edge list) or generates synthetic graph (e.g., Kronecker/RMAT)
 - Final output: prints modularity score, number of communities, iteration count, and timing to stdout
 - Optional: write community assignments to file
+
+## Output Format
+```
+Modularity, #Iterations: 0.456789, 15
+Number of communities: 42
+```
+**How to compare**: extract `Modularity` value; numeric comparison with tolerance ~1e-4. Community count should be exact.

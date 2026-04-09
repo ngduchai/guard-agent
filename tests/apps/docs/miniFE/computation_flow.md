@@ -1,34 +1,43 @@
 # miniFE Computation Flow
 
 ## Overview
-miniFE is a proxy application for unstructured implicit finite element codes. It generates a simple 3D hex mesh, assembles a sparse linear system (stiffness matrix and load vector), and solves it using a conjugate gradient (CG) iterative solver. Each MPI rank owns a contiguous block of mesh nodes; the sparse matrix is distributed by rows across ranks.
+miniFE is a sparse finite element proxy app implementing a conjugate gradient (CG) solver on a 3D structured mesh. The assembled sparse matrix and vectors are distributed across MPI ranks.
 
 ## Main Loop
 
 ```mermaid
 flowchart TD
-    A[MPI_Init + Generate hex mesh] --> B[Assemble sparse matrix A and RHS vector b]
-    B --> C[Initialize CG solver: r = b - A*x, p = r]
-    C --> D[CG iteration loop]
-    D --> E[SpMV: w = A * p]
-    E --> F[MPI halo exchange for p]
-    F --> G[dot product: p^T * w — MPI_Allreduce]
-    G --> H[alpha = r^T*r / p^T*w]
-    H --> I[Update x = x + alpha*p]
-    I --> J[Update r = r - alpha*w]
-    J --> K[dot product: r^T*r — MPI_Allreduce]
-    K --> L{Converged or max iters?}
-    L -->|No| M[beta = r_new^T*r_new / r_old^T*r_old]
-    M --> N[Update p = r + beta*p]
-    N --> D
-    L -->|Yes| O[MPI_Finalize + Output]
+    A[MPI_Init + Generate mesh] --> B[Assemble sparse matrix A and RHS b]
+    B --> C[Set initial guess x = 0]
+    C --> D["Compute r = b − A·x, p = r"]
+    D --> E[CG iteration loop]
+    E --> F["Exchange halos for p (MPI_Isend/Irecv)"]
+    F --> G["SpMV: w = A · p"]
+    G --> H["dot1 = pᵀw (MPI_Allreduce)"]
+    H --> I["alpha = rᵀr / dot1"]
+    I --> J["x = x + alpha·p"]
+    J --> K["r = r − alpha·w"]
+    K --> L["dot2 = rᵀr (MPI_Allreduce)"]
+    L --> M{Converged or max iters?}
+    M -->|No| N["beta = dot2 / dot1_old"]
+    N --> O["p = r + beta·p"]
+    O --> E
+    M -->|Yes| P[Output solution norm + MPI_Finalize]
 ```
 
-## MPI Communication Pattern
-- **Halo exchange**: `MPI_Isend`/`MPI_Irecv`/`MPI_Waitall` to exchange shared node values before each SpMV; communication pattern derived from the sparse matrix non-zero structure
-- **Global reductions**: `MPI_Allreduce(MPI_SUM)` for dot products (two per CG iteration: one for `p^T*w`, one for `r^T*r`)
-- **Decomposition**: 1D row-based distribution of the sparse matrix; each rank owns a contiguous range of global node IDs
+## MPI Communication
+- **Halo exchange**: `MPI_Isend`/`MPI_Irecv`/`MPI_Waitall` for ghost DOF values before SpMV
+- **Global reduction**: `MPI_Allreduce(MPI_SUM)` for dot products (2 per CG iteration)
+- **Decomposition**: structured 3D mesh partitioned by node ownership
 
 ## I/O Points
-- Final output: prints solver iteration count, final residual norm, and timing breakdown to stdout
-- No intermediate file output in the default configuration
+- Final: solution norm and iteration count to stdout
+- YAML output file with timing breakdown
+
+## Output Format
+```
+Final Resid Norm: 3.456789e-07
+Number of iterations: 200
+Total CG Time: 1.234 seconds
+```
+**How to compare**: extract `Final Resid Norm`; numeric comparison with tolerance ~1e-6.
