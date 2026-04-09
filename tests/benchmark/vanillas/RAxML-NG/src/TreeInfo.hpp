@@ -1,0 +1,168 @@
+#ifndef RAXML_TREEINFO_HPP_
+#define RAXML_TREEINFO_HPP_
+
+#include "common.h"
+#include "Tree.hpp"
+#include "Options.hpp"
+#include "AncestralStates.hpp"
+#include "loadbalance/PartitionAssignment.hpp"
+
+struct spr_round_params
+{
+  bool thorough;
+  int radius_min;
+  int radius_max;
+  int ntopol_keep;
+  double subtree_cutoff;
+  cutoff_info_t cutoff_info;
+  double lh_epsilon_brlen_full;
+  double lh_epsilon_brlen_triplet;
+
+  unsigned long int * total_moves;
+  unsigned long int * increasing_moves;
+
+  void reset_cutoff_info(double loglh,bool adaptive = false)
+  {
+    cutoff_info.lh_dec_count = 0;
+    cutoff_info.lh_dec_sum = 0.;
+    cutoff_info.lh_cutoff = adaptive ? loglh / -100.0 : loglh / -1000.0;
+  }
+};
+
+struct nni_round_params
+{
+  double tolerance;
+  double lh_epsilon;
+  double max_rounds;
+};
+
+struct sh_support_params
+{
+  unsigned int num_bootstraps;
+  double tolerance;
+  double lh_epsilon;
+  double sh_epsilon;
+  std::vector<unsigned int *> bsrep_site_weights;
+
+  sh_support_params(size_t bsnum, size_t partnum) : num_bootstraps(bsnum),
+                                                    bsrep_site_weights(bsnum * partnum)
+  {}
+};
+
+
+class TreeInfo
+{
+public:
+  TreeInfo (const Options &opts, const Tree& tree, const PartitionedMSA& parted_msa,
+            const IDVector& tip_msa_idmap, const PartitionAssignment& part_assign,
+            const Model *override_model = nullptr);
+
+  /* with custom site weights, e.g. for bootstrapping */
+  TreeInfo (const Options &opts, const Tree& tree, const PartitionedMSA& parted_msa,
+            const IDVector& tip_msa_idmap, const PartitionAssignment& part_assign,
+            const std::vector<uintVector>& site_weights);
+
+  /* with single partition only, for modeltesting */
+  TreeInfo(const Options &opts, const Tree &tree, const PartitionedMSA &parted_msa,
+           const IDVector &tip_msa_idmap, const PartitionAssignment &part_assign,
+           size_t partition_id, const Model &model);
+
+  TreeInfo(TreeInfo&& other) noexcept;
+
+  virtual
+  ~TreeInfo ();
+
+  TreeInfo(const TreeInfo&) = delete;            // disable copy-construction (the corax-allocation prevents copying)
+
+  TreeInfo& operator=(const TreeInfo&) = delete; // disable copy-assignment (the corax-allocation prevents copying)
+
+  const corax_treeinfo_t &pll_treeinfo() const { return *_pll_treeinfo; }
+
+  const corax_unode_t &pll_utree_root() const
+  {
+    assert(_pll_treeinfo);
+    return *_pll_treeinfo->root;
+  }
+
+  Tree tree() const;
+
+  Tree tree(size_t partition_id) const;
+
+  void tree(const Tree &tree);
+
+  double param_epsilon() const { return _param_epsilon; }
+
+  void param_epsilon(double value) { _param_epsilon = value; }
+
+  /* in parallel mode, partition can be share among multiple threads and TreeInfo objects;
+   * this method returns list of partition IDs for which this thread is designated as "master"
+   * and thus responsible for e.g. sending model parameters to the main thread. */
+  const IDSet &parts_master() const { return _parts_master; }
+
+  void model(size_t partition_id, const Model &model);
+
+  void set_topology_constraint(const Tree &cons_tree);
+
+  double loglh(bool incremental = false);
+
+  double persite_loglh(std::vector<double *> part_site_lh, bool incremental = false);
+
+  double optimize_params(int params_to_optimize, double lh_epsilon);
+
+  double optimize_params_all(double lh_epsilon) { return optimize_params(CORAX_OPT_PARAM_ALL, lh_epsilon); }
+
+  double optimize_model(double lh_epsilon)
+  { return optimize_params(CORAX_OPT_PARAM_ALL & ~CORAX_OPT_PARAM_BRANCHES_ITERATIVE, lh_epsilon); }
+
+  double optimize_branches(double lh_epsilon, double brlen_smooth_factor);
+
+  double spr_round(spr_round_params &params);
+
+  double nni_round(nni_round_params &params);
+
+  void compute_ancestral(const AncestralStatesSharedPtr &ancestral,
+                         const PartitionAssignment &part_assign);
+
+  void sh_support(const sh_support_params &params, doubleVector &support_values);
+
+
+  void custom_reduce(void *parallel_context, void (*parallel_reduce_cb)(void *, double *, size_t, int));
+
+private:
+  corax_treeinfo_t *_pll_treeinfo;
+  IDSet _parts_master;
+  int _brlen_opt_method;
+  double _brlen_min;
+  double _brlen_max;
+  bool _check_lh_impr;
+  bool _use_old_constraint;
+  bool _use_spr_fastclv;
+  double _lh_epsilon;
+  double _param_epsilon;
+  doubleVector _partition_contributions;
+  FreerateOptMethod _freerate_opt;
+  intVector _param_opt_order;
+
+  void init(const Options &opts, const Tree &tree, const PartitionedMSA &parted_msa,
+            const IDVector &tip_msa_idmap, const PartitionAssignment &part_assign,
+            const std::vector<uintVector> &site_weights, const Model *override_model);
+
+  void init(const Options &opts, const Tree &tree, const PartitionedMSA &parted_msa,
+            const IDVector &tip_msa_idmap, const PartitionAssignment &part_assign,
+            const std::vector<uintVector> &site_weights, size_t single_partition_id, const Model &model);
+
+  void assert_lh_improvement(double old_lh, double new_lh, const std::string& where = "");
+};
+
+void assign(PartitionedMSA &parted_msa, const TreeInfo &treeinfo);
+
+void assign(Model &model, const TreeInfo &treeinfo, size_t partition_id);
+
+void assign_models(TreeInfo &treeinfo, const ModelMap &models);
+
+
+corax_partition_t *create_pll_partition(const Options &opts, const MSA &msa, const Model &model,
+                                        const IDVector &tip_msa_idmap,
+                                        const PartitionRange &part_region, const uintVector &weights);
+
+#endif /* RAXML_TREEINFO_HPP_ */
