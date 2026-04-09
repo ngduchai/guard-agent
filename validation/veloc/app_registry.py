@@ -1,7 +1,7 @@
 """
 app_registry.py – Discover and load benchmark application configurations.
 
-Scans the ``tests/benchmark/vanillas/`` directory for apps with ``app.yaml``
+Scans the ``tests/apps/vanillas/`` directory for apps with ``app.yaml``
 files and provides a registry of benchmark applications for the validation
 pipeline.
 """
@@ -24,7 +24,7 @@ from guard_agent.schemas import (
 # Constants
 # ---------------------------------------------------------------------------
 
-_BENCHMARK_ROOT = "tests/benchmark"
+_APPS_ROOT = "tests/apps"
 _VANILLAS_DIR = "vanillas"
 _CHECKPOINTED_DIR = "checkpointed"
 _DOCS_DIR = "docs"
@@ -36,7 +36,7 @@ _DOCS_DIR = "docs"
 
 def discover_apps(project_root: Path) -> list[Path]:
     """Find all vanilla app directories that contain an ``app.yaml``."""
-    vanillas = project_root / _BENCHMARK_ROOT / _VANILLAS_DIR
+    vanillas = project_root / _APPS_ROOT / _VANILLAS_DIR
     if not vanillas.is_dir():
         return []
     return sorted(
@@ -73,17 +73,17 @@ def load_app_config(app_dir: Path) -> AppConfig:
 
 def vanilla_dir(project_root: Path, app_name: str) -> Path:
     """Return the vanilla source directory for an app."""
-    return project_root / _BENCHMARK_ROOT / _VANILLAS_DIR / app_name
+    return project_root / _APPS_ROOT / _VANILLAS_DIR / app_name
 
 
 def checkpointed_dir(project_root: Path, app_name: str) -> Path:
     """Return the checkpointed source directory for an app."""
-    return project_root / _BENCHMARK_ROOT / _CHECKPOINTED_DIR / app_name
+    return project_root / _APPS_ROOT / _CHECKPOINTED_DIR / app_name
 
 
 def docs_dir(project_root: Path, app_name: str) -> Path:
     """Return the documentation directory for an app."""
-    return project_root / _BENCHMARK_ROOT / _DOCS_DIR / app_name
+    return project_root / _APPS_ROOT / _DOCS_DIR / app_name
 
 
 # ---------------------------------------------------------------------------

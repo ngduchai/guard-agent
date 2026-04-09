@@ -1,4 +1,4 @@
-"""Tests for the benchmark validation pipeline.
+"""Tests for the app validation pipeline.
 
 Covers:
   - AppRegistry: discovery and loading of app configurations
@@ -35,9 +35,9 @@ from guard_agent.schemas import (
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
     """Create a minimal project with one test app."""
-    vanillas = tmp_path / "tests" / "benchmark" / "vanillas" / "TestApp"
-    checkpointed = tmp_path / "tests" / "benchmark" / "checkpointed" / "TestApp"
-    docs = tmp_path / "tests" / "benchmark" / "docs" / "TestApp"
+    vanillas = tmp_path / "tests" / "apps" / "vanillas" / "TestApp"
+    checkpointed = tmp_path / "tests" / "apps" / "checkpointed" / "TestApp"
+    docs = tmp_path / "tests" / "apps" / "docs" / "TestApp"
     vanillas.mkdir(parents=True)
     checkpointed.mkdir(parents=True)
     docs.mkdir(parents=True)
@@ -176,7 +176,7 @@ class TestAppRegistry:
 
     def test_load_app_config(self, project_root: Path) -> None:
         from validation.veloc.app_registry import load_app_config
-        app_dir = project_root / "tests" / "benchmark" / "vanillas" / "TestApp"
+        app_dir = project_root / "tests" / "apps" / "vanillas" / "TestApp"
         cfg = load_app_config(app_dir)
         assert cfg.name == "TestApp"
         assert cfg.category == "iterative_fixed"
@@ -319,7 +319,7 @@ class TestToolEvaluator:
 # ---------------------------------------------------------------------------
 
 class TestRealRegistry:
-    """Integration test against the actual tests/benchmark/ directory."""
+    """Integration test against the actual tests/apps/ directory."""
 
     @pytest.fixture
     def real_root(self) -> Path:

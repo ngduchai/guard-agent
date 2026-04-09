@@ -1,5 +1,5 @@
 """
-pipeline.py – End-to-end benchmark validation pipeline.
+pipeline.py – End-to-end app validation pipeline.
 
 Orchestrates:
   1. Reference phase  – validate vanilla/checkpointed pairs
@@ -8,11 +8,11 @@ Orchestrates:
 
 Usage::
 
-    from validation.veloc.pipeline import BenchmarkPipeline
+    from validation.veloc.pipeline import AppValidationPipeline
     from validation.veloc.app_registry import AppRegistry
 
     registry = AppRegistry(project_root)
-    pipeline = BenchmarkPipeline(registry, project_root, output_dir)
+    pipeline = AppValidationPipeline(registry, project_root, output_dir)
     pipeline.run_reference_phase()
     pipeline.run_tool_phase([guard_agent_adapter])
     pipeline.generate_report()
@@ -52,8 +52,8 @@ def _save_state(state_path: Path, state: dict) -> None:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-class BenchmarkPipeline:
-    """Orchestrates the full benchmark validation pipeline."""
+class AppValidationPipeline:
+    """Orchestrates the full app validation pipeline."""
 
     def __init__(
         self,
@@ -189,9 +189,9 @@ class BenchmarkPipeline:
 
     def generate_report(self) -> Path:
         """Generate a summary report for all pipeline results."""
-        report_path = self._output / "benchmark_report.md"
+        report_path = self._output / "validation_report.md"
         lines = [
-            "# Benchmark Validation Report\n",
+            "# App Validation Report\n",
             f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
             f"Apps validated: {len(self._results)}\n",
             "",

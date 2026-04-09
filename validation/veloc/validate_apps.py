@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry point for running the benchmark validation pipeline.
+"""CLI entry point for validating app pairs (vanilla + checkpointed).
 
 Resume is automatic — every completed step (build, golden run, etc.) is
 cached in the output directory.  Re-running the same command picks up
@@ -7,31 +7,31 @@ where it left off.
 
 Usage:
     # Validate all apps (resumes automatically)
-    python validation/veloc/run_benchmark.py
+    python validation/veloc/validate_apps.py
 
     # Validate a single app
-    python validation/veloc/run_benchmark.py --app CoMD
+    python validation/veloc/validate_apps.py --app CoMD
 
     # Validate a category
-    python validation/veloc/run_benchmark.py --category iterative_fixed
+    python validation/veloc/validate_apps.py --category iterative_fixed
 
     # Show progress so far
-    python validation/veloc/run_benchmark.py --status
+    python validation/veloc/validate_apps.py --status
 
     # List all discovered apps
-    python validation/veloc/run_benchmark.py --list
+    python validation/veloc/validate_apps.py --list
 
     # Dry run (show what would be validated without running)
-    python validation/veloc/run_benchmark.py --dry-run
+    python validation/veloc/validate_apps.py --dry-run
 
     # Discard all cached results and start over
-    python validation/veloc/run_benchmark.py --fresh
+    python validation/veloc/validate_apps.py --fresh
 
     # Re-validate a single app from scratch
-    python validation/veloc/run_benchmark.py --app CoMD --fresh
+    python validation/veloc/validate_apps.py --app CoMD --fresh
 
     # Clear cached state for an app without re-running
-    python validation/veloc/run_benchmark.py --clear CoMD
+    python validation/veloc/validate_apps.py --clear CoMD
 """
 
 from __future__ import annotations
@@ -46,12 +46,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from validation.veloc.app_registry import AppRegistry
-from validation.veloc.pipeline import BenchmarkPipeline
+from validation.veloc.pipeline import AppValidationPipeline
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run benchmark validation pipeline (resumes automatically)",
+        description="Validate app pairs (vanilla has no recovery, checkpointed recovers correctly) (resumes automatically)",
     )
     parser.add_argument(
         "--app",
@@ -63,8 +63,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(_project_root / "build" / "benchmark_output"),
-        help="Directory for validation results (default: build/benchmark_output/)",
+        default=str(_project_root / "build" / "validation_output"),
+        help="Directory for validation results (default: build/validation_output/)",
     )
     parser.add_argument(
         "--list",
@@ -96,7 +96,7 @@ def main() -> int:
     registry = AppRegistry(_project_root)
 
     if len(registry) == 0:
-        print("No benchmark apps found. Check tests/benchmark/vanillas/*/app.yaml")
+        print("No apps found. Check tests/apps/vanillas/*/app.yaml")
         return 1
 
     # --list mode
@@ -105,7 +105,7 @@ def main() -> int:
         return 0
 
     output_dir = Path(args.output_dir)
-    pipeline = BenchmarkPipeline(registry, _project_root, output_dir)
+    pipeline = AppValidationPipeline(registry, _project_root, output_dir)
 
     # --status mode
     if args.status:
@@ -161,7 +161,7 @@ def main() -> int:
 
     if total_done < total_apps:
         remaining = total_apps - total_done
-        print(f"\nTo continue: python validation/veloc/run_benchmark.py")
+        print(f"\nTo continue: python validation/veloc/validate_apps.py")
         print(f"  ({remaining} app(s) remaining)")
 
     return 0 if failed == 0 else 1
@@ -195,7 +195,7 @@ def _print_app_list(registry: AppRegistry) -> None:
     print(f"\nTotal: {len(registry)} apps across {len(registry.categories())} categories")
 
 
-def _print_status(pipeline: BenchmarkPipeline, registry: AppRegistry) -> None:
+def _print_status(pipeline: AppValidationPipeline, registry: AppRegistry) -> None:
     summary = pipeline.status()
     if not summary:
         print("No validation results yet. Run without --status to start.")
@@ -218,10 +218,10 @@ def _print_status(pipeline: BenchmarkPipeline, registry: AppRegistry) -> None:
     print(f"\n{done} passed, {partial} partial, {pending} pending out of {total} total")
 
     if done < total:
-        print(f"\nTo continue: python validation/veloc/run_benchmark.py")
+        print(f"\nTo continue: python validation/veloc/validate_apps.py")
 
 
-def _print_dry_run(registry: AppRegistry, pipeline: BenchmarkPipeline, targets: list[str]) -> None:
+def _print_dry_run(registry: AppRegistry, pipeline: AppValidationPipeline, targets: list[str]) -> None:
     summary = pipeline.status()
     print("DRY RUN - would validate:\n")
     for name in targets:
