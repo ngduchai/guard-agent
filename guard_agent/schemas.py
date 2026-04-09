@@ -82,6 +82,10 @@ class CriticalStateCandidate(BaseModel):
         description="How this was identified: static_analysis, user_hint, mpi_buffer",
     )
     location: SourceLocation | None = None
+    veloc_protect_id: int | None = Field(
+        None,
+        description="VeloC memory protection ID assigned during planning",
+    )
 
 
 class ExistingVelocState(BaseModel):
@@ -250,8 +254,8 @@ class ResilienceConfig(BaseModel):
 class EnvironmentConfig(BaseModel):
     """Environment settings."""
     type: str = Field(default="hpc", description="hpc or cloud")
-    scratch_dir: str = Field(default="/tmp/veloc_scratch")
-    persistent_dir: str = Field(default="/tmp/veloc_persistent")
+    scratch_dir: str = Field(default="/tmp/scratch")
+    persistent_dir: str = Field(default="/tmp/persistent")
 
 
 class SourceConfig(BaseModel):
@@ -276,3 +280,83 @@ class GuardAgentConfig(BaseModel):
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     source: SourceConfig = Field(default_factory=SourceConfig)
     hints: HintsConfig = Field(default_factory=HintsConfig)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark app configuration (app.yaml)
+# ---------------------------------------------------------------------------
+
+class BuildConfig(BaseModel):
+    """Build configuration for a benchmark app."""
+    system: str = Field(default="cmake", description="cmake, make, meson")
+    cmd: str = Field(description="Build command template")
+
+
+class RunConfig(BaseModel):
+    """Run configuration for a benchmark app."""
+    cmd: str = Field(description="Run command template, supports {mpi_ranks}")
+    timeout: int = Field(default=120, description="Timeout in seconds")
+
+
+class ComparisonConfig(BaseModel):
+    """Output comparison configuration."""
+    method: str = Field(default="numeric", description="hash, text, numeric, ssim, custom")
+    output_file: str | None = Field(None, description="Path to output file; null = stdout")
+    tolerance: float = Field(default=1e-6, description="Tolerance for numeric comparison")
+
+
+class CheckpointLibConfig(BaseModel):
+    """Checkpoint library configuration."""
+    library: str = Field(default="veloc", description="veloc, scr, fti, native, abft, none")
+    config_file: str | None = Field(None, description="Checkpoint config file path")
+
+
+class AppConfig(BaseModel):
+    """Configuration for a benchmark application (loaded from app.yaml)."""
+    name: str
+    category: str = Field(description="e.g. iterative_fixed, iterative_variable")
+    language: str = Field(description="c or cpp")
+    description: str = Field(default="")
+    mpi_ranks: int = Field(default=4)
+    build: BuildConfig
+    run: RunConfig
+    comparison: ComparisonConfig = Field(default_factory=ComparisonConfig)
+    checkpoint: CheckpointLibConfig = Field(default_factory=CheckpointLibConfig)
+
+
+# ---------------------------------------------------------------------------
+# Reference validation results
+# ---------------------------------------------------------------------------
+
+class ReferenceResult(BaseModel):
+    """Result of validating reference vanilla + checkpointed pair."""
+    app_name: str
+    vanilla_build_success: bool = False
+    golden_run_success: bool = False
+    vanilla_no_recovery_verified: bool = False
+    checkpointed_build_success: bool = False
+    checkpointed_recovery_verified: bool = False
+    output_match: ComparisonResult | None = None
+    golden_output_path: str | None = None
+    error_message: str | None = None
+    elapsed_seconds: float | None = None
+
+
+class ToolEvaluationResult(BaseModel):
+    """Result of evaluating a tool (baseline / guard-agent) on one app."""
+    app_name: str
+    tool_name: str = Field(description="baseline, guard-agent, or custom name")
+    tool_output_dir: str = Field(default="", description="Directory with tool's checkpointed code")
+    build_success: bool = False
+    recovery_verified: bool = False
+    output_match: ComparisonResult | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    elapsed_seconds: float | None = None
+
+
+class PipelineResult(BaseModel):
+    """Full pipeline result for one benchmark app."""
+    app: AppConfig
+    reference: ReferenceResult
+    tool_evaluations: list[ToolEvaluationResult] = Field(default_factory=list)
