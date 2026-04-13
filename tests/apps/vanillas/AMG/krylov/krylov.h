@@ -23,8 +23,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
-#include <mpi.h>
-#include <mpi-ext.h>
 
 #include "_hypre_utilities.h"
 

@@ -20,8 +20,6 @@
 #define HYPRE_PARCSR_LS_HEADER
 
 #include "HYPRE.h"
-#include <stdlib.h>
-#include <stdio.h>
 #include "HYPRE_utilities.h"
 #include "HYPRE_seq_mv.h"
 #include "HYPRE_parcsr_mv.h"

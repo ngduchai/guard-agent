@@ -25,7 +25,7 @@
 #define HYPRE_PARCSR_MV_HEADER
 
 #include "HYPRE_utilities.h"
-#include "../seq_mv/HYPRE_seq_mv.h"
+#include "HYPRE_seq_mv.h"
 
 #ifdef __cplusplus
 extern "C" {

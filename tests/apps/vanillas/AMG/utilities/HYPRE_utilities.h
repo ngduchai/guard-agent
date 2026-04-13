@@ -27,7 +27,6 @@
 
 #ifndef HYPRE_SEQUENTIAL
 #include "mpi.h"
-#include "mpi-ext.h"
 #endif
 
 #ifdef HYPRE_USING_OPENMP

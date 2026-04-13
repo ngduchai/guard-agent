@@ -37,8 +37,6 @@
 #define HYPRE_PAR_VECTOR_STRUCT
 #endif
 
-#include "_hypre_parcsr_mv.h"
-
 typedef struct hypre_ParVector_struct
 {
    MPI_Comm	 comm;
