@@ -114,8 +114,8 @@ int main(int argc, char *argv[])
    struct timeval tv;
    gettimeofday( &tv, NULL );
    double ts = tv.tv_sec + tv.tv_usec / 1000000.0;
-   char hostname[64];
-   gethostname(hostname, 64);
+   char hostname[256];
+   gethostname(hostname, sizeof(hostname));
    printf("TIMESTAMP START/RESTART: %lf (s) node %s daemon %d\n", ts, hostname, getpid());
    fflush(stdout);
 #endif
@@ -132,7 +132,7 @@ if (enable_fti) {
   parseCommandLine(argc, argv);
 
    //char hostname[65];
-   gethostname(hostname, 65);
+   gethostname(hostname, sizeof(hostname));
    printf("%s daemon %d rank %d\n", hostname, (int) getpid(), me);
    //sleep(45);
 
@@ -231,8 +231,8 @@ if (enable_fti) {
 #ifdef TIMER
    gettimeofday(&end, NULL) ;
    elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
-   //char hostname[64];
-   gethostname(hostname, 64);
+   //char hostname[256];
+   gethostname(hostname, sizeof(hostname));
    printf("APP EXE TIME: %lf (s) node %s daemon %d \n", elapsed_time, hostname, getpid());
    fflush(stdout);
 #endif

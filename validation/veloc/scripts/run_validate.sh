@@ -40,6 +40,22 @@ shift
 
 # --- Load per-app config ---
 APP_CONFIG="$REPO_ROOT/validation/veloc/app_configs/${APP_NAME}.json"
+APP_YAML=""
+
+# Check for app.yaml in the 20-app set
+for _yaml_dir in "$REPO_ROOT/tests/apps/vanillas/$APP_NAME" \
+                 "$BUILD_DIR/tests/$APP_NAME" \
+                 "$BUILD_DIR/tests_baseline/$APP_NAME"; do
+  if [ -f "$_yaml_dir/app.yaml" ]; then
+    APP_YAML="$_yaml_dir/app.yaml"
+    break
+  fi
+done
+
+_read_yaml() {
+  # Read a field from app.yaml using yaml_to_config.py helper.
+  python3 -m validation.veloc.yaml_to_config "$APP_YAML" "$1" 2>/dev/null
+}
 
 _read_config() {
   # Read a value from the app config JSON. Returns empty string if not found.
@@ -100,9 +116,22 @@ except (FileNotFoundError, KeyError):
 
 # --- Resolve executable name ---
 EXE_NAME=""
+APP_ARGS=""
+COMPARISON="--comparison-method hash"
+
 if [ -f "$APP_CONFIG" ]; then
+  # JSON config takes priority (legacy 5-app format)
   EXE_NAME=$(_read_config "executable_name")
+  eval "$(_set_env_defaults)"
+  APP_ARGS=$(_read_config "app_args")
+  COMPARISON=$(_read_comparison_flags)
+elif [ -n "$APP_YAML" ]; then
+  # Fall back to app.yaml (20-app format)
+  EXE_NAME=$(_read_yaml "executable_name")
+  APP_ARGS=$(_read_yaml "app_args")
+  COMPARISON=$(_read_yaml "comparison_flags")
 fi
+
 # Fallback: try to extract from CMakeLists.txt
 if [ -z "$EXE_NAME" ]; then
   RESILIENT_SRC_TMP="$BUILD_DIR/tests/$APP_NAME"
@@ -115,30 +144,19 @@ fi
 # Final fallback
 [ -z "$EXE_NAME" ] && EXE_NAME="$APP_NAME"
 
-# --- Resolve app args ---
-APP_ARGS=""
-if [ -f "$APP_CONFIG" ]; then
-  # Set env defaults before expanding args
-  eval "$(_set_env_defaults)"
-  APP_ARGS=$(_read_config "app_args")
-fi
-
-# --- Resolve comparison flags ---
-COMPARISON="--comparison-method hash"
-if [ -f "$APP_CONFIG" ]; then
-  COMPARISON=$(_read_comparison_flags)
-fi
-
 # --- Resolve original source directory ---
 ORIGINAL_SRC=""
 if [ -d "$REPO_ROOT/tests/examples/original/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/examples/original/$APP_NAME"
 elif [ -d "$REPO_ROOT/tests/ecp/vanillas/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/ecp/vanillas/$APP_NAME"
+elif [ -d "$REPO_ROOT/tests/apps/vanillas/$APP_NAME" ]; then
+  ORIGINAL_SRC="$REPO_ROOT/tests/apps/vanillas/$APP_NAME"
 else
   echo "ERROR: Original source not found for '$APP_NAME'." >&2
   echo "  Checked: tests/examples/original/$APP_NAME" >&2
   echo "  Checked: tests/ecp/vanillas/$APP_NAME" >&2
+  echo "  Checked: tests/apps/vanillas/$APP_NAME" >&2
   exit 1
 fi
 

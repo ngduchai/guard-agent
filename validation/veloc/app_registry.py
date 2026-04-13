@@ -54,6 +54,14 @@ def load_app_config(app_dir: Path) -> AppConfig:
     with open(yaml_path) as f:
         raw = yaml.safe_load(f)
 
+    ckpt_build = None
+    if "ckpt_build" in raw and raw["ckpt_build"] is not None:
+        ckpt_build = BuildConfig(**raw["ckpt_build"])
+
+    ckpt_run = None
+    if "ckpt_run" in raw and raw["ckpt_run"] is not None:
+        ckpt_run = RunConfig(**raw["ckpt_run"])
+
     return AppConfig(
         name=raw["name"],
         category=raw.get("category", "unknown"),
@@ -64,6 +72,8 @@ def load_app_config(app_dir: Path) -> AppConfig:
         run=RunConfig(**raw.get("run", {})),
         comparison=ComparisonConfig(**raw.get("comparison", {})),
         checkpoint=CheckpointLibConfig(**raw.get("checkpoint", {})),
+        ckpt_build=ckpt_build,
+        ckpt_run=ckpt_run,
     )
 
 

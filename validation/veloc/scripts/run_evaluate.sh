@@ -71,6 +71,8 @@ if [ -d "$REPO_ROOT/tests/examples/original/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/examples/original/$APP_NAME"
 elif [ -d "$REPO_ROOT/tests/ecp/vanillas/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/ecp/vanillas/$APP_NAME"
+elif [ -d "$REPO_ROOT/tests/apps/vanillas/$APP_NAME" ]; then
+  ORIGINAL_SRC="$REPO_ROOT/tests/apps/vanillas/$APP_NAME"
 else
   echo "ERROR: Original source not found for '$APP_NAME'." >&2
   exit 1

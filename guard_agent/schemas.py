@@ -303,6 +303,10 @@ class ComparisonConfig(BaseModel):
     method: str = Field(default="numeric", description="hash, text, numeric, ssim, custom")
     output_file: str | None = Field(None, description="Path to output file; null = stdout")
     tolerance: float = Field(default=1e-6, description="Tolerance for numeric comparison")
+    ignore_patterns: list[str] = Field(
+        default_factory=list,
+        description="Substrings to match lines excluded before comparison (e.g. timestamps, timing)",
+    )
 
 
 class CheckpointLibConfig(BaseModel):
@@ -322,6 +326,14 @@ class AppConfig(BaseModel):
     run: RunConfig
     comparison: ComparisonConfig = Field(default_factory=ComparisonConfig)
     checkpoint: CheckpointLibConfig = Field(default_factory=CheckpointLibConfig)
+    ckpt_build: BuildConfig | None = Field(
+        default=None,
+        description="Separate build config for checkpointed version; falls back to build if absent",
+    )
+    ckpt_run: RunConfig | None = Field(
+        default=None,
+        description="Separate run config for checkpointed version; falls back to run if absent",
+    )
 
 
 # ---------------------------------------------------------------------------

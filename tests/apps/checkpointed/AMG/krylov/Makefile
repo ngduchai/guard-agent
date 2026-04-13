@@ -28,8 +28,6 @@ include ../Makefile.include
 CFLAGS = \
  -I..\
  -I../utilities\
- -I../parcsr_mv\
- -I../seq_mv\
  ${INCLUDE_CFLAGS}
 
 RANLIB = ranlib
@@ -48,7 +46,6 @@ FILES =\
  pcg.c
 
 OBJS = ${FILES:.c=.o}
-OBJS += ../../libcheckpoint/checkpoint.o
 
 ##################################################################
 # Targets
@@ -57,7 +54,7 @@ OBJS += ../../libcheckpoint/checkpoint.o
 all: libkrylov.a
 
 clean:
-	rm -f *.o *.a *.dxx
+	rm -f *.o *.dxx
 
 veryclean: clean
 	rm -f lib*.a
@@ -78,5 +75,5 @@ ${OBJS}: ${HEADERS}
 # ##################################################################
 
 .c.o:
-	${CXX} -o $@ -c ${CFLAGS} $<
+	${CC} -o $@ -c ${CFLAGS} $<
 

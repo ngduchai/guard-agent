@@ -61,7 +61,7 @@
 #include "graph.hpp"
 #include "utils.hpp"
 
-#include "../libcheckpoint/checkpoint.h"
+#include "libcheckpoint/checkpoint.h"
 
 #ifdef TIMER
 extern double acc_write_time;

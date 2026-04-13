@@ -163,6 +163,21 @@ if [ -d "$REPO_ROOT/tests/ecp/vanillas" ]; then
   done
 fi
 
+# --- 20 benchmark applications (tests/apps/vanillas) ---
+if [ -d "$REPO_ROOT/tests/apps/vanillas" ]; then
+  for app_dir in "$REPO_ROOT/tests/apps/vanillas"/*/; do
+    app_name="$(basename "$app_dir")"
+    target="$TESTS_DIR/$app_name"
+
+    if [ -d "$target" ]; then
+      rm -rf "$target"
+    fi
+
+    cp -a "$app_dir" "$target"
+    echo "  $target  (from tests/apps/vanillas/$app_name)"
+  done
+fi
+
 # --- Baseline copies (no guard-agent, for comparison) ---
 BASELINE_DIR="$BUILD_DIR/tests_baseline"
 mkdir -p "$BASELINE_DIR"
@@ -185,6 +200,15 @@ if [ -d "$REPO_ROOT/tests/ecp/vanillas" ]; then
     target="$BASELINE_DIR/$app_name"
     [ -d "$target" ] && rm -rf "$target"
     cp -r "$app_dir" "$target"
+    echo "  $target"
+  done
+fi
+if [ -d "$REPO_ROOT/tests/apps/vanillas" ]; then
+  for app_dir in "$REPO_ROOT/tests/apps/vanillas"/*/; do
+    app_name="$(basename "$app_dir")"
+    target="$BASELINE_DIR/$app_name"
+    [ -d "$target" ] && rm -rf "$target"
+    cp -a "$app_dir" "$target"
     echo "  $target"
   done
 fi
@@ -479,6 +503,14 @@ exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_evaluate.sh
 WRAPPER
 chmod +x "$BUILD_DIR/run_evaluate.sh"
 echo "  $BUILD_DIR/run_evaluate.sh"
+
+cat > "$BUILD_DIR/run_batch.sh" << 'WRAPPER'
+#!/usr/bin/env bash
+# Wrapper — real script lives in validation/veloc/scripts/
+exec "$(cd "$(dirname "$0")/.." && pwd)/validation/veloc/scripts/run_batch.sh" "$@"
+WRAPPER
+chmod +x "$BUILD_DIR/run_batch.sh"
+echo "  $BUILD_DIR/run_batch.sh"
 
 # NOTE: The inline heredoc scripts that used to live here (run_validate.sh,
 # run_compare.sh, run_iterative.sh, run_evaluate.sh) have been moved to

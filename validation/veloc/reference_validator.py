@@ -35,7 +35,8 @@ def _build_app(source_dir: Path, build_dir: Path, build_cmd: str) -> tuple[bool,
     if source_dir != build_dir:
         if build_dir.exists():
             shutil.rmtree(build_dir)
-        shutil.copytree(source_dir, build_dir)
+        shutil.copytree(source_dir, build_dir, symlinks=True,
+                        ignore_dangling_symlinks=True)
 
     try:
         result = subprocess.run(
@@ -44,7 +45,7 @@ def _build_app(source_dir: Path, build_dir: Path, build_cmd: str) -> tuple[bool,
             cwd=str(build_dir),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1200,
         )
         output = result.stdout + "\n" + result.stderr
         return result.returncode == 0, output
@@ -150,6 +151,16 @@ def _run_with_kill(
         )
 
 
+def _filter_lines(text: str, ignore_patterns: list[str]) -> str:
+    """Remove lines matching any ignore pattern (substring match)."""
+    if not ignore_patterns:
+        return text
+    return "\n".join(
+        ln for ln in text.splitlines()
+        if not any(pat in ln for pat in ignore_patterns)
+    )
+
+
 def _compare_outputs(
     golden_stdout: str,
     test_stdout: str,
@@ -157,6 +168,7 @@ def _compare_outputs(
     tolerance: float = 1e-6,
     golden_file: str | None = None,
     test_file: str | None = None,
+    ignore_patterns: list[str] | None = None,
 ) -> ComparisonResult:
     """Compare golden output against test output."""
     if golden_file and test_file:
@@ -169,9 +181,14 @@ def _compare_outputs(
             score=result.score,
         )
 
+    # Filter lines before comparison
+    patterns = ignore_patterns or []
+    golden_filtered = _filter_lines(golden_stdout, patterns)
+    test_filtered = _filter_lines(test_stdout, patterns)
+
     # Stdout comparison
     if method == "text":
-        passed = golden_stdout.strip() == test_stdout.strip()
+        passed = golden_filtered.strip() == test_filtered.strip()
         return ComparisonResult(
             method="text",
             passed=passed,
@@ -181,8 +198,8 @@ def _compare_outputs(
     if method == "numeric":
         # Extract numbers and compare with tolerance
         import re
-        golden_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", golden_stdout)]
-        test_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", test_stdout)]
+        golden_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", golden_filtered)]
+        test_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", test_filtered)]
         if len(golden_nums) != len(test_nums):
             return ComparisonResult(
                 method="numeric",
@@ -205,8 +222,8 @@ def _compare_outputs(
 
     # Fallback: hash comparison of stdout
     import hashlib
-    h1 = hashlib.sha256(golden_stdout.encode()).hexdigest()
-    h2 = hashlib.sha256(test_stdout.encode()).hexdigest()
+    h1 = hashlib.sha256(golden_filtered.encode()).hexdigest()
+    h2 = hashlib.sha256(test_filtered.encode()).hexdigest()
     passed = h1 == h2
     return ComparisonResult(
         method="hash",
@@ -248,6 +265,7 @@ def verify_no_recovery(
         test_stdout=result.stdout,
         method=app_config.comparison.method,
         tolerance=app_config.comparison.tolerance,
+        ignore_patterns=app_config.comparison.ignore_patterns,
     )
     # If output does NOT match golden, vanilla has no recovery (expected)
     return not comparison.passed
@@ -263,11 +281,12 @@ def verify_recovery(
     Returns (recovered: bool, run_result: RunResult).
     """
     build_dir = work_dir / "checkpointed_kill"
+    run_cfg = app_config.ckpt_run or app_config.run
     result = _run_with_kill(
         build_dir=build_dir if build_dir.exists() else checkpointed_dir,
-        run_cmd=app_config.run.cmd,
+        run_cmd=run_cfg.cmd,
         kill_after=5.0,
-        timeout=app_config.run.timeout,
+        timeout=run_cfg.timeout,
         mpi_ranks=app_config.mpi_ranks,
     )
     return result.succeeded, result
@@ -369,7 +388,8 @@ def validate_reference(
         print(f"  [resume] reusing checkpointed build")
         result.checkpointed_build_success = True
     else:
-        success, output = _build_app(checkpointed_dir, ckpt_build, app_config.build.cmd)
+        ckpt_cmd = app_config.ckpt_build.cmd if app_config.ckpt_build else app_config.build.cmd
+        success, output = _build_app(checkpointed_dir, ckpt_build, ckpt_cmd)
         result.checkpointed_build_success = success
         if not success:
             result.error_message = f"Checkpointed build failed: {output[-500:]}"
@@ -406,6 +426,7 @@ def validate_reference(
             test_stdout=recovery_run.stdout,
             method=app_config.comparison.method,
             tolerance=app_config.comparison.tolerance,
+            ignore_patterns=app_config.comparison.ignore_patterns,
         )
 
     result.elapsed_seconds = time.monotonic() - start

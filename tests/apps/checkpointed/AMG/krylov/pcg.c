@@ -31,7 +31,7 @@
 */
 
 #include "krylov.h"
-//az:#include "_hypre_utilities.h"
+#include "_hypre_utilities.h"
 
 /*--------------------------------------------------------------------------
  * hypre_PCGFunctionsCreate

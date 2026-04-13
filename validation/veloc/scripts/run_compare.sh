@@ -40,6 +40,8 @@ if [ -d "$REPO_ROOT/tests/examples/original/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/examples/original/$APP_NAME"
 elif [ -d "$REPO_ROOT/tests/ecp/vanillas/$APP_NAME" ]; then
   ORIGINAL_SRC="$REPO_ROOT/tests/ecp/vanillas/$APP_NAME"
+elif [ -d "$REPO_ROOT/tests/apps/vanillas/$APP_NAME" ]; then
+  ORIGINAL_SRC="$REPO_ROOT/tests/apps/vanillas/$APP_NAME"
 fi
 
 # --- Check prerequisites ---
