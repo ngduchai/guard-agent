@@ -1,5 +1,4 @@
 
-#include "AMReX_ParallelDescriptor.H"
 #include <AMReX_VisMF.H>
 #include <AMReX_AsyncOut.H>
 #include <AMReX_PlotFileUtil.H>
@@ -236,9 +235,6 @@ WriteMultiLevelPlotfile (const std::string& plotfilename, int nlevels,
                 data = mf[level];
             }
             VisMF::Write(*data, MultiFabFileFullPrefix(level, plotfilename, levelPrefix, mfPrefix));
-        }
-        if (VisMF::GetBarrierAfterLevel()) {
-            ParallelDescriptor::Barrier();
         }
     }
 }

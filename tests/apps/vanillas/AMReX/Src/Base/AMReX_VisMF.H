@@ -26,7 +26,6 @@ namespace amrex {
 class IArrayBox;
 
 /**
-* \ingroup amrex_io
 * \brief File I/O for FabArray<FArrayBox>.
 *  Wrapper class for reading/writing FabArray<FArrayBox> objects to disk in various "smart" ways.
 */
@@ -280,12 +279,6 @@ public:
     static bool GetUseDynamicSetSelection () { return useDynamicSetSelection; }
     static void SetUseDynamicSetSelection (bool usedss) { useDynamicSetSelection = usedss; }
 
-    static bool GetNoFlushAfterWrite () { return noFlushAfterWrite; }
-    static void SetNoFlushAfterWrite (bool nfaw) { noFlushAfterWrite = nfaw; }
-
-    static bool GetBarrierAfterLevel () { return barrierAfterLevel; }
-    static void SetBarrierAfterLevel (bool bal) { barrierAfterLevel = bal; }
-
     static std::string DirName (const std::string& filename);
     static std::string BaseName (const std::string& filename);
 
@@ -360,8 +353,6 @@ private:
     static AMREX_EXPORT bool useSynchronousReads;
     static AMREX_EXPORT bool useDynamicSetSelection;
     static AMREX_EXPORT bool allowSparseWrites;
-    static AMREX_EXPORT bool noFlushAfterWrite;
-    static AMREX_EXPORT bool barrierAfterLevel;
 };
 
 //! Write a FabOnDisk to an ostream in ASCII.
@@ -378,9 +369,9 @@ std::ostream& operator<< (std::ostream& os, const VisMF::Header& hd);
 std::istream& operator>> (std::istream& is, VisMF::Header& hd);
 
 /**
- * \brief Write `iMultiFab/FabArray<IArrayBox>`
+ * \brief Write iMultiFab/FabArray<IArrayBox>
  *
- *  This writes an `iMultiFab/FabArray<IArrayBox>` to files on disk, including
+ *  This writes an iMultiFab/FabArray<IArrayBox> to files on disk, including
  *  a clear text file NAME_H and binary files NAME_D_00000 etc.
  *
  * \param fa is the iMultiFab to be written.
@@ -392,7 +383,7 @@ std::enable_if_t<std::is_same_v<FAB,IArrayBox>>
 Write (const FabArray<FAB>& fa, const std::string& name)
 {
     BL_PROFILE("Write(FabArray)");
-    AMREX_ASSERT(!name.empty() && name.back() != '/');
+    AMREX_ASSERT(name.back() != '/');
 
     auto data_descriptor = FAB::getDataDescriptor();
     int data_bytes = data_descriptor->numBytes();
@@ -528,7 +519,6 @@ Write (const FabArray<FAB>& fa, const std::string& name)
     }
 }
 
-/// \cond DOXYGEN_IGNORE
 namespace detail {
 template <typename FAB>
 void read_fab (FAB& fab, VisMF::FabOnDisk const& fod, std::string const& name)
@@ -546,18 +536,17 @@ void read_fab (FAB& fab, VisMF::FabOnDisk const& fod, std::string const& name)
     fab.readFrom(ifs);
 }
 }
-/// \endcond
 
 /**
- * \brief Read `iMultiFab/FabArray<IArrayBox>`
+ * \brief Read iMultiFab/FabArray<IArrayBox>
  *
- * This reads an `iMultiFab/FabArray<IArrayBox>` from disk.  If it has been
+ * This reads an iMultiFab/FabArray<IArrayBox> from disk.  If it has been
  * fully defined, the BoxArray on the disk must match the BoxArray in the
- * given `iMultiFab/FabArray<IArrayBox>` object.  If it is only constructed
+ * given iMultiFab/FabArray<IArrayBox> object.  If it is only constructed
  * with the default constructor, the BoxArray on the disk will be used and a
  * new DistributionMapping will be made.  When this function is used to
  * restart a calculation from checkpoint files, one should use a fully
- * defined `iMultiFab/FabArray<IArrayBox>` except for the first one in a
+ * defined iMultiFab/FabArray<IArrayBox> except for the first one in a
  * series of iMultiFab/MultiFab objects that share the same
  * BoxArray/DistributionMapping.  This will ensure that they share the same
  * BoxArray/DistributionMapping after restart.
@@ -571,7 +560,7 @@ std::enable_if_t<std::is_same_v<FAB,IArrayBox>>
 Read (FabArray<FAB>& fa, const std::string& name)
 {
     BL_PROFILE("Read(FabArray)");
-    AMREX_ASSERT(!name.empty() && name.back() != '/');
+    AMREX_ASSERT(name.back() != '/');
 
     BoxArray ba;
     int ncomp;
