@@ -74,8 +74,8 @@ resilience:
 
 environment:
   type: hpc                 # hpc or cloud
-  scratch_dir: /tmp/veloc_scratch       # Node-local fast storage (ephemeral)
-  persistent_dir: /tmp/veloc_persistent # Shared persistent storage
+  scratch_dir: /tmp/scratch              # Node-local fast storage (ephemeral)
+  persistent_dir: /tmp/persistent       # Shared persistent storage
 
 source:
   paths:                    # Source directories to analyze

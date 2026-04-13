@@ -289,6 +289,8 @@ def _compare_outputs(
         return ComparisonResult(method="text", passed=passed, details=details)
 
     elif method == "numeric":
+        if baseline_file is not None and resilient_file is not None:
+            return _numeric_compare_files(baseline_file, resilient_file)
         return _numeric_compare(baseline_stdout, resilient_stdout)
 
     return ComparisonResult(
@@ -296,6 +298,87 @@ def _compare_outputs(
         passed=False,
         details=f"Unknown comparison method: {method}",
     )
+
+
+def _numeric_compare_files(
+    baseline_bytes: bytes,
+    resilient_bytes: bytes,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+) -> ComparisonResult:
+    """Compare output files numerically.
+
+    Supports HDF5 files (compares first dataset) and raw binary.
+    """
+    import io
+    try:
+        import h5py
+        import numpy as np
+    except ImportError:
+        return ComparisonResult(
+            method="numeric",
+            passed=False,
+            details="h5py/numpy not available for HDF5 comparison",
+        )
+
+    try:
+        with h5py.File(io.BytesIO(baseline_bytes), "r") as bf, \
+             h5py.File(io.BytesIO(resilient_bytes), "r") as rf:
+            # Find the first dataset in each file
+            b_datasets = []
+            bf.visit(lambda name: b_datasets.append(name) if isinstance(bf[name], h5py.Dataset) else None)
+            r_datasets = []
+            rf.visit(lambda name: r_datasets.append(name) if isinstance(rf[name], h5py.Dataset) else None)
+
+            if not b_datasets or not r_datasets:
+                return ComparisonResult(
+                    method="numeric",
+                    passed=False,
+                    details="No datasets found in HDF5 files",
+                )
+
+            # Use "data" dataset if available, otherwise first dataset
+            b_ds_name = "data" if "data" in b_datasets else b_datasets[0]
+            r_ds_name = "data" if "data" in r_datasets else r_datasets[0]
+
+            b_arr = bf[b_ds_name][...]
+            r_arr = rf[r_ds_name][...]
+
+            if b_arr.shape != r_arr.shape:
+                return ComparisonResult(
+                    method="numeric",
+                    passed=False,
+                    details=f"Shape mismatch: {b_arr.shape} vs {r_arr.shape}",
+                )
+
+            passed = bool(np.allclose(b_arr, r_arr, rtol=rtol, atol=atol))
+            if passed:
+                max_diff = float(np.max(np.abs(b_arr - r_arr)))
+                return ComparisonResult(
+                    method="numeric",
+                    passed=True,
+                    details=f"All {b_arr.size} values match within tolerance (max diff={max_diff:.2e})",
+                    score=1.0,
+                )
+            else:
+                diffs = np.abs(b_arr - r_arr)
+                max_diff = float(np.max(diffs))
+                max_idx = np.unravel_index(np.argmax(diffs), diffs.shape)
+                return ComparisonResult(
+                    method="numeric",
+                    passed=False,
+                    details=(
+                        f"Values differ beyond tolerance at {max_idx}: "
+                        f"{b_arr[max_idx]} vs {r_arr[max_idx]} (max diff={max_diff:.2e})"
+                    ),
+                )
+    except Exception as e:
+        # Not HDF5, fall back to raw byte comparison
+        return ComparisonResult(
+            method="numeric",
+            passed=baseline_bytes == resilient_bytes,
+            details=f"Binary comparison (HDF5 parse failed: {e})",
+        )
 
 
 def _numeric_compare(

@@ -656,11 +656,24 @@ project(MyApp CXX C)
 find_package(MPI REQUIRED)
 
 # Set VeloC install directory (can also be passed via -DVELOC_DIR=...)
-set(VELOC_DIR "/path/to/veloc/install" CACHE PATH "VeloC installation directory")
+set(VELOC_DIR "$ENV{HOME}/.local" CACHE PATH "VeloC installation directory")
+
+# Determine the correct library subdirectory (lib64 or lib).
+# Some systems (RHEL, SUSE, many HPC clusters) install 64-bit libraries
+# under lib64 instead of lib.
+if(EXISTS "${VELOC_DIR}/lib64/libveloc-client.so")
+    set(VELOC_LIB_DIR "${VELOC_DIR}/lib64")
+elseif(EXISTS "${VELOC_DIR}/lib/libveloc-client.so")
+    set(VELOC_LIB_DIR "${VELOC_DIR}/lib")
+else()
+    message(FATAL_ERROR
+        "Cannot find libveloc-client.so in ${VELOC_DIR}/lib or ${VELOC_DIR}/lib64. "
+        "Set -DVELOC_DIR=<prefix> to the VeloC installation prefix.")
+endif()
 
 # Add VeloC include and library paths
 include_directories(${VELOC_DIR}/include)
-link_directories(${VELOC_DIR}/lib)
+link_directories(${VELOC_LIB_DIR})
 
 add_executable(myapp main.cc)
 
@@ -669,9 +682,11 @@ target_link_libraries(myapp
     veloc-client      # VeloC client library
 )
 
-# Set RPATH so the binary finds libveloc-client.so at runtime
+# Set RPATH so the binary finds libveloc-client.so and its transitive
+# dependencies (libveloc-modules, liber, libredset, etc.) at runtime
 set_target_properties(myapp PROPERTIES
-    INSTALL_RPATH "${VELOC_DIR}/lib"
+    INSTALL_RPATH "${VELOC_LIB_DIR}"
+    BUILD_RPATH "${VELOC_LIB_DIR}"
     BUILD_WITH_INSTALL_RPATH TRUE
 )
 ```
@@ -680,6 +695,8 @@ Alternatively, set `LD_LIBRARY_PATH` at runtime:
 
 ```bash
 export LD_LIBRARY_PATH=<install_dir>/lib:$LD_LIBRARY_PATH
+# or, on systems that use lib64:
+export LD_LIBRARY_PATH=<install_dir>/lib64:$LD_LIBRARY_PATH
 ```
 
 ---

@@ -12,11 +12,14 @@ import os
 from typing import Any, Dict, List
 
 from agents.veloc._sdk_loader import get_sdk_tools_list
+from agents.veloc.config import apply_llm_environment
 
 
 def _get_settings() -> Dict[str, Any]:
     """Orchestrator LLM settings from environment."""
     return {
+        # OPENAI_API_KEY may be set directly by the runner, or derived from
+        # ARGO_API_KEY via `agents.veloc.config.apply_llm_environment()`.
         "openai_api_key": os.getenv("OPENAI_API_KEY"),
         "llm_model": os.getenv("ORCHESTRATOR_LLM_MODEL", "gpt-4o"),
     }
@@ -33,8 +36,14 @@ async def get_deployment_plan_from_llm(
     Returns a dict with: summary, steps, transformed_code, raw_llm_response; or error key.
     """
     settings = _get_settings()
-    if not settings.get("openai_api_key"):
-        return {"error": "OPENAI_API_KEY not set"}
+    # Ensure the OpenAI Agents SDK points at either the real OpenAI endpoint
+    # or the Argo OpenAI-compatible endpoint.
+    apply_llm_environment()
+
+    if not os.getenv("OPENAI_API_KEY"):
+        # Provide a helpful message that matches our supported env vars.
+        # (OPENAI_API_KEY is what the SDK consumes.)
+        return {"error": "OPENAI_API_KEY not set. Set OPENAI_API_KEY or ARGO_API_KEY in your environment."}
 
     try:
         from agents.veloc._sdk_loader import Agent, Runner
