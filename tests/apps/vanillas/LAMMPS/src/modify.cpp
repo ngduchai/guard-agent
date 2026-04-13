@@ -15,7 +15,6 @@
 #include "style_compute.h"    // IWYU pragma: keep
 #include "style_fix.h"        // IWYU pragma: keep
 
-#include "accelerator_kokkos.h"
 #include "atom.h"
 #include "comm.h"
 #include "compute.h"    // IWYU pragma: keep
@@ -25,7 +24,6 @@
 #include "group.h"
 #include "input.h"
 #include "memory.h"
-#include "label_map.h"
 #include "region.h"
 #include "update.h"
 #include "variable.h"
@@ -35,8 +33,8 @@
 using namespace LAMMPS_NS;
 using namespace FixConst;
 
-static constexpr int DELTA = 4;
-static constexpr double BIG = 1.0e20;
+#define DELTA 4
+#define BIG 1.0e20
 
 // template for factory function:
 // there will be one instance for each style keyword in the respective style_xxx.h files
@@ -132,9 +130,8 @@ Modify::~Modify()
   memory->destroy(fmask);
 
   // delete all computes
-  // do it via delete_compute() for clean deletion of computes that have created other computes
 
-  while (ncompute) delete_compute(0);
+  for (int i = 0; i < ncompute; i++) delete compute[i];
   memory->sfree(compute);
 
   delete[] list_initial_integrate;
@@ -191,8 +188,6 @@ void Modify::init()
   //   since any of them may be invoked by initial thermo
   // do not clear out invocation times stored within a compute,
   //   b/c some may be holdovers from previous run, like for ave fixes
-  // perform check whether extscalar, extvector, and extarray have been
-  //   set when scalar_flag, vector_flag, or array_flag are true.
 
   for (i = 0; i < ncompute; i++) {
     compute[i]->init();
@@ -205,13 +200,8 @@ void Modify::init()
   //   used to b/c temperature computes called fix->dof() in their init,
   //   and fix rigid required its own init before its dof() could be called,
   //   but computes now do their DOF in setup()
-  // perform check whether extscalar, extvector, and extarray have been
-  //   set when scalar_flag, vector_flag, or array_flag are true.
 
-  for (i = 0; i < nfix; i++) {
-    fix[i]->init();
-    fix[i]->init_flags();
-  }
+  for (i = 0; i < nfix; i++) fix[i]->init();
 
   // set global flag if any fix has its restart_pbc flag set
 
@@ -265,13 +255,11 @@ void Modify::init()
 
   for (i = 0; i < nfix; i++)
     if (!fix[i]->dynamic_group_allow && group->dynamic[fix[i]->igroup])
-      error->all(FLERR, Error::NOLASTLINE, "Fix {} does not allow use with a dynamic group",
-                 fix[i]->style);
+      error->all(FLERR, "Fix {} does not allow use with a dynamic group", fix[i]->style);
 
   for (i = 0; i < ncompute; i++)
     if (!compute[i]->dynamic_group_allow && group->dynamic[compute[i]->igroup])
-      error->all(FLERR, Error::NOLASTLINE, "Compute {} does not allow use with a dynamic group",
-                 compute[i]->style);
+      error->all(FLERR, "Compute {} does not allow use with a dynamic group", compute[i]->style);
 
   // warn if any particle is time integrated more than once
 
@@ -298,8 +286,7 @@ void Modify::init()
   int checkall;
   MPI_Allreduce(&check, &checkall, 1, MPI_INT, MPI_SUM, world);
   if (comm->me == 0 && checkall)
-    error->warning(FLERR, "One or more atoms are time integrated more than once"
-                   + utils::errorurl(32));
+    error->warning(FLERR, "One or more atoms are time integrated more than once");
 }
 
 /* ----------------------------------------------------------------------
@@ -323,10 +310,6 @@ void Modify::setup(int vflag)
     for (int i = 0; i < nfix; i++) fix[i]->setup(vflag);
   else if (update->whichflag == 2)
     for (int i = 0; i < nfix; i++) fix[i]->min_setup(vflag);
-
-  // runtime check for type label self-consistency
-
-  if (atom->labelmapflag && atom->lmap->checkflag) atom->lmap->check_labels();
 }
 
 /* ----------------------------------------------------------------------
@@ -835,22 +818,22 @@ Fix *Modify::add_fix(int narg, char **arg, int trysuffix)
 
   // clang-format off
   const char *exceptions[] =
-    {"GPU", "OMP", "INTEL", "property/atom", "cmap", "cmap3", "rx", "deprecated", "STORE/KIM",
-     "amoeba/pitorsion", "amoeba/bitorsion", "DUMMY", nullptr};
+    {"GPU", "OMP", "INTEL", "property/atom", "cmap", "cmap3", "rx",
+     "deprecated", "STORE/KIM", "amoeba/pitorsion", "amoeba/bitorsion",
+     nullptr};
   // clang-format on
 
   if (domain->box_exist == 0) {
     int m;
     for (m = 0; exceptions[m] != nullptr; m++)
       if (strcmp(arg[2], exceptions[m]) == 0) break;
-    if (exceptions[m] == nullptr)
-      error->all(FLERR, 2, "Fix {} command before simulation box is defined", arg[2]);
+    if (exceptions[m] == nullptr) error->all(FLERR, "Fix command before simulation box is defined");
   }
 
   // check group ID
 
   int igroup = group->find(arg[1]);
-  if (igroup == -1) error->all(FLERR, 1, "Could not find fix group ID {}", arg[1]);
+  if (igroup == -1) error->all(FLERR, "Could not find fix group ID {}", arg[1]);
 
   // if fix ID exists:
   //   set newflag = 0 so create new fix in same location in fix list
@@ -884,7 +867,7 @@ Fix *Modify::add_fix(int narg, char **arg, int trysuffix)
         if (estyle == fix[ifix]->style) match = 1;
       }
     }
-    if (!match) error->all(FLERR, 2, "Replacing a fix, but new style != old style");
+    if (!match) error->all(FLERR, "Replacing a fix, but new style != old style");
 
     if (fix[ifix]->igroup != igroup && comm->me == 0)
       error->warning(FLERR, "Replacing a fix, but new group != old group");
@@ -931,8 +914,7 @@ Fix *Modify::add_fix(int narg, char **arg, int trysuffix)
     fix[ifix] = fix_creator(lmp, narg, arg);
   }
 
-  if (fix[ifix] == nullptr)
-    error->all(FLERR, 2, utils::check_packages_for_style("fix", arg[2], lmp));
+  if (fix[ifix] == nullptr) error->all(FLERR, utils::check_packages_for_style("fix", arg[2], lmp));
 
   // increment nfix and update fix_list vector (if new)
 
@@ -940,9 +922,6 @@ Fix *Modify::add_fix(int narg, char **arg, int trysuffix)
     nfix++;
     fix_list = std::vector<Fix *>(fix, fix + nfix);
   }
-
-  if (fix[ifix]->kokkosable && (!lmp->kokkos || !lmp->kokkos->kokkos_exists))
-    error->all(FLERR, Error::NOLASTLINE, "Cannot use KOKKOS styles without enabling KOKKOS");
 
   // post_constructor() can call virtual methods in parent or child
   //   which would otherwise not yet be visible in child class
@@ -1013,25 +992,22 @@ Fix *Modify::add_fix(const std::string &fixcmd, int trysuffix)
         replace it later with the desired Fix instance
 ------------------------------------------------------------------------- */
 
-Fix *Modify::replace_fix(const std::string &replaceID, int narg, char **arg, int trysuffix)
+Fix *Modify::replace_fix(const char *replaceID, int narg, char **arg, int trysuffix)
 {
-  auto *oldfix = get_fix_by_id(replaceID);
-  if (!oldfix) error->all(FLERR, Error::NOLASTLINE,
-                          "Modify replace_fix ID {} could not be found", replaceID);
+  auto oldfix = get_fix_by_id(replaceID);
+  if (!oldfix) error->all(FLERR, "Modify replace_fix ID {} could not be found", replaceID);
 
   // change ID, igroup, style of fix being replaced to match new fix
   // requires some error checking on arguments for new fix
 
-  if (narg < 3)
-    error->all(FLERR, Error::NOLASTLINE, "Not enough arguments for replace_fix invocation");
+  if (narg < 3) error->all(FLERR, "Not enough arguments for replace_fix invocation");
   if (get_fix_by_id(arg[0])) error->all(FLERR, "Replace_fix ID {} is already in use", arg[0]);
 
   delete[] oldfix->id;
   oldfix->id = utils::strdup(arg[0]);
 
   int jgroup = group->find(arg[1]);
-  if (jgroup == -1) error->all(FLERR, Error::NOLASTLINE,
-                               "Could not find replace_fix group ID {}", arg[1]);
+  if (jgroup == -1) error->all(FLERR, "Could not find replace_fix group ID {}", arg[1]);
   oldfix->igroup = jgroup;
 
   delete[] oldfix->style;
@@ -1053,7 +1029,7 @@ Fix *Modify::replace_fix(const std::string &oldfix, const std::string &fixcmd, i
   std::vector<char *> newarg(args.size());
   int i = 0;
   for (const auto &arg : args) { newarg[i++] = (char *) arg.c_str(); }
-  return replace_fix(oldfix, args.size(), newarg.data(), trysuffix);
+  return replace_fix(oldfix.c_str(), args.size(), newarg.data(), trysuffix);
 }
 
 /* ----------------------------------------------------------------------
@@ -1064,8 +1040,8 @@ void Modify::modify_fix(int narg, char **arg)
 {
   if (narg < 2) utils::missing_cmd_args(FLERR, "fix_modify", error);
 
-  auto *ifix = get_fix_by_id(arg[0]);
-  if (!ifix) error->all(FLERR, Error::NOLASTLINE, "Could not find fix_modify ID {}", arg[0]);
+  auto ifix = get_fix_by_id(arg[0]);
+  if (!ifix) error->all(FLERR, "Could not find fix_modify ID {}", arg[0]);
   ifix->modify_params(narg - 1, &arg[1]);
 }
 
@@ -1077,7 +1053,7 @@ void Modify::modify_fix(int narg, char **arg)
 void Modify::delete_fix(const std::string &id)
 {
   int ifix = find_fix(id);
-  if (ifix < 0) error->all(FLERR, Error::NOLASTLINE, "Could not find fix ID {} to delete", id);
+  if (ifix < 0) error->all(FLERR, "Could not find fix ID {} to delete", id);
   delete_fix(ifix);
 }
 
@@ -1261,8 +1237,7 @@ Compute *Modify::add_compute(int narg, char **arg, int trysuffix)
 
   // error check
 
-  if (get_compute_by_id(arg[0]))
-    error->all(FLERR, Error::ARGZERO, "Reuse of compute ID '{}'", arg[0]);
+  if (get_compute_by_id(arg[0])) error->all(FLERR, "Reuse of compute ID '{}'", arg[0]);
 
   // extend Compute list if necessary
 
@@ -1304,24 +1279,10 @@ Compute *Modify::add_compute(int narg, char **arg, int trysuffix)
   }
 
   if (compute[ncompute] == nullptr)
-    error->all(FLERR, Error::NOLASTLINE, utils::check_packages_for_style("compute", arg[2], lmp));
+    error->all(FLERR, utils::check_packages_for_style("compute", arg[2], lmp));
 
   compute_list = std::vector<Compute *>(compute, compute + ncompute + 1);
-
-  if (compute[ncompute]->kokkosable && (!lmp->kokkos || !lmp->kokkos->kokkos_exists))
-    error->all(FLERR, Error::NOLASTLINE, "Cannot use KOKKOS styles without enabling KOKKOS");
-
-  // post_constructor() can call virtual methods in parent or child
-  //   which would otherwise not yet be visible in child class
-  // post_constructor() allows new compute to create other computes
-  // ncompute increment must come first so recursive call to add_compute within
-  //   post_constructor() will see updated ncompute
-
-  auto *newcompute = compute[ncompute];
-  ++ncompute;
-  newcompute->post_constructor();
-
-  return newcompute;
+  return compute[ncompute++];
 }
 
 /* ----------------------------------------------------------------------
@@ -1347,9 +1308,8 @@ void Modify::modify_compute(int narg, char **arg)
 
   // lookup Compute ID
 
-  auto *icompute = get_compute_by_id(arg[0]);
-  if (!icompute)
-    error->all(FLERR, Error::NOLASTLINE, "Could not find compute_modify ID {}", arg[0]);
+  auto icompute = get_compute_by_id(arg[0]);
+  if (!icompute) error->all(FLERR, "Could not find compute_modify ID {}", arg[0]);
   icompute->modify_params(narg - 1, &arg[1]);
 }
 
@@ -1360,8 +1320,7 @@ void Modify::modify_compute(int narg, char **arg)
 void Modify::delete_compute(const std::string &id)
 {
   int icompute = find_compute(id);
-  if (icompute < 0)
-    error->all(FLERR, Error::NOLASTLINE, "Could not find compute ID {} to delete", id);
+  if (icompute < 0) error->all(FLERR, "Could not find compute ID {} to delete", id);
   delete_compute(icompute);
 }
 
@@ -1460,7 +1419,7 @@ void Modify::addstep_compute(bigint newstep)
   }
 
   for (int icompute = 0; icompute < n_timeflag; icompute++)
-    if (compute[list_timeflag[icompute]]->invoked_flag >=0)
+    if (compute[list_timeflag[icompute]]->invoked_flag)
       compute[list_timeflag[icompute]]->addstep(newstep);
 }
 
@@ -1546,7 +1505,7 @@ int Modify::read_restart(FILE *fp)
 
   // allocate space for each entry
 
-  if (nfix_restart_global > 0) {
+  if (nfix_restart_global) {
     id_restart_global = new char *[nfix_restart_global];
     style_restart_global = new char *[nfix_restart_global];
     state_restart_global = new char *[nfix_restart_global];

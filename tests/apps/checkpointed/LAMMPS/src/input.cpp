@@ -51,15 +51,11 @@
 #include <cstring>
 #include <cerrno>
 #include <cctype>
-#include <filesystem>
 
 using namespace LAMMPS_NS;
 
-static constexpr int DELTALINE = 256;
-static constexpr int DELTA = 4;
-
-// maximum nesting level of input files
-static constexpr int LMP_MAXFILE = 16;
+#define DELTALINE 256
+#define DELTA 4
 
 /* ----------------------------------------------------------------------
    one instance per command in style_command.h
@@ -79,7 +75,7 @@ template <typename T> static Command *command_creator(LAMMPS *lmp)
 
 The Input class contains methods for reading, pre-processing and
 parsing LAMMPS commands and input files and will dispatch commands
-to the respective class instances or contain the code to execute
+to the respective class instances or contains the code to execute
 the commands directly.  It also contains the instance of the
 Variable class which performs computations and text substitutions.
 
@@ -90,7 +86,7 @@ Variable class which performs computations and text substitutions.
 \verbatim embed:rst
 
 This sets up the input processing, processes the *-var* and *-echo*
-command-line flags, holds the factory of commands and creates and
+command line flags, holds the factory of commands and creates and
 initializes an instance of the Variable class.
 
 To execute a command, a specific class instance, derived from
@@ -103,11 +99,9 @@ function executed, and finally the class instance is deleted.
  * \param  argc  number of entries in *argv*
  * \param  argv  argument vector  */
 
-Input::Input(LAMMPS *lmp, int argc, char **argv) :
-    Pointers(lmp), variable(nullptr), labelstr(nullptr), infiles(nullptr), inlines(nullptr),
-    command_map(nullptr)
+Input::Input(LAMMPS *lmp, int argc, char **argv) : Pointers(lmp)
 {
-  MPI_Comm_rank(world, &me);
+  MPI_Comm_rank(world,&me);
 
   maxline = maxcopy = maxwork = 0;
   line = copy = work = nullptr;
@@ -118,15 +112,16 @@ Input::Input(LAMMPS *lmp, int argc, char **argv) :
   echo_log = 1;
 
   label_active = 0;
+  labelstr = nullptr;
   jump_skip = 0;
   utf8_warn = true;
 
   if (me == 0) {
     nfile = 1;
-    infiles = new FILE *[LMP_MAXFILE];
+    maxfile = 16;
+    infiles = new FILE *[maxfile];
     infiles[0] = infile;
-    inlines = new int[LMP_MAXFILE];
-  }
+  } else infiles = nullptr;
 
   variable = new Variable(lmp);
 
@@ -177,7 +172,6 @@ Input::~Input()
   delete[] labelstr;
   memory->sfree(arg);
   delete[] infiles;
-  delete[] inlines;
   delete variable;
 
   delete command_map;
@@ -189,14 +183,13 @@ Input::~Input()
 
 This will read lines from *infile*, parse and execute them until the end
 of the file is reached.  The *infile* pointer will usually point to
-``stdin`` or the input file given with the ``-in`` command-line flag.
+``stdin`` or the input file given with the ``-in`` command line flag.
 
 \endverbatim */
 
 void Input::file()
 {
   int m,n,mstart,ntriple,endfile;
-  int nline = *output->thermo->get_line();
 
   while (true) {
 
@@ -252,19 +245,15 @@ void Input::file()
         m--;
         while (m >= 0 && isspace(line[m])) m--;
 
-        // continue reading if final printable char is "&", count line
+        // continue reading if final printable char is "&"
 
-        if (m >= 0 && line[m] == '&') {
-          ++nline;
-          continue;
-        }
+        if (m >= 0 && line[m] == '&') continue;
 
         // continue reading if odd number of triple quotes
 
         if (ntriple % 2) {
           line[m+1] = '\n';
           m += 2;
-          ++nline;
           continue;
         }
 
@@ -275,7 +264,6 @@ void Input::file()
         break;
       }
     }
-    output->thermo->set_line(++nline);
 
     // bcast the line
     // if n = 0, end-of-file
@@ -285,8 +273,7 @@ void Input::file()
 
     MPI_Bcast(&n,1,MPI_INT,0,world);
     if (n == 0) {
-      if (label_active)
-        error->all(FLERR, Error::NOLASTLINE, "Label {} wasn't found in input script", labelstr);
+      if (label_active) error->all(FLERR,"Label wasn't found in input script");
       break;
     }
 
@@ -313,8 +300,7 @@ void Input::file()
     // execute the command
 
     if (execute_command() && line)
-      error->all(FLERR, Error::COMMAND, "Unknown command: {}",line);
-    nline = *output->thermo->get_line();
+      error->all(FLERR,"Unknown command: {}",line);
   }
 }
 
@@ -322,8 +308,8 @@ void Input::file()
  *
 \verbatim embed:rst
 
-This function opens the file at the path *filename*, puts the current
-file pointer stored in *infile* on a stack and instead assigns *infile*
+This function opens the file at the path *filename*, put the current
+file pointer stored in *infile* on a stack and instead assign *infile*
 with the newly opened file pointer.  Then it will call the
 :cpp:func:`Input::file() <LAMMPS_NS::Input::file()>` function to read,
 parse and execute the contents of that file.  When the end of the file
@@ -341,16 +327,12 @@ void Input::file(const char *filename)
   // call to file() will close filename and decrement nfile
 
   if (me == 0) {
-    if (nfile == LMP_MAXFILE)
-      error->one(FLERR, Error::NOLASTLINE, "Too many nested levels ({}) of input scripts", nfile);
+    if (nfile == maxfile) error->one(FLERR,"Too many nested levels of input scripts");
 
     if (filename) {
       infile = fopen(filename,"r");
       if (infile == nullptr)
-        error->one(FLERR, Error::NOLASTLINE, "Cannot open input script {}: {}",
-                   filename, utils::getsyserror());
-      if (nfile > 0) inlines[nfile - 1] = *output->thermo->get_line();
-      inlines[nfile] = -1;
+        error->one(FLERR,"Cannot open input script {}: {}", filename, utils::getsyserror());
       infiles[nfile++] = infile;
     }
   }
@@ -364,7 +346,6 @@ void Input::file(const char *filename)
       fclose(infile);
       nfile--;
       infile = infiles[nfile-1];
-      output->thermo->set_line(inlines[nfile-1]);
     }
   }
 }
@@ -409,7 +390,7 @@ char *Input::one(const std::string &single)
   // execute the command and return its name
 
   if (execute_command())
-    error->all(FLERR, Error::COMMAND, "Unknown command: {}",line);
+    error->all(FLERR,"Unknown command: {}",line);
 
   return command;
 }
@@ -427,7 +408,7 @@ void Input::write_echo(const std::string &txt)
 }
 
 /* ----------------------------------------------------------------------
-   parse copy of command-line by inserting string terminators
+   parse copy of command line by inserting string terminators
    strip comment = all chars from # on
    replace all $ via variable substitution except within quotes
    command = first word
@@ -458,18 +439,18 @@ void Input::parse()
     if (*ptr == '\'') {
       ptrmatch = strchr(ptr+1,'\'');
       if (ptrmatch == nullptr)
-        error->all(FLERR,"Unmatched single quote in command: {}",line);
+        error->all(FLERR,"Unmatched single quote in command");
       ptr = ptrmatch + 1;
     } else if (*ptr == '"') {
-      if (strstr(ptr,R"(""")") == ptr) {
-        ptrmatch = strstr(ptr+3,R"(""")");
+      if (strstr(ptr,"\"\"\"") == ptr) {
+        ptrmatch = strstr(ptr+3,"\"\"\"");
         if (ptrmatch == nullptr)
-          error->all(FLERR,"Unmatched triple quote in command: {}",line);
+          error->all(FLERR,"Unmatched triple quote in command");
         ptr = ptrmatch + 3;
       } else {
         ptrmatch = strchr(ptr+1,'"');
         if (ptrmatch == nullptr)
-          error->all(FLERR,"Unmatched double quote in command: {}",line);
+          error->all(FLERR,"Unmatched double quote in command");
         ptr = ptrmatch + 1;
       }
     } else ptr++;
@@ -479,8 +460,9 @@ void Input::parse()
     std::string buf = utils::utf8_subst(copy);
     strcpy(copy,buf.c_str());
     if (utf8_warn && (comm->me == 0))
-      error->warning(FLERR,"Detected non-ASCII characters in input. Will try to continue by "
-                     "replacing with ASCII equivalents where known.");
+      error->warning(FLERR,"Detected non-ASCII characters in input. "
+                     "Will try to continue by replacing with ASCII "
+                     "equivalents where known.");
     utf8_warn = false;
   }
 
@@ -542,8 +524,8 @@ char *Input::nextword(char *str, char **next)
   //   stop = first whitespace char after start
   //   next = char after stop, or stop itself if stop is null char
 
-  if (strstr(start,R"(""")") == start) {
-    stop = strstr(&start[3],R"(""")");
+  if (strstr(start,"\"\"\"") == start) {
+    stop = strstr(&start[3],"\"\"\"");
     if (!stop) error->all(FLERR,"Unbalanced quotes in input line");
     start += 3;
     *next = stop+3;
@@ -588,6 +570,7 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
   int i,n,paren_count,nchars;
   char immediate[256];
   char *var,*value,*beyond;
+  int quoteflag = 0;
   char *ptrmatch;
 
   char *ptr = str;
@@ -599,16 +582,9 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
 
   while (*ptr) {
 
-    // if this is not the first character and the character before ptr is a backslash
-    // do *not* expand as variable but overwrite the backslash with the $
-
-    if ((*ptr == '$') && (ptr > str) && (ptr[- 1] == '\\')) {
-
-      ptr2[-1] = *ptr++;
-
     // variable substitution
 
-    } else if (*ptr == '$') {
+    if (*ptr == '$' && !quoteflag) {
 
       // value = ptr to expanded variable
       // variable name between curly braces, e.g. ${a}
@@ -619,7 +595,7 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
 
         while (var[i] != '\0' && var[i] != '}') i++;
 
-        if (var[i] == '\0') error->one(FLERR,"Invalid variable name {}", var);
+        if (var[i] == '\0') error->one(FLERR,"Invalid variable name");
         var[i] = '\0';
         beyond = ptr + strlen(var) + 3;
         value = variable->retrieve(var);
@@ -640,7 +616,7 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
           i++;
         }
 
-        if (var[i] == '\0') error->one(FLERR,"Invalid immediate variable {}", ptr);
+        if (var[i] == '\0') error->one(FLERR,"Invalid immediate variable");
         var[i] = '\0';
         beyond = ptr + strlen(var) + 3;
 
@@ -655,8 +631,8 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
 
         // quick check for proper format string
 
-        if (!utils::strmatch(fmtstr,R"(%[0-9 ]*\.[0-9]+[efgEFG])"))
-          error->all(FLERR,"Incorrect conversion in format string {}", fmtstr);
+        if (!utils::strmatch(fmtstr,"%[0-9 ]*\\.[0-9]+[efgEFG]"))
+          error->all(FLERR,"Incorrect conversion in format string");
 
         snprintf(immediate,256,fmtstr,variable->compute_equal(var));
         value = immediate;
@@ -672,7 +648,7 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
       }
 
       if (value == nullptr)
-        error->one(FLERR,"Substitution for illegal variable {}"+utils::errorurl(13),var);
+        error->one(FLERR,"Substitution for illegal variable {}",var);
 
       // check if storage in str2 needs to be expanded
       // re-initialize ptr and ptr2 to the point beyond the variable.
@@ -701,8 +677,8 @@ void Input::substitute(char *&str, char *&str2, int &max, int &max2, int flag)
       ptr += nchars;
       ptr2 += nchars;
     } else if (*ptr == '"') {
-      if (strstr(ptr,R"(""")") == ptr) {
-        ptrmatch = strstr(ptr+3,R"(""")");
+      if (strstr(ptr,"\"\"\"") == ptr) {
+        ptrmatch = strstr(ptr+3,"\"\"\"");
         if (ptrmatch == nullptr)
           error->all(FLERR,"Unmatched triple quote in command");
         nchars = ptrmatch+3 - ptr;
@@ -743,7 +719,7 @@ int Input::numtriple(char *line)
 {
   int count = 0;
   char *ptr = line;
-  while ((ptr = strstr(ptr,R"(""")"))) {
+  while ((ptr = strstr(ptr,"\"\"\""))) {
     ptr += 3;
     count++;
   }
@@ -892,21 +868,17 @@ int Input::execute_command()
 
 void Input::clear()
 {
-  if (narg > 0)
-    error->all(FLERR, Error::COMMAND, "Incorrect clear command: unexpected argument(s) found");
-  if (output->thermo) output->thermo->set_line(-1);
+  if (narg > 0) error->all(FLERR,"Illegal clear command: unexpected arguments but found {}", narg);
   lmp->destroy();
   lmp->create();
   lmp->post_create();
-  variable->clear_in_progress();
 }
 
 /* ---------------------------------------------------------------------- */
 
 void Input::echo()
 {
-  if (narg != 1)
-    error->all(FLERR, Error::COMMAND, "Echo command expects exactly one argument");
+  if (narg != 1) error->all(FLERR,"Illegal echo command: expected 1 argument but found {}", narg);
 
   if (strcmp(arg[0],"none") == 0) {
     echo_screen = 0;
@@ -920,7 +892,7 @@ void Input::echo()
   } else if (strcmp(arg[0],"both") == 0) {
     echo_screen = 1;
     echo_log = 1;
-  } else error->all(FLERR, Error::ARGZERO, "Unknown echo command keyword: {}", arg[0]);
+  } else error->all(FLERR,"Unknown echo keyword: {}", arg[0]);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -944,8 +916,7 @@ void Input::ifthenelse()
 
   // bound "then" commands
 
-  if (strcmp(arg[1],"then") != 0)
-    error->all(FLERR, 1, R"(Illegal if command: expected "then" but found "{}")", arg[1]);
+  if (strcmp(arg[1],"then") != 0) error->all(FLERR,"Illegal if command: expected \"then\" but found \"{}\"", arg[1]);
 
   int first = 2;
   int iarg = first;
@@ -962,7 +933,7 @@ void Input::ifthenelse()
     int ncommands = last-first + 1;
     if (ncommands <= 0) utils::missing_cmd_args(FLERR, "if then", error);
 
-    auto *commands = new char*[ncommands];
+    auto commands = new char*[ncommands];
     ncommands = 0;
     for (int i = first; i <= last; i++) {
       n = strlen(arg[i]) + 1;
@@ -1015,12 +986,11 @@ void Input::ifthenelse()
     int ncommands = last-first + 1;
     if (ncommands <= 0) utils::missing_cmd_args(FLERR, "if elif/else", error);
 
-    auto *commands = new char*[ncommands];
+    auto commands = new char*[ncommands];
     ncommands = 0;
     for (int i = first; i <= last; i++) {
       n = strlen(arg[i]) + 1;
-      if (n == 1)
-        error->all(FLERR,"Illegal if elif/else command: execute command is empty");
+      if (n == 1) error->all(FLERR,"Illegal if elif/else command: execute command is empty");
       commands[ncommands] = new char[n];
       strcpy(commands[ncommands],arg[i]);
       ncommands++;
@@ -1042,12 +1012,11 @@ void Input::ifthenelse()
 
 void Input::include()
 {
-  if (narg != 1)
-    error->all(FLERR, Error::COMMAND, "Illegal include command. Must name one file to include.");
+  if (narg != 1) error->all(FLERR,"Illegal include command");
 
   if (me == 0) {
-    if (nfile == LMP_MAXFILE)
-      error->one(FLERR, Error::COMMAND, "Too many nested levels ({}) of input scripts", nfile);
+    if (nfile == maxfile)
+      error->one(FLERR,"Too many nested levels of input scripts");
 
     // expand variables
     int n = strlen(arg[0]) + 1;
@@ -1057,7 +1026,7 @@ void Input::include()
 
     infile = fopen(line,"r");
     if (infile == nullptr)
-      error->one(FLERR, Error::ARGZERO, "Cannot open input script {}: {}", line, utils::getsyserror());
+      error->one(FLERR,"Cannot open input script {}: {}", line, utils::getsyserror());
 
     infiles[nfile++] = infile;
   }
@@ -1077,9 +1046,7 @@ void Input::include()
 
 void Input::jump()
 {
-  if (narg < 1 || narg > 2)
-    error->all(FLERR, Error::COMMAND,
-               "Illegal jump command: expected 1 or 2 argument(s) but found {}", narg);
+  if (narg < 1 || narg > 2) error->all(FLERR,"Illegal jump command: expected 1 or 2 argument(s) but found {}", narg);
 
   if (jump_skip) {
     jump_skip = 0;
@@ -1087,16 +1054,14 @@ void Input::jump()
   }
 
   if (me == 0) {
-    output->thermo->set_line(-1);
-    if (strcmp(arg[0],"SELF") == 0) {
-      rewind(infile);
-    } else {
+    if (strcmp(arg[0],"SELF") == 0) rewind(infile);
+    else {
       if (infile && infile != stdin) fclose(infile);
       infile = fopen(arg[0],"r");
       if (infile == nullptr)
-        error->one(FLERR, Error::ARGZERO, "Cannot open input script {}: {}", arg[0],
-                   utils::getsyserror());
-      inlines[nfile-1] = -1;
+        error->one(FLERR,"Cannot open input script {}: {}",
+                                     arg[0], utils::getsyserror());
+
       infiles[nfile-1] = infile;
     }
   }
@@ -1112,8 +1077,7 @@ void Input::jump()
 
 void Input::label()
 {
-  if (narg != 1) error->all(FLERR, Error::COMMAND,
-                            "Illegal label command: expected 1 argument but found {}", narg);
+  if (narg != 1) error->all(FLERR,"Illegal label command: expected 1 argument but found {}", narg);
   if (label_active && strcmp(labelstr,arg[0]) == 0) label_active = 0;
 }
 
@@ -1121,13 +1085,12 @@ void Input::label()
 
 void Input::log()
 {
-  if ((narg < 1) || (narg > 2))
-    error->all(FLERR, Error::COMMAND,
-               "Illegal log command: expected 1 or 2 argument(s) but found {}", narg);
+  if ((narg < 1) || (narg > 2)) error->all(FLERR,"Illegal log command: expected 1 or 2 argument(s) but found {}", narg);
+
   int appendflag = 0;
   if (narg == 2) {
     if (strcmp(arg[1],"append") == 0) appendflag = 1;
-    else error->all(FLERR, 1, "Unknown log keyword: {}", arg[1]);
+    else error->all(FLERR,"Unknown log keyword: {}", arg[1]);
   }
 
   if (me == 0) {
@@ -1138,8 +1101,9 @@ void Input::log()
       else logfile = fopen(arg[0],"w");
 
       if (logfile == nullptr)
-        error->one(FLERR, Error::ARGZERO, "Cannot open logfile {}: {}", arg[0],
-                   utils::getsyserror());
+        error->one(FLERR,"Cannot open logfile {}: {}",
+                                     arg[0], utils::getsyserror());
+
     }
     if (universe->nworlds == 1) universe->ulogfile = logfile;
   }
@@ -1165,12 +1129,11 @@ void Input::partition()
   // new command starts at the 3rd argument,
   // which must not be another partition command
 
-  if (strcmp(arg[2],"partition") == 0)
-    error->all(FLERR, 2, "Illegal partition command argument");
+  if (strcmp(arg[2],"partition") == 0) error->all(FLERR,"Illegal partition command");
 
   char *cmd = strstr(line,arg[2]);
 
-  // execute the remaining command-line on requested partitions
+  // execute the remaining command line on requested partitions
 
   if (yesflag) {
     if (universe->iworld+1 >= ilo && universe->iworld+1 <= ihi) one(cmd);
@@ -1203,15 +1166,13 @@ void Input::print()
   int iarg = 1;
   while (iarg < narg) {
     if (strcmp(arg[iarg],"file") == 0 || strcmp(arg[iarg],"append") == 0) {
-      if (iarg+2 > narg)
-        error->all(FLERR, iarg, "Illegal print {} command: missing argument(s)", arg[iarg]);
+      if (iarg+2 > narg) error->all(FLERR,"Illegal print {} command: missing argument(s)", arg[iarg]);
       if (me == 0) {
         if (fp != nullptr) fclose(fp);
         if (strcmp(arg[iarg],"file") == 0) fp = fopen(arg[iarg+1],"w");
         else fp = fopen(arg[iarg+1],"a");
         if (fp == nullptr)
-          error->one(FLERR, iarg+1, "Cannot open print file {}: {}", arg[iarg+1],
-                     utils::getsyserror());
+          error->one(FLERR,"Cannot open print file {}: {}", arg[iarg+1], utils::getsyserror());
       }
       iarg += 2;
     } else if (strcmp(arg[iarg],"screen") == 0) {
@@ -1222,7 +1183,7 @@ void Input::print()
       if (iarg+2 > narg) utils::missing_cmd_args(FLERR, "print universe", error);
       universeflag = utils::logical(FLERR,arg[iarg+1],false,lmp);
       iarg += 2;
-    } else error->all(FLERR, iarg, "Unknown print keyword: {}", arg[iarg]);
+    } else error->all(FLERR,"Unknown print keyword: {}", arg[iarg]);
   }
 
   if (me == 0) {
@@ -1252,8 +1213,7 @@ void Input::quit()
 {
   if (narg == 0) error->done(0); // 1 would be fully backwards compatible
   if (narg == 1) error->done(utils::inumeric(FLERR,arg[0],false,lmp));
-  error->all(FLERR, Error::COMMAND,
-             "Illegal quit command: expected at most one argument but found {}", narg);
+  error->all(FLERR,"Illegal quit command: expected 0 or 1 argument but found {}", narg);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1285,7 +1245,7 @@ void Input::shell()
   } else if (strcmp(arg[0],"mv") == 0) {
     if (narg != 3) error->all(FLERR,"Illegal shell command: expected 3 argument but found {}", narg);
     if (me == 0) {
-      if (std::filesystem::is_directory(arg[2])) {
+      if (platform::path_is_directory(arg[2])) {
         if (system(fmt::format("mv {} {}", arg[1], arg[2]).c_str()))
           error->warning(FLERR,"Shell command 'mv {} {}' returned with non-zero status", arg[1], arg[2]);
       } else {
@@ -1344,7 +1304,7 @@ void Input::shell()
       }
 
       if (system(cmd.c_str()) != 0)
-        error->warning(FLERR, "Shell command {} returned with non-zero status", cmd);
+        error->warning(FLERR,"Shell command {} returned with non-zero status", cmd);
     }
   }
 }
@@ -1369,12 +1329,11 @@ void Input::variable_command()
 void Input::angle_coeff()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Angle_coeff command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Angle_coeff command before simulation box is defined");
   if (force->angle == nullptr)
-    error->all(FLERR, Error::COMMAND, "Angle_coeff command before angle_style is defined");
+    error->all(FLERR,"Angle_coeff command before angle_style is defined");
   if (atom->avec->angles_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Angle_coeff command when no angles are allowed");
+    error->all(FLERR,"Angle_coeff command when no angles allowed");
   char *newarg = utils::expand_type(FLERR, arg[0], Atom::ANGLE, lmp);
   if (newarg) arg[0] = newarg;
   force->angle->coeff(narg,arg);
@@ -1385,9 +1344,9 @@ void Input::angle_coeff()
 
 void Input::angle_style()
 {
-  if (narg < 1) utils::missing_cmd_args(FLERR, "angle_style", error);
+  if (narg < 1) error->all(FLERR,"Illegal angle_style command");
   if (atom->avec->angles_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Angle_style command when no angles are allowed");
+    error->all(FLERR,"Angle_style command when no angles allowed");
   force->create_angle(arg[0],1);
   if (force->angle) force->angle->settings(narg-1,&arg[1]);
 }
@@ -1405,8 +1364,7 @@ void Input::atom_style()
 {
   if (narg < 1) utils::missing_cmd_args(FLERR, "atom_style", error);
   if (domain->box_exist)
-    error->all(FLERR, Error::COMMAND, "Atom_style command after simulation box is defined"
-               + utils::errorurl(34));
+    error->all(FLERR,"Atom_style command after simulation box is defined");
   atom->create_avec(arg[0],narg-1,&arg[1],1);
 }
 
@@ -1415,12 +1373,11 @@ void Input::atom_style()
 void Input::bond_coeff()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND,
-               "Bond_coeff command before simulation box is defined" + utils::errorurl(33));
+    error->all(FLERR,"Bond_coeff command before simulation box is defined");
   if (force->bond == nullptr)
-    error->all(FLERR, Error::COMMAND, "Bond_coeff command before bond_style is defined");
+    error->all(FLERR,"Bond_coeff command before bond_style is defined");
   if (atom->avec->bonds_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Bond_coeff command when no bonds are allowed");
+    error->all(FLERR,"Bond_coeff command when no bonds allowed");
   char *newarg = utils::expand_type(FLERR, arg[0], Atom::BOND, lmp);
   if (newarg) arg[0] = newarg;
   force->bond->coeff(narg,arg);
@@ -1431,9 +1388,9 @@ void Input::bond_coeff()
 
 void Input::bond_style()
 {
-  if (narg < 1) utils::missing_cmd_args(FLERR, "bond_style", error);
+  if (narg < 1) error->all(FLERR,"Illegal bond_style command");
   if (atom->avec->bonds_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Bond_style command when no bonds allowed");
+    error->all(FLERR,"Bond_style command when no bonds allowed");
   force->create_bond(arg[0],1);
   if (force->bond) force->bond->settings(narg-1,&arg[1]);
 }
@@ -1443,9 +1400,9 @@ void Input::bond_style()
 void Input::bond_write()
 {
   if (atom->avec->bonds_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Bond_write command when no bonds allowed");
+    error->all(FLERR,"Bond_write command when no bonds allowed");
   if (force->bond == nullptr)
-    error->all(FLERR, Error::COMMAND, "Bond_write command before bond_style is defined");
+    error->all(FLERR,"Bond_write command before bond_style is defined");
   else force->bond->write_file(narg,arg);
 }
 
@@ -1454,8 +1411,7 @@ void Input::bond_write()
 void Input::boundary()
 {
   if (domain->box_exist)
-    error->all(FLERR, Error::COMMAND, "Boundary command after simulation box is defined"
-               + utils::errorurl(34));
+    error->all(FLERR,"Boundary command after simulation box is defined");
   domain->set_boundary(narg,arg,0);
 }
 
@@ -1482,7 +1438,7 @@ void Input::comm_style()
     if (lmp->kokkos) comm = new CommTiledKokkos(lmp,oldcomm);
     else comm = new CommTiled(lmp,oldcomm);
     delete oldcomm;
-  } else error->all(FLERR, Error::ARGZERO, "Unknown comm_style argument: {}", arg[0]);
+  } else error->all(FLERR,"Unknown comm_style argument: {}", arg[0]);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1512,12 +1468,11 @@ void Input::dielectric()
 void Input::dihedral_coeff()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Dihedral_coeff command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Dihedral_coeff command before simulation box is defined");
   if (force->dihedral == nullptr)
-    error->all(FLERR, Error::COMMAND, "Dihedral_coeff command before dihedral_style is defined");
+    error->all(FLERR,"Dihedral_coeff command before dihedral_style is defined");
   if (atom->avec->dihedrals_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Dihedral_coeff command when no dihedrals allowed");
+    error->all(FLERR,"Dihedral_coeff command when no dihedrals allowed");
   char *newarg = utils::expand_type(FLERR, arg[0], Atom::DIHEDRAL, lmp);
   if (newarg) arg[0] = newarg;
   force->dihedral->coeff(narg,arg);
@@ -1528,9 +1483,9 @@ void Input::dihedral_coeff()
 
 void Input::dihedral_style()
 {
-  if (narg < 1) utils::missing_cmd_args(FLERR, "dihedral_style", error);
+  if (narg < 1) error->all(FLERR,"Illegal dihedral_style command");
   if (atom->avec->dihedrals_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Dihedral_style command when no dihedrals allowed");
+    error->all(FLERR,"Dihedral_style command when no dihedrals allowed");
   force->create_dihedral(arg[0],1);
   if (force->dihedral) force->dihedral->settings(narg-1,&arg[1]);
 }
@@ -1539,10 +1494,9 @@ void Input::dihedral_style()
 
 void Input::dimension()
 {
-  if (narg != 1)
-    error->all(FLERR, Error::COMMAND, "Dimension command expects exactly one argument");
+  if (narg != 1) error->all(FLERR, "Dimension command expects exactly 1 argument");
   if (domain->box_exist)
-    error->all(FLERR,"Dimension command after simulation box is defined" + utils::errorurl(34));
+    error->all(FLERR,"Dimension command after simulation box is defined");
   domain->dimension = utils::inumeric(FLERR,arg[0],false,lmp);
   if (domain->dimension != 2 && domain->dimension != 3)
     error->all(FLERR, "Invalid dimension argument: {}", arg[0]);
@@ -1550,7 +1504,7 @@ void Input::dimension()
   // must reset default extra_dof of all computes
   // since some were created before dimension command is encountered
 
-  for (const auto &c : modify->get_compute_list()) c->reset_extra_dof();
+  for (auto &c : modify->get_compute_list()) c->reset_extra_dof();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1593,12 +1547,11 @@ void Input::group_command()
 void Input::improper_coeff()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Improper_coeff command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Improper_coeff command before simulation box is defined");
   if (force->improper == nullptr)
-    error->all(FLERR, Error::COMMAND, "Improper_coeff command before improper_style is defined");
+    error->all(FLERR,"Improper_coeff command before improper_style is defined");
   if (atom->avec->impropers_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Improper_coeff command when no impropers allowed");
+    error->all(FLERR,"Improper_coeff command when no impropers allowed");
   char *newarg = utils::expand_type(FLERR, arg[0], Atom::IMPROPER, lmp);
   if (newarg) arg[0] = newarg;
   force->improper->coeff(narg,arg);
@@ -1609,9 +1562,9 @@ void Input::improper_coeff()
 
 void Input::improper_style()
 {
-  if (narg < 1) utils::missing_cmd_args(FLERR, "improper_style", error);
+  if (narg < 1) error->all(FLERR,"Illegal improper_style command");
   if (atom->avec->impropers_allow == 0)
-    error->all(FLERR, Error::COMMAND, "Improper_style command when no impropers allowed");
+    error->all(FLERR,"Improper_style command when no impropers allowed");
   force->create_improper(arg[0],1);
   if (force->improper) force->improper->settings(narg-1,&arg[1]);
 }
@@ -1621,7 +1574,7 @@ void Input::improper_style()
 void Input::kspace_modify()
 {
   if (force->kspace == nullptr)
-    error->all(FLERR, Error::COMMAND, "Kspace_modify command before kspace_style is defined");
+    error->all(FLERR,"KSpace style has not yet been set");
   force->kspace->modify_params(narg,arg);
 }
 
@@ -1636,9 +1589,7 @@ void Input::kspace_style()
 
 void Input::labelmap()
 {
-  if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Labelmap command before simulation box is defined"
-               + utils::errorurl(33));
+  if (domain->box_exist == 0) error->all(FLERR,"Labelmap command before simulation box is defined");
   if (!atom->labelmapflag) atom->add_label_map();
   atom->lmap->modify_lmap(narg,arg);
 }
@@ -1654,12 +1605,9 @@ void Input::lattice()
 
 void Input::mass()
 {
-  if (narg != 2)
-    error->all(FLERR, Error::COMMAND, "Illegal mass command: expected 2 arguments but found {}",
-               narg);
+  if (narg != 2) error->all(FLERR,"Illegal mass command: expected 2 arguments but found {}", narg);
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Mass command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Mass command before simulation box is defined");
   atom->set_mass(FLERR,narg,arg);
 }
 
@@ -1675,8 +1623,7 @@ void Input::min_modify()
 void Input::min_style()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Min_style command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Min_style command before simulation box is defined");
   update->create_minimize(narg,arg,1);
 }
 
@@ -1705,27 +1652,23 @@ void Input::neighbor_command()
 
 void Input::newton()
 {
-  int newton_pair=1;
-  int newton_bond=1;
+  int newton_pair=1,newton_bond=1;
 
   if (narg == 1) {
     newton_pair = newton_bond = utils::logical(FLERR,arg[0],false,lmp);
   } else if (narg == 2) {
     newton_pair = utils::logical(FLERR,arg[0],false,lmp);
     newton_bond = utils::logical(FLERR,arg[1],false,lmp);
-  } else error->all(FLERR, Error::COMMAND, "Illegal newton command");
+  } else error->all(FLERR,"Illegal newton command");
 
   force->newton_pair = newton_pair;
 
   if (domain->box_exist && (newton_bond != force->newton_bond))
-    error->all(FLERR, Error::COMMAND, "Newton bond change after simulation box is defined"
-               + utils::errorurl(34));
+    error->all(FLERR,"Newton bond change after simulation box is defined");
   force->newton_bond = newton_bond;
 
   if (newton_pair || newton_bond) force->newton = 1;
   else force->newton = 0;
-
-  if (lmp->kokkos) lmp->kokkos->newton_check();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1733,16 +1676,15 @@ void Input::newton()
 void Input::package()
 {
   if (domain->box_exist)
-    error->all(FLERR, Error::COMMAND, "Package command after simulation box is defined"
-               + utils::errorurl(34));
-  if (narg < 1) utils::missing_cmd_args(FLERR, "package", error);
+    error->all(FLERR,"Package command after simulation box is defined");
+  if (narg < 1) error->all(FLERR,"Illegal package command");
 
   // same checks for packages existing as in LAMMPS::post_create()
   // since can be invoked here by package command in input script
 
   if (strcmp(arg[0],"gpu") == 0) {
     if (!modify->check_package("GPU"))
-      error->all(FLERR, Error::ARGZERO, "Package gpu command without GPU package installed");
+      error->all(FLERR,"Package gpu command without GPU package installed");
 
     std::string fixcmd = "package_gpu all GPU";
     for (int i = 1; i < narg; i++) fixcmd += std::string(" ") + arg[i];
@@ -1750,12 +1692,12 @@ void Input::package()
 
   } else if (strcmp(arg[0],"kokkos") == 0) {
     if (lmp->kokkos == nullptr || lmp->kokkos->kokkos_exists == 0)
-      error->all(FLERR, Error::ARGZERO, "Package kokkos command without KOKKOS package enabled");
+      error->all(FLERR, "Package kokkos command without KOKKOS package enabled");
     lmp->kokkos->accelerator(narg-1,&arg[1]);
 
   } else if (strcmp(arg[0],"omp") == 0) {
     if (!modify->check_package("OMP"))
-      error->all(FLERR, Error::ARGZERO, "Package omp command without OPENMP package installed");
+      error->all(FLERR, "Package omp command without OPENMP package installed");
 
     std::string fixcmd = "package_omp all OMP";
     for (int i = 1; i < narg; i++) fixcmd += std::string(" ") + arg[i];
@@ -1763,13 +1705,13 @@ void Input::package()
 
  } else if (strcmp(arg[0],"intel") == 0) {
     if (!modify->check_package("INTEL"))
-      error->all(FLERR, Error::ARGZERO, "Package intel command without INTEL package installed");
+      error->all(FLERR, "Package intel command without INTEL package installed");
 
     std::string fixcmd = "package_intel all INTEL";
     for (int i = 1; i < narg; i++) fixcmd += std::string(" ") + arg[i];
     modify->add_fix(fixcmd);
 
-  } else error->all(FLERR, Error::ARGZERO, "Unknown package keyword: {}", arg[0]);
+  } else error->all(FLERR,"Unknown package keyword: {}", arg[0]);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1777,14 +1719,11 @@ void Input::package()
 void Input::pair_coeff()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Pair_coeff command before simulation box is defined"
-               + utils::errorurl(33));
-  if (force->pair == nullptr)
-    error->all(FLERR, Error::COMMAND, "Pair_coeff command without a pair style");
+    error->all(FLERR,"Pair_coeff command before simulation box is defined");
+  if (force->pair == nullptr) error->all(FLERR,"Pair_coeff command without a pair style");
   if (narg < 2) utils::missing_cmd_args(FLERR,"pair_coeff", error);
   if (force->pair->one_coeff && ((strcmp(arg[0],"*") != 0) || (strcmp(arg[1],"*") != 0)))
-    error->all(FLERR, Error::COMMAND, "Pair_coeff must start with * * for pair style {}",
-               force->pair_style);
+    error->all(FLERR,"Pair_coeff must start with * * for pair style {}", force->pair_style);
 
   char *newarg0 = utils::expand_type(FLERR, arg[0], Atom::ATOM, lmp);
   if (newarg0) arg[0] = newarg0;
@@ -1794,7 +1733,7 @@ void Input::pair_coeff()
   // if arg[1] < arg[0], and neither contain a wildcard, reorder
 
   int itype,jtype;
-  if (utils::strmatch(arg[0], R"(^\d+$)") && utils::strmatch(arg[1],R"(^\d+$)")) {
+  if (utils::strmatch(arg[0],"^\\d+$") && utils::strmatch(arg[1],"^\\d+$")) {
     itype = utils::inumeric(FLERR,arg[0],false,lmp);
     jtype = utils::inumeric(FLERR,arg[1],false,lmp);
     if (jtype < itype) {
@@ -1814,7 +1753,7 @@ void Input::pair_coeff()
 void Input::pair_modify()
 {
   if (force->pair == nullptr)
-    error->all(FLERR, Error::COMMAND, "Pair_modify command before pair_style is defined");
+    error->all(FLERR,"Pair_modify command before pair_style is defined");
   force->pair->modify_params(narg,arg);
 }
 
@@ -1852,7 +1791,7 @@ void Input::pair_style()
 void Input::pair_write()
 {
   if (force->pair == nullptr)
-    error->all(FLERR, Error::COMMAND, "Pair_write command before pair_style is defined");
+    error->all(FLERR,"Pair_write command before pair_style is defined");
   force->pair->write_file(narg,arg);
 }
 
@@ -1861,8 +1800,7 @@ void Input::pair_write()
 void Input::processors()
 {
   if (domain->box_exist)
-    error->all(FLERR, Error::COMMAND, "Processors command after simulation box is defined"
-               + utils::errorurl(34));
+    error->all(FLERR,"Processors command after simulation box is defined");
   comm->set_processors(narg,arg);
 }
 
@@ -1892,8 +1830,7 @@ void Input::restart()
 void Input::run_style()
 {
   if (domain->box_exist == 0)
-    error->all(FLERR, Error::COMMAND, "Run_style command before simulation box is defined"
-               + utils::errorurl(33));
+    error->all(FLERR,"Run_style command before simulation box is defined");
   update->create_integrate(narg,arg,1);
 }
 
@@ -1932,7 +1869,7 @@ void Input::special_bonds()
 
 void Input::suffix()
 {
-  if (narg < 1) utils::missing_cmd_args(FLERR,"suffix", error);
+  if (narg < 1) error->all(FLERR,"Illegal suffix command");
 
   const std::string firstarg = arg[0];
 
@@ -1940,8 +1877,7 @@ void Input::suffix()
     lmp->suffix_enable = 0;
   } else if ((firstarg == "on") || (firstarg == "yes") || (firstarg == "true")) {
     lmp->suffix_enable = 1;
-    if (!lmp->suffix)
-      error->all(FLERR, Error::ARGZERO, "May only enable suffixes after defining one");
+    if (!lmp->suffix) error->all(FLERR,"May only enable suffixes after defining one");
   } else {
     lmp->suffix_enable = 1;
 
@@ -1950,7 +1886,7 @@ void Input::suffix()
     lmp->suffix = lmp->suffix2 = nullptr;
 
     if (firstarg == "hybrid") {
-      if (narg != 3) error->all(FLERR,"Illegal suffix hybrid command");
+      if (narg != 3) error->all(FLERR,"Illegal suffix command");
       lmp->suffix = utils::strdup(arg[1]);
       lmp->suffix2 = utils::strdup(arg[2]);
     } else {
@@ -1978,9 +1914,7 @@ void Input::thermo_modify()
 
 void Input::thermo_style()
 {
-  int nline = *output->thermo->get_line();
   output->create_thermo(narg,arg);
-  output->thermo->set_line(nline);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1994,7 +1928,7 @@ void Input::timer_command()
 
 void Input::timestep()
 {
-  if (narg != 1) error->all(FLERR, Error::COMMAND, "Timestep command expects exactly one argument");
+  if (narg != 1) error->all(FLERR,"Illegal timestep command");
 
   update->update_time();
   update->dt = utils::numeric(FLERR,arg[0],false,lmp);
@@ -2012,7 +1946,7 @@ void Input::timestep()
   if (respaflag) update->integrate->reset_dt();
 
   if (force->pair) force->pair->reset_dt();
-  for (const auto &ifix : modify->get_fix_list()) ifix->reset_dt();
+  for (auto &ifix : modify->get_fix_list()) ifix->reset_dt();
   output->reset_dt();
 }
 
@@ -2020,8 +1954,7 @@ void Input::timestep()
 
 void Input::uncompute()
 {
-  if (narg != 1)
-    error->all(FLERR, Error::COMMAND, "Uncompute command expects exactly one argument");
+  if (narg != 1) error->all(FLERR,"Illegal uncompute command");
   modify->delete_compute(arg[0]);
 }
 
@@ -2029,7 +1962,7 @@ void Input::uncompute()
 
 void Input::undump()
 {
-  if (narg != 1) error->all(FLERR, Error::COMMAND, "Undump command expects exactly one argument");
+  if (narg != 1) error->all(FLERR,"Illegal undump command");
   output->delete_dump(arg[0]);
 }
 
@@ -2037,7 +1970,7 @@ void Input::undump()
 
 void Input::unfix()
 {
-  if (narg != 1) error->all(FLERR, Error::COMMAND, "Unfix command expects exactly one argument");
+  if (narg != 1) error->all(FLERR,"Illegal unfix command");
   modify->delete_fix(arg[0]);
 }
 
@@ -2047,8 +1980,7 @@ void Input::units()
 {
   if (narg != 1) error->all(FLERR,"Illegal units command: expected 1 argument but found {}", narg);
   if (domain->box_exist)
-    error->all(FLERR, Error::COMMAND, "Units command after simulation box is defined"
-               + utils::errorurl(34));
+    error->all(FLERR,"Units command after simulation box is defined");
   update->set_units(arg[0]);
 }
 
