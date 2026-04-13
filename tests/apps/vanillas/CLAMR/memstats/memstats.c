@@ -59,7 +59,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/types.h>
+#ifdef __APPLE_CC__
 #include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 #include <string.h>
 
