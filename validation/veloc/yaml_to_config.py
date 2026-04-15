@@ -65,19 +65,33 @@ def parse_run_cmd(run_cmd: str, mpi_ranks: int = 4) -> tuple[str, str, str]:
         return cmd, run_cmd.split()[-1], ""
 
     exe = rest[exe_idx]
-    args = " ".join(rest[exe_idx + 1:])
+    args = " ".join(rest[exe_idx + 1 :])
     return cmd, exe, args
 
 
 def get_comparison_flags(config: dict) -> str:
-    """Build validate.py CLI flags from comparison config."""
+    """Build validate.py CLI flags from comparison config.
+
+    The app.yaml files use short method names (``numeric``, ``text``)
+    while ``validate.py``'s CLI expects hyphenated names
+    (``numeric-tolerance``, ``text-diff``).  This function translates
+    between the two conventions.
+    """
+    # Map short app.yaml names → validate.py CLI names
+    _METHOD_MAP: dict[str, str] = {
+        "numeric": "numeric-tolerance",
+        "text": "text-diff",
+    }
+
     comp = config.get("comparison", {})
-    method = comp.get("method", "hash")
+    raw_method = comp.get("method", "hash")
+    method = _METHOD_MAP.get(raw_method, raw_method)
     flags = [f"--comparison-method {method}"]
 
     tol = comp.get("tolerance")
-    if tol is not None and method == "numeric":
-        flags.append(f"--numeric-tolerance {tol}")
+    if tol is not None and method == "numeric-tolerance":
+        flags.append(f"--numeric-atol {tol}")
+        flags.append(f"--numeric-rtol {tol}")
 
     ssim = comp.get("ssim_threshold")
     if ssim is not None:
@@ -86,6 +100,11 @@ def get_comparison_flags(config: dict) -> str:
     dataset = comp.get("hdf5_dataset")
     if dataset:
         flags.append(f"--hdf5-dataset {dataset}")
+
+    ignore_patterns = comp.get("ignore_patterns")
+    if ignore_patterns:
+        patterns_str = " ".join(f'"{p}"' for p in ignore_patterns)
+        flags.append(f"--text-ignore-patterns {patterns_str}")
 
     output_file = comp.get("output_file")
     if output_file:

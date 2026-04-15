@@ -4,6 +4,8 @@
 #include<mpi.h>
 #endif
 
+#include<hdf5.h>
+
 int main( int argc, char* argv[] )
 {
 	// =====================================================================
@@ -110,6 +112,21 @@ int main( int argc, char* argv[] )
 
 	// Print / Save Results and Exit
 	int is_invalid_result = print_results( in, mype, omp_end-omp_start, nprocs, verification );
+
+	// Write verification result to HDF5 file for validation comparison
+	if( mype == 0 )
+	{
+		double vhash_d = (double) verification;
+		hsize_t dims[1] = {1};
+		hid_t file_id  = H5Fcreate("recon.h5", H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+		hid_t space_id = H5Screate_simple(1, dims, NULL);
+		hid_t dset_id  = H5Dcreate2(file_id, "data", H5T_IEEE_F64LE,
+		                             space_id, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+		H5Dwrite(dset_id, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, &vhash_d);
+		H5Dclose(dset_id);
+		H5Sclose(space_id);
+		H5Fclose(file_id);
+	}
 
 	#ifdef MPI
 	MPI_Finalize();

@@ -31,10 +31,11 @@ export PYTHONPATH="${REPO_ROOT}"
 
 # --- Parse args ---
 USE_BASELINE=false
-MAX_ITERS=5
+MAX_ITERS=10
 INJECTION_DELAY=""
 GROUND_TRUTH_DIR=""
 
+APP_NAME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --baseline)          USE_BASELINE=true; shift ;;
@@ -42,11 +43,14 @@ while [ $# -gt 0 ]; do
     --injection-delay)   INJECTION_DELAY="$2"; shift 2 ;;
     --ground-truth-dir)  GROUND_TRUTH_DIR="$2"; shift 2 ;;
     -*)                  echo "Unknown option: $1" >&2; exit 1 ;;
-    *)                   break ;;
+    *)                   APP_NAME="$1"; shift ;;
   esac
 done
 
-APP_NAME="${1:?Usage: run_iterative.sh [--baseline] <app_name> [--max-iters N]}"
+if [ -z "$APP_NAME" ]; then
+  echo "Usage: run_iterative.sh [--baseline] <app_name> [--max-iters N]" >&2
+  exit 1
+fi
 
 # --- Resolve paths ---
 if [ "$USE_BASELINE" = true ]; then

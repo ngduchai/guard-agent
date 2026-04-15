@@ -47,7 +47,7 @@ BUILD_DIR="$REPO_ROOT/build"
 # --- Defaults ---
 MODE="evaluate"
 APPROACH=""
-MAX_ITERS=5
+MAX_ITERS=10
 CONTINUE=false
 DRY_RUN=false
 APP_LIST_FILE=""
@@ -208,6 +208,34 @@ for i in "${!APPS[@]}"; do
     ((skipped++)) || true
     echo ""
     continue
+  fi
+
+  # Re-copy source from original for incomplete apps so that
+  # modifications left by a previously interrupted OpenCode run
+  # do not poison the next attempt.
+  if $CONTINUE; then
+    for _src_root in "$REPO_ROOT/tests/apps/vanillas" "$REPO_ROOT/tests/ecp/vanillas" "$REPO_ROOT/tests/examples/original"; do
+      if [ -d "$_src_root/$app" ]; then
+        # Only refresh the directory that this run will actually use
+        case "$APPROACH" in
+          --baseline) _dests=("$BUILD_DIR/tests_baseline/$app") ;;
+          "")
+            if [ "$MODE" = "evaluate" ]; then
+              _dests=("$BUILD_DIR/tests/$app" "$BUILD_DIR/tests_baseline/$app")
+            else
+              _dests=("$BUILD_DIR/tests/$app")
+            fi ;;
+        esac
+        for _dest in "${_dests[@]}"; do
+          if [ -d "$_dest" ]; then
+            echo "  [REFRESH] Re-copying $app → $(basename "$(dirname "$_dest")")"
+            rm -rf "$_dest"
+            cp -a "$_src_root/$app" "$_dest"
+          fi
+        done
+        break
+      fi
+    done
   fi
 
   cmd=$(_build_cmd "$app")

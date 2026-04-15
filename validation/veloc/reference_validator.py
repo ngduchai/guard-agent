@@ -347,6 +347,18 @@ def validate_reference(
     ckpt_build = work_dir / "checkpointed_build"
     golden_path = work_dir / "golden_stdout.txt"
 
+    # On resume (not fresh): if any build step is incomplete, wipe the
+    # corresponding build directory so the next _build_app starts from a
+    # clean source copy.  This prevents stale modifications left by an
+    # interrupted external tool (e.g. OpenCode) from poisoning the build.
+    if not fresh:
+        if not _step_done(work_dir, "vanilla_build") and van_build.exists():
+            print(f"  [resume] cleaning stale vanilla_build")
+            shutil.rmtree(van_build)
+        if not _step_done(work_dir, "checkpointed_build") and ckpt_build.exists():
+            print(f"  [resume] cleaning stale checkpointed_build")
+            shutil.rmtree(ckpt_build)
+
     # Step 1: Build vanilla (skip if build dir exists from a prior run)
     if _step_done(work_dir, "vanilla_build"):
         print(f"  [resume] reusing vanilla build")
