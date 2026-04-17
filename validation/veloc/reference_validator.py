@@ -297,6 +297,10 @@ def verify_recovery(
         mpi_ranks=app_config.mpi_ranks,
         restart_cmd=run_cfg.restart_cmd,
     )
+    if not result.succeeded:
+        print(f"  [debug] Recovery failed: exit_code={result.exit_code}")
+        if result.stderr:
+            print(f"  [debug] stderr (last 300 chars): {result.stderr[-300:]}")
     return result.succeeded, result
 
 
