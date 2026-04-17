@@ -553,6 +553,40 @@ Avoid these unless explicitly justified:
 
 ---
 
+## Benchmark application rules
+
+### Reference code is immutable
+
+The `tests/apps/checkpointed/` directory contains **reference implementations** — original upstream source code with native checkpoint/restart support. These are the ground truth for correctness validation.
+
+**NEVER modify files in `tests/apps/checkpointed/`.** This rule has no exceptions.
+
+- Do not add checkpoint logic to reference apps
+- Do not fix bugs in reference apps
+- Do not change build commands, source files, or configuration in reference apps
+- If a reference app does not build or run correctly, report the issue — do not patch it
+
+### Vanilla code is derived from reference
+
+The `tests/apps/vanillas/` directory contains **vanilla versions** — reference code with checkpoint/restart logic removed. These represent the "before" state that the guard-agent will transform.
+
+- Vanilla code is created by removing checkpoint logic from the reference implementation
+- Only `app.yaml`, `prompt.txt`, and build system wrappers (`CMakeLists.txt`) may be added to vanillas
+- Build system changes (CMakeLists.txt, Makefile modifications for portability) are allowed in vanillas
+- Application source code (`.c`, `.cpp`, `.h`, `.hpp`, `.f90`) must not be modified beyond checkpoint removal
+
+### Application selection criteria
+
+Every benchmark application **must** have native checkpoint/restart support in its original upstream source. An application qualifies only if:
+
+1. The original source code writes state to persistent storage (checkpoint)
+2. The original source code reads state back and resumes computation (restart)
+3. The checkpoint/restart logic is part of the upstream project, not added by us
+
+Applications that lack native checkpoint/restart must be removed from the benchmark set, not patched.
+
+---
+
 ## Required output format for coding tasks
 
 For substantial tasks, respond in this structure:

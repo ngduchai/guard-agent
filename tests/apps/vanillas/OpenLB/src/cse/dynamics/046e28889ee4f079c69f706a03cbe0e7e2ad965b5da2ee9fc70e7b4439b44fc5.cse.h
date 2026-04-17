@@ -1,0 +1,485 @@
+/*  This file is part of the OpenLB library
+ *
+ *  Copyright (C) Adrian Kummerlaender, Shota Ito
+ *  E-mail contact: info@openlb.net
+ *  The most recent release of OpenLB can be downloaded at
+ *  <http://www.openlb.net/>
+ *
+ *  This program is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU General Public License
+ *  as published by the Free Software Foundation; either version 2
+ *  of the License, or (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public
+ *  License along with this program; if not, write to the Free
+ *  Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ *  Boston, MA  02110-1301, USA.
+*/
+
+/*  ========================================================
+ *  ==  WARNING: This is an automatically generated file, ==
+ *  ==                  do not modify.                    ==
+ *  ========================================================
+ */
+
+#pragma once
+
+
+namespace olb {
+
+namespace dynamics {
+
+template <typename T, typename... FIELDS>
+struct CSE<dynamics::Tuple<T, descriptors::D3Q19<FIELDS...>, momenta::Tuple<momenta::BulkDensity, momenta::BulkMomentum, momenta::BulkStress, momenta::DefineToNEq>, equilibria::SecondOrder, collision::DualPorousBGK, dynamics::DefaultCombination>> {
+template <concepts::Cell CELL, concepts::Parameters PARAMETERS, concepts::BaseType V=typename CELL::value_t>
+CellStatistic<V> collide(CELL& cell, PARAMETERS& parameters) any_platform {
+auto x19 = cell.template getFieldComponent<olb::descriptors::POROSITY>(0);
+auto x20 = cell.template getFieldComponent<olb::opti::DJDF>(0);
+auto x21 = cell.template getFieldComponent<olb::opti::DJDF>(1);
+auto x22 = cell.template getFieldComponent<olb::opti::DJDF>(10);
+auto x23 = cell.template getFieldComponent<olb::opti::DJDF>(11);
+auto x24 = cell.template getFieldComponent<olb::opti::DJDF>(12);
+auto x25 = cell.template getFieldComponent<olb::opti::DJDF>(13);
+auto x26 = cell.template getFieldComponent<olb::opti::DJDF>(14);
+auto x27 = cell.template getFieldComponent<olb::opti::DJDF>(15);
+auto x28 = cell.template getFieldComponent<olb::opti::DJDF>(16);
+auto x29 = cell.template getFieldComponent<olb::opti::DJDF>(17);
+auto x30 = cell.template getFieldComponent<olb::opti::DJDF>(18);
+auto x31 = cell.template getFieldComponent<olb::opti::DJDF>(2);
+auto x32 = cell.template getFieldComponent<olb::opti::DJDF>(3);
+auto x33 = cell.template getFieldComponent<olb::opti::DJDF>(4);
+auto x34 = cell.template getFieldComponent<olb::opti::DJDF>(5);
+auto x35 = cell.template getFieldComponent<olb::opti::DJDF>(6);
+auto x36 = cell.template getFieldComponent<olb::opti::DJDF>(7);
+auto x37 = cell.template getFieldComponent<olb::opti::DJDF>(8);
+auto x38 = cell.template getFieldComponent<olb::opti::DJDF>(9);
+auto x39 = cell.template getFieldComponent<olb::opti::F>(0);
+auto x40 = cell.template getFieldComponent<olb::opti::F>(1);
+auto x41 = cell.template getFieldComponent<olb::opti::F>(10);
+auto x42 = cell.template getFieldComponent<olb::opti::F>(11);
+auto x43 = cell.template getFieldComponent<olb::opti::F>(12);
+auto x44 = cell.template getFieldComponent<olb::opti::F>(13);
+auto x45 = cell.template getFieldComponent<olb::opti::F>(14);
+auto x46 = cell.template getFieldComponent<olb::opti::F>(15);
+auto x47 = cell.template getFieldComponent<olb::opti::F>(16);
+auto x48 = cell.template getFieldComponent<olb::opti::F>(17);
+auto x49 = cell.template getFieldComponent<olb::opti::F>(18);
+auto x50 = cell.template getFieldComponent<olb::opti::F>(2);
+auto x51 = cell.template getFieldComponent<olb::opti::F>(3);
+auto x52 = cell.template getFieldComponent<olb::opti::F>(4);
+auto x53 = cell.template getFieldComponent<olb::opti::F>(5);
+auto x54 = cell.template getFieldComponent<olb::opti::F>(6);
+auto x55 = cell.template getFieldComponent<olb::opti::F>(7);
+auto x56 = cell.template getFieldComponent<olb::opti::F>(8);
+auto x57 = cell.template getFieldComponent<olb::opti::F>(9);
+auto x58 = parameters.template get<descriptors::OMEGA>();
+auto x59 = x40 + x52;
+auto x60 = x43 + x46;
+auto x61 = x42 + x49;
+auto x62 = x39 + x41 + x44 + x45 + x47 + x48 + x50 + x51 + x53 + x54 + x55 + x56 + x57 + x59 + x60 + x61;
+auto x63 = x62 + V{1};
+auto x64 = V{1} / (x63);
+auto x65 = x64*(x62 + V{1});
+auto x66 = V{0.333333333333333}*cell[0];
+auto x67 = V{1} / ((x63)*(x63));
+auto x68 = V{3}*x67;
+auto x69 = ((x19)*(x19));
+auto x70 = -x45 + x53;
+auto x71 = -x47 + x55;
+auto x72 = x70 + x71;
+auto x73 = -x41;
+auto x74 = -x46 + x54;
+auto x75 = x73 + x74;
+auto x76 = -x44 + x59;
+auto x77 = x72 + x75 + x76;
+auto x78 = ((x77)*(x77));
+auto x79 = x48 - x56;
+auto x80 = -x57;
+auto x81 = x49 + x70 + x80;
+auto x82 = -x50;
+auto x83 = x42 + x44 - x52 + x82;
+auto x84 = x79 + x81 + x83;
+auto x85 = ((x84)*(x84));
+auto x86 = x71 + x79;
+auto x87 = -x49 + x57;
+auto x88 = -x51;
+auto x89 = -x54 + x60 + x88;
+auto x90 = x86 + x87 + x89;
+auto x91 = ((x90)*(x90));
+auto x92 = V{1.5}*x67;
+auto x93 = -x77;
+auto x94 = ((x93)*(x93));
+auto x95 = x92*x94;
+auto x96 = x85*x92;
+auto x97 = x91*x92;
+auto x98 = x96 + x97 + V{-1};
+auto x99 = x95 + x98;
+auto x100 = x19*x64;
+auto x101 = V{3}*x100;
+auto x102 = x100*x84;
+auto x103 = x102 + V{-1};
+auto x104 = x103*x84;
+auto x105 = x100*x91;
+auto x106 = x100*x78;
+auto x107 = x105 + x106;
+auto x108 = x68*x85;
+auto x109 = V{3}*x44;
+auto x110 = V{3}*x49;
+auto x111 = V{3}*x52;
+auto x112 = V{3}*x57;
+auto x113 = -V{3}*x45 + V{3}*x53;
+auto x114 = V{3}*x48 - V{3}*x56;
+auto x115 = x64*(x109 + x110 - x111 - x112 + x113 + x114 + V{3}*x42 - V{3}*x50);
+auto x116 = x78*x92;
+auto x117 = V{1} - x116;
+auto x118 = x115 + x117 - x97;
+auto x119 = x108 + x118;
+auto x120 = x100*x90;
+auto x121 = x120 + V{-1};
+auto x122 = x121*x90;
+auto x123 = x100*x85;
+auto x124 = x106 + x123;
+auto x125 = x68*x91;
+auto x126 = V{3}*x46;
+auto x127 = V{3}*x54;
+auto x128 = -V{3}*x47 + V{3}*x55;
+auto x129 = x64*(-x110 + x112 + x114 + x126 - x127 + x128 + V{3}*x43 - V{3}*x51);
+auto x130 = x129 - x96;
+auto x131 = x117 + x125 + x130;
+auto x132 = V{0.0555555555555556}*cell[2];
+auto x133 = x102 + V{1};
+auto x134 = x133*x84;
+auto x135 = x95 + V{-1};
+auto x136 = -x108 + x115 + x135 + x97;
+auto x137 = V{0.0555555555555556}*cell[3];
+auto x138 = x120 + V{1};
+auto x139 = x138*x90;
+auto x140 = -x125 + x129 + x135 + x96;
+auto x141 = V{0.0555555555555556}*cell[1];
+auto x142 = x100*x93;
+auto x143 = x142 + V{1};
+auto x144 = x143*x77;
+auto x145 = x105 + x123;
+auto x146 = -x109 + x111 + x113 - x126 + x127 + x128 + V{3}*x40 - V{3}*x41;
+auto x147 = -x146*x64;
+auto x148 = x147 - x68*x94 + x98;
+auto x149 = x142 + V{-1};
+auto x150 = x149*x77;
+auto x151 = x146*x64 + x98;
+auto x152 = -x151 + V{3}*x67*x78;
+auto x153 = V{0.0277777777777778}*cell[4];
+auto x154 = x143*x93;
+auto x155 = x105 + x134;
+auto x156 = V{4.5}*x67;
+auto x157 = -x48 + x56;
+auto x158 = x40 + x75;
+auto x159 = -x156*((-x157 - x158 + x42 + 2*x44 - x50 - 2*x52 - x71 - x87)*(-x157 - x158 + x42 + 2*x44 - x50 - 2*x52 - x71 - x87));
+auto x160 = x147 + x99;
+auto x161 = x115 + x159 + x160;
+auto x162 = V{0.0277777777777778}*cell[6];
+auto x163 = x123 + x139;
+auto x164 = x73 + x76;
+auto x165 = -x43 + x51;
+auto x166 = -x156*((-x157 - x164 - x165 + 2*x46 - 2*x54 - x81)*(-x157 - x164 - x165 + 2*x46 - 2*x54 - x81));
+auto x167 = x129 + x160 + x166;
+auto x168 = V{0.0277777777777778}*cell[8];
+auto x169 = x100*x94;
+auto x170 = x139 + x169;
+auto x171 = x156*((2*x48 - 2*x56 + x72 + x83 + x89)*(2*x48 - 2*x56 + x72 + x83 + x89));
+auto x172 = x115 + x99;
+auto x173 = x129 - x171 + x172;
+auto x174 = -x169;
+auto x175 = -x103;
+auto x176 = x175*x84;
+auto x177 = -x121;
+auto x178 = x177*x90;
+auto x179 = x176 + x178;
+auto x180 = x118 + x130 + x171;
+auto x181 = -x149;
+auto x182 = x181*x93;
+auto x183 = -x105;
+auto x184 = x176 + x183;
+auto x185 = -x115;
+auto x186 = x116 + x151;
+auto x187 = -x159 - x185 - x186;
+auto x188 = V{0.0277777777777778}*cell[14];
+auto x189 = -x181*x93;
+auto x190 = x158 - V{2}*x45 + V{2}*x53 + x61 + x80 + x82 + x86;
+auto x191 = -x147 + x99;
+auto x192 = x115 - x156*((x190)*(x190)) + x191;
+auto x193 = -x123;
+auto x194 = x178 + x193;
+auto x195 = -x129;
+auto x196 = -x166 - x186 - x195;
+auto x197 = V{0.0277777777777778}*cell[16];
+auto x198 = x164 + x43 - V{2}*x47 + V{2}*x55 + x70 + x79 + x87 + x88;
+auto x199 = x129 - x156*((x198)*(x198)) + x191;
+auto x200 = V{0.0277777777777778}*cell[18];
+auto x201 = -x175*x84;
+auto x202 = x165 + x47 + V{2}*x49 - x55 - V{2}*x57 + x70 + x74 + x83;
+auto x203 = x185 + x99;
+auto x204 = x129 - x156*((x202)*(x202)) + x203;
+auto x205 = V{0.0277777777777778}*cell[5];
+auto x206 = x105 + x154;
+auto x207 = x147 - x156*((x190)*(x190)) + x203;
+auto x208 = V{0.0277777777777778}*cell[7];
+auto x209 = -x177*x90;
+auto x210 = x123 + x154;
+auto x211 = -x156*((x198)*(x198)) + x160 + x195;
+auto x212 = V{0.0277777777777778}*cell[9];
+auto x213 = x134 + x169;
+auto x214 = -x156*((x202)*(x202)) + x172 + x195;
+auto x215 = -V{0.0555555555555556}*cell[10]*x152*(x101*(x145 - x150) + V{1}) - V{0.0555555555555556}*cell[11]*x119*(x101*(x104 + x107) + V{1}) - V{0.0555555555555556}*cell[12]*x131*(x101*(x122 + x124) + V{1}) - V{0.0277777777777778}*cell[13]*x187*(-x101*(x182 + x184) + V{1}) - V{0.0277777777777778}*cell[15]*x196*(-x101*(x182 + x194) + V{1}) - V{0.0277777777777778}*cell[17]*x180*(-x101*(x174 + x179) + V{1}) + x132*x136*(x101*(x107 + x134) + V{1}) + x137*x140*(x101*(x124 + x139) + V{1}) + x141*x148*(x101*(-x144 + x145) + V{1}) + x153*x161*(x101*(x154 + x155) + V{1}) + x162*x167*(x101*(x154 + x163) + V{1}) + x168*x173*(x101*(x134 + x170) + V{1}) + x188*x192*(-x101*(-x155 - x189) + V{1}) + x197*x199*(-x101*(-x163 - x189) + V{1}) + x200*x204*(-x101*(-x170 - x201) + V{1}) + x205*x207*(-x101*(-x201 - x206) + V{1}) + x208*x211*(-x101*(-x209 - x210) + V{1}) + x212*x214*(-x101*(-x209 - x213) + V{1}) + x66*x99*(x68*x69*(x78 + x85 + x91) + V{1});
+auto x216 = -cell[0] + x20 + x58*(cell[0] + x215*x65);
+auto x217 = V{3}*x64;
+auto x218 = x64*x93;
+auto x219 = x218 + V{-1};
+auto x220 = x219*x77;
+auto x221 = x64*x85;
+auto x222 = x64*x91;
+auto x223 = x221 + x222;
+auto x224 = V{3}*x19;
+auto x225 = x19*x67;
+auto x226 = x225*x85;
+auto x227 = x225*x91;
+auto x228 = x143*x219;
+auto x229 = x227 + x228;
+auto x230 = x149*x219;
+auto x231 = x227 + x230;
+auto x232 = -x219;
+auto x233 = x232*x93;
+auto x234 = x19*x233;
+auto x235 = -x19*x232*x93;
+auto x236 = x139 + x235;
+auto x237 = -x139;
+auto x238 = x234 + x237;
+auto x239 = -x134;
+auto x240 = x178 + x234;
+auto x241 = x134*x64;
+auto x242 = x139*x64;
+auto x243 = x226 + x228;
+auto x244 = x104*x64;
+auto x245 = x122*x64;
+auto x246 = x226 + x230;
+auto x247 = -cell[10] + x22 + x58*(cell[10] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x226 + x231) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(x184 + x234) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(x194 + x234) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x231 + x244) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x245 + x246) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x101*(x179 + x234) + V{1}) - x132*x136*(-x101*(-x155 - x235) + V{1}) - x137*x140*(-x101*(-x163 - x235) + V{1}) - x141*x148*(x224*(x226 + x229) + V{1}) - x153*x161*(x224*(x229 + x241) + V{1}) - x162*x167*(x224*(x242 + x243) + V{1}) - x168*x173*(-x101*(-x134 - x236) + V{1}) - x188*x192*(x224*(x231 + x241) + V{1}) - x197*x199*(x224*(x242 + x246) + V{1}) - x200*x204*(-x101*(x176 + x238) + V{1}) - x205*x207*(x224*(x229 + x244) + V{1}) - x208*x211*(x224*(x243 + x245) + V{1}) - x212*x214*(-x101*(x239 + x240) + V{1}) - x66*x99*(x217*x69*(-x220 + x223) + V{1})));
+auto x248 = x64*x84;
+auto x249 = x248 + V{-1};
+auto x250 = x249*x84;
+auto x251 = x64*x78;
+auto x252 = x222 + x251;
+auto x253 = x225*x78;
+auto x254 = x103*x249;
+auto x255 = x227 + x254;
+auto x256 = x133*x249;
+auto x257 = x227 + x256;
+auto x258 = -x249;
+auto x259 = x258*x84;
+auto x260 = x19*x259;
+auto x261 = x178 + x260;
+auto x262 = -x19*x258*x84;
+auto x263 = x182 + x260;
+auto x264 = x154 + x262;
+auto x265 = -x154;
+auto x266 = x253 + x254;
+auto x267 = x253 + x256;
+auto x268 = -x144*x64;
+auto x269 = -x150*x64;
+auto x270 = -cell[11] + x23 + x58*(cell[11] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(x183 + x263) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x253 + x255) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(x174 + x261) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x255 + x269) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x101*(x178 + x263) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x245 + x266) + V{1}) - x132*x136*(x224*(x253 + x257) + V{1}) - x137*x140*(-x101*(-x170 - x262) + V{1}) - x141*x148*(-x101*(-x206 - x262) + V{1}) - x153*x161*(x224*(x257 + x268) + V{1}) - x162*x167*(-x101*(-x139 - x264) + V{1}) - x168*x173*(x224*(x242 + x267) + V{1}) - x188*x192*(x224*(x257 + x269) + V{1}) - x197*x199*(-x101*(x237 + x263) + V{1}) - x200*x204*(x224*(x242 + x266) + V{1}) - x205*x207*(x224*(x255 + x268) + V{1}) - x208*x211*(-x101*(x261 + x265) + V{1}) - x212*x214*(x224*(x245 + x267) + V{1}) - x66*x99*(x217*x69*(x250 + x252) + V{1})));
+auto x271 = x64*x90;
+auto x272 = x271 + V{-1};
+auto x273 = x272*x90;
+auto x274 = x221 + x251;
+auto x275 = x121*x272;
+auto x276 = x226 + x275;
+auto x277 = x138*x272;
+auto x278 = x226 + x277;
+auto x279 = -x272;
+auto x280 = x279*x90;
+auto x281 = x19*x280;
+auto x282 = x176 + x281;
+auto x283 = -x19*x279*x90;
+auto x284 = x182 + x281;
+auto x285 = x134 + x154;
+auto x286 = x244 + x253;
+auto x287 = x241 + x253;
+auto x288 = -cell[12] + x24 + x58*(cell[12] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(x193 + x284) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(x174 + x282) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x253 + x276) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x101*(x176 + x284) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x269 + x276) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x275 + x286) + V{1}) - x132*x136*(-x101*(-x213 - x283) + V{1}) - x137*x140*(x224*(x253 + x278) + V{1}) - x141*x148*(-x101*(-x210 - x283) + V{1}) - x153*x161*(-x101*(-x283 - x285) + V{1}) - x162*x167*(x224*(x268 + x278) + V{1}) - x168*x173*(x224*(x277 + x287) + V{1}) - x188*x192*(-x101*(x239 + x284) + V{1}) - x197*x199*(x224*(x269 + x278) + V{1}) - x200*x204*(x224*(x277 + x286) + V{1}) - x205*x207*(-x101*(x265 + x282) + V{1}) - x208*x211*(x224*(x268 + x276) + V{1}) - x212*x214*(x224*(x275 + x287) + V{1}) - x66*x99*(x217*x69*(x273 + x274) + V{1})));
+auto x289 = x100*x250;
+auto x290 = -x100*x220;
+auto x291 = x143*x232;
+auto x292 = x100*x259;
+auto x293 = -x242;
+auto x294 = x292 + x293;
+auto x295 = x133*x258;
+auto x296 = x100*x233;
+auto x297 = x293 + x296;
+auto x298 = x178*x64;
+auto x299 = x292 + x298;
+auto x300 = x296 + x298;
+auto x301 = x175*x258;
+auto x302 = -x301;
+auto x303 = x181*x232;
+auto x304 = -x303;
+auto x305 = -x19*x258*x64*x84;
+auto x306 = x242 + x303;
+auto x307 = -x19*x232*x64*x93;
+auto x308 = x242 + x307;
+auto x309 = -cell[13] + x25 + x58*(cell[13] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x231 + x289) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x255 + x290) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(x240 + x260) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x231 + x254) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x299 + x304) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x300 + x302) + V{1}) - x132*x136*(x224*(x257 + x290) + V{1}) - x137*x140*(-x101*(x238 + x260) + V{1}) - x141*x148*(x224*(x229 + x289) + V{1}) - x153*x161*(x224*(x229 + x256) + V{1}) - x162*x167*(-x224*(x291 + x294) + V{1}) - x168*x173*(-x224*(x295 + x297) + V{1}) - x188*x192*(x224*(x231 + x256) + V{1}) - x197*x199*(-x224*(-x305 - x306) + V{1}) - x200*x204*(-x224*(-x301 - x308) + V{1}) - x205*x207*(x224*(x229 + x254) + V{1}) - x208*x211*(-x224*(x291 + x299) + V{1}) - x212*x214*(-x224*(x295 + x300) + V{1}) - x66*x99*(-x217*x69*(-x222 + x233 + x259) + V{1})));
+auto x310 = -x232*x93;
+auto x311 = x248 + V{1};
+auto x312 = x311*x84;
+auto x313 = x222 + x312;
+auto x314 = x19*x312;
+auto x315 = -x314;
+auto x316 = x100*x312;
+auto x317 = x103*x311;
+auto x318 = x227 + x290;
+auto x319 = x133*x311;
+auto x320 = x175*x311;
+auto x321 = -x143*x232;
+auto x322 = x242 + x316;
+auto x323 = -x316;
+auto x324 = x298 + x323;
+auto x325 = -x319;
+auto x326 = -x177*x64*x90;
+auto x327 = x316 + x326;
+auto x328 = -cell[14] + x26 + x58*(cell[14] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x231 + x316) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x317 + x318) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(x240 + x315) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x231 + x317) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(-x303 - x327) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x300 + x320) + V{1}) - x132*x136*(x224*(x318 + x319) + V{1}) - x137*x140*(-x101*(-x236 - x314) + V{1}) - x141*x148*(x224*(x229 + x316) + V{1}) - x153*x161*(x224*(x229 + x319) + V{1}) - x162*x167*(-x224*(-x321 - x322) + V{1}) - x168*x173*(-x224*(-x308 - x319) + V{1}) - x188*x192*(x224*(x231 + x319) + V{1}) - x197*x199*(x224*(x306 + x316) + V{1}) - x200*x204*(-x224*(x297 + x320) + V{1}) - x205*x207*(x224*(x229 + x317) + V{1}) - x208*x211*(-x224*(x291 + x324) + V{1}) - x212*x214*(-x224*(x300 + x325) + V{1}) - x66*x99*(-x217*x69*(-x310 - x313) + V{1})));
+auto x329 = x100*x273;
+auto x330 = x100*x280;
+auto x331 = -x241;
+auto x332 = x330 + x331;
+auto x333 = x138*x279;
+auto x334 = x296 + x331;
+auto x335 = x176*x64;
+auto x336 = x296 + x335;
+auto x337 = x330 + x335;
+auto x338 = x177*x279;
+auto x339 = -x338;
+auto x340 = -x19*x279*x64*x90;
+auto x341 = x241 + x303;
+auto x342 = x241 + x307;
+auto x343 = -cell[15] + x27 + x58*(cell[15] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x246 + x329) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(x234 + x282) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x276 + x290) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x304 + x337) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x246 + x275) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x336 + x339) + V{1}) - x132*x136*(-x101*(x234 + x239 + x281) + V{1}) - x137*x140*(x224*(x278 + x290) + V{1}) - x141*x148*(x224*(x243 + x329) + V{1}) - x153*x161*(-x224*(x291 + x332) + V{1}) - x162*x167*(x224*(x243 + x277) + V{1}) - x168*x173*(-x224*(x333 + x334) + V{1}) - x188*x192*(-x224*(-x340 - x341) + V{1}) - x197*x199*(x224*(x246 + x277) + V{1}) - x200*x204*(-x224*(x333 + x336) + V{1}) - x205*x207*(-x224*(x291 + x337) + V{1}) - x208*x211*(x224*(x243 + x275) + V{1}) - x212*x214*(-x224*(-x338 - x342) + V{1}) - x66*x99*(-x217*x69*(-x221 + x233 + x280) + V{1})));
+auto x344 = x271 + V{1};
+auto x345 = x344*x90;
+auto x346 = x221 + x345;
+auto x347 = x19*x345;
+auto x348 = -x347;
+auto x349 = x176 + x348;
+auto x350 = x134 + x347;
+auto x351 = x100*x345;
+auto x352 = x121*x344;
+auto x353 = x226 + x290;
+auto x354 = x138*x344;
+auto x355 = x177*x344;
+auto x356 = x241 + x351;
+auto x357 = -x354;
+auto x358 = -x351;
+auto x359 = x335 + x358;
+auto x360 = -x175*x64*x84;
+auto x361 = x351 + x360;
+auto x362 = -cell[16] + x28 + x58*(cell[16] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x246 + x351) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(x234 + x349) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x352 + x353) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(-x303 - x361) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x246 + x352) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x336 + x355) + V{1}) - x132*x136*(-x101*(-x235 - x350) + V{1}) - x137*x140*(x224*(x353 + x354) + V{1}) - x141*x148*(x224*(x243 + x351) + V{1}) - x153*x161*(-x224*(-x321 - x356) + V{1}) - x162*x167*(x224*(x243 + x354) + V{1}) - x168*x173*(-x224*(-x342 - x354) + V{1}) - x188*x192*(x224*(x341 + x351) + V{1}) - x197*x199*(x224*(x246 + x354) + V{1}) - x200*x204*(-x224*(x336 + x357) + V{1}) - x205*x207*(-x224*(x291 + x359) + V{1}) - x208*x211*(x224*(x243 + x352) + V{1}) - x212*x214*(-x224*(x334 + x355) + V{1}) - x66*x99*(-x217*x69*(-x310 - x346) + V{1})));
+auto x363 = x64*x94;
+auto x364 = x253 + x289;
+auto x365 = x154*x64;
+auto x366 = -x365;
+auto x367 = x330 + x366;
+auto x368 = x292 + x366;
+auto x369 = x182*x64;
+auto x370 = x330 + x369;
+auto x371 = x292 + x369;
+auto x372 = x301 + x365;
+auto x373 = x305 + x365;
+auto x374 = -cell[17] + x29 + x58*(cell[17] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(x263 + x281) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x266 + x329) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x275 + x364) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x302 + x370) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x339 + x371) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x266 + x275) + V{1}) - x132*x136*(x224*(x267 + x329) + V{1}) - x137*x140*(x224*(x277 + x364) + V{1}) - x141*x148*(-x101*(x260 + x265 + x281) + V{1}) - x153*x161*(-x224*(x295 + x367) + V{1}) - x162*x167*(-x224*(x333 + x368) + V{1}) - x168*x173*(x224*(x267 + x277) + V{1}) - x188*x192*(-x224*(x295 + x370) + V{1}) - x197*x199*(-x224*(x333 + x371) + V{1}) - x200*x204*(x224*(x266 + x277) + V{1}) - x205*x207*(-x224*(-x340 - x372) + V{1}) - x208*x211*(-x224*(-x338 - x373) + V{1}) - x212*x214*(x224*(x267 + x275) + V{1}) - x66*x99*(-x217*x69*(x259 + x280 - x363) + V{1})));
+auto x375 = -x258*x84;
+auto x376 = x345 + x363;
+auto x377 = -x133*x258;
+auto x378 = x351 + x365;
+auto x379 = x358 + x369;
+auto x380 = -x181*x64*x93;
+auto x381 = x351 + x380;
+auto x382 = -cell[18] + x30 + x58*(cell[18] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(x263 + x348) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x266 + x351) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x352 + x364) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(-x301 - x381) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x355 + x371) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x266 + x352) + V{1}) - x132*x136*(x224*(x267 + x351) + V{1}) - x137*x140*(x224*(x354 + x364) + V{1}) - x141*x148*(-x101*(-x264 - x347) + V{1}) - x153*x161*(-x224*(-x377 - x378) + V{1}) - x162*x167*(-x224*(-x354 - x373) + V{1}) - x168*x173*(x224*(x267 + x354) + V{1}) - x188*x192*(-x224*(x295 + x379) + V{1}) - x197*x199*(-x224*(x357 + x371) + V{1}) - x200*x204*(x224*(x266 + x354) + V{1}) - x205*x207*(x224*(x351 + x372) + V{1}) - x208*x211*(-x224*(x355 + x368) + V{1}) - x212*x214*(x224*(x267 + x352) + V{1}) - x66*x99*(-x217*x69*(-x375 - x376) + V{1})));
+auto x383 = x218 + V{1};
+auto x384 = x383*x77;
+auto x385 = x143*x383;
+auto x386 = x227 + x385;
+auto x387 = x149*x383;
+auto x388 = x227 + x387;
+auto x389 = x383*x93;
+auto x390 = x19*x389;
+auto x391 = x201 + x390;
+auto x392 = x209 + x390;
+auto x393 = x139 + x390;
+auto x394 = -x390;
+auto x395 = x226 + x385;
+auto x396 = x226 + x387;
+auto x397 = -cell[1] + x21 + x58*(cell[1] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x226 + x388) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(-x105 - x391) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(-x123 - x392) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x244 + x388) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x245 + x396) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x101*(x179 + x394) + V{1}) - x132*x136*(x101*(x155 + x390) + V{1}) - x137*x140*(x101*(x163 + x390) + V{1}) - x141*x148*(x224*(x226 + x386) + V{1}) - x153*x161*(x224*(x241 + x386) + V{1}) - x162*x167*(x224*(x242 + x395) + V{1}) - x168*x173*(x101*(x134 + x393) + V{1}) - x188*x192*(x224*(x241 + x388) + V{1}) - x197*x199*(x224*(x242 + x396) + V{1}) - x200*x204*(-x101*(-x139 - x391) + V{1}) - x205*x207*(x224*(x244 + x386) + V{1}) - x208*x211*(x224*(x245 + x395) + V{1}) - x212*x214*(-x101*(-x134 - x392) + V{1}) - x66*x99*(x217*x69*(x223 - x384) + V{1})));
+auto x398 = x227 + x317;
+auto x399 = x227 + x319;
+auto x400 = x209 + x314;
+auto x401 = x189 + x314;
+auto x402 = x154 + x314;
+auto x403 = x253 + x317;
+auto x404 = x253 + x319;
+auto x405 = -cell[2] + x31 + x58*(cell[2] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(-x105 - x401) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x253 + x398) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(-x169 - x400) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x269 + x398) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x101*(x178 + x182 + x315) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x245 + x403) + V{1}) - x132*x136*(x224*(x253 + x399) + V{1}) - x137*x140*(x101*(x170 + x314) + V{1}) - x141*x148*(x101*(x206 + x314) + V{1}) - x153*x161*(x224*(x268 + x399) + V{1}) - x162*x167*(x101*(x139 + x402) + V{1}) - x168*x173*(x224*(x242 + x404) + V{1}) - x188*x192*(x224*(x269 + x399) + V{1}) - x197*x199*(-x101*(-x139 - x401) + V{1}) - x200*x204*(x224*(x242 + x403) + V{1}) - x205*x207*(x224*(x268 + x398) + V{1}) - x208*x211*(-x101*(-x154 - x400) + V{1}) - x212*x214*(x224*(x245 + x404) + V{1}) - x66*x99*(x217*x69*(x252 + x312) + V{1})));
+auto x406 = x226 + x352;
+auto x407 = x226 + x354;
+auto x408 = x201 + x347;
+auto x409 = -cell[3] + x32 + x58*(cell[3] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(-x123 - x189 - x347) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(-x169 - x408) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x253 + x406) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x101*(x182 + x349) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x269 + x406) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x286 + x352) + V{1}) - x132*x136*(x101*(x213 + x347) + V{1}) - x137*x140*(x224*(x253 + x407) + V{1}) - x141*x148*(x101*(x210 + x347) + V{1}) - x153*x161*(x101*(x285 + x347) + V{1}) - x162*x167*(x224*(x268 + x407) + V{1}) - x168*x173*(x224*(x287 + x354) + V{1}) - x188*x192*(-x101*(-x189 - x350) + V{1}) - x197*x199*(x224*(x269 + x407) + V{1}) - x200*x204*(x224*(x286 + x354) + V{1}) - x205*x207*(-x101*(-x154 - x408) + V{1}) - x208*x211*(x224*(x268 + x406) + V{1}) - x212*x214*(x224*(x287 + x352) + V{1}) - x66*x99*(x217*x69*(x274 + x345) + V{1})));
+auto x410 = -x100*x384;
+auto x411 = x100*x389;
+auto x412 = x242 + x411;
+auto x413 = -x411;
+auto x414 = x298 + x413;
+auto x415 = x181*x383;
+auto x416 = -x181*x383;
+auto x417 = -x175*x311;
+auto x418 = x326 + x411;
+auto x419 = -cell[4] + x33 + x58*(cell[4] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x316 + x388) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x398 + x410) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(-x314 - x392) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x317 + x388) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x324 + x415) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x320 + x414) + V{1}) - x132*x136*(x224*(x399 + x410) + V{1}) - x137*x140*(x101*(x314 + x393) + V{1}) - x141*x148*(x224*(x316 + x386) + V{1}) - x153*x161*(x224*(x319 + x386) + V{1}) - x162*x167*(x224*(x322 + x385) + V{1}) - x168*x173*(x224*(x319 + x412) + V{1}) - x188*x192*(x224*(x319 + x388) + V{1}) - x197*x199*(-x224*(-x322 - x416) + V{1}) - x200*x204*(-x224*(-x412 - x417) + V{1}) - x205*x207*(x224*(x317 + x386) + V{1}) - x208*x211*(-x224*(-x327 - x385) + V{1}) - x212*x214*(-x224*(-x319 - x418) + V{1}) - x66*x99*(x217*x69*(x313 + x389) + V{1})));
+auto x420 = -x385;
+auto x421 = -cell[5] + x34 + x58*(cell[5] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x289 + x388) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x255 + x410) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(-x101*(x261 + x394) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(x224*(x255 + x387) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x299 + x415) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(-x301 - x418) + V{1}) - x132*x136*(x224*(x257 + x410) + V{1}) - x137*x140*(-x101*(-x262 - x393) + V{1}) - x141*x148*(x224*(x289 + x386) + V{1}) - x153*x161*(x224*(x257 + x385) + V{1}) - x162*x167*(-x224*(-x242 - x305 - x385) + V{1}) - x168*x173*(-x224*(-x377 - x412) + V{1}) - x188*x192*(x224*(x257 + x387) + V{1}) - x197*x199*(-x224*(x294 + x415) + V{1}) - x200*x204*(x224*(x301 + x412) + V{1}) - x205*x207*(x224*(x255 + x385) + V{1}) - x208*x211*(-x224*(x299 + x420) + V{1}) - x212*x214*(-x224*(x295 + x414) + V{1}) - x66*x99*(-x217*x69*(-x222 - x375 - x389) + V{1})));
+auto x422 = x354 + x411;
+auto x423 = x335 + x413;
+auto x424 = -x177*x344;
+auto x425 = x241 + x411;
+auto x426 = -cell[6] + x35 + x58*(cell[6] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x351 + x396) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(-x347 - x391) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x406 + x410) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x359 + x415) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x352 + x396) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(x355 + x423) + V{1}) - x132*x136*(x101*(x350 + x390) + V{1}) - x137*x140*(x224*(x407 + x410) + V{1}) - x141*x148*(x224*(x351 + x395) + V{1}) - x153*x161*(x224*(x356 + x385) + V{1}) - x162*x167*(x224*(x354 + x395) + V{1}) - x168*x173*(x224*(x241 + x422) + V{1}) - x188*x192*(-x224*(-x356 - x416) + V{1}) - x197*x199*(x224*(x354 + x396) + V{1}) - x200*x204*(-x224*(-x360 - x422) + V{1}) - x205*x207*(-x224*(-x361 - x385) + V{1}) - x208*x211*(x224*(x352 + x395) + V{1}) - x212*x214*(-x224*(-x424 - x425) + V{1}) - x66*x99*(x217*x69*(x346 + x389) + V{1})));
+auto x427 = -x279*x90;
+auto x428 = -x138*x279;
+auto x429 = -cell[7] + x36 + x58*(cell[7] - x65*(V{0.0555555555555556}*cell[10]*x152*(x224*(x329 + x396) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(-x101*(x282 + x394) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x276 + x410) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x337 + x415) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(x224*(x276 + x387) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(-x224*(-x338 - x360 - x411) + V{1}) - x132*x136*(-x101*(-x134 - x283 - x390) + V{1}) - x137*x140*(x224*(x278 + x410) + V{1}) - x141*x148*(x224*(x329 + x395) + V{1}) - x153*x161*(-x224*(-x241 - x340 - x385) + V{1}) - x162*x167*(x224*(x278 + x385) + V{1}) - x168*x173*(-x224*(-x425 - x428) + V{1}) - x188*x192*(-x224*(x332 + x415) + V{1}) - x197*x199*(x224*(x278 + x387) + V{1}) - x200*x204*(-x224*(x333 + x423) + V{1}) - x205*x207*(-x224*(x337 + x420) + V{1}) - x208*x211*(x224*(x276 + x385) + V{1}) - x212*x214*(x224*(x338 + x425) + V{1}) - x66*x99*(-x217*x69*(-x221 - x389 - x427) + V{1})));
+auto x430 = x253 + x316;
+auto x431 = x316 + x354;
+auto x432 = x323 + x369;
+auto x433 = x316 + x365;
+auto x434 = -cell[8] + x37 + x58*(cell[8] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(-x347 - x401) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x351 + x403) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x352 + x430) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x320 + x379) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(x355 + x432) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x352 + x403) + V{1}) - x132*x136*(x224*(x351 + x404) + V{1}) - x137*x140*(x224*(x354 + x430) + V{1}) - x141*x148*(x101*(x347 + x402) + V{1}) - x153*x161*(x224*(x319 + x378) + V{1}) - x162*x167*(x224*(x365 + x431) + V{1}) - x168*x173*(x224*(x354 + x404) + V{1}) - x188*x192*(-x224*(-x319 - x381) + V{1}) - x197*x199*(-x224*(-x380 - x431) + V{1}) - x200*x204*(x224*(x354 + x403) + V{1}) - x205*x207*(-x224*(-x378 - x417) + V{1}) - x208*x211*(-x224*(-x424 - x433) + V{1}) - x212*x214*(x224*(x352 + x404) + V{1}) - x66*x99*(x217*x69*(x312 + x376) + V{1})));
+auto x435 = -cell[9] + x38 + x58*(cell[9] - x65*(V{0.0555555555555556}*cell[10]*x152*(-x101*(x284 + x315) + V{1}) + V{0.0555555555555556}*cell[11]*x119*(x224*(x329 + x403) + V{1}) + V{0.0555555555555556}*cell[12]*x131*(x224*(x275 + x430) + V{1}) + V{0.0277777777777778}*cell[13]*x187*(-x224*(x320 + x370) + V{1}) + V{0.0277777777777778}*cell[15]*x196*(-x224*(-x316 - x338 - x380) + V{1}) + V{0.0277777777777778}*cell[17]*x180*(x224*(x275 + x403) + V{1}) - x132*x136*(x224*(x329 + x404) + V{1}) - x137*x140*(x224*(x277 + x430) + V{1}) - x141*x148*(-x101*(-x283 - x402) + V{1}) - x153*x161*(-x224*(-x319 - x340 - x365) + V{1}) - x162*x167*(-x224*(-x428 - x433) + V{1}) - x168*x173*(x224*(x277 + x404) + V{1}) - x188*x192*(-x224*(x325 + x370) + V{1}) - x197*x199*(-x224*(x333 + x432) + V{1}) - x200*x204*(x224*(x277 + x403) + V{1}) - x205*x207*(-x224*(x320 + x367) + V{1}) - x208*x211*(x224*(x338 + x433) + V{1}) - x212*x214*(x224*(x275 + x404) + V{1}) - x66*x99*(-x217*x69*(-x312 - x363 - x427) + V{1})));
+cell[0] = -x216;
+cell[10] = -x247;
+cell[11] = -x270;
+cell[12] = -x288;
+cell[13] = -x309;
+cell[14] = -x328;
+cell[15] = -x343;
+cell[16] = -x362;
+cell[17] = -x374;
+cell[18] = -x382;
+cell[1] = -x397;
+cell[2] = -x405;
+cell[3] = -x409;
+cell[4] = -x419;
+cell[5] = -x421;
+cell[6] = -x426;
+cell[7] = -x429;
+cell[8] = -x434;
+cell[9] = -x435;
+return { cell[0] - x20 - x58*(cell[0] + x215*x65) + V{1}, ((x216)*(x216)) + ((x247)*(x247)) + ((x270)*(x270)) + ((x288)*(x288)) + ((x309)*(x309)) + ((x328)*(x328)) + ((x343)*(x343)) + ((x362)*(x362)) + ((x374)*(x374)) + ((x382)*(x382)) + ((x397)*(x397)) + ((x405)*(x405)) + ((x409)*(x409)) + ((x419)*(x419)) + ((x421)*(x421)) + ((x426)*(x426)) + ((x429)*(x429)) + ((x434)*(x434)) + ((x435)*(x435)) };
+}
+};
+
+}
+
+}
+
+// Generation Info: commit=2a9f114ed32e2878e1a64a356eda56d13e508f7d

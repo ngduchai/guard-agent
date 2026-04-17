@@ -61,15 +61,15 @@ APP_LIST_FILE=""
 EXTRA_ARGS=""
 
 # --- App ordering (shortest → longest build time) ---
+# Only apps with native checkpoint/restart in their reference code.
 ALL_APPS_ORDERED=(
-  Nyx DPLASMA deal.II ExaML CoMD Uintah Nektar++
-  miniVite RAxML-NG miniFE Chameleon LULESH AMG
-  CLAMR LAMMPS Palabos SU2 SAMRAI AMReX WarpX
+  CoMD miniVite CLAMR SW4lite VPIC
+  Athena++ OpenLB LAMMPS SU2 SAMRAI AMReX WarpX
 )
 
-FAST_APPS=(Nyx DPLASMA deal.II ExaML CoMD Uintah Nektar++ miniVite RAxML-NG miniFE)
-MEDIUM_APPS=(Chameleon LULESH AMG CLAMR LAMMPS)
-HEAVY_APPS=(Palabos SU2 SAMRAI AMReX WarpX)
+FAST_APPS=(CoMD miniVite CLAMR SW4lite VPIC Athena++)
+MEDIUM_APPS=(OpenLB LAMMPS SU2)
+HEAVY_APPS=(SAMRAI AMReX WarpX)
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do

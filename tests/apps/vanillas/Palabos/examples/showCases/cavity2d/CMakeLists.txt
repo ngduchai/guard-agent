@@ -3,7 +3,7 @@ if(CI)
 
 get_filename_component(EXECUTABLE_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 ###############################################################################
 
@@ -16,8 +16,9 @@ if(ENABLE_MPI)
     target_link_libraries(${PROJECT_NAME} ${MPI_CXX_LIBRARIES})
 endif()
 
-find_package(TBB REQUIRED)
-target_link_libraries(${PROJECT_NAME} TBB::tbb)
+if(BUILD_HDF5)
+    target_link_libraries(${PROJECT_NAME} ${HDF5_LIBRARIES})
+endif()
 
 if(BUILD_TESTING)
     add_custom_target(${PROJECT_NAME}_test
@@ -170,5 +171,5 @@ if(ENABLE_MPI)
     target_link_libraries(${EXECUTABLE_NAME} ${MPI_CXX_LIBRARIES})
 endif()
 
-find_package(TBB REQUIRED)
-target_link_libraries(${EXECUTABLE_NAME} TBB::tbb)
+
+
