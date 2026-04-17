@@ -407,8 +407,14 @@ def _run_scenario_once(
     dmtcp_coord_port: int = 0,
 ) -> RunMetrics:
     """Execute one run of *scenario* for *codebase* and collect metrics."""
+    from .runner import _symlink_input_data
+
     run_output_dir = output_dir / codebase / scenario.name / f"run_{run_index}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Symlink input data files referenced by relative paths in app_args
+    # so they resolve from the benchmark output directory.
+    _symlink_input_data(source_dir, build_dir, run_output_dir, scenario.app_args)
 
     # Locate veloc.cfg for checkpoint size measurement (resilient only).
     veloc_cfg: Path | None = None

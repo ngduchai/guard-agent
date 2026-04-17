@@ -396,19 +396,25 @@ def run_once(
     # runtime.  This is especially important on Cray/PALS systems where mpirun
     # may not forward the login-node environment to compute nodes.
     run_env = dict(env) if env else dict(os.environ)
+    # Ensure LD_LIBRARY_PATH includes paths for checkpoint libraries
+    # (VeloC, FTI, SCR, jemalloc) so MPI-launched processes can find them.
+    existing_ld = run_env.get("LD_LIBRARY_PATH", "")
+    extra_lib_dirs: list[str] = []
+
     veloc_dir = _detect_veloc_dir()
     if veloc_dir:
         veloc_lib = _veloc_lib_dir(veloc_dir)
-        if veloc_lib:
-            existing_ld = run_env.get("LD_LIBRARY_PATH", "")
-            if veloc_lib not in existing_ld.split(":"):
-                run_env["LD_LIBRARY_PATH"] = (
-                    f"{veloc_lib}:{existing_ld}" if existing_ld else veloc_lib
-                )
-                print(
-                    f"[runner] added {veloc_lib} to LD_LIBRARY_PATH for MPI run",
-                    flush=True,
-                )
+        if veloc_lib and veloc_lib not in existing_ld.split(":"):
+            extra_lib_dirs.append(veloc_lib)
+
+    # Also add $HOME/.local/lib for FTI, SCR, jemalloc if present
+    home_local_lib = os.path.join(os.path.expanduser("~"), ".local", "lib")
+    if os.path.isdir(home_local_lib) and home_local_lib not in existing_ld.split(":"):
+        extra_lib_dirs.append(home_local_lib)
+
+    if extra_lib_dirs:
+        new_ld = ":".join(extra_lib_dirs + ([existing_ld] if existing_ld else []))
+        run_env["LD_LIBRARY_PATH"] = new_ld
 
     mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
     cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
@@ -781,18 +787,23 @@ def run_with_failure_injection(
             flush=True,
         )
 
-        # Ensure LD_LIBRARY_PATH includes VeloC library directory for MPI runs
-        # (same logic as in run_once).
+        # Ensure LD_LIBRARY_PATH includes checkpoint library directories
+        # (VeloC, FTI, SCR, jemalloc) — same logic as in run_once.
         run_env = dict(os.environ)
+        _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
+        _extra_libs: list[str] = []
         _veloc_prefix = _detect_veloc_dir()
         if _veloc_prefix:
             _vlib = _veloc_lib_dir(_veloc_prefix)
-            if _vlib:
-                _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
-                if _vlib not in _existing_ld.split(":"):
-                    run_env["LD_LIBRARY_PATH"] = (
-                        f"{_vlib}:{_existing_ld}" if _existing_ld else _vlib
-                    )
+            if _vlib and _vlib not in _existing_ld.split(":"):
+                _extra_libs.append(_vlib)
+        _home_local_lib = os.path.join(os.path.expanduser("~"), ".local", "lib")
+        if os.path.isdir(_home_local_lib) and _home_local_lib not in _existing_ld.split(":"):
+            _extra_libs.append(_home_local_lib)
+        if _extra_libs:
+            run_env["LD_LIBRARY_PATH"] = ":".join(
+                _extra_libs + ([_existing_ld] if _existing_ld else [])
+            )
 
         t0 = time.monotonic()
         with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:

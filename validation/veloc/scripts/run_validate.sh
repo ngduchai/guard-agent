@@ -248,20 +248,16 @@ fi
 _cleanup() {
   # Kill all descendant processes of this script
   pkill -9 -P $$ 2>/dev/null || true
-  # Also kill by executable name in case they were re-parented
-  if [ -n "${EXE_NAME:-}" ]; then
-    pkill -9 -f "$EXE_NAME" 2>/dev/null || true
-  fi
   pkill -9 -f "failure_injector.py" 2>/dev/null || true
   [ -n "${_ORIG_BUILD_FILE:-}" ] && rm -f "$_ORIG_BUILD_FILE"
   [ -n "${_RES_BUILD_FILE:-}" ] && rm -f "$_RES_BUILD_FILE"
 }
 trap _cleanup EXIT INT TERM
 
-# Kill leftover processes from a previous interrupted run before starting
-if [ -n "${EXE_NAME:-}" ]; then
-  pkill -9 -f "$EXE_NAME" 2>/dev/null || true
-fi
+# Kill leftover MPI/injector processes from a previous interrupted run.
+# Note: we do NOT pkill by $EXE_NAME because that pattern can match
+# the current shell script's own command line (e.g. "miniVite" in
+# "run_validate.sh --reference miniVite"), causing self-kill.
 pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
 
 eval $CMD
