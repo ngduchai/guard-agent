@@ -48,8 +48,6 @@ using namespace std;
 class Source;
 class GridPointSource;
 class EWCuda;
-class CheckPoint;
-
 class EW
 {
  public:
@@ -68,8 +66,6 @@ class EW
    void processSuperGrid( char* buffer );
    void processDeveloper(char* buffer);
    void processFileIO( char* buffer );
-   void processCheckPoint( char* buffer );
-   void processRestart( char* buffer );
    void processMaterialBlock( char* buffer );
    void processdGalerkin( char* buffer );
    void processReceiver( char* buffer );
@@ -474,9 +470,7 @@ class EW
 
    bool m_corder; // (i,j,k,c) order 
 
-   // Output: Images, stations, checkpoints
-   vector<CheckPoint*> m_check_points;
-   CheckPoint* m_restart_check_point;
+   // Output: Images, stations
    vector<TimeSeries*> m_GlobalTimeSeries;
 
    // Discontinuous Galerkin stuff

@@ -251,7 +251,7 @@ def verify_no_recovery(
     result = _run_with_kill(
         build_dir=build_dir if build_dir.exists() else vanilla_dir,
         run_cmd=app_config.run.cmd,
-        kill_after=3.0,
+        kill_after=app_config.run.kill_after,
         timeout=app_config.run.timeout,
         mpi_ranks=app_config.mpi_ranks,
     )
@@ -285,7 +285,7 @@ def verify_recovery(
     result = _run_with_kill(
         build_dir=build_dir if build_dir.exists() else checkpointed_dir,
         run_cmd=run_cfg.cmd,
-        kill_after=5.0,
+        kill_after=run_cfg.kill_after,
         timeout=run_cfg.timeout,
         mpi_ranks=app_config.mpi_ranks,
     )

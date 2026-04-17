@@ -63,12 +63,12 @@ EXTRA_ARGS=""
 # --- App ordering (shortest → longest build time) ---
 # Only apps with native checkpoint/restart in their reference code.
 ALL_APPS_ORDERED=(
-  CoMD miniVite CLAMR SW4lite VPIC
-  Athena++ OpenLB LAMMPS SU2 SAMRAI AMReX WarpX
+  CoMD miniVite CLAMR SW4lite Athena++
+  LAMMPS SU2 SAMRAI AMReX WarpX
 )
 
-FAST_APPS=(CoMD miniVite CLAMR SW4lite VPIC Athena++)
-MEDIUM_APPS=(OpenLB LAMMPS SU2)
+FAST_APPS=(CoMD miniVite CLAMR SW4lite Athena++)
+MEDIUM_APPS=(LAMMPS SU2)
 HEAVY_APPS=(SAMRAI AMReX WarpX)
 
 # --- Parse arguments ---

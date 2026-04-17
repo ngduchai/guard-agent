@@ -296,6 +296,10 @@ class RunConfig(BaseModel):
     """Run configuration for a benchmark app."""
     cmd: str = Field(description="Run command template, supports {mpi_ranks}")
     timeout: int = Field(default=120, description="Timeout in seconds")
+    kill_after: float = Field(
+        default=3.0,
+        description="Seconds before failure injection kills the process. Must be less than app runtime.",
+    )
 
 
 class ComparisonConfig(BaseModel):

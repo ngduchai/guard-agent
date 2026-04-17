@@ -52,7 +52,6 @@
 
 #include "Source.h"
 #include "GridPointSource.h"
-#include "CheckPoint.h"
 
 #include "DG_FUNC.h"
 
