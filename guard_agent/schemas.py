@@ -315,6 +315,11 @@ class ComparisonConfig(BaseModel):
         default_factory=list,
         description="Substrings to match lines excluded before comparison (e.g. timestamps, timing)",
     )
+    keep_patterns: list[str] = Field(
+        default_factory=list,
+        description="If non-empty, only KEEP lines matching any of these substrings (allowlist). "
+                    "Applied before ignore_patterns.",
+    )
 
 
 class CheckpointLibConfig(BaseModel):

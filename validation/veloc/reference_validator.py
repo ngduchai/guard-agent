@@ -158,14 +158,23 @@ def _run_with_kill(
         )
 
 
-def _filter_lines(text: str, ignore_patterns: list[str]) -> str:
-    """Remove lines matching any ignore pattern (substring match)."""
-    if not ignore_patterns:
-        return text
-    return "\n".join(
-        ln for ln in text.splitlines()
-        if not any(pat in ln for pat in ignore_patterns)
-    )
+def _filter_lines(
+    text: str,
+    ignore_patterns: list[str],
+    keep_patterns: list[str] | None = None,
+) -> str:
+    """Filter output lines for comparison.
+
+    If ``keep_patterns`` is non-empty, only lines matching at least one
+    keep pattern survive (allowlist).  Otherwise ``ignore_patterns`` is
+    used as a blocklist.
+    """
+    lines = text.splitlines()
+    if keep_patterns:
+        lines = [ln for ln in lines if any(pat in ln for pat in keep_patterns)]
+    elif ignore_patterns:
+        lines = [ln for ln in lines if not any(pat in ln for pat in ignore_patterns)]
+    return "\n".join(lines)
 
 
 def _compare_outputs(
@@ -176,6 +185,7 @@ def _compare_outputs(
     golden_file: str | None = None,
     test_file: str | None = None,
     ignore_patterns: list[str] | None = None,
+    keep_patterns: list[str] | None = None,
 ) -> ComparisonResult:
     """Compare golden output against test output."""
     if golden_file and test_file:
@@ -190,8 +200,9 @@ def _compare_outputs(
 
     # Filter lines before comparison
     patterns = ignore_patterns or []
-    golden_filtered = _filter_lines(golden_stdout, patterns)
-    test_filtered = _filter_lines(test_stdout, patterns)
+    keeps = keep_patterns or []
+    golden_filtered = _filter_lines(golden_stdout, patterns, keeps or None)
+    test_filtered = _filter_lines(test_stdout, patterns, keeps or None)
 
     # Stdout comparison
     if method == "text":
@@ -273,6 +284,7 @@ def verify_no_recovery(
         method=app_config.comparison.method,
         tolerance=app_config.comparison.tolerance,
         ignore_patterns=app_config.comparison.ignore_patterns,
+        keep_patterns=app_config.comparison.keep_patterns,
     )
     # If output does NOT match golden, vanilla has no recovery (expected)
     return not comparison.passed
@@ -451,6 +463,7 @@ def validate_reference(
             method=app_config.comparison.method,
             tolerance=app_config.comparison.tolerance,
             ignore_patterns=app_config.comparison.ignore_patterns,
+            keep_patterns=app_config.comparison.keep_patterns,
         )
 
     result.elapsed_seconds = time.monotonic() - start
