@@ -98,9 +98,16 @@ def _run_with_kill(
     kill_after: float = 5.0,
     timeout: int = 120,
     mpi_ranks: int = 4,
+    restart_cmd: str | None = None,
 ) -> RunResult:
-    """Start an MPI app, kill it after ``kill_after`` seconds, then restart."""
+    """Start an MPI app, kill it after ``kill_after`` seconds, then restart.
+
+    If ``restart_cmd`` is provided, Phase 2 uses that command instead of
+    repeating ``run_cmd``.  This supports apps that need different flags
+    (e.g. ``-R checkpoint_file``) to restart from a saved checkpoint.
+    """
     cmd = run_cmd.replace("{mpi_ranks}", str(mpi_ranks))
+    restart = (restart_cmd or run_cmd).replace("{mpi_ranks}", str(mpi_ranks))
 
     # Phase 1: Start and kill
     try:
@@ -118,10 +125,10 @@ def _run_with_kill(
     except Exception:
         pass
 
-    # Phase 2: Restart (same command)
+    # Phase 2: Restart (potentially different command)
     try:
         result = subprocess.run(
-            cmd,
+            restart,
             shell=True,
             cwd=str(build_dir),
             capture_output=True,
@@ -288,6 +295,7 @@ def verify_recovery(
         kill_after=run_cfg.kill_after,
         timeout=run_cfg.timeout,
         mpi_ranks=app_config.mpi_ranks,
+        restart_cmd=run_cfg.restart_cmd,
     )
     return result.succeeded, result
 

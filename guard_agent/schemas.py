@@ -300,6 +300,10 @@ class RunConfig(BaseModel):
         default=3.0,
         description="Seconds before failure injection kills the process. Must be less than app runtime.",
     )
+    restart_cmd: str | None = Field(
+        default=None,
+        description="Command to restart from checkpoint after failure. If None, uses cmd (same command).",
+    )
 
 
 class ComparisonConfig(BaseModel):
