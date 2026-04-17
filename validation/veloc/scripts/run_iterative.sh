@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
+# Clean up child processes on exit to prevent zombies after Ctrl+C
+_cleanup() {
+  pkill -9 -P $$ 2>/dev/null || true
+  pkill -9 -f "failure_injector.py" 2>/dev/null || true
+}
+trap _cleanup EXIT INT TERM
+
 # Usage: ./run_iterative.sh [--baseline] <app_name> [--max-iters N]
 #
 # Automated evaluation loop:
@@ -62,6 +69,17 @@ else
   LABEL="guard-agent"
   VALIDATE_FLAG=""
 fi
+
+# Re-copy source from original to ensure a clean starting point.
+# Prevents stale modifications from a previous interrupted run.
+for _src_root in "$REPO_ROOT/tests/apps/vanillas" "$REPO_ROOT/tests/ecp/vanillas" "$REPO_ROOT/tests/examples/original"; do
+  if [ -d "$_src_root/$APP_NAME" ]; then
+    echo "[REFRESH] Re-copying $APP_NAME source (clean)"
+    rm -rf "$APP_DIR"
+    cp -a "$_src_root/$APP_NAME" "$APP_DIR"
+    break
+  fi
+done
 
 if [ ! -d "$APP_DIR" ]; then
   echo "ERROR: App directory not found: $APP_DIR" >&2

@@ -28,10 +28,14 @@ if [ -f "$BUILD_DIR/venv/bin/activate" ]; then
 fi
 export PYTHONPATH="${REPO_ROOT}"
 
-# --- Parse --baseline flag ---
+# --- Parse approach flag ---
 USE_BASELINE=false
+USE_REFERENCE=false
 if [ "${1:-}" = "--baseline" ]; then
   USE_BASELINE=true
+  shift
+elif [ "${1:-}" = "--reference" ]; then
+  USE_REFERENCE=true
   shift
 fi
 
@@ -130,6 +134,8 @@ elif [ -n "$APP_YAML" ]; then
   EXE_NAME=$(_read_yaml "executable_name")
   APP_ARGS=$(_read_yaml "app_args")
   COMPARISON=$(_read_yaml "comparison_flags")
+  ORIGINAL_BUILD_CMD=$(_read_yaml "build_cmd")
+  RESILIENT_BUILD_CMD=$(_read_yaml "ckpt_build_cmd")
 fi
 
 # Fallback: try to extract from CMakeLists.txt
@@ -160,8 +166,11 @@ else
   exit 1
 fi
 
-# --- Resilient source (agent-modified) ---
-if [ "$USE_BASELINE" = true ]; then
+# --- Resilient source (agent-modified or reference) ---
+if [ "$USE_REFERENCE" = true ]; then
+  RESILIENT_SRC="$REPO_ROOT/tests/apps/checkpointed/$APP_NAME"
+  LABEL="reference (human-written)"
+elif [ "$USE_BASELINE" = true ]; then
   RESILIENT_SRC="$BUILD_DIR/tests_baseline/$APP_NAME"
   LABEL="baseline (no guard-agent)"
 else
@@ -181,7 +190,9 @@ if [ -f "$BENCH_FILE" ]; then
 fi
 
 # --- Output directory ---
-if [ "$USE_BASELINE" = true ]; then
+if [ "$USE_REFERENCE" = true ]; then
+  OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_reference"
+elif [ "$USE_BASELINE" = true ]; then
   OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline"
 else
   OUTPUT_DIR="$BUILD_DIR/validation_output/$APP_NAME"
@@ -216,4 +227,44 @@ if [ $# -gt 0 ]; then
   CMD="$CMD $*"
 fi
 
+# Write build commands to temp files to avoid shell quoting issues
+# (build commands can contain nested quotes like CFLAGS="-O3 -Wno-unused-result")
+_ORIG_BUILD_FILE=""
+_RES_BUILD_FILE=""
+if [ -n "${ORIGINAL_BUILD_CMD:-}" ]; then
+  _ORIG_BUILD_FILE=$(mktemp)
+  echo "$ORIGINAL_BUILD_CMD" > "$_ORIG_BUILD_FILE"
+  CMD="$CMD --original-build-cmd @$_ORIG_BUILD_FILE"
+fi
+if [ -n "${RESILIENT_BUILD_CMD:-}" ]; then
+  _RES_BUILD_FILE=$(mktemp)
+  echo "$RESILIENT_BUILD_CMD" > "$_RES_BUILD_FILE"
+  CMD="$CMD --resilient-build-cmd @$_RES_BUILD_FILE"
+fi
+
+# Kill any leftover child processes on exit (Ctrl+C, error, or normal exit).
+# Prevents zombie mpirun/app processes from consuming resources after an
+# interrupted benchmark run.
+_cleanup() {
+  # Kill all descendant processes of this script
+  pkill -9 -P $$ 2>/dev/null || true
+  # Also kill by executable name in case they were re-parented
+  if [ -n "${EXE_NAME:-}" ]; then
+    pkill -9 -f "$EXE_NAME" 2>/dev/null || true
+  fi
+  pkill -9 -f "failure_injector.py" 2>/dev/null || true
+  [ -n "${_ORIG_BUILD_FILE:-}" ] && rm -f "$_ORIG_BUILD_FILE"
+  [ -n "${_RES_BUILD_FILE:-}" ] && rm -f "$_RES_BUILD_FILE"
+}
+trap _cleanup EXIT INT TERM
+
+# Kill leftover processes from a previous interrupted run before starting
+if [ -n "${EXE_NAME:-}" ]; then
+  pkill -9 -f "$EXE_NAME" 2>/dev/null || true
+fi
+pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
+
 eval $CMD
+_exit=$?
+
+exit $_exit

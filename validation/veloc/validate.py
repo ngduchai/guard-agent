@@ -84,9 +84,7 @@ def _save_state(output_dir: Path, state: dict) -> None:
     """Persist pipeline state to disk."""
     output_dir.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _state_path(output_dir).write_text(
-        json.dumps(state, indent=2), encoding="utf-8"
-    )
+    _state_path(output_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def _mark_stage_complete(output_dir: Path, state: dict, stage: str) -> None:
@@ -120,6 +118,7 @@ def is_run_incomplete(output_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Disk loaders – restore previous stage results without re-running
 # ---------------------------------------------------------------------------
+
 
 def _save_correctness_results(output_dir: Path, results: list[CompareResult]) -> None:
     """Persist correctness results to correctness/test_results.json for later loading."""
@@ -242,6 +241,7 @@ def _load_benchmark_results(output_dir: Path) -> BenchmarkResults | None:
 # CLI argument parsing
 # ---------------------------------------------------------------------------
 
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m validation.veloc.validate",
@@ -325,6 +325,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default="veloc.cfg",
         help="Filename of the VeloC configuration file.",
     )
+    build_grp.add_argument(
+        "--original-build-cmd",
+        default=None,
+        help=(
+            "Shell command to build the original codebase (from app.yaml). "
+            "When set, the source is copied to the build directory and this "
+            "command is executed there instead of using CMake. "
+            "Supports Make, Meson, or any build system."
+        ),
+    )
+    build_grp.add_argument(
+        "--resilient-build-cmd",
+        default=None,
+        help=(
+            "Shell command to build the resilient codebase (from app.yaml). "
+            "Same semantics as --original-build-cmd."
+        ),
+    )
 
     # Correctness stage.
     corr_grp = parser.add_argument_group("Correctness validation")
@@ -357,7 +375,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "stage skips rebuilding/re-running the original application and "
             "reuses the output files and elapsed time from this directory.  "
             "The directory must contain the expected output file and a "
-            "ground_truth_meta.json with {\"elapsed_s\": <float>}."
+            'ground_truth_meta.json with {"elapsed_s": <float>}.'
         ),
     )
     corr_grp.add_argument(
@@ -489,6 +507,7 @@ def _build_parser() -> argparse.ArgumentParser:
 # Pipeline stages
 # ---------------------------------------------------------------------------
 
+
 def _stage_correctness(
     args: argparse.Namespace,
     original_src: Path,
@@ -522,6 +541,7 @@ def _stage_correctness(
         # Reuse pre-computed ground truth from Phase 0.
         baseline_out = ground_truth_dir
         import json as _json
+
         meta_path = ground_truth_dir / "ground_truth_meta.json"
         if meta_path.exists():
             meta = _json.loads(meta_path.read_text())
@@ -566,7 +586,10 @@ def _stage_correctness(
         )
 
     # --- Resilient run with failure injection ---
-    print("\n[validate] Running resilient application with failure injection...", flush=True)
+    print(
+        "\n[validate] Running resilient application with failure injection...",
+        flush=True,
+    )
     run_with_failure_injection(
         source_dir=resilient_src,
         build_dir=resilient_build,
@@ -582,10 +605,20 @@ def _stage_correctness(
     )
 
     # --- Also run resilient without failure injection (failure-free check) ---
-    print("\n[validate] Running resilient application without failure injection (failure-free check)...", flush=True)
-    from .runner import run_once
+    print(
+        "\n[validate] Running resilient application without failure injection (failure-free check)...",
+        flush=True,
+    )
+    from .runner import run_once, _symlink_input_data
+
     resilient_clean_out = output_dir / "correctness" / "resilient_clean"
     resilient_clean_out.mkdir(parents=True, exist_ok=True)
+    # Ensure input data referenced by relative paths in app_args is
+    # accessible from the clean-run CWD (mirrors what run_baseline and
+    # run_with_failure_injection do for their run directories).
+    _symlink_input_data(
+        resilient_src, resilient_build, resilient_clean_out, res_app_args
+    )
     clean_result = run_once(
         build_dir=resilient_build,
         executable_name=res_exe,
@@ -682,6 +715,7 @@ def _stage_correctness(
                     continue
             elif approach.approach_type == "criu":
                 from .criu_runner import check_criu_available
+
                 if not check_criu_available():
                     print(
                         f"[validate] WARNING: skipping approach {approach.name!r} – "
@@ -722,16 +756,19 @@ def _stage_correctness(
                     # If MANA's lower-half links against OpenMPI, we must
                     # build the app with OpenMPI's compilers too (not Cray's).
                     from .dmtcp_runner import _resolve_mpirun_for_mana
+
                     mpirun_path = _resolve_mpirun_for_mana()
                     if mpirun_path != "mpirun":
                         ompi_bin = Path(mpirun_path).parent
                         ompi_mpicc = ompi_bin / "mpicc"
                         ompi_mpicxx = ompi_bin / "mpicxx"
                         if ompi_mpicc.exists() and ompi_mpicxx.exists():
-                            cmake_extra.extend([
-                                f"-DCMAKE_C_COMPILER={ompi_mpicc}",
-                                f"-DCMAKE_CXX_COMPILER={ompi_mpicxx}",
-                            ])
+                            cmake_extra.extend(
+                                [
+                                    f"-DCMAKE_C_COMPILER={ompi_mpicc}",
+                                    f"-DCMAKE_CXX_COMPILER={ompi_mpicxx}",
+                                ]
+                            )
                             print(
                                 f"[validate] Using OpenMPI compilers: "
                                 f"{ompi_mpicc}, {ompi_mpicxx}",
@@ -749,7 +786,9 @@ def _stage_correctness(
                     flush=True,
                 )
                 configure_and_build(
-                    approach.codebase_dir, a_build, cmake_extra_args=cmake_extra or None,
+                    approach.codebase_dir,
+                    a_build,
+                    cmake_extra_args=cmake_extra or None,
                 )
 
             a_exe = approach.executable_name or res_exe
@@ -764,7 +803,9 @@ def _stage_correctness(
             if approach.ssim_threshold is not None:
                 approach_comparator = make_comparator(
                     method=args.comparison_method,
-                    plugin_path=Path(args.custom_comparator) if args.custom_comparator else None,
+                    plugin_path=Path(args.custom_comparator)
+                    if args.custom_comparator
+                    else None,
                     dataset=args.hdf5_dataset,
                     ssim_threshold=approach.ssim_threshold,
                     atol=args.numeric_atol,
@@ -790,6 +831,7 @@ def _stage_correctness(
                     flush=True,
                 )
                 from .runner import run_once
+
                 baseline_result_a = run_once(
                     build_dir=effective_build_root / "original",
                     executable_name=args.executable_name,
@@ -807,7 +849,9 @@ def _stage_correctness(
                     )
 
             # --- Approach run with failure injection ---
-            approach_fi_out = output_dir / "correctness" / f"{approach.name}_failure_injection"
+            approach_fi_out = (
+                output_dir / "correctness" / f"{approach.name}_failure_injection"
+            )
             ckpt_dir_fi = approach_fi_out / f"{approach.name}_ckpt"
             print(
                 f"\n[validate] Running {approach.label} with failure injection...",
@@ -815,6 +859,7 @@ def _stage_correctness(
             )
             if approach.approach_type == "criu":
                 from .criu_runner import criu_run_with_failure_injection
+
                 fi_result = criu_run_with_failure_injection(
                     build_dir=a_build,
                     executable_name=a_exe,
@@ -850,9 +895,12 @@ def _stage_correctness(
                     flush=True,
                 )
                 fi_compare = approach_comparator.compare(
-                    approach_baseline_file, approach_fi_file,
+                    approach_baseline_file,
+                    approach_fi_file,
                 )
-                fi_compare.method = f"{fi_compare.method} [{approach.label}, failure-prone]"
+                fi_compare.method = (
+                    f"{fi_compare.method} [{approach.label}, failure-prone]"
+                )
                 print(
                     f"[validate] Test {test_num} ({approach.label}, failure-prone): "
                     f"{fi_compare}",
@@ -871,14 +919,16 @@ def _stage_correctness(
                     f"(exit_code={fi_result.exit_code}).",
                     flush=True,
                 )
-                results.append(CompareResult(
-                    passed=True,
-                    method=f"{approach.label} (failure-prone)",
-                    message=(
-                        "SKIPPED: DMTCP failure injection did not occur; "
-                        "checkpoint/restart cycle could not be completed"
-                    ),
-                ))
+                results.append(
+                    CompareResult(
+                        passed=True,
+                        method=f"{approach.label} (failure-prone)",
+                        message=(
+                            "SKIPPED: DMTCP failure injection did not occur; "
+                            "checkpoint/restart cycle could not be completed"
+                        ),
+                    )
+                )
             else:
                 # Injection happened (checkpoint + kill worked) but the
                 # restored process didn't produce output.  This typically
@@ -893,14 +943,16 @@ def _stage_correctness(
                     f"Output not found: {approach_fi_file}",
                     flush=True,
                 )
-                results.append(CompareResult(
-                    passed=True,
-                    method=f"{approach.label} (failure-prone)",
-                    message=(
-                        "SKIPPED: checkpoint + kill succeeded; restore failed "
-                        "(known MANA/DMTCP platform limitation on Aurora)"
-                    ),
-                ))
+                results.append(
+                    CompareResult(
+                        passed=True,
+                        method=f"{approach.label} (failure-prone)",
+                        message=(
+                            "SKIPPED: checkpoint + kill succeeded; restore failed "
+                            "(known MANA/DMTCP platform limitation on Aurora)"
+                        ),
+                    )
+                )
 
             # --- Approach run without failure injection (failure-free check) ---
             approach_clean_out = output_dir / "correctness" / f"{approach.name}_clean"
@@ -912,6 +964,7 @@ def _stage_correctness(
             )
             if approach.approach_type == "criu":
                 from .criu_runner import criu_run_once
+
                 clean_result_a = criu_run_once(
                     build_dir=a_build,
                     executable_name=a_exe,
@@ -951,7 +1004,8 @@ def _stage_correctness(
                     flush=True,
                 )
                 clean_compare = approach_comparator.compare(
-                    approach_baseline_file, approach_clean_file,
+                    approach_baseline_file,
+                    approach_clean_file,
                 )
                 clean_compare.method = (
                     f"{clean_compare.method} [{approach.label}, failure-free]"
@@ -968,13 +1022,33 @@ def _stage_correctness(
                     f"{approach_clean_file}",
                     flush=True,
                 )
-                results.append(CompareResult(
-                    passed=False,
-                    method=f"{approach.label} (failure-free)",
-                    message=f"Output file not found: {approach_clean_file}",
-                ))
+                results.append(
+                    CompareResult(
+                        passed=False,
+                        method=f"{approach.label} (failure-free)",
+                        message=f"Output file not found: {approach_clean_file}",
+                    )
+                )
 
     return results
+
+
+def _resolve_build_cmd(value: str | None) -> str | None:
+    """Resolve a build command that may use ``@file`` indirection.
+
+    ``run_validate.sh`` writes complex build commands (containing nested
+    quotes) to a temp file and passes ``@/tmp/xxx`` on the CLI so that
+    shell expansion doesn't mangle them.
+    """
+    if value is None:
+        return None
+    if value.startswith("@"):
+        path = value[1:]
+        try:
+            return open(path).read().strip()
+        except FileNotFoundError:
+            return value
+    return value
 
 
 def _stage_benchmarks(
@@ -1024,13 +1098,17 @@ def _stage_benchmarks(
         # Use resilient args for the sweep (they may differ from original args).
         # When benchmark_num_runs is None (NUM_RUNS not set), fall back to 3.
         # Resolve injection delay for benchmarking fallback.
-        _bench_delay = 10.0 if args.injection_delay == "auto" else float(args.injection_delay)
+        _bench_delay = (
+            10.0 if args.injection_delay == "auto" else float(args.injection_delay)
+        )
         scenarios = default_scenario(
             num_procs=args.num_procs,
             app_args=res_app_args,
             injection_delay=_bench_delay,
             max_attempts=args.max_attempts,
-            num_runs=args.benchmark_num_runs if args.benchmark_num_runs is not None else 3,
+            num_runs=args.benchmark_num_runs
+            if args.benchmark_num_runs is not None
+            else 3,
         )
 
     return run_benchmark_sweep(
@@ -1046,6 +1124,8 @@ def _stage_benchmarks(
         install_resilient=args.install_resilient,
         resume=resume,
         extra_approaches=extra_approaches,
+        original_build_cmd=_resolve_build_cmd(getattr(args, 'original_build_cmd', None)),
+        resilient_build_cmd=_resolve_build_cmd(getattr(args, 'resilient_build_cmd', None)),
     )
 
 
@@ -1072,6 +1152,7 @@ def _stage_report(
 # Error reporting helper
 # ---------------------------------------------------------------------------
 
+
 def _fail(
     message: str,
     exc: BaseException | None = None,
@@ -1094,7 +1175,11 @@ def _fail(
         else:
             print(f"  {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     if resume_cmd:
-        print(f"\n[validate] To resume from the last completed stage, run:", file=sys.stderr, flush=True)
+        print(
+            f"\n[validate] To resume from the last completed stage, run:",
+            file=sys.stderr,
+            flush=True,
+        )
         print(f"  {resume_cmd}", file=sys.stderr, flush=True)
     print(sep, file=sys.stderr, flush=True)
     sys.exit(1)
@@ -1103,6 +1188,7 @@ def _fail(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _build_resume_cmd(argv: list[str], output_dir: Path) -> str:
     """Build the command string a user can run to resume from the last stage.
@@ -1143,7 +1229,9 @@ def main(argv: list[str] | None = None) -> int:
     resilient_src = Path(args.resilient_codebase).resolve()
 
     output_dir = Path(args.output_dir).resolve()
-    build_root = Path(args.build_dir).resolve() if args.build_dir else output_dir / "build"
+    build_root = (
+        Path(args.build_dir).resolve() if args.build_dir else output_dir / "build"
+    )
 
     original_build = build_root / "original"
     resilient_build = build_root / "resilient"

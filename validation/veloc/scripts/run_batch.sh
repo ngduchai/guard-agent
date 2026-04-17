@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Clean up child processes on exit to prevent zombies after Ctrl+C
+_batch_cleanup() {
+  pkill -9 -P $$ 2>/dev/null || true
+  pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
+}
+trap _batch_cleanup EXIT INT TERM
+
 # Run validation for multiple applications from a file list.
 #
 # Usage:
@@ -51,6 +58,7 @@ MAX_ITERS=10
 CONTINUE=false
 DRY_RUN=false
 APP_LIST_FILE=""
+EXTRA_ARGS=""
 
 # --- App ordering (shortest → longest build time) ---
 ALL_APPS_ORDERED=(
@@ -68,6 +76,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)         MODE="$2"; shift 2 ;;
     --baseline)     APPROACH="--baseline"; shift ;;
+    --reference)    APPROACH="--reference"; shift ;;
     --guard-agent)  APPROACH=""; shift ;;
     --max-iters)    MAX_ITERS="$2"; shift 2 ;;
     --continue)     CONTINUE=true; shift ;;
@@ -83,11 +92,14 @@ while [[ $# -gt 0 ]]; do
       exit 0 ;;
     -h|--help)
       sed -n '2,/^set -euo/{ /^#/s/^# \?//p }' "$0"; exit 0 ;;
+    --)
+      shift; EXTRA_ARGS="$*"; break ;;
     *)
       if [[ -z "$APP_LIST_FILE" ]]; then
         APP_LIST_FILE="$1"
       else
-        echo "Unknown option: $1" >&2; exit 1
+        # Collect unrecognized flags to forward to the runner script
+        EXTRA_ARGS="${EXTRA_ARGS:+$EXTRA_ARGS }$1"
       fi
       shift ;;
   esac
@@ -153,7 +165,11 @@ _has_results() {
       fi
       ;;
     validate)
-      [[ -d "$BUILD_DIR/validation_output/${app}" ]]
+      case "$APPROACH" in
+        --baseline)   [[ -d "$BUILD_DIR/validation_output/${app}_baseline" ]] ;;
+        --reference)  [[ -d "$BUILD_DIR/validation_output/${app}_reference" ]] ;;
+        *)            [[ -d "$BUILD_DIR/validation_output/${app}" ]] ;;
+      esac
       ;;
   esac
 }
@@ -175,6 +191,11 @@ _build_cmd() {
       ;;
   esac
 
+  # Forward any extra flags to the runner script
+  if [[ -n "$EXTRA_ARGS" ]]; then
+    cmd="$cmd $EXTRA_ARGS"
+  fi
+
   echo "$cmd"
 }
 
@@ -186,6 +207,7 @@ echo "  Approach: ${APPROACH:-both (evaluate)}"
 echo "  Apps:     ${#APPS[@]} from $APP_LIST_FILE"
 echo "  Max iter: $MAX_ITERS"
 echo "  Continue: $CONTINUE"
+[[ -n "$EXTRA_ARGS" ]] && echo "  Extra:    $EXTRA_ARGS"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""
 
@@ -237,6 +259,9 @@ for i in "${!APPS[@]}"; do
       fi
     done
   fi
+
+  # Kill any stray processes from a previous app before starting the next one
+  pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
 
   cmd=$(_build_cmd "$app")
 

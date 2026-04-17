@@ -29,6 +29,7 @@ from pathlib import Path
 # Custom exception
 # ---------------------------------------------------------------------------
 
+
 class ValidationError(RuntimeError):
     """Raised when a run fails and we want to surface stdout/stderr to the caller.
 
@@ -69,7 +70,9 @@ class ValidationError(RuntimeError):
             text_lines = text.splitlines()
             if len(text_lines) > max_lines:
                 omitted = len(text_lines) - max_lines
-                text_lines = [f"  ... ({omitted} lines omitted) ..."] + text_lines[-max_lines:]
+                text_lines = [f"  ... ({omitted} lines omitted) ..."] + text_lines[
+                    -max_lines:
+                ]
             return [f"  {label}:"] + [f"    {l}" for l in text_lines]
 
         lines += _tail(self.stdout, "STDOUT (tail)")
@@ -81,18 +84,24 @@ class ValidationError(RuntimeError):
 # Result dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class RunResult:
     """Structured result of a single MPI application run."""
+
     exit_code: int
     stdout: str
     stderr: str
     elapsed_s: float
-    injected: bool = False          # True if a failure was injected during this run
-    num_attempts: int = 1           # total attempts consumed (>1 for retry runs)
+    injected: bool = False  # True if a failure was injected during this run
+    num_attempts: int = 1  # total attempts consumed (>1 for retry runs)
     output_dir: Path = field(default_factory=Path)
-    last_attempt_elapsed_s: float = 0.0  # wall-clock time of the final (successful) attempt
-    memory_samples_bytes: list[int] = field(default_factory=list)  # RSS samples collected during run
+    last_attempt_elapsed_s: float = (
+        0.0  # wall-clock time of the final (successful) attempt
+    )
+    memory_samples_bytes: list[int] = field(
+        default_factory=list
+    )  # RSS samples collected during run
 
     @property
     def succeeded(self) -> bool:
@@ -102,6 +111,7 @@ class RunResult:
 # ---------------------------------------------------------------------------
 # External tool resolution
 # ---------------------------------------------------------------------------
+
 
 def _resolve_tool(name: str) -> str:
     """Resolve the full path of an external tool (e.g. ``cmake``, ``mpirun``).
@@ -127,6 +137,7 @@ def _resolve_tool(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Build helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> int:
     """Run a shell command, streaming output to stdout, and return the exit code."""
@@ -165,7 +176,10 @@ def _detect_veloc_dir() -> str | None:
         lib_dir = Path(entry)
         if (lib_dir / "libveloc-client.so").is_file():
             prefix = lib_dir.parent  # e.g. /home/user/.local/lib64 -> /home/user/.local
-            print(f"[runner] VeloC detected via LD_LIBRARY_PATH: prefix={prefix}", flush=True)
+            print(
+                f"[runner] VeloC detected via LD_LIBRARY_PATH: prefix={prefix}",
+                flush=True,
+            )
             return str(prefix)
 
     # 3. Well-known prefixes
@@ -173,7 +187,10 @@ def _detect_veloc_dir() -> str | None:
     for candidate in [home / ".local", home / "usr", Path("/usr/local")]:
         for libsub in ["lib", "lib64"]:
             if (candidate / libsub / "libveloc-client.so").is_file():
-                print(f"[runner] VeloC detected at well-known prefix: {candidate}", flush=True)
+                print(
+                    f"[runner] VeloC detected at well-known prefix: {candidate}",
+                    flush=True,
+                )
                 return str(candidate)
 
     return None
@@ -198,24 +215,58 @@ def configure_and_build(
     build_dir: Path,
     run_install: bool = False,
     cmake_extra_args: list[str] | None = None,
+    build_cmd: str | None = None,
 ) -> None:
-    """Configure (via CMake) and build the example.
+    """Configure and build the example.
 
-    Skips the configure step if ``CMakeCache.txt`` and a generator build file
-    already exist (idempotent).  If *run_install* is True, also runs
-    ``cmake --install`` with the install prefix set to *build_dir* so that
-    runtime config files (e.g. ``veloc.cfg``) are placed next to the binary.
+    If *build_cmd* is provided, the source tree is copied to *build_dir*
+    and the shell command is executed there (matching the approach used by
+    ``reference_validator.py``).  This supports Make, Meson, and any other
+    build system — the command comes directly from ``app.yaml``.
 
-    Auto-detects the VeloC installation directory and passes it to CMake as
-    ``-DVELOC_DIR=<prefix>`` so that the build can find ``libveloc-client.so``
-    and all its transitive dependencies regardless of the default in the
-    project's ``CMakeLists.txt``.
+    Otherwise, falls back to the original CMake-based flow: configure via
+    ``cmake -S ... -B ...``, build via ``cmake --build``, and optionally
+    install via ``cmake --install``.
 
     *cmake_extra_args* are appended to the ``cmake -S ... -B ...`` command.
-    For DMTCP/MANA builds, pass ``["-DDMTCP_USE_MANA_STUB=ON", "-DMANA_ROOT=..."]``.
     """
+    import shutil
+
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    # Marker file written after a successful shell-command build.
+    # When configure_and_build is called again (e.g. by run_baseline or
+    # run_with_failure_injection) without build_cmd, it detects the marker
+    # and skips the build instead of falling through to CMake.
+    _shell_build_marker = build_dir / ".shell_build_done"
+
+    # ── Shell-command build (from app.yaml build.cmd) ────────────────────
+    if build_cmd is not None:
+        # Copy source to build directory (same as reference_validator._build_app)
+        if source_dir != build_dir:
+            if build_dir.exists():
+                shutil.rmtree(build_dir)
+            shutil.copytree(source_dir, build_dir, symlinks=True,
+                            ignore_dangling_symlinks=True)
+
+        import subprocess as _sp
+        result = _sp.run(
+            build_cmd, shell=True, cwd=str(build_dir),
+            capture_output=True, text=True, timeout=1200,
+        )
+        if result.returncode != 0:
+            output = (result.stdout + "\n" + result.stderr)[-1000:]
+            raise RuntimeError(
+                f"Build failed for {source_dir}:\n{output}"
+            )
+        _shell_build_marker.write_text(build_cmd)
+        return
+
+    # If a previous shell build already populated this directory, skip CMake.
+    if _shell_build_marker.exists():
+        return
+
+    # ── CMake-based build (original flow) ────────────────────────────────
     cmake = os.environ.get("CMAKE_PATH") or _resolve_tool("cmake")
 
     cache = build_dir / "CMakeCache.txt"
@@ -235,9 +286,7 @@ def configure_and_build(
             # can locate VeloC's transitive dependencies.
             veloc_lib = _veloc_lib_dir(veloc_dir)
             if veloc_lib:
-                configure_cmd.append(
-                    f"-DCMAKE_PREFIX_PATH={veloc_dir}"
-                )
+                configure_cmd.append(f"-DCMAKE_PREFIX_PATH={veloc_dir}")
 
         if cmake_extra_args:
             configure_cmd.extend(cmake_extra_args)
@@ -262,6 +311,7 @@ def configure_and_build(
 # Executable discovery
 # ---------------------------------------------------------------------------
 
+
 def _find_executable(build_dir: Path, executable_name: str) -> Path:
     """Locate the built executable under *build_dir*, searching recursively."""
     candidate = build_dir / executable_name
@@ -278,6 +328,7 @@ def _find_executable(build_dir: Path, executable_name: str) -> Path:
 # ---------------------------------------------------------------------------
 # Single MPI run
 # ---------------------------------------------------------------------------
+
 
 def run_once(
     build_dir: Path,
@@ -329,7 +380,9 @@ def run_once(
     if cfg_in_cwd.exists():
         ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_in_cwd)
         if ckpt_dirs:
-            print("[runner] clearing VeloC checkpoint directories before run:", flush=True)
+            print(
+                "[runner] clearing VeloC checkpoint directories before run:", flush=True
+            )
             for d in ckpt_dirs:
                 print(f"  - {d}", flush=True)
             clear_checkpoint_dirs(ckpt_dirs)
@@ -349,8 +402,13 @@ def run_once(
         if veloc_lib:
             existing_ld = run_env.get("LD_LIBRARY_PATH", "")
             if veloc_lib not in existing_ld.split(":"):
-                run_env["LD_LIBRARY_PATH"] = f"{veloc_lib}:{existing_ld}" if existing_ld else veloc_lib
-                print(f"[runner] added {veloc_lib} to LD_LIBRARY_PATH for MPI run", flush=True)
+                run_env["LD_LIBRARY_PATH"] = (
+                    f"{veloc_lib}:{existing_ld}" if existing_ld else veloc_lib
+                )
+                print(
+                    f"[runner] added {veloc_lib} to LD_LIBRARY_PATH for MPI run",
+                    flush=True,
+                )
 
     mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
     cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
@@ -364,7 +422,11 @@ def run_once(
 
         # Start memory monitoring thread if requested.
         mem_thread = None
-        if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
+        if (
+            memory_monitor_fn
+            and memory_stop_event
+            and memory_samples_holder is not None
+        ):
             mem_thread = threading.Thread(
                 target=memory_monitor_fn,
                 args=(proc.pid, memory_samples_holder, memory_stop_event),
@@ -400,6 +462,7 @@ def run_once(
 # Failure injector launcher
 # ---------------------------------------------------------------------------
 
+
 def _start_failure_injector(
     target_parent_pid: int,
     executable_name: str,
@@ -424,10 +487,14 @@ def _start_failure_injector(
     cmd = [
         sys.executable,
         str(script_path),
-        "--parent-pid", str(target_parent_pid),
-        "--executable-name", executable_name,
-        "--flag-path", str(injection_flag_path),
-        "--delay-seconds", str(delay_seconds),
+        "--parent-pid",
+        str(target_parent_pid),
+        "--executable-name",
+        executable_name,
+        "--flag-path",
+        str(injection_flag_path),
+        "--delay-seconds",
+        str(delay_seconds),
     ]
     if nodes:
         cmd.extend(["--nodes", nodes])
@@ -440,6 +507,7 @@ def _start_failure_injector(
 # ---------------------------------------------------------------------------
 # VeloC checkpoint directory helpers
 # ---------------------------------------------------------------------------
+
 
 def extract_checkpoint_dirs_from_veloc_cfg(cfg_path: Path) -> list[Path]:
     """Parse a VeloC config file and return the scratch/persistent directories."""
@@ -504,9 +572,54 @@ def _copy_veloc_cfg(
             return
 
 
+def _symlink_input_data(
+    source_dir: Path,
+    build_dir: Path,
+    run_cwd: Path,
+    app_args: list[str],
+) -> None:
+    """Create symlinks in *run_cwd* for input data directories referenced by *app_args*.
+
+    Many applications reference input files via relative paths (e.g.
+    ``test/sedovsmall/sedovsmall.pnt``).  When the run CWD differs from the
+    source or build directory, these paths do not resolve.  This helper
+    identifies the top-level directory component of each arg that looks like a
+    relative path and, if a matching directory exists in the source tree (or
+    build tree, e.g. via an existing symlink), creates a symlink in the run CWD
+    so the application can find its input data.
+    """
+    if run_cwd == source_dir or run_cwd == build_dir:
+        return  # no symlink needed
+
+    for arg in app_args:
+        # Skip flags and absolute paths.
+        if arg.startswith("-") or os.path.isabs(arg):
+            continue
+        # Extract the top-level directory component (e.g. "test" from
+        # "test/sedovsmall/sedovsmall.pnt").
+        top = arg.split("/")[0].split(os.sep)[0]
+        if not top or top == "." or top == "..":
+            continue
+        link_dst = run_cwd / top
+        if link_dst.exists() or link_dst.is_symlink():
+            continue  # already present
+        # Prefer the source directory; fall back to the build directory (which
+        # may itself contain a symlink created by CMake).
+        for candidate_dir in (source_dir, build_dir):
+            candidate = candidate_dir / top
+            if candidate.exists() or candidate.is_symlink():
+                link_dst.symlink_to(candidate.resolve())
+                print(
+                    f"[runner] symlinked {link_dst} → {candidate.resolve()}",
+                    flush=True,
+                )
+                break
+
+
 # ---------------------------------------------------------------------------
 # Baseline run
 # ---------------------------------------------------------------------------
+
 
 def run_baseline(
     source_dir: Path,
@@ -520,6 +633,10 @@ def run_baseline(
     """Build and run the baseline (original) application once without failure injection."""
     configure_and_build(source_dir, build_dir, run_install=run_install)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure input data referenced by relative paths in app_args is accessible
+    # from the run CWD (which differs from the build directory).
+    _symlink_input_data(source_dir, build_dir, output_dir, app_args)
 
     result = run_once(
         build_dir=build_dir,
@@ -544,6 +661,7 @@ def run_baseline(
 # ---------------------------------------------------------------------------
 # Resilient run with failure injection and retry loop
 # ---------------------------------------------------------------------------
+
 
 def run_with_failure_injection(
     source_dir: Path,
@@ -603,11 +721,17 @@ def run_with_failure_injection(
     # Subsequent attempts within the same run intentionally reuse the
     # checkpoints written by the previous (killed) attempt — that is the
     # whole point of the resilience retry loop.
-    for cfg_candidate in (build_dir / veloc_config_name, source_dir / veloc_config_name):
+    for cfg_candidate in (
+        build_dir / veloc_config_name,
+        source_dir / veloc_config_name,
+    ):
         if cfg_candidate.exists():
             ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_candidate)
             if ckpt_dirs:
-                print("[runner] clearing VeloC checkpoint/scratch directories before run:", flush=True)
+                print(
+                    "[runner] clearing VeloC checkpoint/scratch directories before run:",
+                    flush=True,
+                )
                 for d in ckpt_dirs:
                     print(f"  - {d}", flush=True)
                 clear_checkpoint_dirs(ckpt_dirs)
@@ -642,6 +766,7 @@ def run_with_failure_injection(
         attempt_dir.mkdir(parents=True, exist_ok=True)
 
         _copy_veloc_cfg(source_dir, build_dir, attempt_dir, veloc_config_name)
+        _symlink_input_data(source_dir, build_dir, attempt_dir, app_args)
 
         stdout_path = attempt_dir / "stdout.txt"
         stderr_path = attempt_dir / "stderr.txt"
@@ -665,18 +790,27 @@ def run_with_failure_injection(
             if _vlib:
                 _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
                 if _vlib not in _existing_ld.split(":"):
-                    run_env["LD_LIBRARY_PATH"] = f"{_vlib}:{_existing_ld}" if _existing_ld else _vlib
+                    run_env["LD_LIBRARY_PATH"] = (
+                        f"{_vlib}:{_existing_ld}" if _existing_ld else _vlib
+                    )
 
         t0 = time.monotonic()
         with stdout_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
             mpi_proc = subprocess.Popen(
-                cmd, cwd=str(attempt_dir), stdout=out_f, stderr=err_f,
+                cmd,
+                cwd=str(attempt_dir),
+                stdout=out_f,
+                stderr=err_f,
                 env=run_env,
             )
 
         # Start per-attempt memory monitoring if requested.
         mem_thread = None
-        if memory_monitor_fn and memory_stop_event and memory_samples_holder is not None:
+        if (
+            memory_monitor_fn
+            and memory_stop_event
+            and memory_samples_holder is not None
+        ):
             memory_stop_event.clear()
             memory_samples_holder[0] = []
             mem_thread = threading.Thread(
@@ -740,7 +874,9 @@ def run_with_failure_injection(
             if success_output_filename:
                 src = attempt_dir / success_output_filename
                 if src.exists():
-                    shutil.copy2(src, output_dir / success_output_filename)
+                    dst = output_dir / success_output_filename
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
             print(
                 f"[runner] successful resilient run after {attempt} attempt(s) "
                 f"({total_injections} injection(s) total). Output saved under {output_dir}",
@@ -769,7 +905,9 @@ def run_with_failure_injection(
                 if success_output_filename:
                     src = attempt_dir / success_output_filename
                     if src.exists():
-                        shutil.copy2(src, output_dir / success_output_filename)
+                        dst = output_dir / success_output_filename
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
                 print(
                     f"[runner] run completed with exit 0 and no injection "
                     f"(injection_delay={injection_delay}s exceeded runtime). "
@@ -791,7 +929,10 @@ def run_with_failure_injection(
             # Clear checkpoint directories so the next attempt starts from
             # scratch instead of restoring from the completed checkpoint
             # (which would cause it to finish instantly again).
-            for cfg_candidate in (build_dir / veloc_config_name, source_dir / veloc_config_name):
+            for cfg_candidate in (
+                build_dir / veloc_config_name,
+                source_dir / veloc_config_name,
+            ):
                 if cfg_candidate.exists():
                     ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_candidate)
                     if ckpt_dirs:
@@ -810,6 +951,9 @@ def run_with_failure_injection(
                 flush=True,
             )
         else:
-            print("[runner] MPI run did not complete successfully; restarting.", flush=True)
+            print(
+                "[runner] MPI run did not complete successfully; restarting.",
+                flush=True,
+            )
 
         time.sleep(1.0)

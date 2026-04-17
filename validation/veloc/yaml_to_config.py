@@ -137,6 +137,13 @@ def main():
         print(get_comparison_flags(config))
     elif field == "build_cmd":
         print(config.get("build", {}).get("cmd", ""))
+    elif field == "ckpt_build_cmd":
+        ckpt = config.get("ckpt_build")
+        if ckpt:
+            print(ckpt.get("cmd", ""))
+        else:
+            # Fall back to vanilla build command
+            print(config.get("build", {}).get("cmd", ""))
     elif field == "run_cmd":
         full_cmd = run_cmd_raw.replace("{mpi_ranks}", str(mpi_ranks))
         print(full_cmd)

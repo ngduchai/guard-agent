@@ -47,12 +47,14 @@ from typing import Any
 # Result dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CompareResult:
     """Result of a single output comparison."""
+
     passed: bool
     method: str
-    score: float | None = None      # SSIM value, max-abs-diff, etc. (None for hash)
+    score: float | None = None  # SSIM value, max-abs-diff, etc. (None for hash)
     message: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -65,6 +67,7 @@ class CompareResult:
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
+
 
 class BaseComparator(ABC):
     """Abstract base class for all output comparators."""
@@ -95,6 +98,7 @@ class BaseComparator(ABC):
 # ---------------------------------------------------------------------------
 # Hash comparator
 # ---------------------------------------------------------------------------
+
 
 class HashComparator(BaseComparator):
     """SHA-256 byte-identical comparison."""
@@ -133,6 +137,7 @@ class HashComparator(BaseComparator):
 # ---------------------------------------------------------------------------
 # SSIM comparator
 # ---------------------------------------------------------------------------
+
 
 class SSIMComparator(BaseComparator):
     """Structural Similarity Index on an HDF5 dataset.
@@ -205,6 +210,7 @@ class SSIMComparator(BaseComparator):
     @staticmethod
     def _load_hdf5(path: Path, dataset: str):
         import h5py
+
         with h5py.File(path, "r") as f:
             if dataset not in f:
                 available = list(f.keys())
@@ -216,6 +222,7 @@ class SSIMComparator(BaseComparator):
     @staticmethod
     def _compute_ssim(arr1, arr2) -> float:
         from skimage.metrics import structural_similarity
+
         data_range = max(
             float(arr1.max() - arr1.min()),
             float(arr2.max() - arr2.min()),
@@ -235,6 +242,7 @@ class SSIMComparator(BaseComparator):
 # ---------------------------------------------------------------------------
 # Numeric tolerance comparator
 # ---------------------------------------------------------------------------
+
 
 class NumericToleranceComparator(BaseComparator):
     """Element-wise comparison with absolute and relative tolerance.
@@ -285,9 +293,7 @@ class NumericToleranceComparator(BaseComparator):
 
         abs_diff = np.abs(arr1.astype(float) - arr2.astype(float))
         max_abs_diff = float(abs_diff.max())
-        max_rel_diff = float(
-            (abs_diff / (np.abs(arr1.astype(float)) + 1e-300)).max()
-        )
+        max_rel_diff = float((abs_diff / (np.abs(arr1.astype(float)) + 1e-300)).max())
         passed = bool(np.allclose(arr1, arr2, atol=self.atol, rtol=self.rtol))
 
         return CompareResult(
@@ -310,27 +316,33 @@ class NumericToleranceComparator(BaseComparator):
     def _load(self, path: Path, np):
         if path.suffix in {".npy", ".npz"}:
             return np.load(path)
-        # Assume HDF5
+        # Try HDF5 first, fall back to text (np.loadtxt) for plain-text
+        # numeric files (e.g. .xy output from PENNANT).
         try:
             import h5py
+
+            with h5py.File(path, "r") as f:
+                if self.dataset not in f:
+                    available = list(f.keys())
+                    raise KeyError(
+                        f"Dataset {self.dataset!r} not found in {path}. "
+                        f"Available: {available}"
+                    )
+                return f[self.dataset][...]
         except ImportError:
-            raise RuntimeError(
-                "h5py is required for HDF5 numeric comparison. "
-                "Install with: pip install h5py"
-            )
-        with h5py.File(path, "r") as f:
-            if self.dataset not in f:
-                available = list(f.keys())
-                raise KeyError(
-                    f"Dataset {self.dataset!r} not found in {path}. "
-                    f"Available: {available}"
-                )
-            return f[self.dataset][...]
+            pass  # h5py not installed — fall through to text loader
+        except OSError:
+            pass  # Not a valid HDF5 file — fall through to text loader
+
+        # Fall back: load as a plain-text numeric file.
+        # np.loadtxt skips '#' comment lines by default.
+        return np.loadtxt(path)
 
 
 # ---------------------------------------------------------------------------
 # Text diff comparator
 # ---------------------------------------------------------------------------
+
 
 class TextDiffComparator(BaseComparator):
     """Line-by-line text diff.
@@ -352,7 +364,8 @@ class TextDiffComparator(BaseComparator):
 
         diff = list(
             difflib.unified_diff(
-                lines1, lines2,
+                lines1,
+                lines2,
                 fromfile=str(baseline_path),
                 tofile=str(resilient_path),
                 lineterm="",
@@ -371,14 +384,14 @@ class TextDiffComparator(BaseComparator):
         if not self.ignore_patterns:
             return lines
         return [
-            ln for ln in lines
-            if not any(pat in ln for pat in self.ignore_patterns)
+            ln for ln in lines if not any(pat in ln for pat in self.ignore_patterns)
         ]
 
 
 # ---------------------------------------------------------------------------
 # Custom plugin comparator
 # ---------------------------------------------------------------------------
+
 
 class CustomPluginComparator(BaseComparator):
     """Load a user-supplied Python file and call its ``compare()`` function.
@@ -399,7 +412,9 @@ class CustomPluginComparator(BaseComparator):
 
     @staticmethod
     def _load_plugin(plugin_path: Path):
-        spec = importlib.util.spec_from_file_location("_veloc_custom_comparator", plugin_path)
+        spec = importlib.util.spec_from_file_location(
+            "_veloc_custom_comparator", plugin_path
+        )
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load plugin from {plugin_path}")
         module = importlib.util.module_from_spec(spec)

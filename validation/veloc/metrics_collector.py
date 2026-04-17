@@ -741,6 +741,8 @@ def run_benchmark_sweep(
     dmtcp_executable_name: str | None = None,
     dmtcp_coord_base_port: int = 7800,
     extra_approaches: list[ApproachConfig] | None = None,
+    original_build_cmd: str | None = None,
+    resilient_build_cmd: str | None = None,
 ) -> BenchmarkResults:
     """Execute all scenarios for all codebases and collect RunMetrics.
 
@@ -834,9 +836,12 @@ def run_benchmark_sweep(
 
     # Build all codebases once before the sweep.
     print("[metrics] building original codebase...", flush=True)
-    configure_and_build(original_source_dir, original_build_dir)
+    configure_and_build(original_source_dir, original_build_dir,
+                        build_cmd=original_build_cmd)
     print("[metrics] building resilient codebase...", flush=True)
-    configure_and_build(resilient_source_dir, resilient_build_dir, run_install=install_resilient)
+    configure_and_build(resilient_source_dir, resilient_build_dir,
+                        run_install=install_resilient if not resilient_build_cmd else False,
+                        build_cmd=resilient_build_cmd)
 
     # Build approach codebases and resolve their build dirs.
     # If MANA is available, build DMTCP approaches with MANA stub so
