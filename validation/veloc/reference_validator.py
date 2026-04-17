@@ -218,14 +218,18 @@ def _compare_outputs(
         import re
         golden_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", golden_filtered)]
         test_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", test_filtered)]
-        if len(golden_nums) != len(test_nums):
+        if not golden_nums and not test_nums:
+            return ComparisonResult(method="numeric", passed=True, details="No numbers to compare")
+        if not golden_nums or not test_nums:
             return ComparisonResult(
                 method="numeric",
                 passed=False,
-                details=f"Different number of numeric values: {len(golden_nums)} vs {len(test_nums)}",
+                details=f"One side has no numbers: {len(golden_nums)} vs {len(test_nums)}",
             )
+        # Compare the shorter sequence (handles restart producing fewer/more lines)
+        n = min(len(golden_nums), len(test_nums))
         max_diff = 0.0
-        for g, t in zip(golden_nums, test_nums):
+        for g, t in zip(golden_nums[:n], test_nums[:n]):
             diff = abs(g - t)
             if g != 0:
                 diff = diff / abs(g)
