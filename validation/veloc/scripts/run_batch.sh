@@ -64,12 +64,12 @@ EXTRA_ARGS=""
 # Only apps with native checkpoint/restart in their reference code.
 ALL_APPS_ORDERED=(
   CoMD miniVite CLAMR SW4lite Athena++
-  LAMMPS SU2 SAMRAI AMReX WarpX
+  LAMMPS SAMRAI WarpX
 )
 
 FAST_APPS=(CoMD miniVite CLAMR SW4lite Athena++)
-MEDIUM_APPS=(LAMMPS SU2)
-HEAVY_APPS=(SAMRAI AMReX WarpX)
+MEDIUM_APPS=(LAMMPS SAMRAI)
+HEAVY_APPS=(WarpX)
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do

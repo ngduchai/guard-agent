@@ -110,6 +110,8 @@ def _run_with_kill(
     restart = (restart_cmd or run_cmd).replace("{mpi_ranks}", str(mpi_ranks))
 
     # Phase 1: Start and kill
+    import os
+    import signal
     try:
         start = time.monotonic()
         proc = subprocess.Popen(
@@ -118,28 +120,38 @@ def _run_with_kill(
             cwd=str(build_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,  # create new process group
         )
         time.sleep(kill_after)
-        proc.kill()
+        # Kill the entire process group (shell + MPI processes)
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         proc.wait(timeout=10)
     except Exception:
         pass
+    # Clean up any zombie MPI processes
+    subprocess.run("pkill -9 -f 'mpirun|orted' 2>/dev/null || true",
+                    shell=True, timeout=5)
 
     # Phase 2: Restart (potentially different command)
+    # Use temp files for stdout/stderr to avoid pipe buffer deadlock
+    # with apps that produce large output (e.g. SAMRAI per-step logging).
+    stdout_file = build_dir / "_restart_stdout.txt"
+    stderr_file = build_dir / "_restart_stderr.txt"
     try:
-        result = subprocess.run(
-            restart,
-            shell=True,
-            cwd=str(build_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with open(stdout_file, "w") as fout, open(stderr_file, "w") as ferr:
+            result = subprocess.run(
+                restart,
+                shell=True,
+                cwd=str(build_dir),
+                stdout=fout,
+                stderr=ferr,
+                timeout=timeout,
+            )
         elapsed = time.monotonic() - start
         return RunResult(
             exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=stdout_file.read_text(),
+            stderr=stderr_file.read_text(),
             elapsed_s=elapsed,
             injected=True,
             num_attempts=2,
@@ -149,7 +161,7 @@ def _run_with_kill(
         elapsed = time.monotonic() - start
         return RunResult(
             exit_code=-1,
-            stdout="",
+            stdout=stdout_file.read_text() if stdout_file.exists() else "",
             stderr=f"Restart timed out after {timeout}s",
             elapsed_s=elapsed,
             injected=True,
