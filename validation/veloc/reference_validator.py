@@ -63,29 +63,32 @@ def _run_app(
 ) -> RunResult:
     """Run an MPI application and capture output."""
     cmd = run_cmd.replace("{mpi_ranks}", str(mpi_ranks))
+    stdout_file = build_dir / "_run_stdout.txt"
+    stderr_file = build_dir / "_run_stderr.txt"
 
     try:
         start = time.monotonic()
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=str(build_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with open(stdout_file, "w") as fout, open(stderr_file, "w") as ferr:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=str(build_dir),
+                stdout=fout,
+                stderr=ferr,
+                timeout=timeout,
+            )
         elapsed = time.monotonic() - start
         return RunResult(
             exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=stdout_file.read_text(errors="replace"),
+            stderr=stderr_file.read_text(errors="replace"),
             elapsed_s=elapsed,
             output_dir=build_dir,
         )
     except subprocess.TimeoutExpired:
         return RunResult(
             exit_code=-1,
-            stdout="",
+            stdout=stdout_file.read_text(errors="replace") if stdout_file.exists() else "",
             stderr=f"Process timed out after {timeout} seconds",
             elapsed_s=float(timeout),
             output_dir=build_dir,
