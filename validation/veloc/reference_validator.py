@@ -150,8 +150,8 @@ def _run_with_kill(
         elapsed = time.monotonic() - start
         return RunResult(
             exit_code=result.returncode,
-            stdout=stdout_file.read_text(),
-            stderr=stderr_file.read_text(),
+            stdout=stdout_file.read_text(errors="replace"),
+            stderr=stderr_file.read_text(errors="replace"),
             elapsed_s=elapsed,
             injected=True,
             num_attempts=2,
@@ -161,7 +161,7 @@ def _run_with_kill(
         elapsed = time.monotonic() - start
         return RunResult(
             exit_code=-1,
-            stdout=stdout_file.read_text() if stdout_file.exists() else "",
+            stdout=stdout_file.read_text(errors="replace") if stdout_file.exists() else "",
             stderr=f"Restart timed out after {timeout}s",
             elapsed_s=elapsed,
             injected=True,

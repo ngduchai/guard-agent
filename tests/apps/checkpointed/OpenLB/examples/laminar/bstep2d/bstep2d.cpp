@@ -342,7 +342,7 @@ int main(int argc, char* argv[])
   MyCase::ParametersD myCaseParameters;
   {
     using namespace olb::parameters;
-    myCaseParameters.set<RESOLUTION>(60);
+    myCaseParameters.set<RESOLUTION>(20);
     myCaseParameters.set<LATTICE_RELAXATION_TIME>(0.518);
     myCaseParameters.set<PHYS_LENGTH_OF_STEP>(0.2);
     myCaseParameters.set<PHYS_HEIGHT_OF_STEP>(0.0049);
