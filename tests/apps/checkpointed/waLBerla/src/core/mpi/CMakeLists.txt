@@ -1,0 +1,45 @@
+target_sources( walberla_core
+        PUBLIC
+        Broadcast.h
+        BufferDataTypeExtensions.h
+        BufferSizeTrait.h
+        BufferSystem.h
+        BufferSystem.impl.h
+        BufferSystemHelper.h
+        BufferSystemHelper.impl.h
+        CMakeLists.txt
+        Datatype.h
+        Environment.h
+        Gather.h
+        Gatherv.h
+        MPIHelper.h
+        BufferIO.h
+        MPIManager.h
+        MPIOperation.h
+        MPITextFile.h
+        MPIWrapper.h
+        OpenMPBufferSystem.h
+        OpenMPBufferSystem.impl.h
+        Operation.h
+        RecvBuffer.h
+        Reduce.h
+        SendBuffer.h
+        SetReduction.h
+        Tokenizing.h
+        all.h
+        growPolicies/ConstantGrowth.h
+        growPolicies/LinearGrowth.h
+        growPolicies/OptimalGrowth.h
+)
+
+target_sources( walberla_core
+        PRIVATE
+        CMakeLists.txt
+        Gatherv.cpp
+        MPIHelper.cpp
+        BufferIO.cpp
+        MPIManager.cpp
+        MPITextFile.cpp
+        MPIWrapper.cpp
+        Tokenizing.cpp
+)

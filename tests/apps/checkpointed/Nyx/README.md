@@ -1,127 +1,92 @@
-# HPCCG
-High Performance Computing Conjugate Gradients:  The original Mantevo miniapp
-------------------------------------------------
-Description:
-------------------------------------------------
-HPCCG: A simple conjugate gradient benchmark code for a 3D chimney 
-domain on an arbitrary number of processors.
-
-Author: Michael A. Heroux, Sandia National Laboratories (maherou@sandia.gov)
-
-This simple benchmark code is a self-contained piece of C++ software 
-that generates a 27-point finite difference matrix with a user-prescribed 
-sub-block size on each processor.
-
-It is implemented to be very scalable (in a weak sense).  Any 
-reasonable parallel computer should be able to achieve excellent 
-scaled speedup (weak scaling).  
-
-Kernel performance should be reasonable, but no attempts have been made
-to provide special kernel optimizations.
-
-------------------------------------------------
-Compiling the code:
-------------------------------------------------
-
-There is a simple Makefile that should be easily modified for most 
-Unix-like environments.  There are also a few Makefiles with extensions 
-that indicate the target machine and compilers. Read the Makefile for 
-further instructions.  If you generate a Makefile for your platform 
-and care to share it, please send it to the author.
-
-By default the code compiles with MPI support and can be run on one 
-or more processors.  If you don't have MPI, or want to compile without 
-MPI support, you may change the definition of USE_MPI in the 
-makefile, or use make as follows:
-
-`make USE_MPI=`
-
-To remove all output files, type:
-
-`make clean`
-
-------------------------------------------------
-Running the code:
-------------------------------------------------
-
-Usage:
-
-`test_HPCCG nx ny nz` (serial mode)
-
-`mpirun -np numproc test_HPCCG nx ny nz` (MPI mode)
-
-where nx, ny, nz are the number of nodes in the x, y and z 
-dimension respectively on a each processor.
-The global grid dimensions will be nx, ny and numproc * nz.  
-In other words, the domains are stacked in the z direction.
-
-Example:
-
-`mpirun -np 16 ./test_HPCCG 20 30 10`
-
-This will construct a local problem of dimension 20-by-30-by-10 
-whose global problem has dimension 20-by-30-by-160.
-
---------------------
-Using OpenMP and MPI
---------------------
-
-The values of nx, ny and nz are the local problem size.  The global size
-is nx-by-ny-by-(nz * number of MPI ranks).
-
-The number of OpenMP threads is defined by the standard OpenMP mechanisms.
-Typically this value defaults to the maximum number of reasonable threads a
-compute node can support.  The number of threads can be modified by defining
-the environment variable OMP_NUM_THREADS. 
-To set the number of threads to 4:
-
-In tcsh or csh: `setenv OMP_NUM_THREADS 4`
-In sh or bash: `export OMP_NUM_THREADS=4`
-
-You can also define it when executing the run of HPCCG:
-
-`ENV OMP_NUM_THREADS=4 mpirun -np 16 ./test_HPCCG 50 50 50`
-
----------------------------------
-What size problem is a good size?
----------------------------------
-
-I think the best way to give this guidance is to pick the problems so that 
-the data size is over a range from 25% of total system memory up to 75%.
-
-If nx=ny=nz and n = nx * ny * nz, local to each MPI rank, then the number of bytes 
-used for each rank works like this:
-
-Matrix storage: 336 * n bytes total (27 pt stencil), 96 * n bytes total (7 pt stencil)
-27 * n  or 7 * n, 12 bytes per nonzero: 324 * n bytes total or 84 * n bytes total
-n pointers for start of rows, 8 bytes per pointer: 8 * n bytes total
-n integers for nnz per row: 4 * n bytes.
-
-Preconditioner: Roughly same as matrix
-
-Algorithm vectors: 48 * n bytes total
-6 * n double vectors
-
-Total memory per MPI rank:720 * n bytes for 27 pt stencil, 240 * n bytes for 7 pt stencil.
-
-On an 16GB system with 4 MPI ranks running with the 27 pt stencil: 
-- 25% of the memory would allow 1GB per MPI rank.  
-  n would approximately be 1GB/720, so 1.39M and nx=ny=nz=100.
-
-- 75% of the memory would allow 3GB per MPI rank.  
-  n would approximately be 3GB/720, so 4.17M and nx=ny=nz=161.
-
-Alternate usage:
-
-There is an alternate mode that allows specification of a data 
-file containing a general sparse matrix.  This usage is deprecated.  
-Please contact the author if you have need for this more general case.
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.5059767.svg)](https://doi.org/10.5281/zenodo.5059767)
+[![DOI](https://joss.theoj.org/papers/10.21105/joss.03068/status.svg)](https://doi.org/10.21105/joss.03068)
+[![AMReX](https://amrex-codes.github.io/badges/powered%20by-AMReX-red.svg)](https://amrex-codes.github.io)
 
 
--------------------------------------------------
-Changing the sparse matrix structure:
--------------------------------------------------
+![Nyx](https://github.com/AMReX-Astro/Nyx/blob/development/Util/banner.jpeg)
 
-HPCCG supports two sparse matrix data structures: a 27-pt 3D grid based
-structure and a 7-pt 3D grid based structure.  To switch between the two
-change the bool value for use_7pt_stencil in generate_matrix.cpp.
+*An adaptive mesh, massively-parallel, cosmological simulation code*
+
+******
+
+## About
+
+Nyx code solves equations of compressible hydrodynamics on an adaptive grid
+hierarchy coupled with an N-body treatment of dark matter. The gas dynamics in
+Nyx uses a finite volume methodology on a set of 3-D Eulerian grids;
+dark matter is represented as discrete particles moving under the influence of
+gravity. Particles are evolved via a particle-mesh method, using Cloud-in-Cell
+deposition/interpolation scheme. Both baryonic and dark matter contribute to
+the gravitational field. In addition, Nyx includes physics needed to
+accurately model the intergalactic medium: in optically thin limit and assuming
+ionization equilibrium, the code calculates heating and cooling processes of the
+primordial-composition gas in an ionizing ultraviolet background radiation field.
+Additional physics capabilities are under development.
+
+While Nyx can run on any Linux system in general, we particularly focus on supercomputer systems.
+Nyx is parallelized with MPI + X, where X can be OpenMP on multicore architectures and
+CUDA/HIP/DPC++ on hybrid CPU/GPU architectures.
+In the OpenMP regime, Nyx has been successfully run at parallel concurrency
+of up to 2,097,152 on NERSC's Cori-KNL. With Cuda implementation, it was run on up to
+13,824 GPUs on OLCF's Summit.
+
+More information on Nyx can be found at the [main web page](http://amrex-astro.github.io/Nyx/) and
+the [online documentation](https://amrex-astro.github.io/Nyx/docs_html/).
+
+## Standards and dependencies
+
+To compile the code we require C++11 compliant compilers that support MPI-2 or
+higher implementation.  If threads or accelerators are used, we require 
+OpenMP 4.5 or higher, Cuda 9 or higher, or HIP-Clang.
+To use Nyx, you also need [AMReX](https://github.com/AMReX-codes/amrex).
+
+For example, to compile the Lyman alpha (LyA) executable on Summit:
+```sh
+$ module load gcc/6.4.0 cuda/11.0.3
+
+$ git clone https://github.com/AMReX-Codes/amrex.git
+$ git clone https://github.com/AMReX-astro/Nyx.git
+
+$ cd Nyx/Exec/LyA
+$ make -j 12 USE_CUDA=TRUE
+```
+
+See the [Getting Started section](https://amrex-astro.github.io/Nyx/docs_html/NyxGettingStarted.html) for more information.
+
+## Development model
+
+Please see CONTRIBUTING.md for details on how to contribute to AMReX.
+
+## Outputs
+
+Nyx outputs certain global diagnostics at each timestep and plot files at regular
+intervals, or at user-specified redshifts. Visualization packages
+[VisIt](https://wci.llnl.gov/simulation/computer-codes/visit),
+[Paraview](https://www.paraview.org/),
+[yt](http://yt-project.org/),
+and [Amrvis](https://github.com/AMReX-Codes/amrvis)
+have built-in support for the AMReX file format used by Nyx.
+
+In addition, Nyx interfaces with two post-processing suites, Reeber and Gimlet. Reeber
+uses topological methods to construct merge trees of scalar fields, which is in
+turn used to find halos.  Gimlet computes a variety of quantities
+related to the Lyman-alpha forest science.  These suites are fully MPI-parallel and can
+be run either *in situ* or in-transit, or with a combination of both
+(see [Friesen et al. 2016](https://comp-astrophys-cosmol.springeropen.com/articles/10.1186/s40668-016-0017-2)).
+
+## License
+
+Nyx Copyright (c) 2017, The Regents of the University of California,
+through Lawrence Berkeley National Laboratory (subject to receipt of
+any required approvals from the U.S. Dept. of Energy).  All rights
+reserved.
+
+Details of the license can be found in [license.txt](license.txt) file.
+
+If you have questions about your rights to use or distribute this software, 
+please contact Berkeley Lab's Innovation & Partnerships Office at IPO@lbl.gov.
+
+## Contact
+
+For questions, comments, suggestions, contact Jean Sexton (JMSexton@lbl.gov)
+or Zarija Lukic (zarija@lbl.gov).

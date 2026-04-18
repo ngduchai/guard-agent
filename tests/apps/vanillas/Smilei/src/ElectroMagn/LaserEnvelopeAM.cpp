@@ -1,0 +1,616 @@
+
+#include "LaserEnvelope.h"
+
+#include "Params.h"
+#include "Patch.h"
+#include "cField2D.h"
+#include "Field2D.h"
+#include "ElectroMagn.h"
+#include "Profile.h"
+#include "ElectroMagnFactory.h"
+#include "EnvelopeBC.h"
+#include "EnvelopeBC_Factory.h"
+#include <complex>
+#include "SimWindow.h"
+
+
+using namespace std;
+
+LaserEnvelopeAM::LaserEnvelopeAM( Params &params, Patch *patch )
+    : LaserEnvelope( params, patch )
+{
+
+    one_ov_dl_sq    = 1./cell_length[0]/cell_length[0];
+    one_ov_2dl      = 1./2./cell_length[0];
+    one_ov_dr_sq    = 1./cell_length[1]/cell_length[1];
+    one_ov_2dr      = 1./2./cell_length[1];
+    dr              = cell_length[1];
+
+    std::vector<unsigned int>  dimPrim( params.nDim_field );
+    // Dimension of the primal and dual grids
+    for( size_t i=0 ; i<params.nDim_field ; i++ ) {
+        // Standard scheme
+        dimPrim[i] = params.patch_size_[i]+1;
+        // + Ghost domain
+        dimPrim[i] += 2*params.oversize[i];
+    }
+    
+    
+    A_  = new cField2D( dimPrim, "A_mode_1" );   //It's actually a mode 0 but the name is just a trick to fool Happi.
+    A0_ = new cField2D( dimPrim, "Aold_mode_1" );
+    
+    Phi_         = new Field2D( dimPrim, "Phi_mode_0" );
+    Phi_m        = new Field2D( dimPrim, "Phi_m_mode_0" );
+    
+    GradPhil_    = new Field2D( dimPrim, "GradPhil_mode_0" );
+    GradPhil_m   = new Field2D( dimPrim, "GradPhil_m_mode_0" );
+    
+    GradPhir_    = new Field2D( dimPrim, "GradPhir_mode_0" );
+    GradPhir_m   = new Field2D( dimPrim, "GradPhir_m_mode_0" );
+
+    // in cylindrical symmetry the gradient along theta is zero
+    
+    
+}
+
+
+LaserEnvelopeAM::LaserEnvelopeAM( LaserEnvelope *envelope, Patch *patch, Params &params, unsigned int n_moved )
+    : LaserEnvelope( envelope, patch, params, n_moved )
+{
+    A_           = new cField2D( envelope->A_->dims_, "A_mode_1" );//It's actually a mode 0 but the name is just a trick to fool Happi.
+    A0_          = new cField2D( envelope->A0_->dims_, "Aold_mode_1" );
+    
+    Phi_         = new Field2D( envelope->Phi_->dims_ );
+    Phi_m        = new Field2D( envelope->Phi_m->dims_ );
+    
+    GradPhil_    = new Field2D( envelope->GradPhil_->dims_ );
+    GradPhil_m   = new Field2D( envelope->GradPhil_m->dims_ );
+    
+    GradPhir_    = new Field2D( envelope->GradPhir_->dims_ );
+    GradPhir_m   = new Field2D( envelope->GradPhir_m->dims_ );
+ 
+    // in cylindrical symmetry the gradient along theta is zero
+    
+}
+
+
+void LaserEnvelopeAM::initEnvelopeInsideTheWindow( Patch *patch, ElectroMagn *EMfields )
+{
+    cField2D *A2Dcyl          = static_cast<cField2D *>( A_ );
+    cField2D *A02Dcyl         = static_cast<cField2D *>( A0_ );
+    Field2D *Env_Aabs2Dcyl    = static_cast<Field2D *>( EMfields->Env_A_abs_ );
+    Field2D *Env_Eabs2Dcyl    = static_cast<Field2D *>( EMfields->Env_E_abs_ );
+    Field2D *Env_Exabs2Dcyl   = static_cast<Field2D *>( EMfields->Env_Ex_abs_ );
+    
+    Field2D *Phi2Dcyl         = static_cast<Field2D *>( Phi_ );
+    Field2D *Phi_m2Dcyl       = static_cast<Field2D *>( Phi_m );
+    
+    Field2D *GradPhil2Dcyl    = static_cast<Field2D *>( GradPhil_ );
+    Field2D *GradPhil_m2Dcyl  = static_cast<Field2D *>( GradPhil_m );
+    
+    Field2D *GradPhir2Dcyl    = static_cast<Field2D *>( GradPhir_ );
+    Field2D *GradPhir_m2Dcyl  = static_cast<Field2D *>( GradPhir_m );
+
+    bool isYmin = ( static_cast<ElectroMagnAM *>( EMfields ) )->isYmin;
+    //int  j_glob = ( static_cast<ElectroMagnAM *>( EMfields ) )->j_glob_;
+    
+    
+    vector<double> position( 2, 0 );
+    double t;
+    double t_previous_timestep;    
+    
+    // position[0]: x coordinate
+    // position[1]: r coordinate
+    // t: time coordinate --> x/c for the envelope initialization
+    
+    position[0]           = cell_length[0]*( ( double )( patch->getCellStartingGlobalIndex( 0 ) )+( A2Dcyl->isDual( 0 )?-0.5:0. ) );
+    t                     = position[0];          // x-ct     , t=0
+    t_previous_timestep   = position[0]+timestep; // x-c(t-dt), t=0
+    double pos1 = cell_length[1]*( ( double )( patch->getCellStartingGlobalIndex( 1 ) )+( A2Dcyl->isDual( 1 )?-0.5:0. ) );
+    
+    // UNSIGNED INT LEADS TO PB IN PERIODIC BCs
+    for( unsigned int i=0 ; i<A_->dims_[0] ; i++ ) { // x loop
+        position[1] = pos1;
+        for( unsigned int j=0 ; j<A_->dims_[1] ; j++ ) { // r loop
+            // init envelope through Python function
+            ( *A2Dcyl )( i, j )      += profile_->complexValueAt( position, t );
+            ( *A02Dcyl )( i, j )     += profile_->complexValueAt( position, t_previous_timestep );
+            
+            // |A|
+            ( *Env_Aabs2Dcyl )( i, j )= std::abs( ( *A2Dcyl )( i, j ) );
+            // |E envelope| = |-(dA/dt-ik0cA)|
+            ( *Env_Eabs2Dcyl )( i, j )= std::abs( ( ( *A2Dcyl )( i, j )-( *A02Dcyl )( i, j ) )/timestep - i1*omega*( *A2Dcyl )( i, j ) );
+            // compute ponderomotive potential at timestep n
+            ( *Phi2Dcyl )( i, j )     = ellipticity_factor*std::abs( ( *A2Dcyl )( i, j ) ) * std::abs( ( *A2Dcyl )( i, j ) ) * 0.5;
+            // compute ponderomotive potential at timestep n-1
+            ( *Phi_m2Dcyl )( i, j )   = ellipticity_factor*std::abs( ( *A02Dcyl )( i, j ) ) * std::abs( ( *A02Dcyl )( i, j ) ) * 0.5;
+            // interpolate in time
+            ( *Phi_m2Dcyl )( i, j )   = 0.5*( ( *Phi_m2Dcyl )( i, j )+( *Phi2Dcyl )( i, j ) );
+            
+            position[1] += cell_length[1];
+        } // end y loop
+        position[0]          += cell_length[0];
+        t                     = position[0];
+        t_previous_timestep   = position[0]+timestep;
+    } // end x loop
+    
+    // Compute gradient of ponderomotive potential and |Ex|
+    for( unsigned int i=1 ; i<A_->dims_[0]-1 ; i++ ) { // x loop
+        for( unsigned int j=std::max(isYmin*3,1) ; j<A_->dims_[1]-1 ; j++ ) { // r loop
+            // gradient in x direction
+            ( *GradPhil2Dcyl )( i, j ) = ( ( *Phi2Dcyl )( i+1, j )-( *Phi2Dcyl )( i-1, j ) ) * one_ov_2dl;
+            ( *GradPhil_m2Dcyl )( i, j ) = ( ( *Phi_m2Dcyl )( i+1, j )-( *Phi_m2Dcyl )( i-1, j ) ) * one_ov_2dl;
+            // gradient in thet direction
+            ( *GradPhir2Dcyl )( i, j ) = ( ( *Phi2Dcyl )( i, j+1 )-( *Phi2Dcyl )( i, j-1 ) ) * one_ov_2dr;
+            ( *GradPhir_m2Dcyl )( i, j ) = ( ( *Phi_m2Dcyl )( i, j+1 )-( *Phi_m2Dcyl )( i, j-1 ) ) * one_ov_2dr;
+
+            // in cylindrical symmetry the gradient along theta is zero
+
+            // |Ex envelope| = |-dA/dr|, central finite difference for the space derivative  
+            ( *Env_Exabs2Dcyl )( i, j ) =  std::abs( (( *A2Dcyl )( i, j+1)-( *A2Dcyl )( i, j-1) )*one_ov_2dr );
+
+        } // end r loop
+    } // end l loop
+    
+    // 
+    if (isYmin){ // axis BC
+        for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+            unsigned int j = 2;  // j_p=2 corresponds to r=0    
+            ( *Phi2Dcyl )      ( i, j )   = ellipticity_factor*std::abs( ( *A2Dcyl )( i, j ) ) * std::abs( ( *A2Dcyl )( i, j ) ) * 0.5;  
+            ( *Env_Aabs2Dcyl ) ( i, j )   = std::abs( ( *A2Dcyl )( i, j ) );
+            ( *Env_Exabs2Dcyl )( i, j )   = 0.;
+            // Axis BC on |A|
+            ( *Env_Aabs2Dcyl )( i, j-1 )  = ( *Env_Aabs2Dcyl )( i, j+1 );
+            ( *Env_Aabs2Dcyl )( i, j-2 )  = ( *Env_Aabs2Dcyl )( i, j+2 );
+            // Axis BC on |E|
+            ( *Env_Eabs2Dcyl )( i, j-1 )  = ( *Env_Eabs2Dcyl )( i, j+1 );
+            ( *Env_Eabs2Dcyl )( i, j-2 )  = ( *Env_Eabs2Dcyl )( i, j+2 );
+            // Axis BC on |Ex|
+            ( *Env_Exabs2Dcyl )( i, j-1 ) = ( *Env_Eabs2Dcyl )( i, j+1 );
+            ( *Env_Exabs2Dcyl )( i, j-2 ) = ( *Env_Eabs2Dcyl )( i, j+2 );
+            
+                  
+        } // end l loop
+    }
+}
+
+void LaserEnvelopeAM::injectEnvelopeFromXmin( Patch *patch, Params &params, double time_dual )
+{
+  
+    cField2D *A2D                 = static_cast<cField2D *>( A_ );
+    cField2D *A02D                = static_cast<cField2D *>( A0_ );
+
+    double t                      = time_dual;          // x-ct     , t=0
+    double t_previous_timestep    = time_dual-timestep; // x-c(t-dt), t=0
+
+    vector<double>  position( 1, 0 );
+    //position[0] = cell_length[0]*( ( double )( patch->getCellStartingGlobalIndex( 0 ) )+( A_->isDual( 0 )?-0.5:0. ) + 1 );
+    double pos1 = cell_length[1]*( ( double )( patch->getCellStartingGlobalIndex( 1 ) )+( A_->isDual( 1 )?-0.5:0. ) );
+
+    // oversize
+    int oversize_                 = params.oversize[0];
+
+
+    bool inject_envelope_from_this_patch = ( patch->isBoundary(0) ) && (  patch->isXmin() );
+    bool isYmin = patch->isYmin();
+    
+    // Impose the envelope value for x=0 at time t and t-dt 
+    if ( inject_envelope_from_this_patch ){
+        position[0] = pos1;
+        for( unsigned int j=0 ; j<A_->dims_[1] ; j++ ) { 
+            ( *A2D  )( oversize_-1, j )  = profile_->complexValueAt( position, t );
+            ( *A02D )( oversize_-1, j )  = profile_->complexValueAt( position, t_previous_timestep );
+            position[0] += cell_length[1];
+        }
+        
+        if (isYmin){ // axis BC
+            unsigned int j = 2;  // j_p=2 corresponds to r=0    
+            ( *A2D  )( oversize_-1, j-1 )  = ( *A2D  )( oversize_-1, j+1 );
+            ( *A02D )( oversize_-1, j-2 )  = ( *A02D )( oversize_-1, j+2 );  
+        }
+        
+        if (envelope_solver=="explicit_reduced_dispersion"){
+            // This solver needs another point on the x direction, for one timestep, as initial condition. 
+            // This value will be found by locally solving the envelope wave equation.
+          
+            // Adapting the approach by C. Benedetti described in 
+            // F. Massimo et al., PPCF 2025 https://doi.org/10.1088/1361-6587/addc97,
+            // the second order derivatives in time and longitudinal coordinate are neglected
+            // under the paraxial and slowly varying envelope approximation.
+          
+            // The resulting envelope equation, that will be discretized with first order derivatives, is 
+            // \nabla^2_\perp A + 2*i*(dA/dl+dA/dt) = 0.
+            
+            int  j_glob = ( static_cast<ElectroMagnAM *>( patch->EMfields ) )->j_glob_;
+            
+            // from A^n_i and A^(n-1)_i, we find A^n_{i-1}
+            for( unsigned int j=std::max(3*isYmin,1) ; j<A_->dims_[1]-1 ; j++ ) { 
+            
+                // A^n_{i-1} = A^n_i
+                ( *A2D  )( oversize_-2, j )  = ( *A2D  )( oversize_-1, j );
+                // A^n_{i-1}+= dl/dt*(A^{n+1}_i-A^{n}_i), until here it is like an upwind scheme for the advection equation
+                ( *A2D  )( oversize_-2, j ) += cell_length[0]/timestep*( ( *A2D  )( oversize_-1, j   )-   ( *A02D)( oversize_-1, j ));
+                // A^n_{i-1}+=dl/(2i) * (\nabla^2_\perp A)|^n_i
+                ( *A2D  )( oversize_-2, j ) += (cell_length[0]/2./i1) *( ( *A2D  )( oversize_-1, j-1 )-2.*( *A2D )( oversize_-1, j )+( *A2D )( oversize_-1, j+1 ) )*one_ov_dr_sq; // r part
+                ( *A2D  )( oversize_-2, j ) += (cell_length[0]/2./i1) *( ( *A2D  )( oversize_-1, j+1 )-   ( *A2D )( oversize_-1, j-1 ) ) * one_ov_2dr / ( ( double )( j_glob+j )*dr ); // r part 
+            
+            } // end j loop
+            
+            if (isYmin){ // axis BC
+                unsigned int j = 2;  // j_p=2 corresponds to r=0 
+            
+                // here the transverse laplacian has a different discretization,
+                // otherwise, the integration is the same   
+                // A^n_{i-1} = A^n_i
+                ( *A2D  )( oversize_-2, j   )  = ( *A2D  )( oversize_-1, j );
+                // A^n_{i-1}+=dl/(2i) * (\nabla^2_\perp A)|^n_i
+                ( *A2D  )( oversize_-2, j   ) += (cell_length[0]/2./i1)*4.*( ( *A2D )( oversize_-1, j+1 )-( *A2D  )( oversize_-1, j ) ) * one_ov_dr_sq; // r part
+                
+                // boundary condition reflection below the axis
+                ( *A2D  )( oversize_-2, j-1 )  = ( *A2D  )( oversize_-2, j+1 );
+            
+            } // end axis BC
+            
+        }  // end if envelope_solver=="explicit_reduced_dispersion"
+          
+    } // end inject_envelope_from_this_patch
+    
+    
+      
+}
+
+LaserEnvelopeAM::~LaserEnvelopeAM()
+{
+}
+
+void LaserEnvelopeAM::updateEnvelope( Patch *patch )
+{
+    //// solves envelope equation in lab frame (see doc):
+    // full_laplacian(A)+2ik0*(dA/dl+(1/c)*dA/dt)-d^2A/dt^2*(1/c^2)=Chi*A
+    // where Chi is the plasma susceptibility [= sum(q^2*rho/mass/gamma_ponderomotive) for all species]
+    // gamma_ponderomotive=sqrt(1+p^2+|A|^2/2) in normalized units
+    
+    // the following explicit finite difference scheme is obtained through centered finite difference derivatives
+    // e.g. (dA/dl) @ time n and indices ij = (A^n    _{i+1,j} - A^n    _{i-1,j}) /2/dl
+    //      (dA/dt) @ time n and indices ij = (A^{n+1}_{i  ,j} - A^{n-1}_{i  ,j}) /2/dt
+    // A0 is A^{n-1}
+    //      (d^2A/dl^2) @ time n and indices ij = (A^{n}_{i+1,j}-2*A^{n}_{i,j}+A^{n}_{i-1,j})/dl^2
+    
+   
+    cField2D *A2Dcyl       = static_cast<cField2D *>( A_ );               // the envelope at timestep n
+    cField2D *A02Dcyl      = static_cast<cField2D *>( A0_ );              // the envelope at timestep n-1
+    Field2D *Env_Chi2Dcyl  = static_cast<Field2D *>( patch->EMfields->Env_Chi_ ); // source term of envelope equation
+  
+    int  j_glob = ( static_cast<ElectroMagnAM *>( patch->EMfields ) )->j_glob_;
+    bool isYmin = patch->isBoundary( 1, 0 );
+    bool isYmax = patch->isBoundary( 1, 1 );
+
+    // temporary variable for updated envelope
+    cField2D *A2Dcylnew;
+    A2Dcylnew  = new cField2D( A_->dims_ );
+
+    if (isYmax){
+        for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) {
+            for ( unsigned int j=A_->dims_[1]-4 ; j < A_->dims_[1]-1 ; j++ ) {
+                ( *Env_Chi2Dcyl )( i, j ) = 1.*( *Env_Chi2Dcyl )( i, A_->dims_[1]-5 );
+            }
+        }
+    }
+ 
+    //// explicit solver
+    for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+        for( unsigned int j=std::max(3*isYmin,1) ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+            ( *A2Dcylnew )( i, j ) -= ( *Env_Chi2Dcyl )( i, j )*( *A2Dcyl )( i, j ); // subtract here source term Chi*A from plasma
+            // A2Dcylnew = laplacian - source term
+            ( *A2Dcylnew )( i, j ) += ( ( *A2Dcyl )( i-1, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+1, j ) )*one_ov_dl_sq; // l part
+            ( *A2Dcylnew )( i, j ) += ( ( *A2Dcyl )( i, j-1 )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i, j+1 ) )*one_ov_dr_sq; // r part
+            ( *A2Dcylnew )( i, j ) += ( ( *A2Dcyl )( i, j+1 )-( *A2Dcyl )( i, j-1 ) ) * one_ov_2dr / ( ( double )( j_glob+j )*dr ); // r part         
+
+            // A2Dcylnew = A2Dcylnew+2ik0*dA/dl
+            ( *A2Dcylnew )( i, j ) += i1_2k0_over_2dl*( ( *A2Dcyl )( i+1, j )-( *A2Dcyl )( i-1, j ) );
+            // A2Dcylnew = A2Dcylnew*dt^2
+            ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*dt_sq;
+            // A2Dcylnew = A2Dcylnew + 2/c^2 A2Dcyl - (1+ik0cdt)A02Dcyl/c^2
+            ( *A2Dcylnew )( i, j ) += 2.*( *A2Dcyl )( i, j )-one_plus_ik0dt*( *A02Dcyl )( i, j );
+            // A2Dcylnew = A2Dcylnew * (1+ik0dct)/(1+k0^2c^2dt^2)
+            ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*one_plus_ik0dt_ov_one_plus_k0sq_dtsq;
+        } // end r loop
+    } // end l loop
+
+    if (isYmin){ // axis BC
+        for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+           unsigned int j = 2; // j_p = 2 corresponds to r=0
+
+           ( *A2Dcylnew )( i, j ) -= ( *Env_Chi2Dcyl )( i, j )*( *A2Dcyl )( i, j ); // subtract here source term Chi*A from plasma
+           ( *A2Dcylnew )( i, j ) += ( ( *A2Dcyl )( i-1, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+1, j ) )*one_ov_dl_sq; // l part
+           ( *A2Dcylnew )( i, j ) += 4. * ( ( *A2Dcyl )( i, j+1 )-( *A2Dcyl )( i, j ) ) * one_ov_dr_sq; // r part
+
+           // A2Dcylnew = A2Dcylnew+2ik0*dA/dl
+           ( *A2Dcylnew )( i, j ) += i1_2k0_over_2dl*( ( *A2Dcyl )( i+1, j )-( *A2Dcyl )( i-1, j ) );
+           // A2Dcylnew = A2Dcylnew*dt^2
+           ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*dt_sq;
+           // A2Dcylnew = A2Dcylnew + 2/c^2 A2Dcyl - (1+ik0cdt)A02Dcyl/c^2
+           ( *A2Dcylnew )( i, j ) += 2.*( *A2Dcyl )( i, j )-one_plus_ik0dt*( *A02Dcyl )( i, j );
+           // A2Dcylnew = A2Dcylnew * (1+ik0dct)/(1+k0^2c^2dt^2)
+           ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*one_plus_ik0dt_ov_one_plus_k0sq_dtsq;
+           
+        } 
+    }    
+
+    for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // x loop
+        for( unsigned int j=isYmin*2 ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+            // final back-substitution
+            ( *A02Dcyl )( i, j )       = ( *A2Dcyl )( i, j );
+            ( *A2Dcyl )( i, j )        = ( *A2Dcylnew )( i, j );
+        } // end r loop
+    } // end l loop
+
+
+    delete A2Dcylnew;
+} // end LaserEnvelopeAM::updateEnvelope
+
+void LaserEnvelopeAM::updateEnvelopeReducedDispersion( Patch *patch )
+{
+    //// solves envelope equation in lab frame (see doc):
+    // full_laplacian(A)+2ik0*(dA/dz+(1/c)*dA/dt)-d^2A/dt^2*(1/c^2)=Chi*A
+    // where Chi is the plasma susceptibility [= sum(q^2*rho/mass/gamma_ponderomotive) for all species]
+    // gamma_ponderomotive=sqrt(1+p^2+|A|^2/2) in normalized units
+    
+    // the following explicit finite difference scheme is obtained through centered finite difference derivatives
+    // e.g. (dA/dl) @ time n and indices ij = (A^n    _{i+1,j} - A^n    _{i-1,j}) /2/dl
+    //      (dA/dt) @ time n and indices ij = (A^{n+1}_{i  ,j} - A^{n-1}_{i  ,j}) /2/dt
+    // A0 is A^{n-1}
+    //      (d^2A/dl^2) @ time n and indices ij = (A^{n}_{i+1,j,k}-2*A^{n}_{i,j}+A^{n}_{i-1,j})/dl^2
+    
+    // An optimized form for the derivatives along x has been proposed in D. Terzani, P. Londrillo, JCP 2019
+    // to reduce the numerical dispersion for the envelope solver.
+    // The derivatives along l of the reduced dispersion scheme are defined as follows:
+    // delta= [1-(dt/dl)^2]/3,
+    // (dA/dl)_opt = (1+delta)*(dA/dl) - delta*(A_{i+2,j,k}-A_{i-2,j,k})/4/dl
+    // (d^2A/dl^2)_opt = (1+delta)*(d^2A/dl^2) - delta*(A_{i+2,j,k}-2*A_{i,j,k}+A_{i-2,j,k})/(4dl^2)
+  
+   
+    cField2D *A2Dcyl       = static_cast<cField2D *>( A_ );                  // the envelope at timestep n
+    cField2D *A02Dcyl      = static_cast<cField2D *>( A0_ );                 // the envelope at timestep n-1
+    Field2D *Env_Chi2Dcyl  = static_cast<Field2D *>( patch->EMfields->Env_Chi_ );   // source term of envelope equation
+  
+    int  j_glob = ( static_cast<ElectroMagnAM *>( patch->EMfields ) )->j_glob_;
+    bool isYmin = patch->isBoundary( 1, 0 );//( static_cast<ElectroMagn2D *>( EMfields ) )->isYmin;
+    bool isYmax = patch->isBoundary( 1, 1 );//( static_cast<ElectroMagn2D *>( EMfields ) )->isYmax;
+
+    // temporary variable for updated envelope
+    cField2D *A2Dcylnew;
+    A2Dcylnew  = new cField2D( A_->dims_ );
+
+    if (isYmax){
+        for( unsigned int i=2 ; i <A_->dims_[0]-2; i++ ) {
+            for ( unsigned int j=A_->dims_[1]-4 ; j < A_->dims_[1]-1 ; j++ ) {
+                ( *Env_Chi2Dcyl )( i, j ) = 1.*( *Env_Chi2Dcyl )( i, A_->dims_[1]-5 );
+            }
+        }
+    }
+
+    //// explicit solver
+    for( unsigned int i=2 ; i <A_->dims_[0]-2; i++ ) { // l loop
+        for( unsigned int j=std::max(3*isYmin,1) ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+            ( *A2Dcylnew )( i, j ) -= ( *Env_Chi2Dcyl )( i, j )*( *A2Dcyl )( i, j ); // subtract here source term Chi*A from plasma
+            // A2Dcylnew = laplacian - source term
+            ( *A2Dcylnew )( i, j ) += (1.+delta)*( ( *A2Dcyl )( i-1, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+1, j ) )*one_ov_dl_sq; // l part with optimized derivative
+            ( *A2Dcylnew )( i, j ) -= delta*     ( ( *A2Dcyl )( i-2, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+2, j ) )*one_ov_dl_sq*0.25;
+            ( *A2Dcylnew )( i, j ) +=            ( ( *A2Dcyl )( i, j-1 )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i, j+1 ) )*one_ov_dr_sq; // r part
+            ( *A2Dcylnew )( i, j ) +=            ( ( *A2Dcyl )( i, j+1 )-   ( *A2Dcyl )( i, j-1 ) ) * one_ov_2dr / ( ( double )( j_glob+j )*dr ); // r part         
+
+            // A2Dcylnew = A2Dcylnew+2ik0*dA/dl, where dA/dl uses the optimized form
+            ( *A2Dcylnew )( i, j ) += i1_2k0_over_2dl*(1.+delta)*( ( *A2Dcyl )( i+1, j )-( *A2Dcyl )( i-1, j ) );
+            ( *A2Dcylnew )( i, j ) -= i1_2k0_over_2dl*delta*0.5 *( ( *A2Dcyl )( i+2, j )-( *A2Dcyl )( i-2, j ) );
+            // A2Dcylnew = A2Dcylnew*dt^2
+            ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*dt_sq;
+            // A2Dcylnew = A2Dcylnew + 2/c^2 A2Dcyl - (1+ik0cdt)A02Dcyl/c^2
+            ( *A2Dcylnew )( i, j ) += 2.*( *A2Dcyl )( i, j )-one_plus_ik0dt*( *A02Dcyl )( i, j );
+            // A2Dcylnew = A2Dcylnew * (1+ik0dct)/(1+k0^2c^2dt^2)
+            ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*one_plus_ik0dt_ov_one_plus_k0sq_dtsq;
+        } // end r loop
+    } // end l loop
+
+    if (isYmin){ // axis BC
+        for( unsigned int i=2 ; i <A_->dims_[0]-2; i++ ) { // l loop
+           unsigned int j = 2; // j_p = 2 corresponds to r=0
+
+           ( *A2Dcylnew )( i, j ) -= ( *Env_Chi2Dcyl )( i, j )*( *A2Dcyl )( i, j ); // subtract here source term Chi*A from plasma
+           ( *A2Dcylnew )( i, j ) += (1.+delta)*( ( *A2Dcyl )( i-1, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+1, j ) )*one_ov_dl_sq; // l part with optimized derivative
+           ( *A2Dcylnew )( i, j ) -= delta*     ( ( *A2Dcyl )( i-2, j )-2.*( *A2Dcyl )( i, j )+( *A2Dcyl )( i+2, j ) )*one_ov_dl_sq*0.25;
+           ( *A2Dcylnew )( i, j ) += 4. *       ( ( *A2Dcyl )( i, j+1 )   -( *A2Dcyl )( i, j ) ) * one_ov_dr_sq; // r part
+
+           // A2Dcylnew = A2Dcylnew+2ik0*dA/dl, where dA/dl uses the optimized form
+           ( *A2Dcylnew )( i, j ) += i1_2k0_over_2dl*(1.+delta)*( ( *A2Dcyl )( i+1, j )-( *A2Dcyl )( i-1, j ) );
+           ( *A2Dcylnew )( i, j ) -= i1_2k0_over_2dl*delta*0.5 *( ( *A2Dcyl )( i+2, j )-( *A2Dcyl )( i-2, j ) );
+           // A2Dcylnew = A2Dcylnew*dt^2
+           ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*dt_sq;
+           // A2Dcylnew = A2Dcylnew + 2/c^2 A2Dcyl - (1+ik0cdt)A02Dcyl/c^2
+           ( *A2Dcylnew )( i, j ) += 2.*( *A2Dcyl )( i, j )-one_plus_ik0dt*( *A02Dcyl )( i, j );
+           // A2Dcylnew = A2Dcylnew * (1+ik0dct)/(1+k0^2c^2dt^2)
+           ( *A2Dcylnew )( i, j )  = ( *A2Dcylnew )( i, j )*one_plus_ik0dt_ov_one_plus_k0sq_dtsq;
+           
+        } 
+    }    
+
+    for( unsigned int i=2 ; i <A_->dims_[0]-2; i++ ) { // x loop
+        for( unsigned int j=isYmin*2 ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+            // final back-substitution
+            ( *A02Dcyl )( i, j )       = ( *A2Dcyl )( i, j );
+            ( *A2Dcyl )( i, j )        = ( *A2Dcylnew )( i, j );            
+        } // end r loop
+    } // end l loop
+
+
+    delete A2Dcylnew;
+} // end LaserEnvelopeAM::updateEnvelopeReducedDispersion
+
+
+void LaserEnvelopeAM::computePhiEnvAEnvE( ElectroMagn *EMfields )
+{
+
+    // computes Phi=|A|^2/2 (the ponderomotive potential), new values immediately after the envelope update
+    
+    cField2D *A2Dcyl          = static_cast<cField2D *>( A_ );               // the envelope at timestep n
+
+    cField2D *A02Dcyl      = static_cast<cField2D *>( A0_ );                 // the envelope at timestep n-1
+    
+    Field2D *Phi2Dcyl         = static_cast<Field2D *>( Phi_ );              //Phi=|A|^2/2 is the ponderomotive potential
+    
+    Field2D *Env_Aabs2Dcyl = static_cast<Field2D *>( EMfields->Env_A_abs_ ); // field for diagnostic and ionization
+
+    Field2D *Env_Eabs2Dcyl = static_cast<Field2D *>( EMfields->Env_E_abs_ ); // field for diagnostic and ionization
+
+    Field2D *Env_Exabs2Dcyl = static_cast<Field2D *>( EMfields->Env_Ex_abs_ ); // field for diagnostic and ionization
+
+    bool isYmin = ( static_cast<ElectroMagnAM *>( EMfields ) )->isYmin;
+
+    //int  j_glob = ( static_cast<ElectroMagnAM *>( EMfields ) )->j_glob_;
+    
+    
+    // Compute ponderomotive potential Phi=|A|^2/2, at timesteps n+1, including ghost cells
+    for( unsigned int i=0 ; i <A_->dims_[0]-1; i++ ) { // x loop
+        for( unsigned int j=std::max(3*isYmin,1) ; j < A_->dims_[1]-1; j++ ) { // r loop
+            ( *Phi2Dcyl )( i, j )       = ellipticity_factor*std::abs( ( *A2Dcyl )( i, j ) ) * std::abs( ( *A2Dcyl )( i, j ) ) * 0.5;
+            ( *Env_Aabs2Dcyl )( i, j )  = std::abs( ( *A2Dcyl )( i, j ) );
+            // |E envelope| = |-(dA/dt-ik0cA)|, forward finite difference for the time derivative
+            ( *Env_Eabs2Dcyl )( i, j )  = std::abs( ( ( *A2Dcyl )( i, j )-( *A02Dcyl )( i, j ) )/timestep - i1*omega*( *A2Dcyl )( i, j ) );
+            // |Ex envelope| = |-dA/dr|, central finite difference for the space derivative
+            ( *Env_Exabs2Dcyl )( i, j ) =  std::abs( (( *A2Dcyl )( i, j+1)-( *A2Dcyl )( i, j-1) )*one_ov_2dr );
+        } // end r loop
+    } // end l loop
+
+    // 
+    if (isYmin){ // axis BC
+        for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+            unsigned int j = 2;  // j_p=2 corresponds to r=0    
+            ( *Phi2Dcyl )      ( i, j )   = ellipticity_factor*std::abs( ( *A2Dcyl )( i, j ) ) * std::abs( ( *A2Dcyl )( i, j ) ) * 0.5;  
+            ( *Env_Aabs2Dcyl ) ( i, j )   = std::abs( ( *A2Dcyl )( i, j ) );
+            ( *Env_Eabs2Dcyl ) ( i, j )   = std::abs( ( ( *A2Dcyl )( i, j )-( *A02Dcyl )( i, j ) )/timestep - i1*omega*( *A2Dcyl )( i, j ) );
+            ( *Env_Exabs2Dcyl )( i, j )   = 0.;
+            // Axis BC on |A|
+            ( *Env_Aabs2Dcyl )( i, j-1 )  = ( *Env_Aabs2Dcyl )( i, j+1 );
+            ( *Env_Aabs2Dcyl )( i, j-2 )  = ( *Env_Aabs2Dcyl )( i, j+2 );
+            // Axis BC on |E|
+            ( *Env_Eabs2Dcyl )( i, j-1 )  = ( *Env_Eabs2Dcyl )( i, j+1 );
+            ( *Env_Eabs2Dcyl )( i, j-2 )  = ( *Env_Eabs2Dcyl )( i, j+2 );
+            // Axis BC on |Ex|
+            ( *Env_Exabs2Dcyl)( i, j-1 )  = ( *Env_Exabs2Dcyl)( i, j+1 );
+            ( *Env_Exabs2Dcyl)( i, j-2 )  = ( *Env_Exabs2Dcyl)( i, j+2 );
+            
+                  
+        } // end l loop
+    }
+    
+} // end LaserEnvelopeAM::computePhiEnvAEnvE
+
+
+void LaserEnvelopeAM::computeGradientPhi( ElectroMagn *EMfields )
+{
+
+    // computes gradient of Phi=|A|^2/2 (the ponderomotive potential), new values immediately after the envelope update
+    Field2D *GradPhil2Dcyl    = static_cast<Field2D *>( GradPhil_ );
+    Field2D *GradPhir2Dcyl    = static_cast<Field2D *>( GradPhir_ );
+    Field2D *Phi2Dcyl         = static_cast<Field2D *>( Phi_ );      //Phi=|A|^2/2 is the ponderomotive potential
+    bool isYmin = ( static_cast<ElectroMagnAM *>( EMfields ) )->isYmin;
+    
+    
+    // Compute gradients of Phi, at timesteps n
+    for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+        for( unsigned int j=std::max(3*isYmin,1) ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+        
+            // gradient in l direction
+            ( *GradPhil2Dcyl )( i, j ) = ( ( *Phi2Dcyl )( i+1, j )-( *Phi2Dcyl )( i-1, j ) ) * one_ov_2dl;
+            // gradient in r direction
+            ( *GradPhir2Dcyl )( i, j ) = ( ( *Phi2Dcyl )( i, j+1 )-( *Phi2Dcyl )( i, j-1 ) ) * one_ov_2dr;
+            
+        } // end r loop
+    } // end l loop
+
+    
+    if (isYmin){ // axis BC
+        for( unsigned int i=1 ; i <A_->dims_[0]-1; i++ ) { // l loop
+            unsigned int j = 2;  // j_p=2 corresponds to r=0      
+      
+            // gradient in x direction
+            ( *GradPhil2Dcyl )( i, j ) = ( ( *Phi2Dcyl )( i+1, j )-( *Phi2Dcyl )( i-1, j ) ) * one_ov_2dl;
+            // gradient in r direction, identically zero on r = 0
+            ( *GradPhir2Dcyl )( i, j ) = 0. ; // ( ( *Phi2Dcyl )( i, j+1 )-( *Phi2Dcyl )( i, j-1 ) ) * one_ov_2dr;
+
+            // Axis BC on gradient in x direction
+            ( *GradPhil2Dcyl )( i, j-1 ) = ( *GradPhil2Dcyl )( i, j+1 );
+            ( *GradPhil2Dcyl )( i, j-2 ) = ( *GradPhil2Dcyl )( i, j+2 );
+            // Axis BC on gradient in r direction
+            ( *GradPhir2Dcyl )( i, j-1 ) = ( *GradPhir2Dcyl )( i, j+1 );
+            ( *GradPhir2Dcyl )( i, j-2 ) = ( *GradPhir2Dcyl )( i, j+2 );
+                            
+        } // end l loop
+    }
+
+} // end LaserEnvelopeAM::computeGradientPhi
+
+
+void LaserEnvelopeAM::savePhiAndGradPhi()
+{
+    // Static cast of the fields
+    Field2D *Phi2Dcyl         = static_cast<Field2D *>( Phi_ );
+    Field2D *Phi_m2Dcyl       = static_cast<Field2D *>( Phi_m );
+    
+    Field2D *GradPhil2Dcyl    = static_cast<Field2D *>( GradPhil_ );
+    Field2D *GradPhil_m2Dcyl  = static_cast<Field2D *>( GradPhil_m );
+    
+    Field2D *GradPhir2Dcyl    = static_cast<Field2D *>( GradPhir_ );
+    Field2D *GradPhir_m2Dcyl  = static_cast<Field2D *>( GradPhir_m );
+    
+    for( unsigned int i=0 ; i <A_->dims_[0]-1; i++ ) { // l loop
+        for( unsigned int j=0 ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+        
+            // ponderomotive potential Phi=|A|^2/2
+            ( *Phi_m2Dcyl )( i, j )       = ( *Phi2Dcyl )( i, j );
+            
+            // gradient of ponderomotive potential
+            ( *GradPhil_m2Dcyl )( i, j )  = ( *GradPhil2Dcyl )( i, j );
+            ( *GradPhir_m2Dcyl )( i, j )  = ( *GradPhir2Dcyl )( i, j );
+            
+        } // end r loop
+    } // end l loop
+    
+    
+}//END savePhiAndGradPhi
+
+
+void LaserEnvelopeAM::centerPhiAndGradPhi()
+{
+    // Static cast of the fields
+    Field2D *Phi2Dcyl         = static_cast<Field2D *>( Phi_ );
+    Field2D *Phi_m2Dcyl       = static_cast<Field2D *>( Phi_m );
+    
+    Field2D *GradPhil2Dcyl    = static_cast<Field2D *>( GradPhil_ );
+    Field2D *GradPhil_m2Dcyl  = static_cast<Field2D *>( GradPhil_m );
+    
+    Field2D *GradPhir2Dcyl    = static_cast<Field2D *>( GradPhir_ );
+    Field2D *GradPhir_m2Dcyl  = static_cast<Field2D *>( GradPhir_m );
+    
+    // Phi_m and GradPhi_m quantities now contain values at timestep n
+    
+    for( unsigned int i=0 ; i <A_->dims_[0]-1; i++ ) { // l loop
+        for( unsigned int j=0 ; j < A_->dims_[1]-1 ; j++ ) { // r loop
+        
+            // ponderomotive potential Phi=|A|^2/2
+            ( *Phi_m2Dcyl )( i, j )       = 0.5*( ( *Phi_m2Dcyl )( i, j )+( *Phi2Dcyl )( i, j ) );
+            
+            // gradient of ponderomotive potential
+            ( *GradPhil_m2Dcyl )( i, j )  = 0.5*( ( *GradPhil_m2Dcyl )( i, j )+( *GradPhil2Dcyl )( i, j ) );
+            ( *GradPhir_m2Dcyl )( i, j )  = 0.5*( ( *GradPhir_m2Dcyl )( i, j )+( *GradPhir2Dcyl )( i, j ) );
+            
+        } // end r loop
+    } // end l loop
+    
+    // Phi_m and GradPhi_m quantities now contain values interpolated at timestep n+1/2
+    // these are used for the ponderomotive position advance
+    
+    
+}//END centerPhiAndGradPhi
+
+

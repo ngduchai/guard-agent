@@ -1,0 +1,9 @@
+target_sources(${amr_wind_lib_name}
+  PRIVATE
+  OceanWavesFillInflow.cpp
+  OceanWavesBoundary.cpp
+  PlaneFillInflow.cpp
+  BoundaryPlane.cpp
+  FillMPL.cpp
+  ModulatedPowerLaw.cpp
+  )

@@ -1,0 +1,47 @@
+target_sources( walberla_core
+        PUBLIC
+        AABB.h
+        AABBFwd.h
+        Angles.h
+        Constants.h
+        DistributedSample.h
+        FPClassify.h
+        FastInvSqrt.h
+        GenericAABB.h
+        GenericAABB.impl.h
+        IntegerFactorization.h
+        KahanSummation.h
+        Limits.h
+        MathTrait.h
+        Matrix2.h
+        Matrix3.h
+        MatrixMxN.h
+        Parser.h
+        ParserOMP.h
+        Plane.h
+        Primes.h
+        Quaternion.h
+        Random.h
+        Rot3.h
+        RotationFunctions.h
+        Sample.h
+        Shims.h
+        SqrtTrait.h
+        Uint.h
+        Utility.h
+        Vector2.h
+        Vector3.h
+        extern/exprtk.h
+)
+
+target_sources( walberla_core
+        PRIVATE
+        DistributedSample.cpp
+        IntegerFactorization.cpp
+        Parser.cpp
+        ParserOMP.cpp
+        Primes.cpp
+        Random.cpp
+        Sample.cpp
+        Uint.cpp
+)

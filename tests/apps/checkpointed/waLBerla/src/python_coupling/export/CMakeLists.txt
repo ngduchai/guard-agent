@@ -1,0 +1,24 @@
+target_sources(walberla_python_coupling
+        PUBLIC
+        GatherExport.impl.h
+        GPUExport.h
+        GPUExport.impl.h
+        FieldCommunicationExport.impl.h
+        BlockForestCommunicationExport.h
+        VTKExport.h
+        BlockForestCommunicationExport.impl.h
+        MPIExport.h
+        FieldCommunicationExport.h
+        BlockForestExport.h
+        BasicExport.h
+        FieldExport.impl.h
+        FieldExports.h
+)
+
+target_sources(walberla_python_coupling
+        PRIVATE
+        VTKExport.cpp
+        BasicExport.cpp
+        MPIExport.cpp
+        BlockForestExport.cpp
+)
