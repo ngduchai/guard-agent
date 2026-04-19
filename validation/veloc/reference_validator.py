@@ -498,6 +498,10 @@ def validate_reference(
         )
         result.vanilla_no_recovery_verified = passed
         _mark_step(work_dir, "no_recovery", str(passed))
+        # Save T_vanilla
+        timing = json.loads(timing_path.read_text()) if timing_path.is_file() else {}
+        timing["T_vanilla"] = t_vanilla
+        timing_path.write_text(json.dumps(timing))
 
     # Step 5: Verify checkpointed has recovery (time-based)
     recovery_stdout_path = work_dir / "recovery_stdout.txt"
@@ -536,5 +540,42 @@ def validate_reference(
             keep_patterns=app_config.comparison.keep_patterns,
         )
 
+    # Collect metrics
+    result.t_golden = golden_elapsed
+    result.kill_after_used = kill_after
+    if timing_path.is_file():
+        timing = json.loads(timing_path.read_text())
+        result.t_ckpt = timing.get("T_ckpt")
+        result.t_vanilla = timing.get("T_vanilla")
+
+    # Measure checkpoint size on disk
+    ckpt_size, ckpt_count = _measure_checkpoint_size(ckpt_build)
+    result.checkpoint_size_bytes = ckpt_size
+    result.checkpoint_file_count = ckpt_count
+    if ckpt_size > 0:
+        print(f"  [checkpoint] {ckpt_count} files, {ckpt_size / 1024:.1f} KB total")
+
     result.elapsed_seconds = time.monotonic() - start
     return result
+
+
+def _measure_checkpoint_size(build_dir: Path) -> tuple[int, int]:
+    """Measure total size of checkpoint files in the build directory.
+
+    Scans for common checkpoint file patterns: .rst, .h5, .dat, .crx,
+    chk*, dump*, restart*, checkpoint*, backup*.
+    """
+    total_bytes = 0
+    file_count = 0
+    patterns = [
+        "*.rst", "*.h5", "*.crx", "*.dat", "*.cpt",
+        "chk*", "dump*", "restart*", "checkpoint*", "backup*",
+    ]
+    seen = set()
+    for pat in patterns:
+        for f in build_dir.rglob(pat):
+            if f.is_file() and f not in seen:
+                seen.add(f)
+                total_bytes += f.stat().st_size
+                file_count += 1
+    return total_bytes, file_count

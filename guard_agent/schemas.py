@@ -365,6 +365,15 @@ class ReferenceResult(BaseModel):
     golden_output_path: str | None = None
     error_message: str | None = None
     elapsed_seconds: float | None = None
+    # Timing metrics
+    t_golden: float | None = Field(None, description="Error-free runtime (seconds)")
+    t_vanilla: float | None = Field(None, description="Vanilla kill+restart total time (seconds)")
+    t_ckpt: float | None = Field(None, description="Checkpointed kill+restart total time (seconds)")
+    kill_after_used: float | None = Field(None, description="Actual kill_after used (seconds)")
+    injection_fired: bool | None = Field(None, description="Whether kill signal fired before app exited")
+    # Checkpoint metrics
+    checkpoint_size_bytes: int | None = Field(None, description="Total checkpoint data size on disk (bytes)")
+    checkpoint_file_count: int | None = Field(None, description="Number of checkpoint files written")
 
 
 class ToolEvaluationResult(BaseModel):
