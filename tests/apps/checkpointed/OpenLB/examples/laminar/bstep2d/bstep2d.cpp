@@ -34,6 +34,7 @@
  */
 
 #include <olb.h>
+#include <fstream>
 using namespace olb;
 using namespace olb::names;
 
@@ -296,6 +297,10 @@ void getResults(MyCase& myCase, std::size_t iT, util::Timer<MyCase::value_t> &ti
   if (iT % 5000 == 0 && iT > 0) {
     clout << "Checkpointing the system at t=" << iT << std::endl;
     sLattice.save( "bstep2d.checkpoint" );
+    // Save iteration number for restart
+    std::ofstream iterFile("bstep2d.checkpoint.iter");
+    iterFile << iT;
+    iterFile.close();
   }
 }
 
@@ -315,8 +320,13 @@ void simulate(MyCase& myCase)
   // Try to load checkpoint for restart
   std::size_t startIter = 0;
   if (sLattice.load("bstep2d.checkpoint")) {
-    clout << "Loaded checkpoint, resuming..." << std::endl;
-    startIter = 1; // Resume after checkpoint
+    // Read saved iteration number
+    std::ifstream iterFile("bstep2d.checkpoint.iter");
+    if (iterFile.good()) {
+      iterFile >> startIter;
+      startIter++; // resume from next iteration
+    }
+    clout << "Loaded checkpoint, resuming from iteration " << startIter << std::endl;
   }
 
   timer.start();
