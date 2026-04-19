@@ -63,13 +63,13 @@ EXTRA_ARGS=""
 # --- App ordering (shortest → longest build time) ---
 # Only apps with native checkpoint/restart in their reference code.
 ALL_APPS_ORDERED=(
-  CoMD miniVite CLAMR SW4lite Athena++ VPIC OpenLB Palabos
-  Smilei waLBerla incflo GRChombo LAMMPS SAMRAI
+  CoMD miniVite CLAMR SW4lite Athena++ SPARTA OpenLB Palabos
+  Smilei incflo GRChombo LAMMPS SAMRAI
   WarpX Castro AMR-Wind NekRS QMCPACK Nyx
 )
 
-FAST_APPS=(CoMD miniVite CLAMR SW4lite Athena++ VPIC OpenLB Palabos)
-MEDIUM_APPS=(Smilei waLBerla incflo GRChombo LAMMPS SAMRAI)
+FAST_APPS=(CoMD miniVite CLAMR SW4lite Athena++ SPARTA OpenLB Palabos)
+MEDIUM_APPS=(Smilei incflo GRChombo LAMMPS SAMRAI)
 HEAVY_APPS=(WarpX Castro AMR-Wind NekRS QMCPACK Nyx)
 
 # --- Parse arguments ---
