@@ -94,6 +94,7 @@ class RunResult:
     stderr: str
     elapsed_s: float
     injected: bool = False  # True if a failure was injected during this run
+    injection_fired: bool = False  # True if kill signal was sent while process was still alive
     num_attempts: int = 1  # total attempts consumed (>1 for retry runs)
     output_dir: Path = field(default_factory=Path)
     last_attempt_elapsed_s: float = (

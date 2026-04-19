@@ -277,15 +277,22 @@ class AppValidationPipeline:
         return summary
 
     def clear(self, app_name: str | None = None) -> None:
-        """Clear persisted state so apps are re-validated on next run.
+        """Clear persisted state AND work directories.
 
         If *app_name* is given, only clear that app.  Otherwise clear all.
         """
+        import shutil
         if app_name:
+            work_dir = self._output / "work" / app_name
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
             for phase in ("reference", "tools"):
                 self._state.get(phase, {}).pop(app_name, None)
             self._results.pop(app_name, None)
         else:
+            work_dir = self._output / "work"
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
             self._state.clear()
             self._results.clear()
         self._save()
