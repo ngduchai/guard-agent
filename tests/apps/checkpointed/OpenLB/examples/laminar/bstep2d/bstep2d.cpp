@@ -292,8 +292,8 @@ void getResults(MyCase& myCase, std::size_t iT, util::Timer<MyCase::value_t> &ti
     heatmap::write(planeReduction, iT, jpeg_Param);
   }
 
-  // Saves lattice data (checkpoint)
-  if (iT % converter.getLatticeTime(1) == 0 && iT > 0) {
+  // Saves lattice data (checkpoint every 5000 iterations)
+  if (iT % 5000 == 0 && iT > 0) {
     clout << "Checkpointing the system at t=" << iT << std::endl;
     sLattice.save( "bstep2d.checkpoint" );
   }
