@@ -8,6 +8,7 @@ RST=$(ls -t restart.sparta.* 2>/dev/null | head -1)
 if [ -n "$RST" ]; then
     echo "Restarting from checkpoint: $RST"
     cat > /tmp/sparta_restart.in << EOFIN
+seed            56789
 read_restart    $RST
 stats           5000
 compute         temp temp
