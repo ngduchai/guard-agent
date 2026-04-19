@@ -374,6 +374,12 @@ class ReferenceResult(BaseModel):
     # Checkpoint metrics
     checkpoint_size_bytes: int | None = Field(None, description="Total checkpoint data size on disk (bytes)")
     checkpoint_file_count: int | None = Field(None, description="Number of checkpoint files written")
+    # Derived metrics
+    time_saved_s: float | None = Field(None, description="T_vanilla - T_ckpt (seconds saved by checkpoint)")
+    speedup: float | None = Field(None, description="T_vanilla / T_ckpt (how much faster checkpoint is)")
+    recovery_overhead: float | None = Field(None, description="T_ckpt / T_golden - 1.0 (fractional overhead vs error-free)")
+    # Memory metrics
+    peak_memory_bytes: int | None = Field(None, description="Peak RSS during checkpointed recovery run (bytes)")
 
 
 class ToolEvaluationResult(BaseModel):

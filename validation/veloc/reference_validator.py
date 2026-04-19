@@ -523,10 +523,13 @@ def validate_reference(
         _mark_step(work_dir, "recovery", str(recovered))
         if recovery_stdout:
             recovery_stdout_path.write_text(recovery_stdout)
-        # Save timing
+        # Save timing + injection status + memory
         timing = json.loads(timing_path.read_text()) if timing_path.is_file() else {}
         timing["T_ckpt"] = t_ckpt
         timing["kill_after_used"] = kill_after
+        timing["injection_fired"] = recovery_run.injection_fired if recovery_run else False
+        if recovery_run and recovery_run.memory_samples_bytes:
+            timing["peak_memory_bytes"] = max(recovery_run.memory_samples_bytes)
         timing_path.write_text(json.dumps(timing))
 
     # Step 6: Compare checkpointed output vs golden
@@ -543,17 +546,36 @@ def validate_reference(
     # Collect metrics
     result.t_golden = golden_elapsed
     result.kill_after_used = kill_after
+
+    # Load timing from cache (populated by steps 4 and 5)
     if timing_path.is_file():
         timing = json.loads(timing_path.read_text())
         result.t_ckpt = timing.get("T_ckpt")
         result.t_vanilla = timing.get("T_vanilla")
+        result.injection_fired = timing.get("injection_fired")
+        result.peak_memory_bytes = timing.get("peak_memory_bytes")
+
+    # Derived metrics
+    if result.t_vanilla is not None and result.t_ckpt is not None:
+        result.time_saved_s = result.t_vanilla - result.t_ckpt
+        if result.t_ckpt > 0:
+            result.speedup = result.t_vanilla / result.t_ckpt
+    if result.t_ckpt is not None and golden_elapsed > 0:
+        result.recovery_overhead = result.t_ckpt / golden_elapsed - 1.0
 
     # Measure checkpoint size on disk
     ckpt_size, ckpt_count = _measure_checkpoint_size(ckpt_build)
     result.checkpoint_size_bytes = ckpt_size
     result.checkpoint_file_count = ckpt_count
+
+    # Summary
+    print(f"  [metrics] T_golden={golden_elapsed:.1f}s T_vanilla={result.t_vanilla or 0:.1f}s T_ckpt={result.t_ckpt or 0:.1f}s")
+    if result.speedup:
+        print(f"  [metrics] speedup={result.speedup:.2f}x time_saved={result.time_saved_s:.1f}s overhead={result.recovery_overhead:.1%}")
     if ckpt_size > 0:
-        print(f"  [checkpoint] {ckpt_count} files, {ckpt_size / 1024:.1f} KB total")
+        print(f"  [metrics] checkpoint: {ckpt_count} files, {ckpt_size / 1024:.1f} KB")
+    if result.peak_memory_bytes:
+        print(f"  [metrics] peak_memory: {result.peak_memory_bytes / 1024 / 1024:.1f} MB")
 
     result.elapsed_seconds = time.monotonic() - start
     return result
