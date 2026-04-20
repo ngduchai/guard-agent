@@ -11,6 +11,14 @@ grep -rn 'add_subdirectory' src/ CMakeLists.txt 2>/dev/null | grep -v '#' | whil
   fi
 done
 
+# Clean stale CMakeCache if paths changed (copied to different directory)
+if [ -f build/CMakeCache.txt ]; then
+  cached_dir=$(grep 'CMAKE_HOME_DIRECTORY' build/CMakeCache.txt | head -1 | cut -d= -f2)
+  if [ "$cached_dir" != "$(pwd)" ]; then
+    rm -rf build
+  fi
+fi
+
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release \
   -DQMC_MPI=ON \
