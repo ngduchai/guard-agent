@@ -132,7 +132,7 @@ int main(int argc, char** argv)
    {
      // ----------------------------------------------------------------------
      // ilaguna - Save checkpoint
-     int ckptRate = 2;
+     int ckptRate = 500;
      if ((iStep % ckptRate)==0 && iStep>0 && !loaded)
      {
        if(getMyRank() == 0) printf("Saving checkpoint...\n");
