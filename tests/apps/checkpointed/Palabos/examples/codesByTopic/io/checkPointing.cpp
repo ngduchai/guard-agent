@@ -127,11 +127,18 @@ int main(int argc, char *argv[])
     cavitySetup(lattice, parameters, *boundaryCondition);
     delete boundaryCondition;
 
-    // Load saved data from a previous simulation, if the initial time step
-    //   is larger than zero.
-    if (iniT > 0) {
-        // loadRawMultiBlock(lattice, "checkpoint.dat");
-        loadBinaryBlock(lattice, "checkpoint.dat");
+    // Auto-detect checkpoint: if checkpoint.dat.iter exists, load from checkpoint
+    {
+        std::ifstream iterFile("checkpoint.dat.iter");
+        if (iterFile.good()) {
+            plint savedIter;
+            iterFile >> savedIter;
+            if (savedIter > iniT && savedIter < endT) {
+                pcout << "Loading checkpoint at iteration " << savedIter << endl;
+                loadBinaryBlock(lattice, "checkpoint.dat");
+                iniT = savedIter + 1;
+            }
+        }
     }
 
     // Main loop over time iterations.
@@ -143,8 +150,10 @@ int main(int argc, char *argv[])
 
         if (iT % checkPointIter == 0 && iT > iniT) {
             pcout << "Saving the state of the simulation ..." << endl;
-            // saveRawMultiBlock(lattice, "checkpoint.dat");
             saveBinaryBlock(lattice, "checkpoint.dat");
+            // Save iteration number for restart
+            std::ofstream iterFile("checkpoint.dat.iter");
+            iterFile << iT;
         }
 
         // Lattice Boltzmann iteration step.
