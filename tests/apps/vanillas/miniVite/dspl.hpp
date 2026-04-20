@@ -51,12 +51,38 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
+#include <signal.h>
+#include <unistd.h>
 
 #include <mpi.h>
 #include <omp.h>
+#include <fti.h>
 
 #include "graph.hpp"
 #include "utils.hpp"
+
+#include "libcheckpoint/checkpoint.h"
+
+#ifdef TIMER
+extern double acc_write_time;
+#endif
+
+using namespace std;
+
+#define enable_fti 1
+
+// new variables for C/R implementation
+int cp_stride = 0;
+int procfi = 0;
+int nodefi = 0;
+int cp2f = 0;
+int cp2m = 0;
+int cp2a = 0;
+int restart = 0;
+int level = 0;
+int survivor=0;
+int myrank=0;
+int procsize=0;
 
 struct Comm {
   GraphElem size;
@@ -79,7 +105,10 @@ const int CommunityDataTag  = 5;
 
 static MPI_Datatype commType;
 
-void distSumVertexDegree(const Graph &g, std::vector<GraphWeight> &vDegree, std::vector<Comm> &localCinfo)
+static void FTI_Protect_Louvain( vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, vector<GraphElem> &svdata, vector<GraphElem> &rvdata, vector<GraphElem> &pastComm, vector<GraphElem> &currComm, vector<GraphElem> &targetComm, unordered_map<GraphElem, GraphElem> &remoteComm, map<GraphElem,Comm> &remoteCinfo, map<GraphElem,Comm> &remoteCupdate, vector<Comm> &localCinfo, vector<Comm> &localCupdate, vector<GraphWeight> &vDegree, vector<GraphWeight> &clusterWeight, Graph &g ); 
+
+
+void distSumVertexDegree(const Graph &g, vector<GraphWeight> &vDegree, vector<Comm> &localCinfo)
 {
   const GraphElem nv = g.get_lnv();
 
@@ -106,7 +135,7 @@ void distSumVertexDegree(const Graph &g, std::vector<GraphWeight> &vDegree, std:
   }
 } // distSumVertexDegree
 
-GraphWeight distCalcConstantForSecondTerm(const std::vector<GraphWeight> &vDegree, MPI_Comm gcomm)
+GraphWeight distCalcConstantForSecondTerm(const vector<GraphWeight> &vDegree, MPI_Comm gcomm)
 {
   GraphWeight totalEdgeWeightTwice = 0.0;
   GraphWeight localWeight = 0.0;
@@ -129,7 +158,7 @@ GraphWeight distCalcConstantForSecondTerm(const std::vector<GraphWeight> &vDegre
   return (1.0 / static_cast<GraphWeight>(totalEdgeWeightTwice));
 } // distCalcConstantForSecondTerm
 
-void distInitComm(std::vector<GraphElem> &pastComm, std::vector<GraphElem> &currComm, const GraphElem base)
+void distInitComm(vector<GraphElem> &pastComm, vector<GraphElem> &currComm, const GraphElem base)
 {
   const size_t csz = currComm.size();
 
@@ -148,10 +177,10 @@ void distInitComm(std::vector<GraphElem> &pastComm, std::vector<GraphElem> &curr
   }
 } // distInitComm
 
-void distInitLouvain(const Graph &dg, std::vector<GraphElem> &pastComm, 
-        std::vector<GraphElem> &currComm, std::vector<GraphWeight> &vDegree, 
-        std::vector<GraphWeight> &clusterWeight, std::vector<Comm> &localCinfo, 
-        std::vector<Comm> &localCupdate, GraphWeight &constantForSecondTerm,
+void distInitLouvain(const Graph &dg, vector<GraphElem> &pastComm, 
+        vector<GraphElem> &currComm, vector<GraphWeight> &vDegree, 
+        vector<GraphWeight> &clusterWeight, vector<Comm> &localCinfo, 
+        vector<Comm> &localCupdate, GraphWeight &constantForSecondTerm,
         const int me)
 {
   const GraphElem base = dg.get_base(me);
@@ -171,13 +200,13 @@ void distInitLouvain(const Graph &dg, std::vector<GraphElem> &pastComm,
   distInitComm(pastComm, currComm, base);
 } // distInitLouvain
 
-GraphElem distGetMaxIndex(const std::unordered_map<GraphElem, GraphElem> &clmap, const std::vector<GraphWeight> &counter,
-			  const GraphWeight selfLoop, const std::vector<Comm> &localCinfo, 
-			  const std::map<GraphElem,Comm> &remoteCinfo, const GraphWeight vDegree, 
+GraphElem distGetMaxIndex(const unordered_map<GraphElem, GraphElem> &clmap, const vector<GraphWeight> &counter,
+			  const GraphWeight selfLoop, const vector<Comm> &localCinfo, 
+			  const map<GraphElem,Comm> &remoteCinfo, const GraphWeight vDegree, 
                           const GraphElem currSize, const GraphWeight currDegree, const GraphElem currComm,
 			  const GraphElem base, const GraphElem bound, const GraphWeight constant)
 {
-  std::unordered_map<GraphElem, GraphElem>::const_iterator storedAlready;
+  unordered_map<GraphElem, GraphElem>::const_iterator storedAlready;
   GraphElem maxIndex = currComm;
   GraphWeight curGain = 0.0, maxGain = 0.0;
   GraphWeight eix = static_cast<GraphWeight>(counter[0]) - static_cast<GraphWeight>(selfLoop);
@@ -202,7 +231,7 @@ GraphElem distGetMaxIndex(const std::unordered_map<GraphElem, GraphElem> &clmap,
           }
           else {
               // is_remote, lookup map
-              std::map<GraphElem,Comm>::const_iterator citer = remoteCinfo.find(storedAlready->first);
+              map<GraphElem,Comm>::const_iterator citer = remoteCinfo.find(storedAlready->first);
               ay = citer->second.degree;
               size = citer->second.size; 
           }
@@ -227,15 +256,15 @@ GraphElem distGetMaxIndex(const std::unordered_map<GraphElem, GraphElem> &clmap,
   return maxIndex;
 } // distGetMaxIndex
 
-GraphWeight distBuildLocalMapCounter(const GraphElem e0, const GraphElem e1, std::unordered_map<GraphElem, GraphElem> &clmap, 
-				   std::vector<GraphWeight> &counter, const Graph &g, 
-                                   const std::vector<GraphElem> &currComm, 
-                                   const std::unordered_map<GraphElem, GraphElem> &remoteComm,
+GraphWeight distBuildLocalMapCounter(const GraphElem e0, const GraphElem e1, unordered_map<GraphElem, GraphElem> &clmap, 
+				   vector<GraphWeight> &counter, const Graph &g, 
+                                   const vector<GraphElem> &currComm, 
+                                   const unordered_map<GraphElem, GraphElem> &remoteComm,
 	                           const GraphElem vertex, const GraphElem base, const GraphElem bound)
 {
   GraphElem numUniqueClusters = 1L;
   GraphWeight selfLoop = 0;
-  std::unordered_map<GraphElem, GraphElem>::const_iterator storedAlready;
+  unordered_map<GraphElem, GraphElem>::const_iterator storedAlready;
 
   for (GraphElem j = e0; j < e1; j++) {
         
@@ -247,11 +276,11 @@ GraphWeight distBuildLocalMapCounter(const GraphElem e0, const GraphElem e1, std
     if (tail_ == vertex + base)
       selfLoop += weight;
 
-    // is_local, direct access local std::vector<GraphElem>
+    // is_local, direct access local vector<GraphElem>
     if ((tail_ >= base) && (tail_ < bound))
       tcomm = currComm[tail_ - base];
     else { // is_remote, lookup map
-      std::unordered_map<GraphElem, GraphElem>::const_iterator iter = remoteComm.find(tail_);
+      unordered_map<GraphElem, GraphElem>::const_iterator iter = remoteComm.find(tail_);
 
 #ifdef DEBUG_PRINTF  
       assert(iter != remoteComm.end());
@@ -264,7 +293,7 @@ GraphWeight distBuildLocalMapCounter(const GraphElem e0, const GraphElem e1, std
     if (storedAlready != clmap.end())
       counter[storedAlready->second] += weight;
     else {
-        clmap.insert(std::unordered_map<GraphElem, GraphElem>::value_type(tcomm, numUniqueClusters));
+        clmap.insert(unordered_map<GraphElem, GraphElem>::value_type(tcomm, numUniqueClusters));
         counter.push_back(weight);
         numUniqueClusters++;
     }
@@ -273,18 +302,18 @@ GraphWeight distBuildLocalMapCounter(const GraphElem e0, const GraphElem e1, std
   return selfLoop;
 } // distBuildLocalMapCounter
 
-void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::vector<GraphElem> &currComm,
-				 std::vector<GraphElem> &targetComm, const std::vector<GraphWeight> &vDegree,
-                                 std::vector<Comm> &localCinfo, std::vector<Comm> &localCupdate,
-				 const std::unordered_map<GraphElem, GraphElem> &remoteComm, 
-                                 const std::map<GraphElem,Comm> &remoteCinfo, 
-                                 std::map<GraphElem,Comm> &remoteCupdate, const GraphWeight constantForSecondTerm,
-                                 std::vector<GraphWeight> &clusterWeight, const int me)
+void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const vector<GraphElem> &currComm,
+				 vector<GraphElem> &targetComm, const vector<GraphWeight> &vDegree,
+                                 vector<Comm> &localCinfo, vector<Comm> &localCupdate,
+				 const unordered_map<GraphElem, GraphElem> &remoteComm, 
+                                 const map<GraphElem,Comm> &remoteCinfo, 
+                                 map<GraphElem,Comm> &remoteCupdate, const GraphWeight constantForSecondTerm,
+                                 vector<GraphWeight> &clusterWeight, const int me)
 {
   GraphElem localTarget = -1;
   GraphElem e0, e1, selfLoop = 0;
-  std::unordered_map<GraphElem, GraphElem> clmap;
-  std::vector<GraphWeight> counter;
+  unordered_map<GraphElem, GraphElem> clmap;
+  vector<GraphWeight> counter;
 
   const GraphElem base = dg.get_base(me), bound = dg.get_bound(me);
   const GraphElem cc = currComm[i];
@@ -300,7 +329,7 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
         currCommIsLocal=true;
   } else {
   // is remote
-        std::map<GraphElem,Comm>::const_iterator citer = remoteCinfo.find(cc);
+        map<GraphElem,Comm>::const_iterator citer = remoteCinfo.find(cc);
 	ccDegree = citer->second.degree;
  	ccSize = citer->second.size;
 	currCommIsLocal=false;
@@ -309,7 +338,7 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
   dg.edge_range(i, e0, e1);
 
   if (e0 != e1) {
-    clmap.insert(std::unordered_map<GraphElem, GraphElem>::value_type(cc, 0));
+    clmap.insert(unordered_map<GraphElem, GraphElem>::value_type(cc, 0));
     counter.push_back(0.0);
 
     selfLoop =  distBuildLocalMapCounter(e0, e1, clmap, counter, dg, 
@@ -354,7 +383,7 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
         localCupdate[cc-base].size--;
  
         // search target!     
-        std::map<GraphElem,Comm>::iterator iter=remoteCupdate.find(localTarget);
+        map<GraphElem,Comm>::iterator iter=remoteCupdate.find(localTarget);
  
         #pragma omp atomic update
         iter->second.degree += vDegree[i];
@@ -370,7 +399,7 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
         localCupdate[localTarget-base].size++;
        
         // search current 
-        std::map<GraphElem,Comm>::iterator iter=remoteCupdate.find(cc);
+        map<GraphElem,Comm>::iterator iter=remoteCupdate.find(cc);
   
         #pragma omp atomic update
         iter->second.degree -= vDegree[i];
@@ -382,7 +411,7 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
    if ((localTarget != cc) && (localTarget != -1) && !currCommIsLocal && !targetCommIsLocal) {
        
         // search current 
-        std::map<GraphElem,Comm>::iterator iter = remoteCupdate.find(cc);
+        map<GraphElem,Comm>::iterator iter = remoteCupdate.find(cc);
   
         #pragma omp atomic update
         iter->second.degree -= vDegree[i];
@@ -404,8 +433,8 @@ void distExecuteLouvainIteration(const GraphElem i, const Graph &dg, const std::
   targetComm[i] = localTarget;
 } // distExecuteLouvainIteration
 
-GraphWeight distComputeModularity(const Graph &g, std::vector<Comm> &localCinfo,
-			     const std::vector<GraphWeight> &clusterWeight,
+GraphWeight distComputeModularity(const Graph &g, vector<Comm> &localCinfo,
+			     const vector<GraphWeight> &clusterWeight,
 			     const GraphWeight constantForSecondTerm,
 			     const int me)
 {
@@ -444,18 +473,18 @@ GraphWeight distComputeModularity(const Graph &g, std::vector<Comm> &localCinfo,
   const double t1 = MPI_Wtime();
 #endif
 
-  GraphWeight currMod = std::fabs((e_a_xx[0] * constantForSecondTerm) - 
+  GraphWeight currMod = fabs((e_a_xx[0] * constantForSecondTerm) - 
       (e_a_xx[1] * constantForSecondTerm * constantForSecondTerm));
 #ifdef DEBUG_PRINTF  
-  std::cout << "[" << me << "]le_xx: " << le_xx << ", la2_x: " << la2_x << std::endl;
-  std::cout << "[" << me << "]e_xx: " << e_a_xx[0] << ", a2_x: " << e_a_xx[1] << ", currMod: " << currMod << std::endl;
-  std::cout << "[" << me << "]Reduction time: " << (t1 - t0) << std::endl;
+  cout << "[" << me << "]le_xx: " << le_xx << ", la2_x: " << la2_x << endl;
+  cout << "[" << me << "]e_xx: " << e_a_xx[0] << ", a2_x: " << e_a_xx[1] << ", currMod: " << currMod << endl;
+  cout << "[" << me << "]Reduction time: " << (t1 - t0) << endl;
 #endif
 
   return currMod;
 } // distComputeModularity
 
-void distUpdateLocalCinfo(std::vector<Comm> &localCinfo, const std::vector<Comm> &localCupdate)
+void distUpdateLocalCinfo(vector<Comm> &localCinfo, const vector<Comm> &localCupdate)
 {
     size_t csz = localCinfo.size();
 
@@ -470,8 +499,8 @@ void distUpdateLocalCinfo(std::vector<Comm> &localCinfo, const std::vector<Comm>
     }
 }
 
-void distCleanCWandCU(const GraphElem nv, std::vector<GraphWeight> &clusterWeight,
-        std::vector<Comm> &localCupdate)
+void distCleanCWandCU(const GraphElem nv, vector<GraphWeight> &clusterWeight,
+        vector<Comm> &localCupdate)
 {
 #ifdef OMP_SCHEDULE_RUNTIME
 #pragma omp for schedule(runtime)
@@ -487,68 +516,40 @@ void distCleanCWandCU(const GraphElem nv, std::vector<GraphWeight> &clusterWeigh
 
 #if defined(USE_MPI_RMA)
 void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
-        const size_t &ssz, const size_t &rsz, const std::vector<GraphElem> &ssizes, 
-        const std::vector<GraphElem> &rsizes, const std::vector<GraphElem> &svdata, 
-        const std::vector<GraphElem> &rvdata, const std::vector<GraphElem> &currComm, 
-        const std::vector<Comm> &localCinfo, std::map<GraphElem,Comm> &remoteCinfo, 
-        std::unordered_map<GraphElem, GraphElem> &remoteComm, std::map<GraphElem,Comm> &remoteCupdate, 
-        const MPI_Win &commwin, const std::vector<GraphElem> &disp)
+        const size_t &ssz, const size_t &rsz, const vector<GraphElem> &ssizes, 
+        const vector<GraphElem> &rsizes, const vector<GraphElem> &svdata, 
+        const vector<GraphElem> &rvdata, const vector<GraphElem> &currComm, 
+        const vector<Comm> &localCinfo, map<GraphElem,Comm> &remoteCinfo, 
+        unordered_map<GraphElem, GraphElem> &remoteComm, map<GraphElem,Comm> &remoteCupdate, 
+        const MPI_Win &commwin, const vector<MPI_Aint> &disp)
 #else
 void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
-        const size_t &ssz, const size_t &rsz, const std::vector<GraphElem> &ssizes, 
-        const std::vector<GraphElem> &rsizes, const std::vector<GraphElem> &svdata, 
-        const std::vector<GraphElem> &rvdata, const std::vector<GraphElem> &currComm, 
-        const std::vector<Comm> &localCinfo, std::map<GraphElem,Comm> &remoteCinfo, 
-        std::unordered_map<GraphElem, GraphElem> &remoteComm, std::map<GraphElem,Comm> &remoteCupdate)
+        const size_t &ssz, const size_t &rsz, const vector<GraphElem> &ssizes, 
+        const vector<GraphElem> &rsizes, const vector<GraphElem> &svdata, 
+        const vector<GraphElem> &rvdata, const vector<GraphElem> &currComm, 
+        const vector<Comm> &localCinfo, map<GraphElem,Comm> &remoteCinfo, 
+        unordered_map<GraphElem, GraphElem> &remoteComm, map<GraphElem,Comm> &remoteCupdate)
 #endif
 {
 #if defined(USE_MPI_RMA)
-    std::vector<GraphElem> scdata(ssz);
+    vector<GraphElem> scdata(ssz);
 #else
-    std::vector<GraphElem> rcdata(rsz), scdata(ssz);
+    vector<GraphElem> rcdata(rsz), scdata(ssz);
 #endif
   GraphElem spos, rpos;
 #if defined(REPLACE_STL_UOSET_WITH_VECTOR)
-  std::vector< std::vector< GraphElem > > rcinfo(nprocs);
+  vector< vector< GraphElem > > rcinfo(nprocs);
 #else
-  std::vector<std::unordered_set<GraphElem> > rcinfo(nprocs);
+  vector<unordered_set<GraphElem> > rcinfo(nprocs);
 #endif
 
 #if defined(USE_MPI_SENDRECV)
 #else
-  std::vector<MPI_Request> rreqs(nprocs), sreqs(nprocs);
+  vector<MPI_Request> rreqs(nprocs), sreqs(nprocs);
 #endif
 
 #ifdef DEBUG_PRINTF  
   double t0, t1, ta = 0.0;
-#endif
-
-#if defined(USE_MPI_RMA) && !defined(USE_MPI_ACCUMULATE)
-  int num_comm_procs;
-#endif
-
-#if defined(USE_MPI_RMA) && !defined(USE_MPI_ACCUMULATE)
-  spos = 0;
-  rpos = 0;
-  std::vector<int> comm_proc(nprocs);
-  std::vector<int> comm_proc_buf_disp(nprocs);
-  
-  /* Initialize all to -1 (unsure if necessary) */
-  for (int i = 0; i < nprocs; i++) {
-      comm_proc[i] = -1;
-      comm_proc_buf_disp[i] = -1;
-  }
-  
-  num_comm_procs = 0;
-  for (int i = 0; i < nprocs; i++) {
-      if ((i != me) && (ssizes[i] > 0)) {
-          comm_proc[num_comm_procs] = i;
-          comm_proc_buf_disp[num_comm_procs] = spos;
-          num_comm_procs++;
-      }
-      spos += ssizes[i];
-      rpos += rsizes[i];
-  }
 #endif
 
   const GraphElem base = dg.get_base(me), bound = dg.get_bound(me);
@@ -570,18 +571,16 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
     scdata[i] = comm;
   }
 
-  std::vector<GraphElem> rcsizes(nprocs), scsizes(nprocs);
-  std::vector<CommInfo> sinfo, rinfo;
+  vector<GraphElem> rcsizes(nprocs), scsizes(nprocs);
+  vector<CommInfo> sinfo, rinfo;
 
 #ifdef DEBUG_PRINTF  
   t0 = MPI_Wtime();
 #endif
-#if !defined(USE_MPI_RMA) || defined(USE_MPI_ACCUMULATE)
   spos = 0;
   rpos = 0;
-#endif
 #if defined(USE_MPI_COLLECTIVES)
-  std::vector<int> scnts(nprocs), rcnts(nprocs), sdispls(nprocs), rdispls(nprocs);
+  vector<int> scnts(nprocs), rcnts(nprocs), sdispls(nprocs), rdispls(nprocs);
   for (int i = 0; i < nprocs; i++) {
       scnts[i] = ssizes[i];
       rcnts[i] = rsizes[i];
@@ -596,22 +595,19 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
           MPI_GRAPH_TYPE, rcdata.data(), rcnts.data(), rdispls.data(), 
           MPI_GRAPH_TYPE, gcomm);
 #elif defined(USE_MPI_RMA)
-#if defined(USE_MPI_ACCUMULATE)
   for (int i = 0; i < nprocs; i++) {
       if ((i != me) && (ssizes[i] > 0)) {
+#if defined(USE_MPI_ACCUMULATE)
           MPI_Accumulate(scdata.data() + spos, ssizes[i], MPI_GRAPH_TYPE, i, 
                   disp[i], ssizes[i], MPI_GRAPH_TYPE, MPI_REPLACE, commwin);
+#else
+          MPI_Put(scdata.data() + spos, ssizes[i], MPI_GRAPH_TYPE, i, 
+                  disp[i], ssizes[i], MPI_GRAPH_TYPE, commwin);
+#endif
       }
       spos += ssizes[i];
       rpos += rsizes[i];
   }
-#else
-  for (int i = 0; i < num_comm_procs; i++) {
-      int target_rank = comm_proc[i];
-      MPI_Put(scdata.data() + comm_proc_buf_disp[i], ssizes[target_rank], MPI_GRAPH_TYPE,
-              target_rank, disp[target_rank], ssizes[target_rank], MPI_GRAPH_TYPE, commwin);
-  }
-#endif
 #elif defined(USE_MPI_SENDRECV)
   for (int i = 0; i < nprocs; i++) {
       if (i != me)
@@ -676,7 +672,7 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
     const GraphElem comm = rcdata[i];
 #endif
 
-    remoteComm.insert(std::unordered_map<GraphElem, GraphElem>::value_type(rvdata[i], comm));
+    remoteComm.insert(unordered_map<GraphElem, GraphElem>::value_type(rvdata[i], comm));
     const int tproc = dg.get_owner(comm);
 
     if (tproc != me)
@@ -736,15 +732,15 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
   }
 
 #ifdef DEBUG_PRINTF  
-  std::cout << "[" << me << "]Total communities to receive: " << rtcsz << std::endl;
+  cout << "[" << me << "]Total communities to receive: " << rtcsz << endl;
 #endif
 #if defined(USE_MPI_COLLECTIVES)
-  std::vector<GraphElem> rcomms(rtcsz), scomms(stcsz);
+  vector<GraphElem> rcomms(rtcsz), scomms(stcsz);
 #else
 #if defined(REPLACE_STL_UOSET_WITH_VECTOR)
-  std::vector<GraphElem> rcomms(rtcsz);
+  vector<GraphElem> rcomms(rtcsz);
 #else
-  std::vector<GraphElem> rcomms(rtcsz), scomms(stcsz);
+  vector<GraphElem> rcomms(rtcsz), scomms(stcsz);
 #endif
 #endif
   sinfo.resize(rtcsz);
@@ -758,7 +754,7 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
 #if defined(USE_MPI_COLLECTIVES)
   for (int i = 0; i < nprocs; i++) {
       if (i != me) {
-          std::copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
+          copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
       }
       scnts[i] = scsizes[i];
       rcnts[i] = rcsizes[i];
@@ -777,10 +773,10 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
       if (i != me) {
 #ifdef OMP_SCHEDULE_RUNTIME
 #pragma omp parallel for default(none), shared(rcsizes, rcomms, localCinfo, sinfo, rdispls), \
-          firstprivate(i, base), schedule(runtime) , if(rcsizes[i] >= 1000)
+          firstprivate(i), schedule(runtime) , if(rcsizes[i] >= 1000)
 #else
 #pragma omp parallel for default(none), shared(rcsizes, rcomms, localCinfo, sinfo, rdispls), \
-          firstprivate(i, base), schedule(guided) , if(rcsizes[i] >= 1000)
+          firstprivate(i), schedule(guided) , if(rcsizes[i] >= 1000)
 #endif
           for (GraphElem j = 0; j < rcsizes[i]; j++) {
               const GraphElem comm = rcomms[rdispls[i] + j];
@@ -794,7 +790,7 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
           commType, gcomm);
 #else
 #if !defined(USE_MPI_SENDRECV)
-  std::vector<MPI_Request> rcreqs(nprocs);
+  vector<MPI_Request> rcreqs(nprocs);
 #endif
   for (int i = 0; i < nprocs; i++) {
       if (i != me) {
@@ -804,7 +800,7 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
                   rcomms.data() + rpos, rcsizes[i], MPI_GRAPH_TYPE, i, CommunityTag, 
                   gcomm, MPI_STATUSES_IGNORE);
 #else
-          std::copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
+          copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
           MPI_Sendrecv(scomms.data() + spos, scsizes[i], MPI_GRAPH_TYPE, i, CommunityTag, 
                   rcomms.data() + rpos, rcsizes[i], MPI_GRAPH_TYPE, i, CommunityTag, 
                   gcomm, MPI_STATUSES_IGNORE);
@@ -822,7 +818,7 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
               MPI_Isend(rcinfo[i].data(), scsizes[i], MPI_GRAPH_TYPE, i, 
                       CommunityTag, gcomm, &sreqs[i]);
 #else
-              std::copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
+              copy(rcinfo[i].begin(), rcinfo[i].end(), scomms.data() + spos);
               MPI_Isend(scomms.data() + spos, scsizes[i], MPI_GRAPH_TYPE, i, 
                       CommunityTag, gcomm, &sreqs[i]);
 #endif
@@ -860,11 +856,11 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
 #if defined(USE_MPI_SENDRECV)
 #ifdef OMP_SCHEDULE_RUNTIME
 #pragma omp parallel for default(none), shared(rcsizes, rcomms, localCinfo, sinfo), \
-          firstprivate(i, rpos, base), schedule(runtime) , if(rcsizes[i] >= 1000)
+          firstprivate(i, rpos), schedule(runtime) , if(rcsizes[i] >= 1000)
 
 #else
 #pragma omp parallel for default(none), shared(rcsizes, rcomms, localCinfo, sinfo), \
-          firstprivate(i, rpos, base), schedule(guided) , if(rcsizes[i] >= 1000)
+          firstprivate(i, rpos), schedule(guided) , if(rcsizes[i] >= 1000)
 #endif
           for (GraphElem j = 0; j < rcsizes[i]; j++) {
               const GraphElem comm = rcomms[rpos + j];
@@ -946,8 +942,8 @@ void fillRemoteCommunities(const Graph &dg, const int me, const int nprocs,
       comm.size = rinfo[i].size;
       comm.degree = rinfo[i].degree;
 
-      remoteCinfo.insert(std::map<GraphElem,Comm>::value_type(ccomm, comm));
-      remoteCupdate.insert(std::map<GraphElem,Comm>::value_type(ccomm, Comm()));
+      remoteCinfo.insert(map<GraphElem,Comm>::value_type(ccomm, comm));
+      remoteCupdate.insert(map<GraphElem,Comm>::value_type(ccomm, Comm()));
   }
 } // end fillRemoteCommunities
 
@@ -975,17 +971,17 @@ void destroyCommunityMPIType()
   MPI_Type_free(&commType);
 } // destroyCommunityMPIType
 
-void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
-			     const std::map<GraphElem,Comm> &remoteCupdate,
+void updateRemoteCommunities(const Graph &dg, vector<Comm> &localCinfo,
+			     const map<GraphElem,Comm> &remoteCupdate,
 			     const int me, const int nprocs)
 {
   const GraphElem base = dg.get_base(me), bound = dg.get_bound(me);
-  std::vector<std::vector<CommInfo>> remoteArray(nprocs);
+  vector<vector<CommInfo>> remoteArray(nprocs);
   MPI_Comm gcomm = dg.get_comm();
   
   // FIXME TODO can we use TBB::concurrent_vector instead,
   // to make this parallel; first we have to get rid of maps
-  for (std::map<GraphElem,Comm>::const_iterator iter = remoteCupdate.begin(); iter != remoteCupdate.end(); iter++) {
+  for (map<GraphElem,Comm>::const_iterator iter = remoteCupdate.begin(); iter != remoteCupdate.end(); iter++) {
       const GraphElem i = iter->first;
       const Comm &curr = iter->second;
 
@@ -1003,7 +999,7 @@ void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
       remoteArray[tproc].push_back(rcinfo);
   }
 
-  std::vector<GraphElem> send_sz(nprocs), recv_sz(nprocs);
+  vector<GraphElem> send_sz(nprocs), recv_sz(nprocs);
 
 #ifdef DEBUG_PRINTF  
   GraphWeight tc = 0.0;
@@ -1040,11 +1036,11 @@ void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
     scnt += send_sz[i];
   }
 #ifdef DEBUG_PRINTF  
-  std::cout << "[" << me << "]Total number of remote communities to update: " << scnt << std::endl;
+  cout << "[" << me << "]Total number of remote communities to update: " << scnt << endl;
 #endif
 
   GraphElem currPos = 0;
-  std::vector<CommInfo> rdata(rcnt);
+  vector<CommInfo> rdata(rcnt);
 
 #ifdef DEBUG_PRINTF  
   const double t2 = MPI_Wtime();
@@ -1059,7 +1055,7 @@ void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
       currPos += recv_sz[i];
   }
 #else
-  std::vector<MPI_Request> sreqs(nprocs), rreqs(nprocs);
+  vector<MPI_Request> sreqs(nprocs), rreqs(nprocs);
   for (int i = 0; i < nprocs; i++) {
     if ((i != me) && (recv_sz[i] > 0))
       MPI_Irecv(rdata.data() + currPos, recv_sz[i], commType, i, 
@@ -1083,7 +1079,7 @@ void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
 #endif
 #ifdef DEBUG_PRINTF  
   const double t3 = MPI_Wtime();
-  std::cout << "[" << me << "]Update remote community MPI time: " << (t3 - t2) << std::endl;
+  cout << "[" << me << "]Update remote community MPI time: " << (t3 - t2) << endl;
 #endif
 
 #ifdef OMP_SCHEDULE_RUNTIME
@@ -1105,13 +1101,13 @@ void updateRemoteCommunities(const Graph &dg, std::vector<Comm> &localCinfo,
 // initial setup before Louvain iteration begins
 #if defined(USE_MPI_RMA)
 void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
-        std::vector<GraphElem> &ssizes, std::vector<GraphElem> &rsizes, 
-        std::vector<GraphElem> &svdata, std::vector<GraphElem> &rvdata,
+        vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, 
+        vector<GraphElem> &svdata, vector<GraphElem> &rvdata,
         const int me, const int nprocs, MPI_Win &commwin)
 #else
 void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
-        std::vector<GraphElem> &ssizes, std::vector<GraphElem> &rsizes, 
-        std::vector<GraphElem> &svdata, std::vector<GraphElem> &rvdata,
+        vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, 
+        vector<GraphElem> &svdata, vector<GraphElem> &rvdata,
         const int me, const int nprocs)
 #endif
 {
@@ -1120,11 +1116,11 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
   MPI_Comm gcomm = dg.get_comm();
 
 #ifdef USE_OPENMP_LOCK
-  std::vector<omp_lock_t> locks(nprocs);
+  vector<omp_lock_t> locks(nprocs);
   for (int i = 0; i < nprocs; i++)
     omp_init_lock(&locks[i]);
 #endif
-  std::vector<std::unordered_set<GraphElem>> parray(nprocs);
+  vector<unordered_set<GraphElem>> parray(nprocs);
 
 #ifdef USE_OPENMP_LOCK
 #pragma omp parallel default(shared), shared(dg, locks, parray), firstprivate(me)
@@ -1175,7 +1171,7 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
 
   int pproc = 0;
   // TODO FIXME parallelize this loop
-  for (std::vector<std::unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
+  for (vector<unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
     ssz += iter->size();
     ssizes[pproc] = iter->size();
     pproc++;
@@ -1203,10 +1199,10 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
   pproc = 0;
 
 #if defined(USE_MPI_COLLECTIVES)
-  std::vector<int> scnts(nprocs), rcnts(nprocs), sdispls(nprocs), rdispls(nprocs);
+  vector<int> scnts(nprocs), rcnts(nprocs), sdispls(nprocs), rdispls(nprocs);
   
-  for (std::vector<std::unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
-      std::copy(iter->begin(), iter->end(), svdata.begin() + cpos);
+  for (vector<unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
+      copy(iter->begin(), iter->end(), svdata.begin() + cpos);
       
       scnts[pproc] = iter->size();
       rcnts[pproc] = rsizes[pproc];
@@ -1224,7 +1220,7 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
           MPI_GRAPH_TYPE, rvdata.data(), rcnts.data(), rdispls.data(), 
           MPI_GRAPH_TYPE, gcomm);
 #else
-  std::vector<MPI_Request> rreqs(nprocs), sreqs(nprocs);
+  vector<MPI_Request> rreqs(nprocs), sreqs(nprocs);
   for (int i = 0; i < nprocs; i++) {
       if ((i != me) && (rsizes[i] > 0))
           MPI_Irecv(rvdata.data() + rpos, rsizes[i], MPI_GRAPH_TYPE, i, 
@@ -1235,8 +1231,8 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
       rpos += rsizes[i];
   }
 
-  for (std::vector<std::unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
-      std::copy(iter->begin(), iter->end(), svdata.begin() + cpos);
+  for (vector<unordered_set<GraphElem>>::const_iterator iter = parray.begin(); iter != parray.end(); iter++) {
+      copy(iter->begin(), iter->end(), svdata.begin() + cpos);
 
       if ((me != pproc) && (iter->size() > 0))
           MPI_Isend(svdata.data() + cpos, iter->size(), MPI_GRAPH_TYPE, pproc, 
@@ -1252,9 +1248,9 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
   MPI_Waitall(nprocs, rreqs.data(), MPI_STATUSES_IGNORE);
 #endif
 
-  std::swap(svdata, rvdata);
-  std::swap(ssizes, rsizes);
-  std::swap(ssz, rsz);
+  swap(svdata, rvdata);
+  swap(ssizes, rsizes);
+  swap(ssz, rsz);
 
   // create MPI window for communities
 #if defined(USE_MPI_RMA)  
@@ -1272,24 +1268,24 @@ void exchangeVertexReqs(const Graph &dg, size_t &ssz, size_t &rsz,
 } // exchangeVertexReqs
 
 #if defined(USE_MPI_RMA)
-GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
-        size_t &ssz, size_t &rsz, std::vector<GraphElem> &ssizes, std::vector<GraphElem> &rsizes, 
-        std::vector<GraphElem> &svdata, std::vector<GraphElem> &rvdata, const GraphWeight lower, 
-        const GraphWeight thresh, int &iters, MPI_Win &commwin)
+GraphWeight distLouvainMethod(const int me, const int nprocs, Graph &dg,
+        size_t &ssz, size_t &rsz, vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, 
+        vector<GraphElem> &svdata, vector<GraphElem> &rvdata, const GraphWeight lower, 
+        const GraphWeight thresh, int &iters, MPI_Win &commwin, int level)
 #else
-GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
-        size_t &ssz, size_t &rsz, std::vector<GraphElem> &ssizes, std::vector<GraphElem> &rsizes, 
-        std::vector<GraphElem> &svdata, std::vector<GraphElem> &rvdata, const GraphWeight lower, 
-        const GraphWeight thresh, int &iters)
+GraphWeight distLouvainMethod(const int me, const int nprocs, Graph &dg,
+        size_t &ssz, size_t &rsz, vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, 
+        vector<GraphElem> &svdata, vector<GraphElem> &rvdata, const GraphWeight lower, 
+        const GraphWeight thresh, int &iters, int level)
 #endif
 {
-  std::vector<GraphElem> pastComm, currComm, targetComm;
-  std::vector<GraphWeight> vDegree;
-  std::vector<GraphWeight> clusterWeight;
-  std::vector<Comm> localCinfo, localCupdate;
+  vector<GraphElem> pastComm, currComm, targetComm;
+  vector<GraphWeight> vDegree;
+  vector<GraphWeight> clusterWeight;
+  vector<Comm> localCinfo, localCupdate;
  
-  std::unordered_map<GraphElem, GraphElem> remoteComm;
-  std::map<GraphElem,Comm> remoteCinfo, remoteCupdate;
+  unordered_map<GraphElem, GraphElem> remoteComm;
+  map<GraphElem,Comm> remoteCinfo, remoteCupdate;
   
   const GraphElem nv = dg.get_lnv();
   MPI_Comm gcomm = dg.get_comm();
@@ -1304,9 +1300,9 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
   targetComm.resize(nv);
 
 #ifdef DEBUG_PRINTF  
-  std::cout << "[" << me << "]constantForSecondTerm: " << constantForSecondTerm << std::endl;
+  cout << "[" << me << "]constantForSecondTerm: " << constantForSecondTerm << endl;
   if (me == 0)
-      std::cout << "Threshold: " << thresh << std::endl;
+      cout << "Threshold: " << thresh << endl;
 #endif
   const GraphElem base = dg.get_base(me), bound = dg.get_bound(me);
 
@@ -1321,7 +1317,7 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
           svdata, rvdata, me, nprocs, commwin);
   
   // store the remote displacements 
-  std::vector<GraphElem> disp(nprocs);
+  vector<MPI_Aint> disp(nprocs);
   MPI_Exscan(ssizes.data(), (GraphElem*)disp.data(), nprocs, MPI_GRAPH_TYPE, 
           MPI_SUM, gcomm);
 #else
@@ -1331,17 +1327,154 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
 
 #ifdef DEBUG_PRINTF  
   t1 = MPI_Wtime();
-  std::cout << "[" << me << "]Initial communication setup time before Louvain iteration (in s): " << (t1 - t0) << std::endl;
+  cout << "[" << me << "]Initial communication setup time before Louvain iteration (in s): " << (t1 - t0) << endl;
 #endif
- 
+  
+  MPI_Comm comm=MPI_COMM_WORLD;
+  MPI_Comm_rank(comm, &myrank);
+  MPI_Comm_size(comm, &procsize);
+
+  int g_edge_list_sz = dg.edge_list_.size();
+  printf("Normal: g_edge_list_sz - %d \n", g_edge_list_sz);
+
+// FTI CPR code   
+int recovered = 0;
+if (enable_fti) {
+
+  printf("Add FTI protection to Louvain data objects ... \n");
+
+  FTI_Protect(0,&numIters,1,FTI_INTG);
+  FTI_Protect(9,&ssz,1,FTI_INTG);
+  FTI_Protect(10,&rsz,1,FTI_INTG);
+  FTI_Protect_Louvain( ssizes, rsizes, svdata, rvdata, pastComm, currComm, targetComm, remoteComm, remoteCinfo, remoteCupdate, localCinfo, localCupdate, vDegree, clusterWeight, dg );
+  printf("Done: Add FTI protection to data objects ... \n");
+
+}
+
+
   // start Louvain iteration
   while(true) {
+
+  printf("********* Iteration %d ********\n", numIters);
+  if (cp_stride == 0) {
+       printf("ERROR: Please set '-CP' flage for FTI checkpointing interval ... \n");
+  }
+  // end of 
+  // writing varialbes to checkpionts
+
+  // do FTI Recover
+  if (enable_fti) {
+    if ( FTI_Status() != 0){ 
+#ifdef TIMER
+   double elapsed_time;
+   struct timeval start;
+   struct timeval end;
+   gettimeofday(&start, NULL) ;
+#endif
+/*
+       printf("FTI: Before recovery g_edge_list_sz - %d with rank %d \n", g_edge_list_sz, myrank);
+	int res = FTI_RecoverVarInit();
+	printf("test1 \n");
+        res += FTI_RecoverVar(8);
+	printf("test2 \n");
+	res += FTI_RecoverVarFinalize();
+	printf("test3 \n");
+	  printf("the value of FTI_SCES: %d \n", FTI_SCES);
+       if (res != 0) {
+	  printf("Recovery failed for g_edge_list_sz ... \n");
+       }
+       printf("FTI: After recovery g_edge_list_sz - %d with rank %d \n", g_edge_list_sz, myrank);
+       dg.edge_indices_.resize(g_edge_list_sz);
+*/
+       printf("Do FTI Recover to Louvain data objects ... \n");
+       FTI_Recover();
+       printf("Done: FTI Recover data objects from failure ... \n");
+#ifdef TIMER
+   gettimeofday(&end, NULL) ;
+   elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
+   printf("READ CP TIME: %lf (s) Rank %d \n", elapsed_time, myrank);
+   fflush(stdout);
+#endif
+       recovered = 1;
+       procfi = 0;
+       nodefi = 0;
+    }
+  }
+
+  // do FTI CPR
+  if (enable_fti){  
+#ifdef TIMER
+   double elapsed_time;
+   struct timeval start;
+   struct timeval end;
+   gettimeofday(&start, NULL) ;
+#endif
+    if ( (!recovered) && (numIters%cp_stride +1) == cp_stride ){ 
+      printf("Do FTI checkpointing ... \n"); 
+      FTI_Checkpoint(numIters, level);
+    }
+    recovered = 0;
+#ifdef TIMER
+   gettimeofday(&end, NULL) ;
+   elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
+   acc_write_time+=elapsed_time;
+
+#endif
+  }
+  // do FTI CPR
+
+  // simulation of proc/node failures
+    if (procfi == 1 && numIters==4){
+#ifdef TIMER
+   	      printf("WRITE CP TIME: %lf (s) Rank %d \n", acc_write_time, myrank);
+		fflush(stdout);
+#endif
+    	if (myrank == (procsize-1)){
+#ifdef TIMER
+           struct timeval tv;
+           gettimeofday( &tv, NULL );
+           double ts = tv.tv_sec + tv.tv_usec / 1000000.0;
+     	   char hostname[64];
+   	   gethostname(hostname, 64);
+   	   printf("TIMESTAMP KILL: %lf (s) node %s daemon %d\n", ts, hostname, getpid());
+           fflush(stdout);
+#endif
+      	   printf("KILL rank %d\n", myrank);
+      	   kill(getpid(), SIGTERM);
+    	}
+    }
+
+    if (nodefi == 1 && numIters==4){
+#ifdef TIMER
+   	      printf("WRITE CP TIME: %lf (s) Rank %d \n", acc_write_time,myrank);
+		fflush(stdout);
+#endif
+    	if (myrank == (procsize-1)){
+#ifdef TIMER
+           char hostname[64];
+           gethostname(hostname, 64);
+           struct timeval tv;
+           gettimeofday( &tv, NULL );
+           double ts = tv.tv_sec + tv.tv_usec / 1000000.0;
+     	   //char hostname[64];
+   	   gethostname(hostname, 64);
+   	   printf("TIMESTAMP KILL: %lf (s) node %s daemon %d\n", ts, hostname, getpid());
+           fflush(stdout);
+#endif
+      	   gethostname(hostname, 64);
+      	   printf("KILL %s daemon %d rank %d\n", hostname, (int) getppid(),myrank);
+           kill(getppid(), SIGTERM );
+    	}
+    }
+  // simuation of proc/node failures
+
 #ifdef DEBUG_PRINTF  
     const double t2 = MPI_Wtime();
     if (me == 0)
-        std::cout << "Starting Louvain iteration: " << numIters << std::endl;
+        cout << "Starting Louvain iteration: " << numIters << endl;
 #endif
     numIters++;
+
 
 #ifdef DEBUG_PRINTF  
     t0 = MPI_Wtime();
@@ -1360,8 +1493,8 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
 
 #ifdef DEBUG_PRINTF  
     t1 = MPI_Wtime();
-    std::cout << "[" << me << "]Remote community map size: " << remoteComm.size() << std::endl;
-    std::cout << "[" << me << "]Iteration communication time: " << (t1 - t0) << std::endl;
+    cout << "[" << me << "]Remote community map size: " << remoteComm.size() << endl;
+    cout << "[" << me << "]Iteration communication time: " << (t1 - t0) << endl;
 #endif
 
 #ifdef DEBUG_PRINTF  
@@ -1422,6 +1555,11 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
     }
   } // end of Louvain iteration
 
+#ifdef DEBUG_PRINTF  
+    if (me == 0)
+        cout << "End of Louvain iteration: " << endl;
+#endif
+
 #if defined(USE_MPI_RMA)
   MPI_Win_unlock_all(commwin);
   MPI_Win_free(&commwin);
@@ -1439,5 +1577,93 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, const Graph &dg,
   
   return prevMod;
 } // distLouvainMethod plain
+
+static void FTI_Protect_Louvain( vector<GraphElem> &ssizes, vector<GraphElem> &rsizes, vector<GraphElem> &svdata, vector<GraphElem> &rvdata, vector<GraphElem> &pastComm, vector<GraphElem> &currComm, vector<GraphElem> &targetComm, unordered_map<GraphElem, GraphElem> &remoteComm, map<GraphElem,Comm> &remoteCinfo, map<GraphElem,Comm> &remoteCupdate, vector<Comm> &localCinfo, vector<Comm> &localCupdate, vector<GraphWeight> &vDegree, vector<GraphWeight> &clusterWeight, Graph &g ) {
+
+#if USE_32_BIT_GRAPH
+
+FTI_InitType(&FTI_GraphElem, sizeof(int32_t));
+FTI_InitType(&FTI_GraphWeight, sizeof(float));
+FTI_InitType(&FTI_EDGE, sizeof(int32_t)+sizeof(float)); 
+FTI_InitType(&FTI_Comm, sizeof(int32_t)+sizeof(float)); 
+
+#else
+
+FTI_InitType(&FTI_GraphElem, sizeof(int64_t));
+FTI_InitType(&FTI_GraphWeight, sizeof(double));
+FTI_InitType(&FTI_EDGE, sizeof(int64_t)+sizeof(double));
+FTI_InitType(&FTI_Comm, sizeof(int64_t)+sizeof(double));
+
+#endif
+
+  int n = 22;
+
+  // Create a new FTI data type - FTI_GraphElem
+  //FTIT_type FTI_GraphElem;
+  //FTI_InitType(&FTI_GraphElem, sizeof(GraphElem)); 
+
+  // Create a new FTI data type - FTI_EDGE
+  //FTIT_type FTI_EDGE;
+  //FTI_InitType(&FTI_EDGE, sizeof(GraphElem)+sizeof(GraphWeight)); 
+
+  // Create a new FTI data type - FTI_Comm
+  //FTIT_type FTI_Comm;
+  //FTI_InitType(&FTI_Comm, sizeof(GraphElem)+sizeof(GraphWeight)); 
+
+  // Create a new FTI data type - FTI_GraphWeight
+  //FTIT_type FTI_GraphWeight;
+  //FTI_InitType(&FTI_GraphWeight, sizeof(GraphWeight));
+
+  // protect lnv_,lne_,nv_,ne_
+  FTI_Protect(1,&g.lnv_,1,FTI_GraphElem);
+  FTI_Protect(2,&g.lne_,1,FTI_GraphElem);
+  FTI_Protect(3,&g.nv_,1,FTI_GraphElem);
+  FTI_Protect(4,&g.ne_,1,FTI_GraphElem);
+
+  // protect parts_
+  int size=g.parts_.size();
+  FTI_Protect(6,&g.parts_[0],size,FTI_GraphElem);
+
+  // protect edge_list_
+  size=g.edge_list_.size();
+  FTI_Protect(7,&g.edge_list_[0],size,FTI_EDGE);
+
+  size=ssizes.size();
+  FTI_Protect(11,&ssizes[0],size,FTI_INTG);
+
+  size=rsizes.size();
+  FTI_Protect(12,&rsizes[0],size,FTI_GraphElem);
+
+  size=rvdata.size();
+  FTI_Protect(13,&rvdata[0],size,FTI_GraphElem);
+
+  size=pastComm.size();
+  FTI_Protect(14,&pastComm[0],size,FTI_GraphElem);
+
+  size=currComm.size();
+  FTI_Protect(15,&currComm[0],size,FTI_GraphElem);
+
+  size=targetComm.size();
+  FTI_Protect(16,&targetComm[0],size,FTI_GraphElem);
+
+  size=localCinfo.size();
+  FTI_Protect(17,&localCinfo[0],size,FTI_Comm);
+
+  size=localCupdate.size();
+  FTI_Protect(18,&localCupdate[0],size,FTI_Comm);
+
+  size=vDegree.size();
+  FTI_Protect(19,&vDegree[0],size,FTI_GraphWeight);
+
+  size=clusterWeight.size();
+  FTI_Protect(20,&clusterWeight[0],size,FTI_GraphWeight);
+
+  size=svdata.size();
+  FTI_Protect(21,&svdata[0],size,FTI_GraphElem);
+
+  size=g.edge_indices_.size();
+  FTI_Protect(22,&g.edge_indices_[0],size,FTI_GraphElem);
+
+} // FTI_Protect_Louvain
 
 #endif // __DSPL

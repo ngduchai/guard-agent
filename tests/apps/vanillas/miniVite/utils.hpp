@@ -42,10 +42,7 @@
 #define UTILS_HPP
 
 #define PI                          (3.14159)
-
-#ifndef MAX_PRINT_NEDGE
-#define MAX_PRINT_NEDGE             (10000000)
-#endif
+#define MAX_PRINT_NEDGE             (100000)
 
 // Read https://en.wikipedia.org/wiki/Linear_congruential_generator#Period_length
 // about choice of LCG parameters
@@ -68,17 +65,28 @@
 #include <random>
 #include <utility>
 #include <cstring>
+#include <fti.h>
 
-#ifdef USE_32_BIT_GRAPH
+FTIT_type FTI_GraphElem;
+FTIT_type FTI_GraphWeight;
+FTIT_type FTI_EDGE;
+FTIT_type FTI_Comm;
+
+//#ifdef USE_32_BIT_GRAPH
+#if (USE_32_BIT_GRAPH)
+
 using GraphElem = int32_t;
 using GraphWeight = float;
 const MPI_Datatype MPI_GRAPH_TYPE = MPI_INT32_T;
 const MPI_Datatype MPI_WEIGHT_TYPE = MPI_FLOAT;
-#else
+
+#else 
+
 using GraphElem = int64_t;
 using GraphWeight = double;
 const MPI_Datatype MPI_GRAPH_TYPE = MPI_INT64_T;
 const MPI_Datatype MPI_WEIGHT_TYPE = MPI_DOUBLE;
+
 #endif
 
 extern unsigned seed;

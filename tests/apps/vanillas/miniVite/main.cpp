@@ -50,12 +50,20 @@
 #include <sstream>
 #include <string>
 
-#include <omp.h>
+//#include <omp.h>
 #include <mpi.h>
 
 #include "dspl.hpp"
 
-// TODO FIXME add options for desired MPI thread-level
+/* for sleep function */
+#include <signal.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+
+#ifdef TIMER
+double acc_write_time=0;
+#endif
 
 static std::string inputFileName;
 static int me, nprocs;
@@ -63,8 +71,7 @@ static int ranksPerNode = 1;
 static GraphElem nvRGG = 0;
 static bool generateGraph = false;
 static bool readBalanced = false;
-static bool showGraph = false;
-static GraphWeight randomEdgePercent = 0.0;
+static int randomEdgePercent = 0;
 static bool randomNumberLCG = false;
 static bool isUnitEdgeWeight = true;
 static GraphWeight threshold = 1.0E-6;
@@ -72,32 +79,62 @@ static GraphWeight threshold = 1.0E-6;
 // parse command line parameters
 static void parseCommandLine(const int argc, char * const argv[]);
 
+// FTI Protect for Graph
+//static void FTI_Protect_Graph(Graph &g);
+
+
+
 int main(int argc, char *argv[])
 {
-  double t0, t1, t2, t3, ti = 0.0;
-#ifdef DISABLE_THREAD_MULTIPLE_CHECK
-  MPI_Init(&argc, &argv);
-#else  
-  int max_threads;
+#ifdef TIMER
+   double elapsed_time;
+   struct timeval start;
+   struct timeval end;
+#endif
 
-  max_threads = omp_get_max_threads();
+  int max_threads=0;
+
+  //max_threads = omp_get_max_threads();
 
   if (max_threads > 1) {
       int provided;
-      MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-      if (provided < MPI_THREAD_MULTIPLE) {
-          std::cerr << "MPI library does not support MPI_THREAD_MULTIPLE." << std::endl;
+      MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+      if (provided < MPI_THREAD_FUNNELED) {
+          std::cerr << "MPI library does not support MPI_THREAD_FUNNELED." << std::endl;
           MPI_Abort(MPI_COMM_WORLD, -99);
       }
   } else {
       MPI_Init(&argc, &argv);
   }
+#ifdef TIMER
+   gettimeofday(&start, NULL) ;
 #endif
+
+#ifdef TIMER
+   struct timeval tv;
+   gettimeofday( &tv, NULL );
+   double ts = tv.tv_sec + tv.tv_usec / 1000000.0;
+   char hostname[256];
+   gethostname(hostname, sizeof(hostname));
+   printf("TIMESTAMP START/RESTART: %lf (s) node %s daemon %d\n", ts, hostname, getpid());
+   fflush(stdout);
+#endif
+
+  double t0, t1, t2, t3, ti = 0.0;
+
+if (enable_fti) {
+    FTI_Init(argv[1], MPI_COMM_WORLD);
+}
 
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
   MPI_Comm_rank(MPI_COMM_WORLD, &me);
 
   parseCommandLine(argc, argv);
+
+   //char hostname[65];
+   gethostname(hostname, sizeof(hostname));
+   printf("%s daemon %d rank %d\n", hostname, (int) getpid(), me);
+   //sleep(45);
 
   createCommunityMPIType();
   double td0, td1, td, tdt;
@@ -111,6 +148,7 @@ int main(int argc, char *argv[])
   if (generateGraph) { 
       GenerateRGG gr(nvRGG);
       g = gr.generate(randomNumberLCG, isUnitEdgeWeight, randomEdgePercent);
+      //g->print(false);
   }
   else { // read input graph
       BinaryEdgeList rm;
@@ -118,12 +156,12 @@ int main(int argc, char *argv[])
           g = rm.read_balanced(me, nprocs, ranksPerNode, inputFileName);
       else
           g = rm.read(me, nprocs, ranksPerNode, inputFileName);
+      //g->print();
   }
 
-  assert(g != nullptr);
-  if (showGraph)
-      g->print();
+  int recovered = 0;
 
+  assert(g != nullptr);
 #ifdef PRINT_DIST_STATS 
   g->print_dist_stats();
 #endif
@@ -163,53 +201,145 @@ int main(int argc, char *argv[])
 
 #if defined(USE_MPI_RMA)
   currMod = distLouvainMethod(me, nprocs, *g, ssz, rsz, ssizes, rsizes, 
-                svdata, rvdata, currMod, threshold, iters, commwin);
+                svdata, rvdata, currMod, threshold, iters, commwin, level);
 #else
   currMod = distLouvainMethod(me, nprocs, *g, ssz, rsz, ssizes, rsizes, 
-                svdata, rvdata, currMod, threshold, iters);
+                svdata, rvdata, currMod, threshold, iters, level);
 #endif
   MPI_Barrier(MPI_COMM_WORLD);
   t0 = MPI_Wtime();
-  total = t0 - t1;
+  
+  if(me == 0) {
+      std::cout << "Modularity: " << currMod << ", Iterations: " 
+          << iters << ", Time (in s): "<<t0-t1<< std::endl;
 
-  double tot_time = 0.0;
-  MPI_Reduce(&total, &tot_time, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-  if (me == 0) {
-      double avgt = (tot_time / nprocs);
-      if (!generateGraph) {
-        std::cout << "-------------------------------------------------------" << std::endl;
-        std::cout << "File: " << inputFileName << std::endl;
-        std::cout << "-------------------------------------------------------" << std::endl;
-      }
-      std::cout << "-------------------------------------------------------" << std::endl;
-#ifdef USE_32_BIT_GRAPH
-      std::cout << "32-bit datatype" << std::endl;
-#else
-      std::cout << "64-bit datatype" << std::endl;
-#endif
-      std::cout << "-------------------------------------------------------" << std::endl;
-      std::cout << "Average total time (in s), #Processes: " << avgt << ", " << nprocs << std::endl;
-      std::cout << "Modularity, #Iterations: " << currMod << ", " << iters << std::endl;
-      std::cout << "MODS (final modularity * average time): " << (currMod * avgt) << std::endl;
-      std::cout << "-------------------------------------------------------" << std::endl;
+      std::cout << "**********************************************************************" << std::endl;
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
 
+  double tot_time = 0.0;
+  MPI_Reduce(&total, &tot_time, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  
   delete g;
   destroyCommunityMPIType();
 
+if (enable_fti) {
+    FTI_Finalize();
+}
+
+#ifdef TIMER
+   gettimeofday(&end, NULL) ;
+   elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
+   //char hostname[256];
+   gethostname(hostname, sizeof(hostname));
+   printf("APP EXE TIME: %lf (s) node %s daemon %d \n", elapsed_time, hostname, getpid());
+   fflush(stdout);
+#endif
+
+   printf("WRITE CP TIME: %lf (s) node %s daemon %d \n", acc_write_time, hostname, getpid());
+   fflush(stdout);
+
+// close MPI
   MPI_Finalize();
 
   return 0;
-} // main
+}
 
 void parseCommandLine(const int argc, char * const argv[])
 {
   int ret;
 
-  while ((ret = getopt(argc, argv, "f:br:t:n:wlp:s")) != -1) {
+  // new code for C/R implementation
+  if(argc > 1) {
+      int i = 1; 
+      while (i<argc) {
+	 int ok=0;
+         if(strcmp(argv[i], "-CP") == 0) {
+            if (i+1 >= argc) {
+               printf("Missing integer argument to -cp\n");
+            }
+            ok = atoi(argv[i+1]);
+            if(!ok) {
+               printf("Parse Error on option -cp integer value required after argument - CP: %d \n", ok);
+            }
+            cp_stride=ok;
+            i+=2;
+         }
+         else if(strcmp(argv[i], "-PROCFI") == 0) {
+            procfi = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-NODEFI") == 0) {
+            nodefi = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-CP2F") == 0) {
+            cp2f = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-CP2M") == 0) {
+            cp2m = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-CP2A") == 0) {
+            cp2a = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-RESTART") == 0) {
+            restart = 1;
+            i++;
+         }
+         else if(strcmp(argv[i], "-LEVEL") == 0) {
+            level = atoi(argv[i+1]);
+            i+=2;
+         }
+	 else if(strcmp(argv[i], "config.L1.fti") == 0) {
+	    i++;
+	 }
+	 else if(strcmp(argv[i], "-f") == 0) {	
+	    inputFileName.assign(argv[i+1]);
+	    i+=2;
+	 }
+         else if(strcmp(argv[i], "-b") == 0) {
+            readBalanced = true;
+            i++;
+         }
+         else if(strcmp(argv[i], "-r") == 0) {
+            ranksPerNode = atoi(argv[i+1]);
+            i+=2;
+         }
+         else if(strcmp(argv[i], "-t") == 0) {
+            threshold = atof(argv[i+1]);
+            i+=2;
+         }
+         else if(strcmp(argv[i], "-n") == 0) {
+            nvRGG = atol(argv[i+1]);
+	    if (nvRGG > 0)
+		generateGraph = true;
+            i+=2;
+         }
+         else if(strcmp(argv[i], "-w") == 0) {
+            isUnitEdgeWeight = false;
+            i++;
+         }
+         else if(strcmp(argv[i], "-l") == 0) {
+            randomNumberLCG = true;
+            i++;
+         }
+         else if(strcmp(argv[i], "-p") == 0) {
+            randomEdgePercent = atoi(argv[i+1]);
+            i+=2;
+         }
+         else {
+	    i++;
+         }
+      }
+  }
+  // end of C/R code
+
+/*
+  while ((ret = getopt(argc, argv, "f:br:t:n:wlp:")) != -1) {
     switch (ret) {
     case 'f':
       inputFileName.assign(optarg);
@@ -235,16 +365,14 @@ void parseCommandLine(const int argc, char * const argv[])
       randomNumberLCG = true;
       break;
     case 'p':
-      randomEdgePercent = atof(optarg);
-      break;
-    case 's':
-      showGraph = true;
+      randomEdgePercent = atoi(optarg);
       break;
     default:
-      assert(0 && "Option not recognized!!!");
+      //assert(0 && "Should not reach here!!");
       break;
     }
   }
+*/
 
   if (me == 0 && (argc == 1)) {
       std::cerr << "Must specify some options." << std::endl;
@@ -261,7 +389,7 @@ void parseCommandLine(const int argc, char * const argv[])
       MPI_Abort(MPI_COMM_WORLD, -99);
   } 
    
-  if (me == 0 && !generateGraph && (randomEdgePercent > 0.0)) {
+  if (me == 0 && !generateGraph && randomEdgePercent) {
       std::cerr << "Must specify -g for graph generation first to add random edges to it." << std::endl;
       MPI_Abort(MPI_COMM_WORLD, -99);
   } 
@@ -276,3 +404,36 @@ void parseCommandLine(const int argc, char * const argv[])
       MPI_Abort(MPI_COMM_WORLD, -99);
   }
 } // parseCommandLine
+
+/*
+// FTI protect for Graph
+void FTI_Protect_Graph(Graph &g) {
+
+  // Create a new FTI data type - FTI_EDGE
+  FTIT_type FTI_EDGE;
+  FTI_InitType(&FTI_EDGE, sizeof(GraphElem)+sizeof(GraphWeight)); 
+
+  // protect edge_list_
+  int size=g.edge_list_.size();
+  FTI_Protect(0,&g.edge_list_[0],size,FTI_EDGE);
+
+  // Create a new FTI data type - FTI_GraphElem
+  FTIT_type FTI_GraphElem;
+  FTI_InitType(&FTI_GraphElem, sizeof(GraphElem)); 
+
+  // protect edge_indices_ 
+  size=g.edge_indices_.size();
+  FTI_Protect(1,&g.edge_indices_[0],size,FTI_GraphElem);
+
+  // protect lnv_,lne_,nv_,ne_
+  FTI_Protect(2,&g.lnv_,1,FTI_GraphElem);
+  FTI_Protect(3,&g.lne_,1,FTI_GraphElem);
+  FTI_Protect(4,&g.nv_,1,FTI_GraphElem);
+  FTI_Protect(5,&g.ne_,1,FTI_GraphElem);
+
+  // protect parts_
+  size=g.parts_.size();
+  FTI_Protect(6,&g.parts_[0],size,FTI_GraphElem);
+
+} // FTI_Protect_Graph
+*/

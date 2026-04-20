@@ -178,6 +178,12 @@ class Graph
         GraphElem get_ne() const { return ne_; }
         MPI_Comm get_comm() const { return comm_; }
        
+	// code for C/R
+	void set_lnv(GraphElem lnv_new) {lnv_=lnv_new;}
+	void set_lne(GraphElem lne_new) {lne_=lne_new;}
+	void set_nv(GraphElem nv_new) {nv_=nv_new;}
+	void set_ne(GraphElem ne_new) {ne_=ne_new;}
+
         // return edge and active info
         // ----------------------------
        
@@ -250,20 +256,19 @@ class Graph
         // print statistics about edge distribution
         void print_dist_stats()
         {
-            long sumdeg = 0, maxdeg = 0;
-            long lne = (long) lne_;
+            GraphElem sumdeg = 0, maxdeg = 0;
 
-            MPI_Reduce(&lne, &sumdeg, 1, MPI_LONG, MPI_SUM, 0, comm_);
-            MPI_Reduce(&lne, &maxdeg, 1, MPI_LONG, MPI_MAX, 0, comm_);
+            MPI_Reduce(&lne_, &sumdeg, 1, MPI_GRAPH_TYPE, MPI_SUM, 0, comm_);
+            MPI_Reduce(&lne_, &maxdeg, 1, MPI_GRAPH_TYPE, MPI_MAX, 0, comm_);
 
-            long my_sq = lne*lne;
-            long sum_sq = 0;
-            MPI_Reduce(&my_sq, &sum_sq, 1, MPI_LONG, MPI_SUM, 0, comm_);
+            GraphElem my_sq = lne_*lne_;
+            GraphElem sum_sq = 0;
+            MPI_Reduce(&my_sq, &sum_sq, 1, MPI_GRAPH_TYPE, MPI_SUM, 0, comm_);
 
-            double average  = (double) sumdeg / size_;
-            double avg_sq   = (double) sum_sq / size_;
-            double var      = avg_sq - (average*average);
-            double stddev   = sqrt(var);
+            GraphWeight average  = (GraphWeight) sumdeg / size_;
+            GraphWeight avg_sq   = (GraphWeight) sum_sq / size_;
+            GraphWeight var      = avg_sq - (average*average);
+            GraphWeight stddev   = sqrt(var);
 
             MPI_Barrier(comm_);
 
@@ -288,9 +293,11 @@ class Graph
         // public variables
         std::vector<GraphElem> edge_indices_;
         std::vector<Edge> edge_list_;
-    private:
-        GraphElem lnv_, lne_, nv_, ne_;
         std::vector<GraphElem> parts_;       
+    //private:
+        GraphElem lnv_, lne_, nv_, ne_;
+	// removed for C/R
+        //std::vector<GraphElem> parts_;       
         MPI_Comm comm_; 
         int rank_, size_;
 };
@@ -630,7 +637,8 @@ class GenerateRGG
             GraphWeight rt = sqrt((GraphWeight)2.0736/(GraphWeight)nv);
             rn_ = (rc + rt)/(GraphWeight)2.0;
             
-            assert(((GraphWeight)1.0/(GraphWeight)nprocs_) > rn_);
+	    // az:
+            //assert(((GraphWeight)1.0/(GraphWeight)nprocs_) > rn_);
             
             MPI_Barrier(comm_);
         }
@@ -640,7 +648,7 @@ class GenerateRGG
         // use Euclidean distance as edge weight
         // for random edges, choose from (0,1)
         // otherwise, use unit weight throughout
-        Graph* generate(bool isLCG, bool unitEdgeWeight = true, GraphWeight randomEdgePercent = 0.0)
+        Graph* generate(bool isLCG, bool unitEdgeWeight = true, int randomEdgePercent = 0)
         {
             // Generate random coordinate points
             std::vector<GraphWeight> X, Y, X_up, Y_up, X_down, Y_down;
@@ -936,15 +944,15 @@ class GenerateRGG
             
             // add random edges based on 
             // randomEdgePercent 
-            if (randomEdgePercent > 0.0) {
+            if (randomEdgePercent > 0) {
                 const GraphElem pnedges = (edgeList.size()/2);
                 GraphElem tot_pnedges = 0;
 
                 MPI_Allreduce(&pnedges, &tot_pnedges, 1, MPI_GRAPH_TYPE, MPI_SUM, comm_);
                 
                 // extra #edges per process
-                const GraphElem nrande = (((GraphElem)(randomEdgePercent * (GraphWeight)tot_pnedges))/100);
-                GraphElem pnrande = 0.0;
+                const GraphElem nrande = (((GraphElem)randomEdgePercent * tot_pnedges)/100);
+                GraphElem pnrande;
 
                 // TODO FIXME try to ensure a fair edge distibution
                 if (nrande < nprocs_) {
@@ -987,7 +995,8 @@ class GenerateRGG
                 // make sure each process has a 
                 // different seed this time since
                 // we want random edges
-                unsigned rande_seed = (unsigned)(time(0)^getpid());
+                unsigned rande_seed = (unsigned)(rank_);
+                //unsigned rande_seed = (unsigned)(time(0)^getpid());
                 GraphWeight weight = 1.0;
                 std::hash<GraphElem> reh;
                

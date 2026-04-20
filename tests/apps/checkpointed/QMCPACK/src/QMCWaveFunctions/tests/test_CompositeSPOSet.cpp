@@ -1,0 +1,54 @@
+//////////////////////////////////////////////////////////////////////////////////////
+// This file is distributed under the University of Illinois/NCSA Open Source License.
+// See LICENSE file in top directory for details.
+//
+// Copyright (c) 2021 QMCPACK developers.
+//
+// File developed by: Peter Doak, doakpw@ornl.gov, Oak Ridge National Lab
+//
+// File created by: Peter Doak, doakpw@ornl.gov, Oak Ridge National Lab
+//////////////////////////////////////////////////////////////////////////////////////
+
+
+#include "catch.hpp"
+#include "QMCWaveFunctions/CompositeSPOSet.h"
+#include <exception>
+#include <MinimalParticlePool.h>
+#include <MinimalWaveFunctionPool.h>
+#include "Utilities/ProjectData.h"
+
+namespace qmcplusplus
+{
+
+TEST_CASE("CompositeSPO::diamond_1x1x1", "[wavefunction")
+{
+  Libxml2Document doc;
+
+  ProjectData test_project("test", ProjectData::DriverVersion::BATCH);
+  Communicate* comm;
+  comm = OHMMS::Controller;
+  outputManager.pause();
+
+  auto particle_pool = MinimalParticlePool::make_diamondC_1x1x1(comm);
+  auto wavefunction_pool =
+      MinimalWaveFunctionPool::make_diamondC_1x1x1(test_project.getRuntimeOptions(), comm, particle_pool);
+  TrialWaveFunction& psi(wavefunction_pool.getWaveFunction().value());
+
+  std::vector<std::string> sposets{"spo_ud", "spo_dm"};
+  std::vector<std::unique_ptr<SPOSet>> spos;
+  for (auto sposet_str : sposets)
+  {
+    auto& sposet = psi.getSPOSet(sposet_str);
+    spos.emplace_back(sposet.makeClone());
+  }
+
+  CompositeSPOSet<SPOSet::ValueType> comp_sposet("one_composite_set", std::move(spos));
+  CHECK(comp_sposet.size() == 8);
+
+  auto& pset = *particle_pool.getParticleSet("e");
+  SPOSet::ValueMatrix psiM(pset.R.size(), comp_sposet.getOrbitalSetSize());
+  SPOSet::GradMatrix dpsiM(pset.R.size(), comp_sposet.getOrbitalSetSize());
+  SPOSet::ValueMatrix d2psiM(pset.R.size(), comp_sposet.getOrbitalSetSize());
+  comp_sposet.evaluate_notranspose(pset, 0, pset.R.size(), psiM, dpsiM, d2psiM);
+}
+} // namespace qmcplusplus

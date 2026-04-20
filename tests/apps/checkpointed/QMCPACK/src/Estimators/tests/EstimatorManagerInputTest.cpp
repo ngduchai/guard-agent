@@ -1,0 +1,172 @@
+//////////////////////////////////////////////////////////////////////////////////////
+// This file is distributed under the University of Illinois/NCSA Open Source License.
+// See LICENSE file in top directory for details.
+//
+// Copyright (c) 2024 QMCPACK developers.
+//
+// File developed by: Peter Doak, doakpw@ornl.gov, Oak Ridge National Lab
+//
+// File refactored from: Refactored from test_manager.cpp
+//////////////////////////////////////////////////////////////////////////////////////
+#include "EstimatorManagerInputTest.h"
+
+#include "catch.hpp"
+
+#include "ValidEnergyDensityInput.h"
+#include "ValidOneBodyDensityMatricesInput.h"
+#include "ValidSpinDensityInput.h"
+#include "ValidMomentumDistributionInput.h"
+#include "ValidScalarEstimatorInput.h"
+#include "tests/ValidStructureFactorInput.h"
+
+namespace qmcplusplus
+{
+namespace testing
+{
+using ScalarInput = testing::ScalarEstimatorInputs;
+
+Libxml2Document createEstimatorManagerNewGlobalInputXML()
+{
+  const int max_node_recurse = 3;
+  Libxml2Document estimators_doc;
+  estimators_doc.newDoc("Estimators");
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(ScalarInput::getXml(ScalarInput::valid::LOCAL_ENERGY)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  return estimators_doc;
+}
+
+Libxml2Document createEstimatorNewGlobalOperatorEstInputXML()
+{
+  const int max_node_recurse = 3;
+  Libxml2Document estimators_doc;
+  estimators_doc.newDoc("Estimators");
+  {
+    using Input = testing::ValidStructureFactorInput;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::SKALL)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  return estimators_doc;
+}
+
+Libxml2Document createEstimatorManagerNewInputXML()
+{
+  const int max_node_recurse = 3;
+  Libxml2Document estimators_doc;
+  estimators_doc.newDoc("Estimators");
+  {
+    using Input = testing::ValidOneBodyDensityMatricesInput;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::VANILLA)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(valid_momentum_distribution_input_sections[0]));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    using Input = testing::EnergyDensityInputs;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::CELL)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    using Input = testing::ValidStructureFactorInput;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::SKALL)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  ScalarInput scalar_input;
+  for (auto& input_xml : scalar_input)
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(input_xml));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  return estimators_doc;
+}
+
+Libxml2Document createEstimatorManagerNewVMCInputXML()
+{
+  const int max_node_recurse = 3;
+  Libxml2Document estimators_doc;
+  estimators_doc.newDoc("Estimators");
+  {
+    using Input = testing::ValidOneBodyDensityMatricesInput;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::VANILLA)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(valid_momentum_distribution_input_sections[0]));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    using Input = testing::EnergyDensityInputs;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::CELL)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(ScalarInput::getXml(ScalarInput::valid::LOCAL_ENERGY)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  return estimators_doc;
+}
+
+Libxml2Document createEstimatorManagerEnergyDenistyInputXML()
+{
+  const int max_node_recurse = 3;
+  Libxml2Document estimators_doc;
+  estimators_doc.newDoc("Estimators");
+  {
+    using Input = testing::EnergyDensityInputs;
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(Input::getXml(Input::valid::CELL)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+  {
+    Libxml2Document doc;
+    std::string_view xml{R"XML(
+<estimator type="PerParticleHamiltonianLogger" to_stdout="false"/>
+)XML"};
+    REQUIRE(doc.parseFromString(xml));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  {
+    Libxml2Document doc;
+    REQUIRE(doc.parseFromString(ScalarInput::getXml(ScalarInput::valid::LOCAL_ENERGY)));
+    xmlNodePtr node = doc.getRoot();
+    estimators_doc.addChild(xmlCopyNode(node, max_node_recurse));
+  }
+
+  return estimators_doc;
+}
+
+
+} // namespace testing
+} // namespace qmcplusplus
