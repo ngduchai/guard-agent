@@ -1357,12 +1357,6 @@ if (checkpoint_exists(myrank)) {
   while(true) {
 
   printf("********* Iteration %d ********\n", numIters);
-  if (cp_stride == 0) {
-       printf("ERROR: Please set '-CP' flage for FTI checkpointing interval ... \n");
-  }
-  // end of 
-  // writing varialbes to checkpionts
-
   // Simple file-based checkpoint: write every 5 iterations
   if (!recovered && numIters > 0 && numIters % 5 == 0) {
     write_checkpoint(myrank, numIters, currComm, clusterWeight);
