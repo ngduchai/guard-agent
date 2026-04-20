@@ -56,12 +56,12 @@
 
 #include <mpi.h>
 #include <omp.h>
-#include <fti.h>
+// FTI not used in vanilla
 
 #include "graph.hpp"
 #include "utils.hpp"
 
-#include "libcheckpoint/checkpoint.h"
+// checkpoint not used in vanilla
 
 #ifdef TIMER
 extern double acc_write_time;
@@ -69,7 +69,7 @@ extern double acc_write_time;
 
 using namespace std;
 
-#define enable_fti 1
+#define enable_fti 0
 
 // new variables for C/R implementation
 int cp_stride = 0;

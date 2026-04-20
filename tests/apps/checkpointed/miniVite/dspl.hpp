@@ -1369,15 +1369,6 @@ if (checkpoint_exists(myrank)) {
     if (myrank == 0) printf("[checkpoint] Saved at iteration %d\n", numIters);
   }
   recovered = 0;
-  {
-#ifdef TIMER
-   gettimeofday(&end, NULL) ;
-   elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
-   acc_write_time+=elapsed_time;
-
-#endif
-  }
-  // do FTI CPR
 
   // simulation of proc/node failures
     if (procfi == 1 && numIters==4){
