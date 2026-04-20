@@ -123,7 +123,7 @@ int main(int argc, char *argv[])
   double t0, t1, t2, t3, ti = 0.0;
 
 if (enable_fti) {
-    FTI_Init(argv[1], MPI_COMM_WORLD);
+    // FTI removed — using simple checkpoint
 }
 
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
@@ -225,7 +225,7 @@ if (enable_fti) {
   destroyCommunityMPIType();
 
 if (enable_fti) {
-    FTI_Finalize();
+    // FTI removed
 }
 
 #ifdef TIMER

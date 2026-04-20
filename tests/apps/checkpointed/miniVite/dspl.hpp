@@ -56,12 +56,13 @@
 
 #include <mpi.h>
 #include <omp.h>
-#include <fti.h>
+//#include <fti.h>  // Replaced with simple_checkpoint.h
 
 #include "graph.hpp"
 #include "utils.hpp"
 
-#include "libcheckpoint/checkpoint.h"
+#include "simple_checkpoint.h"
+//#include "libcheckpoint/checkpoint.h"
 
 #ifdef TIMER
 extern double acc_write_time;
@@ -1337,18 +1338,18 @@ GraphWeight distLouvainMethod(const int me, const int nprocs, Graph &dg,
   int g_edge_list_sz = dg.edge_list_.size();
   printf("Normal: g_edge_list_sz - %d \n", g_edge_list_sz);
 
-// FTI CPR code   
+// Simple file-based checkpoint (replaces FTI)
 int recovered = 0;
-if (enable_fti) {
-
-  printf("Add FTI protection to Louvain data objects ... \n");
-
-  FTI_Protect(0,&numIters,1,FTI_INTG);
-  FTI_Protect(9,&ssz,1,FTI_INTG);
-  FTI_Protect(10,&rsz,1,FTI_INTG);
-  FTI_Protect_Louvain( ssizes, rsizes, svdata, rvdata, pastComm, currComm, targetComm, remoteComm, remoteCinfo, remoteCupdate, localCinfo, localCupdate, vDegree, clusterWeight, dg );
-  printf("Done: Add FTI protection to data objects ... \n");
-
+int myrank;
+MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+if (checkpoint_exists(myrank)) {
+  printf("[rank %d] Loading checkpoint...\n", myrank);
+  if (read_checkpoint(myrank, numIters, currComm, clusterWeight)) {
+    printf("[rank %d] Restored from iteration %d\n", myrank, numIters);
+    // Restore pastComm from currComm
+    pastComm = currComm;
+    recovered = 1;
+  }
 }
 
 
@@ -1362,58 +1363,13 @@ if (enable_fti) {
   // end of 
   // writing varialbes to checkpionts
 
-  // do FTI Recover
-  if (enable_fti) {
-    if ( FTI_Status() != 0){ 
-#ifdef TIMER
-   double elapsed_time;
-   struct timeval start;
-   struct timeval end;
-   gettimeofday(&start, NULL) ;
-#endif
-/*
-       printf("FTI: Before recovery g_edge_list_sz - %d with rank %d \n", g_edge_list_sz, myrank);
-	int res = FTI_RecoverVarInit();
-	printf("test1 \n");
-        res += FTI_RecoverVar(8);
-	printf("test2 \n");
-	res += FTI_RecoverVarFinalize();
-	printf("test3 \n");
-	  printf("the value of FTI_SCES: %d \n", FTI_SCES);
-       if (res != 0) {
-	  printf("Recovery failed for g_edge_list_sz ... \n");
-       }
-       printf("FTI: After recovery g_edge_list_sz - %d with rank %d \n", g_edge_list_sz, myrank);
-       dg.edge_indices_.resize(g_edge_list_sz);
-*/
-       printf("Do FTI Recover to Louvain data objects ... \n");
-       FTI_Recover();
-       printf("Done: FTI Recover data objects from failure ... \n");
-#ifdef TIMER
-   gettimeofday(&end, NULL) ;
-   elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
-   printf("READ CP TIME: %lf (s) Rank %d \n", elapsed_time, myrank);
-   fflush(stdout);
-#endif
-       recovered = 1;
-       procfi = 0;
-       nodefi = 0;
-    }
+  // Simple file-based checkpoint: write every 5 iterations
+  if (!recovered && numIters > 0 && numIters % 5 == 0) {
+    write_checkpoint(myrank, numIters, currComm, clusterWeight);
+    if (myrank == 0) printf("[checkpoint] Saved at iteration %d\n", numIters);
   }
-
-  // do FTI CPR
-  if (enable_fti){  
-#ifdef TIMER
-   double elapsed_time;
-   struct timeval start;
-   struct timeval end;
-   gettimeofday(&start, NULL) ;
-#endif
-    if ( (!recovered) && (numIters%cp_stride +1) == cp_stride ){ 
-      printf("Do FTI checkpointing ... \n"); 
-      FTI_Checkpoint(numIters, level);
-    }
-    recovered = 0;
+  recovered = 0;
+  {
 #ifdef TIMER
    gettimeofday(&end, NULL) ;
    elapsed_time = (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_usec - start.tv_usec))/1000000 ;
