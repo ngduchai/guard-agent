@@ -9,7 +9,7 @@ Main(
     grid_length  = [L],
     number_of_patches = [ 16 ],
     timestep = 0.0095,
-    simulation_time = 10.,
+    simulation_time = 35.,
     EM_boundary_conditions = [ ['periodic'] ],
 )
 
