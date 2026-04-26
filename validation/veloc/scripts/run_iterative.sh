@@ -221,7 +221,9 @@ Then make the change."
 
   cd "$REPO_ROOT"
   OPENCODE_END=$(date +%s.%N)
-  OPENCODE_ELAPSED=$(echo "$OPENCODE_END - $OPENCODE_START" | bc 2>/dev/null || echo "0")
+  # awk emits a leading 0 for fractions (unlike bc which would write
+  # ".865" instead of "0.865" — invalid JSON when interpolated below).
+  OPENCODE_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $OPENCODE_END - $OPENCODE_START }" 2>/dev/null || echo "0")
   echo "[iter $ITER] OpenCode finished in ${OPENCODE_ELAPSED}s"
 
   # --- Per-iter inspection: pull tool-call breakdown + file-change stats ---
@@ -292,9 +294,12 @@ except Exception as e:
   set -e
 
   VALIDATE_END=$(date +%s.%N)
-  VALIDATE_ELAPSED=$(echo "$VALIDATE_END - $VALIDATE_START" | bc 2>/dev/null || echo "0")
-  ITER_ELAPSED=$(echo "$OPENCODE_ELAPSED + $VALIDATE_ELAPSED" | bc 2>/dev/null || echo "0")
-  TOTAL_ELAPSED=$(echo "$TOTAL_ELAPSED + $ITER_ELAPSED" | bc 2>/dev/null || echo "0")
+  # awk preserves leading zero for fractions; bc would strip it (".865"
+  # → invalid JSON).  Same fix applied to OPENCODE_ELAPSED + ITER_ELAPSED
+  # + TOTAL_ELAPSED below for consistency across all four float fields.
+  VALIDATE_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $VALIDATE_END - $VALIDATE_START }" 2>/dev/null || echo "0")
+  ITER_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $OPENCODE_ELAPSED + $VALIDATE_ELAPSED }" 2>/dev/null || echo "0")
+  TOTAL_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $TOTAL_ELAPSED + $ITER_ELAPSED }" 2>/dev/null || echo "0")
 
   # Extract build output for feedback (if build failed)
   grep -A 20 "Build failed\|CMake Error\|make.*Error\|error:" \
