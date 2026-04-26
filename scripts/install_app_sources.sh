@@ -43,17 +43,39 @@ JOBS="$(nproc 2>/dev/null || echo 2)"
 # Each entry: name|repo_url|branch_or_tag|clone_flags|source_subdir
 #   source_subdir: if the relevant source is in a subdirectory of the repo
 APPS=(
-  "AMG|https://github.com/LLNL/AMG.git|||"
-  "miniFE|https://github.com/Mantevo/miniFE.git|||ref/src"
-  "LAMMPS|https://github.com/lammps/lammps.git|stable_2Aug2023||"
-  "Palabos|https://github.com/omalaspinas/palabos.git|||"
-  "RAxML-NG|https://github.com/amkozlov/raxml-ng.git||--recurse-submodules|"
-  "AMReX|https://github.com/AMReX-Codes/amrex.git|24.10||"
+  # Active 19-app benchmark suite — see tests/apps/README.md for attribution.
+  # Format: name|url|branch|extra-clone-flags|subdir-after-clone-to-extract
+  "CoMD|https://github.com/exmatex/CoMD.git|||"
   "CLAMR|https://github.com/lanl/CLAMR.git|||"
-  "Nyx|https://github.com/AMReX-Astro/Nyx.git|||"
+  "SW4lite|https://github.com/geodynamics/sw4lite.git|||"
+  "MMSP|https://github.com/mesoscale/mmsp.git||--recurse-submodules|"
+  "HyPar|https://github.com/debog/hypar.git|||"
+  "SPPARKS|https://github.com/sandialabs/spparks.git|||"
+  "HPCG|https://github.com/hpcg-benchmark/hpcg.git|||"
+  "PRK_Stencil|https://github.com/ParRes/Kernels.git|||MPI1/Stencil"
+  "SST|https://github.com/sstsimulator/sst-core.git|||"
+  "Athena++|https://github.com/PrincetonUniversity/athena.git|||"
+  "SPARTA|https://github.com/sandialabs/sparta.git|||"
+  "OpenLB|https://gitlab.com/openlb/release.git|||"
+  "Smilei|https://github.com/SmileiPIC/Smilei.git|||"
+  "LAMMPS|https://github.com/lammps/lammps.git|stable_2Aug2023||"
   "SAMRAI|https://github.com/LLNL/SAMRAI.git||--recurse-submodules|"
-  "Nektar++|https://gitlab.nektar.info/nektar/nektar.git|v5.7.0||"
-  "SU2|https://github.com/su2code/SU2.git|v8.1.0|--recurse-submodules|"
+  "ROSS|https://github.com/ROSS-org/ROSS.git||--recurse-submodules|"
+  "WarpX|https://github.com/ECP-WarpX/WarpX.git|||"
+  "QMCPACK|https://github.com/QMCPACK/qmcpack.git|||"
+  "Nyx|https://github.com/AMReX-Astro/Nyx.git||--recurse-submodules|"
+
+  # Apps formerly considered but dropped from the suite.  Kept here as a
+  # historical record so a future operator can re-evaluate without having to
+  # re-discover the URLs.
+  # "AMG|https://github.com/LLNL/AMG.git|||"            # dropped: superseded by HPCG for class (1) preconditioned Krylov coverage
+  # "miniFE|https://github.com/Mantevo/miniFE.git|||ref/src"  # dropped: lighter than HPCG and overlaps it
+  # "Palabos|https://github.com/omalaspinas/palabos.git|||"   # dropped: OpenLB chosen as the LBM representative
+  # "RAxML-NG|https://github.com/amkozlov/raxml-ng.git||--recurse-submodules|"  # dropped: out of scope for current taxonomy
+  # "AMReX|https://github.com/AMReX-Codes/amrex.git|24.10||"   # dropped: AMReX is a framework dependency of Nyx/WarpX, not an app on its own
+  # "Nektar++|https://gitlab.nektar.info/nektar/nektar.git|v5.7.0||"  # dropped: build-cost too high for current tier budget
+  # "SU2|https://github.com/su2code/SU2.git|v8.1.0|--recurse-submodules|"  # dropped: covered by Athena++ for class (3) AMR
+  # "miniVite|https://github.com/Exa-Graph/miniVite.git|||"  # dropped: FTI inlined into source without #ifdef guards (Issue #18)
 )
 
 if $LIST_ONLY; then
