@@ -50,9 +50,278 @@ from .reporter import generate_report
 from .runner import (
     ValidationError,
     configure_and_build,
+    extract_checkpoint_dirs_from_veloc_cfg,
+    measure_checkpoint_dirs,
     run_baseline,
+    run_with_checkpoint_observed_injection,
     run_with_failure_injection,
+    snapshot_checkpoint_dirs,
 )
+
+
+def _capture_checkpoint_artifacts(
+    veloc_cfg_dirs: "list[Path]",
+    veloc_cfg_name: str,
+    out_dir: "Path",
+    label: str,
+) -> None:
+    """Measure and snapshot the resilient run's checkpoint artifacts so they
+    survive across batch invocations (e.g. baseline apps that write to
+    /tmp/<APP>_persistent paths get overwritten or rotated by later runs;
+    this preserves the size + a copy of the files for retrospective analysis).
+
+    Writes:
+        out_dir/checkpoint_metrics.json   — total/per-dir size + file count
+        out_dir/checkpoints/<dir-name>/   — copy of each ckpt dir
+    """
+    cfg_path = None
+    for d in veloc_cfg_dirs:
+        c = d / veloc_cfg_name
+        if c.exists():
+            cfg_path = c
+            break
+    if cfg_path is None:
+        # No veloc.cfg means non-VeloC checkpointing (POSIX cwd-relative,
+        # native HDF5, etc.).  Those files already live under out_dir, so
+        # they are preserved by default; just write an empty metrics record.
+        ckpt_dirs: list[Path] = []
+    else:
+        ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_path)
+
+    measurement = measure_checkpoint_dirs(ckpt_dirs)
+    measurement["label"] = label
+    measurement["veloc_cfg"] = str(cfg_path) if cfg_path else None
+    snapshot_dest = out_dir / "checkpoints"
+    snap = snapshot_checkpoint_dirs(ckpt_dirs, snapshot_dest)
+    measurement["snapshot"] = snap
+
+    metrics_file = out_dir / "checkpoint_metrics.json"
+    metrics_file.write_text(json.dumps(measurement, indent=2))
+    print(
+        f"[validate] checkpoint metrics for {label}: "
+        f"{measurement['total_size_bytes']} bytes across "
+        f"{measurement['total_file_count']} file(s) in "
+        f"{len(ckpt_dirs)} dir(s); snapshot → {snapshot_dest}",
+        flush=True,
+    )
+
+
+def _measure_resilience_signals(
+    resilient_elapsed: float,
+    original_elapsed: float,
+    veloc_cfg_dirs: "list[Path]",
+    veloc_cfg_name: str,
+    out_dir: "Path",
+    *,
+    checkpoint_observed: "bool | None" = None,
+    kill_attempt_elapsed_s: "float | None" = None,
+    recovery_attempt_elapsed_s: "float | None" = None,
+) -> dict:
+    """Measure the raw resilience signals and persist them to disk.
+
+    Policy-free: computes wall-time ratio + checkpoint file count + (when
+    the checkpoint-observed strategy was used) the per-attempt timings and
+    the checkpoint-observation outcome.  Writes ``resilience_proof.json``
+    with all raw signals plus pass/fail flags evaluated at three caps
+    (1.2x for the new production policy, 1.7x for legacy Validation A, 1.9x
+    for legacy Validation B).  Callers (Validation A or Validation B
+    enforcers) decide PASS/FAIL based on their own policy and raise on FAIL.
+
+    *checkpoint_observed*, *kill_attempt_elapsed_s*, *recovery_attempt_elapsed_s*
+    come from :func:`runner.run_with_checkpoint_observed_injection` and are
+    consumed by the new Validation B policy.  Pass ``None`` when the legacy
+    fixed-delay strategy was used.
+    """
+    cfg_path = None
+    for d in veloc_cfg_dirs:
+        c = d / veloc_cfg_name
+        if c.exists():
+            cfg_path = c
+            break
+    ckpt_dirs = (extract_checkpoint_dirs_from_veloc_cfg(cfg_path)
+                 if cfg_path else [])
+    measurement = measure_checkpoint_dirs(ckpt_dirs)
+    files_count = measurement["total_file_count"]
+
+    ratio = (resilient_elapsed / original_elapsed) if original_elapsed > 0 else float("inf")
+    has_ckpt = files_count > 0
+    # New production policy (checkpoint-observed strategy): kill+recover total
+    # must be < 1.2x failure-free.  For legacy fixed-delay strategy callers,
+    # we still publish the older 1.7x / 1.9x flags for backward-compat.
+    fast_at_production_cap = ratio < 1.2
+    fast_at_audit_cap = ratio <= 1.7
+    fast_at_legacy_production_cap = ratio < 1.9
+
+    print(
+        f"[validate] resilience signals — resilient_elapsed={resilient_elapsed:.1f}s, "
+        f"original_elapsed={original_elapsed:.1f}s, ratio={ratio:.2f}x; "
+        f"checkpoint files = {files_count}; "
+        f"wall-time PASS at 1.2x (Validation B new) = {fast_at_production_cap}, "
+        f"PASS at 1.7x (Validation A) = {fast_at_audit_cap}, "
+        f"PASS at 1.9x (legacy) = {fast_at_legacy_production_cap}",
+        flush=True,
+    )
+
+    signals = {
+        "resilient_elapsed_s": resilient_elapsed,
+        "original_elapsed_s": original_elapsed,
+        "ratio": ratio,
+        "wall_time_pass_at_1_2": fast_at_production_cap,
+        "wall_time_pass_at_1_7": fast_at_audit_cap,
+        "wall_time_pass_at_1_9": fast_at_legacy_production_cap,
+        "checkpoint_files": files_count,
+        "checkpoint_files_pass": has_ckpt,
+        "checkpoint_observed": checkpoint_observed,
+        "kill_attempt_elapsed_s": kill_attempt_elapsed_s,
+        "recovery_attempt_elapsed_s": recovery_attempt_elapsed_s,
+        "veloc_cfg": str(cfg_path) if cfg_path else None,
+        "checkpoint_dirs_scanned": [str(d) for d in ckpt_dirs],
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "resilience_proof.json").write_text(json.dumps(signals, indent=2))
+    return signals
+
+
+def _enforce_validation_b(
+    signals: dict,
+    output_correct: bool,
+    out_dir: "Path",
+) -> None:
+    """Validation B (production / checkpoint-solution) — checkpoint-observed.
+
+    PASS iff **all three** hold:
+      (1) ``checkpoint_observed`` is True  — at least one checkpoint file
+          was written during the kill attempt (proves the application is
+          actually attempting checkpoints, not just running to completion);
+      (2) ``output_correct`` — recovery-attempt output matches baseline;
+      (3) wall-time ratio < 1.2 ×  — kill_attempt + recovery_attempt total
+          under 1.2 × failure-free runtime (real recovery from checkpoint,
+          not an expensive redo).
+
+    Used to validate any candidate resilient solution: reference checkpointed
+    code, LLM-generated code from the iterative pipeline, or DMTCP/CRIU
+    approaches.  Raises :class:`ValidationError` on FAIL identifying which
+    subset of signals failed.
+    """
+    checkpoint_observed = signals.get("checkpoint_observed")
+    has_ckpt = signals["checkpoint_files_pass"]
+    fast = signals["wall_time_pass_at_1_2"]
+
+    # When the checkpoint-observed runner was used, "checkpoint_observed"
+    # is the authoritative signal: False means polling completed without
+    # ever seeing a checkpoint file (auto-FAIL, no recovery to validate).
+    # When the legacy runner was used (None), fall back to the post-run
+    # checkpoint-files snapshot.
+    if checkpoint_observed is None:
+        checkpoint_signal = has_ckpt
+    else:
+        checkpoint_signal = checkpoint_observed
+
+    passed = checkpoint_signal and output_correct and fast
+
+    print(
+        f"[validate] Validation B — checkpoint_observed={checkpoint_observed}, "
+        f"checkpoint_files={signals['checkpoint_files']}, "
+        f"output_correct={output_correct}, "
+        f"fast_at_1.2x={fast} (ratio={signals['ratio']:.2f}x) → "
+        f"{'PASS' if passed else 'FAIL'}",
+        flush=True,
+    )
+
+    # Mirror policy verdict back into the proof JSON for downstream tooling.
+    proof_path = out_dir / "resilience_proof.json"
+    if proof_path.exists():
+        s = json.loads(proof_path.read_text())
+        s["validation_mode"] = "B"
+        s["output_correct"] = output_correct
+        s["passed"] = passed
+        proof_path.write_text(json.dumps(s, indent=2))
+
+    if not passed:
+        missing = []
+        if not checkpoint_signal:
+            if checkpoint_observed is False:
+                missing.append(
+                    "no checkpoint file appeared during the kill attempt "
+                    "(checkpoint-observed strategy: app never wrote state)"
+                )
+            else:
+                missing.append("no checkpoint files written")
+        if not output_correct:
+            missing.append("recovery output mismatch vs baseline")
+        if not fast:
+            missing.append(
+                f"kill+recovery wall-time ratio {signals['ratio']:.2f}x "
+                "≥ 1.2x cap"
+            )
+        raise ValidationError(
+            "Validation B failed: " + " AND ".join(missing) + ".  Production "
+            "policy requires a checkpoint to be observed during execution "
+            "AND recovery output correctness AND total kill+recovery wall-time "
+            "< 1.2x failure-free baseline.",
+            output_dir=out_dir,
+        )
+
+
+def _enforce_validation_a(
+    signals: dict,
+    accuracy_match: bool,
+    out_dir: "Path",
+) -> None:
+    """Validation A (vanilla audit).
+
+    PASS iff:
+      (1) ``accuracy_match``  — vanilla failure-free output matches the
+          reference checkpointed code's failure-free output (proves the
+          checkpoint-stripping process didn't corrupt the algorithm);
+      (2) NOT (wall-time ratio < 1.8 × OR checkpoint files written)  — the
+          vanilla failed at least one resilience signal under failure
+          injection (proves it cannot actually recover, only redo from
+          scratch).
+
+    Used by ``run_validate.sh --audit-vanilla`` to gate a vanilla into the
+    experiment pool.  A PASS confirms the vanilla is correct and properly
+    stripped of recovery capability.
+
+    Raises ValidationError on FAIL with which condition failed.
+    """
+    fast = signals["wall_time_pass_at_1_7"]
+    has_ckpt = signals["checkpoint_files_pass"]
+    appears_resilient = fast or has_ckpt
+    passed = accuracy_match and not appears_resilient
+
+    print(
+        f"[validate] Validation A (audit) — accuracy_match={accuracy_match}, "
+        f"appears_resilient={appears_resilient} "
+        f"(fast_at_1.7x={fast}, has_ckpt={has_ckpt}) → "
+        f"{'PASS' if passed else 'FAIL'}",
+        flush=True,
+    )
+
+    proof_path = out_dir / "resilience_proof.json"
+    if proof_path.exists():
+        s = json.loads(proof_path.read_text())
+        s["validation_mode"] = "A"
+        s["accuracy_match"] = accuracy_match
+        s["appears_resilient"] = appears_resilient
+        s["passed"] = passed
+        proof_path.write_text(json.dumps(s, indent=2))
+
+    if not passed:
+        reasons = []
+        if not accuracy_match:
+            reasons.append("vanilla failure-free output diverges from reference")
+        if appears_resilient:
+            reasons.append(
+                f"vanilla appears to recover (ratio {signals['ratio']:.2f}x, "
+                f"checkpoint files {signals['checkpoint_files']})"
+            )
+        raise ValidationError(
+            "Validation A (vanilla audit) failed: " + " AND ".join(reasons) +
+            ".  Audit requires accuracy match against reference AND that "
+            "the vanilla NOT recover under failure injection.",
+            output_dir=out_dir,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -343,19 +612,43 @@ def _build_parser() -> argparse.ArgumentParser:
             "Same semantics as --original-build-cmd."
         ),
     )
+    build_grp.add_argument(
+        "--app-input-subdir",
+        default=None,
+        help=(
+            "Subdirectory (relative to the app source root) extracted from a "
+            "stripped 'cd <subdir> && ...' prefix in app.yaml's run.cmd.  "
+            "When set, the contents of that subdirectory are flattened into "
+            "the per-run cwd so apps that expect to run from that directory "
+            "(SPARTA, SPPARKS, HyPar) find their input files."
+        ),
+    )
 
     # Correctness stage.
     corr_grp = parser.add_argument_group("Correctness validation")
     corr_grp.add_argument(
         "--output-file-name",
-        default="recon.h5",
-        help="Name of the output file produced by both applications to compare.",
+        default="stdout.txt",
+        help=(
+            "Name of the output file produced by both applications to compare. "
+            "Defaults to 'stdout.txt' (the captured run output written by the "
+            "runner) so apps with comparison.output_file=null in app.yaml use "
+            "stdout-based comparison.  Override per app via "
+            "comparison.output_file in app.yaml when the app writes a "
+            "specific result file (e.g. recon.h5, plt00010)."
+        ),
     )
     corr_grp.add_argument(
         "--max-attempts",
         type=int,
-        default=10,
-        help="Maximum resilient retry attempts before giving up.",
+        default=4,
+        help=(
+            "Maximum resilient retry attempts before giving up.  Default 4 "
+            "= 1 successful injection + 1 recovery run + 2 retries for OS "
+            "scheduling jitter on the injector.  Higher values waste time "
+            "when the injector is systematically missing (timing skew, "
+            "consistently-late injection delay)."
+        ),
     )
     corr_grp.add_argument(
         "--injection-delay",
@@ -376,6 +669,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "reuses the output files and elapsed time from this directory.  "
             "The directory must contain the expected output file and a "
             'ground_truth_meta.json with {"elapsed_s": <float>}.'
+        ),
+    )
+    corr_grp.add_argument(
+        "--no-baseline-cache",
+        action="store_true",
+        help=(
+            "Disable the auto-detect of build/baseline_cache/<APP>/.  Forces "
+            "the in-process warmup + 2 measurement passes for every "
+            "invocation.  Useful when iterating on the cache-key logic "
+            "itself or when intentionally re-measuring."
         ),
     )
     corr_grp.add_argument(
@@ -423,6 +726,31 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATTERN",
         help="Substrings to ignore when comparing text files (text-diff method).",
+    )
+    corr_grp.add_argument(
+        "--text-keep-patterns",
+        nargs="*",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Substrings; only stdout lines matching at least one survive the "
+            "filter before comparison.  Allowlist counterpart of "
+            "--text-ignore-patterns; takes precedence when both are set.  "
+            "Sourced from comparison.keep_patterns in app.yaml."
+        ),
+    )
+    corr_grp.add_argument(
+        "--text-strip-patterns",
+        nargs="*",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Regex substring patterns removed from each surviving line "
+            "before number extraction.  Use to drop timing fields embedded "
+            "in deterministic output lines (e.g. miniVite's `Time (in s): "
+            "[0-9.]+` next to its Modularity result).  Sourced from "
+            "comparison.strip_patterns in app.yaml."
+        ),
     )
 
     # Benchmarking stage.
@@ -499,6 +827,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "Reads pipeline_state.json from --output-dir and skips already-completed stages."
         ),
     )
+    ctrl_grp.add_argument(
+        "--vanilla-audit",
+        action="store_true",
+        help=(
+            "Switch the correctness stage to Validation A (vanilla audit): "
+            "PASSES iff the vanilla failure-free output matches the reference "
+            "checkpointed code's failure-free output (accuracy) AND the "
+            "failure-injected vanilla fails at least one resilience signal "
+            "(no recovery: wall-time ratio ≥ 1.8x AND no checkpoint files).  "
+            "Without this flag, validate.py runs Validation B (production): "
+            "PASSES iff resilient output matches baseline AND ≥1 checkpoint "
+            "file exists AND wall-time < 1.95x baseline."
+        ),
+    )
+    ctrl_grp.add_argument(
+        "--reference-codebase",
+        default=None,
+        help=(
+            "Path to the reference checkpointed code, used by --vanilla-audit "
+            "for the accuracy comparison.  When omitted, auto-derives from "
+            "--original-codebase by replacing 'vanillas' with 'checkpointed' "
+            "in the path (i.e. tests/apps/vanillas/<APP> → "
+            "tests/apps/checkpointed/<APP>)."
+        ),
+    )
 
     return parser
 
@@ -521,6 +874,9 @@ def _stage_correctness(
     res_app_args: list[str],
     approaches: list[ApproachConfig] | None = None,
     build_root: Path | None = None,
+    original_build_cmd: str | None = None,
+    resilient_build_cmd: str | None = None,
+    app_input_subdir: str | None = None,
 ) -> list[CompareResult]:
     """Run baseline + resilient + approaches, compare outputs.
 
@@ -535,6 +891,31 @@ def _stage_correctness(
     resilient_out = output_dir / "correctness" / "resilient"
 
     # --- Baseline / ground truth ---
+    # Auto-detect a populated baseline cache before the explicit
+    # --ground-truth-dir check.  When neither --ground-truth-dir nor
+    # --no-baseline-cache is set, invoke the per-app collector
+    # (validation/veloc/collect_baseline.py) which either reuses a valid
+    # build/baseline_cache/<APP>/ directory or runs the warmup + 2 baseline
+    # passes once and writes the results there.  Setting args.ground_truth_dir
+    # programmatically lets the existing reuse branch (below) take over
+    # unchanged.  This eliminates the per-iter cost of running 3 baseline
+    # passes on every validate.py invocation when the vanilla source hasn't
+    # changed (the common case for the iterative LLM loop).
+    if not args.ground_truth_dir and not getattr(args, "no_baseline_cache", False):
+        auto_dir = _autodetect_or_collect_baseline_cache(
+            args=args,
+            original_src=original_src,
+            original_app_args=orig_app_args,
+            original_build_cmd=original_build_cmd,
+            app_input_subdir=app_input_subdir,
+        )
+        if auto_dir is not None:
+            args.ground_truth_dir = str(auto_dir)
+            print(
+                f"[validate] Auto-resolved baseline cache: {auto_dir}",
+                flush=True,
+            )
+
     ground_truth_dir = Path(args.ground_truth_dir) if args.ground_truth_dir else None
 
     if ground_truth_dir and ground_truth_dir.exists():
@@ -554,27 +935,87 @@ def _stage_correctness(
             flush=True,
         )
     else:
-        # Run baseline from scratch.
+        # Run baseline THREE times — discard first as warmup, take MIN of
+        # the next two as the recorded baseline.  The first mpirun pays the
+        # cold-cache cost (page cache empty, dynamic libs not loaded, MPI
+        # runtime cold, CPU governor scaling up).  A single warmup is not
+        # always enough to reach steady state on the very first run after
+        # a fresh boot or long idle (CLAMR audit: warmup 130s, measurement
+        # 128s, but actual steady-state is ~88s — confirmed by repeated
+        # back-to-back runs).  Two measurement passes + MIN cancels these
+        # one-off outliers cheaply: the worst case is one extra baseline
+        # run per app, and only on the apps that actually need it.
         baseline_out = output_dir / "correctness" / "baseline"
-        print("\n[validate] Running baseline (original) application...", flush=True)
-        baseline_result = run_baseline(
+        baseline_2_out = output_dir / "correctness" / "baseline_2"
+        warmup_out = output_dir / "correctness" / "baseline_warmup"
+        print(
+            "\n[validate] Running baseline (original) application — "
+            "warmup pass (timing discarded)...",
+            flush=True,
+        )
+        run_baseline(
+            source_dir=original_src,
+            build_dir=original_build,
+            output_dir=warmup_out,
+            executable_name=orig_exe,
+            num_procs=args.num_procs,
+            app_args=orig_app_args,
+            build_cmd=original_build_cmd,
+            app_input_subdir=app_input_subdir,
+        )
+        print(
+            "\n[validate] Running baseline (original) application — "
+            "measurement pass 1 of 2...",
+            flush=True,
+        )
+        baseline_result_1 = run_baseline(
             source_dir=original_src,
             build_dir=original_build,
             output_dir=baseline_out,
             executable_name=orig_exe,
             num_procs=args.num_procs,
             app_args=orig_app_args,
+            build_cmd=original_build_cmd,
+            app_input_subdir=app_input_subdir,
         )
-        baseline_elapsed = baseline_result.elapsed_s
+        print(
+            "\n[validate] Running baseline (original) application — "
+            "measurement pass 2 of 2...",
+            flush=True,
+        )
+        baseline_result_2 = run_baseline(
+            source_dir=original_src,
+            build_dir=original_build,
+            output_dir=baseline_2_out,
+            executable_name=orig_exe,
+            num_procs=args.num_procs,
+            app_args=orig_app_args,
+            build_cmd=original_build_cmd,
+            app_input_subdir=app_input_subdir,
+        )
+        baseline_elapsed = min(baseline_result_1.elapsed_s, baseline_result_2.elapsed_s)
+        print(
+            f"[validate] Baseline measurements: "
+            f"pass1={baseline_result_1.elapsed_s:.1f}s, "
+            f"pass2={baseline_result_2.elapsed_s:.1f}s, "
+            f"using MIN={baseline_elapsed:.1f}s",
+            flush=True,
+        )
 
     # --- Determine injection delay ---
+    # Inject failures at 90% of failure-free runtime.  Rationale: (i) leaves
+    # 90% of the run for checkpoint cadence to fire (typically 5-30s
+    # cadences fire many times within a 100+s window); (ii) reserves a 10%
+    # kill window so the failure injector has time to find ranks and SIGKILL
+    # before the app exits naturally; (iii) vanilla redo total ≈ 0.90 + 1.0
+    # = 1.90 × baseline — Validation A cap of 1.7 catches it (0.20 margin),
+    # Validation B cap of 1.9 sits exactly at the redo upper bound.
     if args.injection_delay == "auto":
-        # Use 1/3 of baseline runtime so at least one checkpoint is written
-        injection_delay = max(5.0, min(baseline_elapsed / 3.0, 300.0))
+        injection_delay = max(5.0, baseline_elapsed * 0.90)
         print(
             f"[validate] Baseline runtime: {baseline_elapsed:.1f}s. "
             f"Adaptive injection delay: {injection_delay:.1f}s "
-            f"(1/3 of runtime, clamped to [5, 300]s)",
+            f"(90% of runtime, floor 5s)",
             flush=True,
         )
     else:
@@ -586,22 +1027,122 @@ def _stage_correctness(
         )
 
     # --- Resilient run with failure injection ---
-    print(
-        "\n[validate] Running resilient application with failure injection...",
-        flush=True,
+    # Branch on validation mode:
+    #   * Vanilla audit (Validation A): legacy fixed-delay retry loop.  We
+    #     want to know whether the vanilla appears resilient under standard
+    #     0.90x-baseline injection — i.e. whether the strip was complete.
+    #   * Production (Validation B): checkpoint-observed strategy.  Watch
+    #     for the application to actually write a checkpoint, then SIGKILL,
+    #     then validate that recovery completes within 1.2x baseline with
+    #     correct output.
+    if getattr(args, "vanilla_audit", False):
+        print(
+            "\n[validate] Running resilient application with failure injection "
+            "(legacy fixed-delay strategy — vanilla audit mode)...",
+            flush=True,
+        )
+        # Cap each mpirun attempt at ~3x the baseline runtime.  Without
+        # this, an LLM-generated solution with runaway checkpoint cadence
+        # (e.g. one checkpoint per inner loop iteration) can hang for hours
+        # instead of failing fast.  Floor of 60 s so very short baselines
+        # still leave room for normal startup variance.
+        attempt_timeout_s = max(60.0, baseline_elapsed * 3.0)
+        print(
+            f"[validate] Per-attempt wallclock cap: {attempt_timeout_s:.1f}s "
+            f"(3x baseline, floor 60s)",
+            flush=True,
+        )
+        fp_result = run_with_failure_injection(
+            source_dir=resilient_src,
+            build_dir=resilient_build,
+            output_dir=resilient_out,
+            executable_name=res_exe,
+            num_procs=args.num_procs,
+            app_args=res_app_args,
+            max_attempts=args.max_attempts,
+            injection_delay=injection_delay,
+            run_install=args.install_resilient,
+            success_output_filename=args.output_file_name,
+            veloc_config_name=args.veloc_config_name,
+            build_cmd=resilient_build_cmd,
+            app_input_subdir=app_input_subdir,
+            extra_source_dirs=[original_src],
+            attempt_timeout_s=attempt_timeout_s,
+        )
+        ckpt_observed_for_signals: bool | None = None
+        kill_attempt_elapsed_for_signals: float | None = None
+        recovery_attempt_elapsed_for_signals: float | None = None
+    else:
+        print(
+            "\n[validate] Running resilient application with failure injection "
+            "(checkpoint-observed strategy — production mode)...",
+            flush=True,
+        )
+        # Recovery timeout: 1.5x baseline, with a 60 s floor so MPI startup
+        # + recovery has room on very short baselines (e.g. CoMD ~10 s)
+        # without tripping the safety kill before recovery can even begin.
+        recovery_timeout_s = max(60.0, baseline_elapsed * 1.5)
+        print(
+            f"[validate] Checkpoint-observed config: poll after "
+            f"{baseline_elapsed * 0.5:.1f}s (50% of baseline), "
+            f"5s post-checkpoint wait, recovery timeout "
+            f"{recovery_timeout_s:.1f}s (1.5x baseline, floor 60s). "
+            f"Verdict cap: kill+recovery total < "
+            f"{baseline_elapsed * 1.2:.1f}s (1.2x baseline).",
+            flush=True,
+        )
+        fp_result = run_with_checkpoint_observed_injection(
+            source_dir=resilient_src,
+            build_dir=resilient_build,
+            output_dir=resilient_out,
+            executable_name=res_exe,
+            num_procs=args.num_procs,
+            app_args=res_app_args,
+            failure_free_elapsed=baseline_elapsed,
+            observation_threshold_fraction=0.5,
+            poll_interval_s=1.0,
+            post_checkpoint_wait_s=5.0,
+            recovery_timeout_s=recovery_timeout_s,
+            run_install=args.install_resilient,
+            success_output_filename=args.output_file_name,
+            veloc_config_name=args.veloc_config_name,
+            build_cmd=resilient_build_cmd,
+            app_input_subdir=app_input_subdir,
+            extra_source_dirs=[original_src],
+        )
+        ckpt_observed_for_signals = fp_result.checkpoint_observed
+        kill_attempt_elapsed_for_signals = fp_result.kill_attempt_elapsed_s
+        recovery_attempt_elapsed_for_signals = fp_result.recovery_attempt_elapsed_s
+
+    # --- Measure resilience signals (raw, policy-free) ---
+    # Compute wall-time ratio + checkpoint-file count for the failure-injected
+    # run.  Two enforcers will consume these signals: Validation A (vanilla
+    # audit) demands the run NOT recover; Validation B (production / LLM-
+    # generated) demands it DOES recover under stricter AND-logic.  Enforced
+    # after the output comparisons below so we can plug `output_correct` into
+    # Validation B.
+    resilience_signals = _measure_resilience_signals(
+        resilient_elapsed=fp_result.elapsed_s,
+        original_elapsed=baseline_elapsed,
+        veloc_cfg_dirs=[resilient_src, resilient_build],
+        veloc_cfg_name=args.veloc_config_name,
+        out_dir=resilient_out,
+        checkpoint_observed=ckpt_observed_for_signals,
+        kill_attempt_elapsed_s=kill_attempt_elapsed_for_signals,
+        recovery_attempt_elapsed_s=recovery_attempt_elapsed_for_signals,
     )
-    run_with_failure_injection(
-        source_dir=resilient_src,
-        build_dir=resilient_build,
-        output_dir=resilient_out,
-        executable_name=res_exe,
-        num_procs=args.num_procs,
-        app_args=res_app_args,
-        max_attempts=args.max_attempts,
-        injection_delay=injection_delay,
-        run_install=args.install_resilient,
-        success_output_filename=args.output_file_name,
-        veloc_config_name=args.veloc_config_name,
+
+    # --- Capture checkpoint metrics + snapshot the on-disk artifacts ---
+    # Without this, baseline runs whose veloc.cfg writes to /tmp/<APP>_persistent
+    # would have those files overwritten or rotated away by later batch apps,
+    # destroying the data needed for any retrospective size / file-count
+    # comparison against the reference.  We measure the size, then copy the
+    # contents into the per-app output dir so they survive.
+    _capture_checkpoint_artifacts(
+        veloc_cfg_dirs=[resilient_src, resilient_build],
+        veloc_cfg_name=args.veloc_config_name,
+        out_dir=resilient_out,
+        label="failure_prone",
     )
 
     # --- Also run resilient without failure injection (failure-free check) ---
@@ -617,7 +1158,9 @@ def _stage_correctness(
     # accessible from the clean-run CWD (mirrors what run_baseline and
     # run_with_failure_injection do for their run directories).
     _symlink_input_data(
-        resilient_src, resilient_build, resilient_clean_out, res_app_args
+        resilient_src, resilient_build, resilient_clean_out, res_app_args,
+        extra_source_dirs=[original_src],
+        input_subdir=app_input_subdir,
     )
     clean_result = run_once(
         build_dir=resilient_build,
@@ -636,17 +1179,71 @@ def _stage_correctness(
             flush=True,
         )
 
-    # --- Compare outputs ---
-    plugin_path = Path(args.custom_comparator) if args.custom_comparator else None
-    comparator = make_comparator(
-        method=args.comparison_method,
-        plugin_path=plugin_path,
-        dataset=args.hdf5_dataset,
-        ssim_threshold=args.ssim_threshold,
-        atol=args.numeric_atol,
-        rtol=args.numeric_rtol,
-        ignore_patterns=args.text_ignore_patterns,
+    # --- Capture checkpoint metrics + snapshot for the failure-free run too ---
+    _capture_checkpoint_artifacts(
+        veloc_cfg_dirs=[resilient_src, resilient_build],
+        veloc_cfg_name=args.veloc_config_name,
+        out_dir=resilient_clean_out,
+        label="failure_free",
     )
+
+    # --- Compare outputs ---
+    # Two paths:
+    #   1. output_file_name == "stdout.txt" → stdout-based comparison via the
+    #      shared reference_validator._compare_outputs (handles keep_patterns +
+    #      ignore_patterns + numeric extraction from arbitrary text).
+    #   2. otherwise → file-based comparison via make_comparator (HDF5, SSIM,
+    #      hash, numpy-loadable text matrices, custom plugins).
+    use_stdout_compare = args.output_file_name == "stdout.txt"
+
+    if use_stdout_compare:
+        # Map validate.py CLI method names back to reference_validator's short
+        # names ("numeric"/"text"/"hash") since _compare_outputs uses those.
+        _METHOD_REVERSE = {
+            "numeric-tolerance": "numeric",
+            "text-diff": "text",
+            "hash": "hash",
+        }
+        ref_method = _METHOD_REVERSE.get(args.comparison_method, "text")
+        # Tolerance for the numeric path: relative diff, so use the rtol value.
+        ref_tolerance = float(args.numeric_rtol or args.numeric_atol or 1e-6)
+        from .reference_validator import _compare_outputs as _stdout_compare
+    else:
+        plugin_path = Path(args.custom_comparator) if args.custom_comparator else None
+        comparator = make_comparator(
+            method=args.comparison_method,
+            plugin_path=plugin_path,
+            dataset=args.hdf5_dataset,
+            ssim_threshold=args.ssim_threshold,
+            atol=args.numeric_atol,
+            rtol=args.numeric_rtol,
+            ignore_patterns=args.text_ignore_patterns,
+        )
+
+    def _do_compare(label: str, golden_path: Path, test_path: Path) -> CompareResult:
+        """Run one comparison.  Falls through to the right backend based on
+        whether we're doing stdout-based or file-based comparison."""
+        if use_stdout_compare:
+            golden_text = golden_path.read_text(errors="replace") if golden_path.exists() else ""
+            test_text = test_path.read_text(errors="replace") if test_path.exists() else ""
+            res = _stdout_compare(
+                golden_stdout=golden_text,
+                test_stdout=test_text,
+                method=ref_method,
+                tolerance=ref_tolerance,
+                ignore_patterns=args.text_ignore_patterns,
+                keep_patterns=args.text_keep_patterns,
+                strip_patterns=args.text_strip_patterns,
+            )
+            return CompareResult(
+                method=f"{res.method} [{label}]",
+                passed=bool(res.passed),
+                score=res.score,
+                message=res.details or "",
+            )
+        result = comparator.compare(golden_path, test_path)
+        result.method = f"{result.method} [{label}]"
+        return result
 
     results: list[CompareResult] = []
 
@@ -659,8 +1256,7 @@ def _stage_correctness(
         f"  resilient: {resilient_file}",
         flush=True,
     )
-    result1 = comparator.compare(baseline_file, resilient_file)
-    result1.method = f"{result1.method} [VeloC, failure-prone]"
+    result1 = _do_compare("VeloC, failure-prone", baseline_file, resilient_file)
     print(f"[validate] Test 1 (VeloC, failure-prone): {result1}", flush=True)
     results.append(result1)
 
@@ -673,8 +1269,7 @@ def _stage_correctness(
             f"  resilient: {resilient_clean_file}",
             flush=True,
         )
-        result2 = comparator.compare(baseline_file, resilient_clean_file)
-        result2.method = f"{result2.method} [VeloC, failure-free]"
+        result2 = _do_compare("VeloC, failure-free", baseline_file, resilient_clean_file)
         print(f"[validate] Test 2 (VeloC, failure-free): {result2}", flush=True)
         results.append(result2)
     else:
@@ -682,6 +1277,124 @@ def _stage_correctness(
             f"[validate] Skipping failure-free comparison: "
             f"{resilient_clean_file} not found.",
             flush=True,
+        )
+
+    # --- Resilience policy enforcement ---
+    # Validation A (vanilla audit): also build the reference checkpointed
+    # code, run it failure-free, and compare its output to the vanilla
+    # baseline.  Audit PASSES iff (a) outputs match (the strip didn't break
+    # the algorithm) AND (b) the failure-injected vanilla failed at least
+    # one resilience signal (cannot recover).
+    #
+    # Validation B (production): require output_correct AND ≥1 checkpoint
+    # file AND wall-time < 1.95 × baseline.  Stricter AND-logic to make
+    # sure the resilient code actually recovered (didn't just redo the work
+    # from scratch) and produced the right answer.
+    if getattr(args, "vanilla_audit", False):
+        # Locate reference checkpointed code.
+        ref_codebase = None
+        if getattr(args, "reference_codebase", None):
+            ref_codebase = Path(args.reference_codebase).resolve()
+        else:
+            # Auto-derive from the vanilla source path:
+            # tests/apps/vanillas/<APP>  →  tests/apps/checkpointed/<APP>
+            try:
+                parts = list(original_src.parts)
+                idx = parts.index("vanillas")
+                parts[idx] = "checkpointed"
+                guess = Path(*parts)
+                if guess.exists():
+                    ref_codebase = guess
+            except ValueError:
+                pass
+
+        accuracy_match = False
+        if ref_codebase is None or not ref_codebase.exists():
+            print(
+                f"\n[validate] Validation A: reference codebase not found "
+                f"(tried --reference-codebase + auto-derived "
+                f"tests/apps/checkpointed/<APP>); accuracy check FAILS.",
+                flush=True,
+            )
+        else:
+            print(
+                f"\n[validate] Validation A: building + running reference "
+                f"checkpointed code for accuracy comparison: {ref_codebase}",
+                flush=True,
+            )
+            ref_baseline_out = output_dir / "correctness" / "reference_baseline"
+            ref_build_dir = build_root / "reference" if build_root else \
+                output_dir / "build" / "reference"
+            try:
+                ref_result = run_baseline(
+                    source_dir=ref_codebase,
+                    build_dir=ref_build_dir,
+                    output_dir=ref_baseline_out,
+                    executable_name=orig_exe,
+                    num_procs=args.num_procs,
+                    app_args=orig_app_args,
+                    build_cmd=original_build_cmd,
+                    app_input_subdir=app_input_subdir,
+                    # Force vanilla input files to take precedence over the
+                    # reference's own.  Without this, apps like SW4lite
+                    # (vanilla "time t=15.0" vs reference "time t=2.0") and
+                    # Athena++ (vanilla 200x200 AMR tlim=19 vs reference
+                    # 50x100 tlim=1) compare apples-to-oranges and the
+                    # accuracy_match check trivially fails.  The resilient
+                    # run already uses vanilla source for everything; this
+                    # makes the reference run symmetric.
+                    priority_source_dirs=[original_src],
+                    # Still fall back to vanilla source for input files the
+                    # reference doesn't ship (e.g. LAMMPS bench/in.lj_long
+                    # exists in vanilla only; reference has in.lj/in.lj_ckpt/
+                    # in.lj_restart instead).  Functionally subsumed by
+                    # priority_source_dirs above but kept for clarity.
+                    extra_source_dirs=[original_src],
+                )
+                ref_baseline_file = ref_baseline_out / args.output_file_name
+                if ref_baseline_file.exists():
+                    print(
+                        f"\n[validate] Comparing outputs (vanilla vs reference, "
+                        f"both failure-free):\n"
+                        f"  vanilla:   {baseline_file}\n"
+                        f"  reference: {ref_baseline_file}",
+                        flush=True,
+                    )
+                    acc_result = _do_compare(
+                        "vanilla vs reference (accuracy)",
+                        baseline_file,
+                        ref_baseline_file,
+                    )
+                    print(
+                        f"[validate] Accuracy check (Validation A): {acc_result}",
+                        flush=True,
+                    )
+                    results.append(acc_result)
+                    accuracy_match = bool(acc_result.passed)
+                else:
+                    print(
+                        f"[validate] Validation A: reference output file "
+                        f"{ref_baseline_file} not produced; accuracy FAILS.",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    f"[validate] Validation A: reference build/run errored "
+                    f"({type(exc).__name__}: {exc}); accuracy FAILS.",
+                    flush=True,
+                )
+
+        _enforce_validation_a(
+            signals=resilience_signals,
+            accuracy_match=accuracy_match,
+            out_dir=resilient_out,
+        )
+    else:
+        # Validation B: AND-logic policy on the resilient run.
+        _enforce_validation_b(
+            signals=resilience_signals,
+            output_correct=bool(result1.passed),
+            out_dir=resilient_out,
         )
 
     # --- Approach correctness checks ---
@@ -1051,6 +1764,72 @@ def _resolve_build_cmd(value: str | None) -> str | None:
     return value
 
 
+def _default_baseline_cache_dir(original_src: Path) -> Path:
+    """Per-app baseline-cache directory under ``build/baseline_cache/<APP>``.
+
+    The app name is the last path component of the vanilla source dir.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / "build" / "baseline_cache" / Path(original_src).name
+
+
+def _autodetect_or_collect_baseline_cache(
+    *,
+    args: argparse.Namespace,
+    original_src: Path,
+    original_app_args: list[str],
+    original_build_cmd: str | None,
+    app_input_subdir: str | None,
+) -> Path | None:
+    """Auto-detect a populated baseline cache, or run the collector to populate
+    it.
+
+    Returns the cache directory path on success (caller assigns it to
+    ``args.ground_truth_dir`` so the existing reuse branch fires), or
+    ``None`` on failure (caller falls back to the in-process 3-pass
+    baseline).
+
+    Imports the collector lazily so this module stays importable even if
+    ``collect_baseline`` ever has an import-time issue.
+    """
+    try:
+        from .collect_baseline import collect
+    except ImportError as exc:
+        print(
+            f"[validate] WARNING: collect_baseline import failed ({exc}); "
+            "falling back to in-process baseline.",
+            flush=True,
+        )
+        return None
+
+    cache_dir = _default_baseline_cache_dir(original_src)
+    try:
+        cache_dir, _meta, _was_hit = collect(
+            original_src=original_src,
+            executable_name=(
+                getattr(args, "original_executable_name", None)
+                or args.executable_name
+            ),
+            num_procs=args.num_procs,
+            app_args=original_app_args,
+            original_build_cmd=original_build_cmd,
+            app_input_subdir=app_input_subdir,
+            veloc_config_name=args.veloc_config_name,
+            cache_dir=cache_dir,
+            force=False,
+            check_only=False,
+        )
+        return cache_dir
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[validate] WARNING: baseline collector failed "
+            f"({type(exc).__name__}: {exc}); falling back to in-process "
+            "baseline.",
+            flush=True,
+        )
+        return None
+
+
 def _stage_benchmarks(
     args: argparse.Namespace,
     original_src: Path,
@@ -1126,6 +1905,7 @@ def _stage_benchmarks(
         extra_approaches=extra_approaches,
         original_build_cmd=_resolve_build_cmd(getattr(args, 'original_build_cmd', None)),
         resilient_build_cmd=_resolve_build_cmd(getattr(args, 'resilient_build_cmd', None)),
+        app_input_subdir=getattr(args, 'app_input_subdir', None),
     )
 
 
@@ -1344,6 +2124,11 @@ def main(argv: list[str] | None = None) -> int:
                     res_app_args=res_app_args,
                     approaches=approaches if approaches else None,
                     build_root=build_root,
+                    original_build_cmd=_resolve_build_cmd(
+                        getattr(args, 'original_build_cmd', None)),
+                    resilient_build_cmd=_resolve_build_cmd(
+                        getattr(args, 'resilient_build_cmd', None)),
+                    app_input_subdir=getattr(args, 'app_input_subdir', None),
                 )
             except Exception as exc:
                 _fail(
