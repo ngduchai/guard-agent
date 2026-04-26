@@ -337,7 +337,7 @@ EOFMETRICS
   # --- Step 4: Check result ---
   if [ "$VALIDATE_EXIT" -eq 0 ]; then
     EVAL_END=$(date +%s.%N)
-    WALL_ELAPSED=$(echo "$EVAL_END - $EVAL_START" | bc 2>/dev/null || echo "0")
+    WALL_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $EVAL_END - $EVAL_START }" 2>/dev/null || echo "0")
 
     echo ""
     echo "════════════════════════════════════════════════════════════════════"
@@ -372,7 +372,7 @@ done
 
 # --- Max iterations exhausted ---
 EVAL_END=$(date +%s.%N)
-WALL_ELAPSED=$(echo "$EVAL_END - $EVAL_START" | bc 2>/dev/null || echo "0")
+WALL_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $EVAL_END - $EVAL_START }" 2>/dev/null || echo "0")
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
