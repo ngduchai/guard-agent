@@ -76,6 +76,10 @@ for _src_root in "$REPO_ROOT/tests/apps/vanillas" "$REPO_ROOT/tests/ecp/vanillas
   if [ -d "$_src_root/$APP_NAME" ]; then
     echo "[REFRESH] Re-copying $APP_NAME source (clean)"
     rm -rf "$APP_DIR"
+    # Ensure parent (build/tests_baseline/ or build/tests/) exists.  Bare
+    # `cp` does not create missing parents and earlier overnight cleanup
+    # may have removed the parent dir entirely.
+    mkdir -p "$(dirname "$APP_DIR")"
     cp -a "$_src_root/$APP_NAME" "$APP_DIR"
     break
   fi
@@ -127,30 +131,38 @@ for ITER in $(seq 1 "$MAX_ITERS"); do
   if [ "$ITER" -eq 1 ]; then
     PROMPT="$INITIAL_PROMPT"
   else
-    # Feed back the validation error from the previous iteration
+    # Feed back the validation error from the previous iteration.
+    # The fallback prompt deliberately ships only the raw artefacts (the
+    # validator output and the build output) plus the failure-analysis
+    # discipline from the original prompt.txt.  We do NOT include a checklist
+    # of what to do (initialise X, register Y, finalise Z, link library W) —
+    # the whole point of the experiment is to measure whether the agent can
+    # diagnose its own failure and decide for itself what to change.  Listing
+    # API steps here would short-circuit that judgment and contaminate every
+    # iteration past the first.  See ISSUES.md issue #18.
     PREV_LOG="$LOG_DIR/iter_$((ITER - 1))"
-    PROMPT="The previous attempt to make this code resilient with VeloC checkpointing failed validation.
+    PROMPT="Your previous attempt to make this code resilient against
+mid-execution process failures was rejected by the validation pipeline.
+The raw output of that pipeline is below.
 
-Here is the validation output from the failed run:
-
---- VALIDATION STDOUT ---
+--- VALIDATION STDOUT (last 100 lines) ---
 $(tail -100 "$PREV_LOG/validate_stdout.txt" 2>/dev/null || echo "(no stdout)")
 
---- VALIDATION STDERR ---
+--- VALIDATION STDERR (last 100 lines) ---
 $(tail -100 "$PREV_LOG/validate_stderr.txt" 2>/dev/null || echo "(no stderr)")
 
---- BUILD OUTPUT ---
+--- BUILD OUTPUT (last 50 lines) ---
 $(tail -50 "$PREV_LOG/build_output.txt" 2>/dev/null || echo "(no build output)")
 
-Please analyze the errors above and fix the VeloC checkpoint injection.
-The code is in the current directory. Review what was done wrong, fix it, and ensure:
-1. VeloC is properly initialized after MPI_Init
-2. Critical state is registered with VELOC_Mem_protect
-3. Restart logic checks for existing checkpoints before the main loop
-4. Checkpoints are taken inside the main computation loop
-5. VeloC is finalized before MPI_Finalize
-6. veloc.cfg exists with valid scratch/persistent paths
-7. CMakeLists.txt links veloc-client"
+Continue working in the current directory.  Apply the same narration and
+failure-analysis discipline you were given originally:
+
+  1. Quote the exact error message you are reacting to.
+  2. State your hypothesis for the root cause.
+  3. Describe the specific change you intend to make and why it
+     should fix it.
+
+Then make the change."
   fi
 
   # Save the prompt for debugging
@@ -162,12 +174,63 @@ The code is in the current directory. Review what was done wrong, fix it, and en
   OPENCODE_START_MS=$(date +%s%3N)
   cd "$APP_DIR"
 
-  opencode run "$PROMPT" > "$ITER_LOG/opencode_stdout.txt" 2> "$ITER_LOG/opencode_stderr.txt" || true
+  # Hard cap on OpenCode wallclock per iteration.  The opencode CLI has been
+  # observed to hang indefinitely on a stalled SSE/Argo response (the body
+  # of a tool-call round-trip never closes), blocking the whole iterative
+  # pipeline.  900 s is generous — typical iterations finish in < 5 min.
+  # Override via OPENCODE_TIMEOUT env var if needed.
+  # 1800 s default (was 900): observed iter 1 of CoMD/HPCG/SPARTA exceeding
+  # 900 s during the *productive* exploration phase (40+ steps, multi-MB
+  # context, source files getting edited but the LLM not yet finishing).
+  # 1800 s gives iter 1 room to actually converge instead of being killed
+  # mid-edit-batch; iters 2+ that just react to a build error still finish
+  # in under 5 min so the cap doesn't matter for them.  Override via
+  # OPENCODE_TIMEOUT env var (e.g. for slower providers).
+  OPENCODE_TIMEOUT="${OPENCODE_TIMEOUT:-1800}"
+  # --dangerously-skip-permissions is paired with a strict deny-list in
+  # ~/.config/opencode/opencode.json's "permission" block:
+  #   - edit/write/patch: ALLOW only under build/tests_baseline/** and
+  #     build/tests/**; DENY everywhere else
+  #   - bash: DENY (the iterative loop runs all builds externally)
+  #   - webfetch/websearch/external_directory: DENY
+  # With those denies in place, --dangerously-skip-permissions only auto-
+  # approves the *safe* operations (read/list/grep/glob anywhere, edits
+  # within the per-app codebase) and explicit denies still apply.
+  #
+  # Model selection: OPENCODE_MODEL env var (default: argo/claudeopus47).
+  # Available models from opencode.json (Argo dev gateway):
+  #   argo/claudeopus47    Claude Opus 4.7 (default — highest-quality Anthropic)
+  #   argo/claudeopus46    Claude Opus 4.6
+  #   argo/claudesonnet46  Claude Sonnet 4.6
+  #   argo/claudehaiku45   Claude Haiku 4.5
+  #   argo/gpt54           GPT-5.4 (highest-quality OpenAI)
+  #   argo/gemini25pro     Gemini 2.5 Pro (highest-quality Google)
+  OPENCODE_MODEL="${OPENCODE_MODEL:-argo/claudeopus47}"
+  echo "[iter $ITER] OpenCode model: $OPENCODE_MODEL"
+  timeout --kill-after=10 "$OPENCODE_TIMEOUT" \
+    opencode run --dangerously-skip-permissions --model "$OPENCODE_MODEL" "$PROMPT" \
+    > "$ITER_LOG/opencode_stdout.txt" 2> "$ITER_LOG/opencode_stderr.txt" \
+    || {
+      _ec=$?
+      if [ "$_ec" = 124 ] || [ "$_ec" = 137 ]; then
+        echo "[iter $ITER] OpenCode timed out after ${OPENCODE_TIMEOUT}s — treating as iteration failure" \
+          | tee -a "$ITER_LOG/opencode_stderr.txt"
+      fi
+      true
+    }
 
   cd "$REPO_ROOT"
   OPENCODE_END=$(date +%s.%N)
   OPENCODE_ELAPSED=$(echo "$OPENCODE_END - $OPENCODE_START" | bc 2>/dev/null || echo "0")
   echo "[iter $ITER] OpenCode finished in ${OPENCODE_ELAPSED}s"
+
+  # --- Per-iter inspection: pull tool-call breakdown + file-change stats ---
+  # Writes inspection.json + inspection.md into the iter dir so a later
+  # human / agent can quickly see WHAT OpenCode did this iteration without
+  # re-querying the SQLite DB.  Best-effort — failures here do not affect
+  # the iterative loop.
+  python3 -m validation.veloc.scripts.inspect_iter "$ITER_LOG" --write \
+    >> "$ITER_LOG/inspection.run.log" 2>&1 || true
 
   # --- Extract token usage from OpenCode's SQLite DB ---
   OPENCODE_DB="$HOME/.local/share/opencode/opencode.db"
