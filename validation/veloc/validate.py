@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -934,6 +935,30 @@ def _stage_correctness(
             f"(elapsed={baseline_elapsed:.1f}s)",
             flush=True,
         )
+        # Compatibility shim: downstream tools (audit_aggregate_report.py and
+        # any future consumers) historically check for
+        # ``output_dir/correctness/baseline/stdout.txt`` to confirm the
+        # baseline ran successfully.  When ground_truth_dir lives elsewhere
+        # (e.g. build/baseline_cache/<APP>/ via the auto-detect block above),
+        # that legacy path is empty and downstream verdicts read incorrectly
+        # as "vanilla broken".  Mirror the cache's stdout.txt + stderr.txt
+        # into the legacy path so existing tooling keeps working without
+        # needing per-tool cache awareness.
+        legacy_baseline = output_dir / "correctness" / "baseline"
+        legacy_baseline.mkdir(parents=True, exist_ok=True)
+        for fname in ("stdout.txt", "stderr.txt"):
+            src = ground_truth_dir / fname
+            if src.exists():
+                try:
+                    shutil.copy2(src, legacy_baseline / fname)
+                except OSError as exc:
+                    print(
+                        f"[validate] WARNING: could not mirror {src} → "
+                        f"{legacy_baseline / fname} ({exc}); "
+                        "downstream tools that read the legacy path may "
+                        "report this run as vanilla-broken.",
+                        flush=True,
+                    )
     else:
         # Run baseline THREE times — discard first as warmup, take MIN of
         # the next two as the recorded baseline.  The first mpirun pays the
