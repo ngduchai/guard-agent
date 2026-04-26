@@ -673,16 +673,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     corr_grp.add_argument(
-        "--no-baseline-cache",
-        action="store_true",
-        help=(
-            "Disable the auto-detect of build/baseline_cache/<APP>/.  Forces "
-            "the in-process warmup + 2 measurement passes for every "
-            "invocation.  Useful when iterating on the cache-key logic "
-            "itself or when intentionally re-measuring."
-        ),
-    )
-    corr_grp.add_argument(
         "--comparison-method",
         choices=("hash", "ssim", "numeric-tolerance", "text-diff", "custom"),
         default="ssim",
@@ -892,140 +882,50 @@ def _stage_correctness(
     resilient_out = output_dir / "correctness" / "resilient"
 
     # --- Baseline / ground truth ---
-    # Auto-detect a populated baseline cache before the explicit
-    # --ground-truth-dir check.  When neither --ground-truth-dir nor
-    # --no-baseline-cache is set, invoke the per-app collector
-    # (validation/veloc/collect_baseline.py) which either reuses a valid
-    # build/baseline_cache/<APP>/ directory or runs the warmup + 2 baseline
-    # passes once and writes the results there.  Setting args.ground_truth_dir
-    # programmatically lets the existing reuse branch (below) take over
-    # unchanged.  This eliminates the per-iter cost of running 3 baseline
-    # passes on every validate.py invocation when the vanilla source hasn't
-    # changed (the common case for the iterative LLM loop).
-    if not args.ground_truth_dir and not getattr(args, "no_baseline_cache", False):
-        auto_dir = _autodetect_or_collect_baseline_cache(
+    # SINGLE canonical path.  The collector (collect_baseline.py) is the
+    # ONLY way to get baseline timing — either it returns a valid cache or
+    # it runs the warmup + 2 measurement passes itself and populates the
+    # cache.  validate.py then reads baseline_elapsed + the comparator's
+    # expected stdout/stderr files directly from build/baseline_cache/<APP>/.
+    #
+    # If --ground-truth-dir is given explicitly, that overrides the cache
+    # location (useful for testing or for pointing at a curated baseline
+    # collected on a different machine).  Otherwise the per-app default is
+    # build/baseline_cache/<APP>/ via _default_baseline_cache_dir().
+    if args.ground_truth_dir:
+        baseline_out = Path(args.ground_truth_dir).resolve()
+        if not baseline_out.exists():
+            raise ValidationError(
+                f"--ground-truth-dir {baseline_out} does not exist; provide "
+                "a populated baseline cache directory or omit the flag to "
+                "let the collector populate one automatically.",
+                stdout="", stderr="", exit_code=-1, output_dir=output_dir,
+            )
+    else:
+        baseline_out = _autodetect_or_collect_baseline_cache(
             args=args,
             original_src=original_src,
             original_app_args=orig_app_args,
             original_build_cmd=original_build_cmd,
             app_input_subdir=app_input_subdir,
         )
-        if auto_dir is not None:
-            args.ground_truth_dir = str(auto_dir)
-            print(
-                f"[validate] Auto-resolved baseline cache: {auto_dir}",
-                flush=True,
-            )
 
-    ground_truth_dir = Path(args.ground_truth_dir) if args.ground_truth_dir else None
-
-    if ground_truth_dir and ground_truth_dir.exists():
-        # Reuse pre-computed ground truth from Phase 0.
-        baseline_out = ground_truth_dir
-        import json as _json
-
-        meta_path = ground_truth_dir / "ground_truth_meta.json"
-        if meta_path.exists():
-            meta = _json.loads(meta_path.read_text())
-            baseline_elapsed = float(meta["elapsed_s"])
-        else:
-            baseline_elapsed = 30.0  # conservative fallback
-        print(
-            f"\n[validate] Reusing ground truth from {ground_truth_dir} "
-            f"(elapsed={baseline_elapsed:.1f}s)",
-            flush=True,
+    meta_path = baseline_out / "ground_truth_meta.json"
+    if not meta_path.exists():
+        raise ValidationError(
+            f"Baseline cache at {baseline_out} is missing ground_truth_meta.json. "
+            "Run `python -m validation.veloc.collect_baseline --app <APP>` to "
+            "populate it, or supply --ground-truth-dir pointing at a "
+            "pre-populated cache.",
+            stdout="", stderr="", exit_code=-1, output_dir=output_dir,
         )
-        # Compatibility shim: downstream tools (audit_aggregate_report.py and
-        # any future consumers) historically check for
-        # ``output_dir/correctness/baseline/stdout.txt`` to confirm the
-        # baseline ran successfully.  When ground_truth_dir lives elsewhere
-        # (e.g. build/baseline_cache/<APP>/ via the auto-detect block above),
-        # that legacy path is empty and downstream verdicts read incorrectly
-        # as "vanilla broken".  Mirror the cache's stdout.txt + stderr.txt
-        # into the legacy path so existing tooling keeps working without
-        # needing per-tool cache awareness.
-        legacy_baseline = output_dir / "correctness" / "baseline"
-        legacy_baseline.mkdir(parents=True, exist_ok=True)
-        for fname in ("stdout.txt", "stderr.txt"):
-            src = ground_truth_dir / fname
-            if src.exists():
-                try:
-                    shutil.copy2(src, legacy_baseline / fname)
-                except OSError as exc:
-                    print(
-                        f"[validate] WARNING: could not mirror {src} → "
-                        f"{legacy_baseline / fname} ({exc}); "
-                        "downstream tools that read the legacy path may "
-                        "report this run as vanilla-broken.",
-                        flush=True,
-                    )
-    else:
-        # Run baseline THREE times — discard first as warmup, take MIN of
-        # the next two as the recorded baseline.  The first mpirun pays the
-        # cold-cache cost (page cache empty, dynamic libs not loaded, MPI
-        # runtime cold, CPU governor scaling up).  A single warmup is not
-        # always enough to reach steady state on the very first run after
-        # a fresh boot or long idle (CLAMR audit: warmup 130s, measurement
-        # 128s, but actual steady-state is ~88s — confirmed by repeated
-        # back-to-back runs).  Two measurement passes + MIN cancels these
-        # one-off outliers cheaply: the worst case is one extra baseline
-        # run per app, and only on the apps that actually need it.
-        baseline_out = output_dir / "correctness" / "baseline"
-        baseline_2_out = output_dir / "correctness" / "baseline_2"
-        warmup_out = output_dir / "correctness" / "baseline_warmup"
-        print(
-            "\n[validate] Running baseline (original) application — "
-            "warmup pass (timing discarded)...",
-            flush=True,
-        )
-        run_baseline(
-            source_dir=original_src,
-            build_dir=original_build,
-            output_dir=warmup_out,
-            executable_name=orig_exe,
-            num_procs=args.num_procs,
-            app_args=orig_app_args,
-            build_cmd=original_build_cmd,
-            app_input_subdir=app_input_subdir,
-        )
-        print(
-            "\n[validate] Running baseline (original) application — "
-            "measurement pass 1 of 2...",
-            flush=True,
-        )
-        baseline_result_1 = run_baseline(
-            source_dir=original_src,
-            build_dir=original_build,
-            output_dir=baseline_out,
-            executable_name=orig_exe,
-            num_procs=args.num_procs,
-            app_args=orig_app_args,
-            build_cmd=original_build_cmd,
-            app_input_subdir=app_input_subdir,
-        )
-        print(
-            "\n[validate] Running baseline (original) application — "
-            "measurement pass 2 of 2...",
-            flush=True,
-        )
-        baseline_result_2 = run_baseline(
-            source_dir=original_src,
-            build_dir=original_build,
-            output_dir=baseline_2_out,
-            executable_name=orig_exe,
-            num_procs=args.num_procs,
-            app_args=orig_app_args,
-            build_cmd=original_build_cmd,
-            app_input_subdir=app_input_subdir,
-        )
-        baseline_elapsed = min(baseline_result_1.elapsed_s, baseline_result_2.elapsed_s)
-        print(
-            f"[validate] Baseline measurements: "
-            f"pass1={baseline_result_1.elapsed_s:.1f}s, "
-            f"pass2={baseline_result_2.elapsed_s:.1f}s, "
-            f"using MIN={baseline_elapsed:.1f}s",
-            flush=True,
-        )
+    meta = json.loads(meta_path.read_text())
+    baseline_elapsed = float(meta["elapsed_s"])
+    print(
+        f"\n[validate] Baseline cache: {baseline_out} "
+        f"(elapsed_s={baseline_elapsed:.1f}, cached_at={meta.get('cached_at','?')})",
+        flush=True,
+    )
 
     # --- Determine injection delay ---
     # Inject failures at 90% of failure-free runtime.  Rationale: (i) leaves
@@ -1805,54 +1705,35 @@ def _autodetect_or_collect_baseline_cache(
     original_app_args: list[str],
     original_build_cmd: str | None,
     app_input_subdir: str | None,
-) -> Path | None:
-    """Auto-detect a populated baseline cache, or run the collector to populate
-    it.
+) -> Path:
+    """Return the populated baseline-cache directory for this app.
 
-    Returns the cache directory path on success (caller assigns it to
-    ``args.ground_truth_dir`` so the existing reuse branch fires), or
-    ``None`` on failure (caller falls back to the in-process 3-pass
-    baseline).
-
-    Imports the collector lazily so this module stays importable even if
-    ``collect_baseline`` ever has an import-time issue.
+    The collector (``validation.veloc.collect_baseline``) is the SINGLE
+    source of truth for baseline timing.  On a cache hit it returns
+    immediately; on a miss it runs warmup + 2 measurement passes itself
+    and writes the cache.  Any failure raises — there is no fallback,
+    because the only alternative would be a duplicate 3-pass code path
+    in ``validate.py`` and the design goal is one canonical path.
     """
-    try:
-        from .collect_baseline import collect
-    except ImportError as exc:
-        print(
-            f"[validate] WARNING: collect_baseline import failed ({exc}); "
-            "falling back to in-process baseline.",
-            flush=True,
-        )
-        return None
+    from .collect_baseline import collect
 
     cache_dir = _default_baseline_cache_dir(original_src)
-    try:
-        cache_dir, _meta, _was_hit = collect(
-            original_src=original_src,
-            executable_name=(
-                getattr(args, "original_executable_name", None)
-                or args.executable_name
-            ),
-            num_procs=args.num_procs,
-            app_args=original_app_args,
-            original_build_cmd=original_build_cmd,
-            app_input_subdir=app_input_subdir,
-            veloc_config_name=args.veloc_config_name,
-            cache_dir=cache_dir,
-            force=False,
-            check_only=False,
-        )
-        return cache_dir
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"[validate] WARNING: baseline collector failed "
-            f"({type(exc).__name__}: {exc}); falling back to in-process "
-            "baseline.",
-            flush=True,
-        )
-        return None
+    cache_dir, _meta, _was_hit = collect(
+        original_src=original_src,
+        executable_name=(
+            getattr(args, "original_executable_name", None)
+            or args.executable_name
+        ),
+        num_procs=args.num_procs,
+        app_args=original_app_args,
+        original_build_cmd=original_build_cmd,
+        app_input_subdir=app_input_subdir,
+        veloc_config_name=args.veloc_config_name,
+        cache_dir=cache_dir,
+        force=False,
+        check_only=False,
+    )
+    return cache_dir
 
 
 def _stage_benchmarks(
