@@ -1,6 +1,6 @@
 # SW4lite — Seismic Wave Propagation (4th order)
 
-**Category:** Iterative / Fixed state  
+**Class:** (1) iterative_fixed  
 **Language:** C++ (MPI)  
 **Checkpoint library:** POSIX parallel I/O (`Parallel_IO` class with `pwrite`)
 
@@ -103,12 +103,10 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Predictor (Um, U -> Up)
+    Note right of RN: Predictor (Um, U -> Up)
     R0->>R1: halo exchange (displacement ghost cells)
     R1->>R0: halo exchange (displacement ghost cells)
-    Note over R0,RN: 4th-order corrector + BCs + source
-    Note over R0,RN: Array cycling (Um <- U <- Up)
-    Note over R0,RN: Step complete
+    Note right of RN: Corrector + BCs + source → cycling → done
 ```
 
 ### Application Lifetime View
@@ -119,42 +117,13 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(230,245,255)
-    Note over R0,RN: INIT — allocate Um, U, Up (3-component displacement)
-    Note over R0,RN: Per rank: Um[nx_local][ny_local][nz][3], U[...], Up[...]
-    Note over R0,RN: Size fixed by 2D domain decomposition
-    Note over R0,RN: Setup halo buffers, load material properties (static)
-    end
-
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP — state size FIXED (structured grid is static)
-    loop Steps beginCycle to nSteps
-        Note over R0,RN: Predictor: Um, U → Up (predicted)
-        R0->>R1: halo exchange (displacement ghost cells, 4 faces)
-        R1->>R0: halo exchange (displacement ghost cells, 4 faces)
-        Note over R0,RN: 4th-order corrector + BCs + source injection
-        Note over R0,RN: Array cycling: Um ← U ← Up
-    end
-    end
-
-    rect rgb(255,230,220)
-    Note over R0,RN: CHECKPOINT — every cycleInterval=50 steps
-    Note over R0,RN: Rank 0 writes header, all ranks pwrite local U, Up
-    Note over R0,RN: File: restart.cycle=NNNNNN.sw4checkpoint (CONSTANT size)
-    end
-
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP continues (periodic checkpoints)
-    loop Remaining steps
-        Note over R0,RN: Predictor → halo exchange → corrector → BCs → cycling
-        R0->>R1: halo exchange (displacement ghost cells)
-        R1->>R0: halo exchange (displacement ghost cells)
-    end
-    end
-
-    rect rgb(230,255,230)
-    Note over R0,RN: FINALIZE — compute error vs analytic, print error norms
-    end
+    Note right of RN: INIT: Um,U,Up (FIXED) → LOOP start
+    R0->>R1: halo exchange (displacement ghost cells, 4 faces)
+    R1->>R0: halo exchange (displacement ghost cells, 4 faces)
+    Note right of RN: Predict → correct → cycle | CKPT every 50
+    R0->>R1: halo exchange (displacement ghost cells)
+    R1->>R0: halo exchange (displacement ghost cells)
+    Note right of RN: FINALIZE: error vs analytic, norms
 ```
 
 **Key observations:**

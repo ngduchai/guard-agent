@@ -1,6 +1,6 @@
 # Athena++ — Astrophysical MHD Code
 
-**Category:** Iterative / Fixed state  
+**Class:** (3) iterative_adaptive  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native binary restart files (`RestartOutput`)
 
@@ -106,12 +106,10 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Cycle begins
+    Note right of RN: Cycle begins
     R0->>R1: ghost-zone U (MeshBlock boundaries)
     R1->>R0: ghost-zone U (MeshBlock boundaries)
-    Note over R0,RN: Local reconstruct → Riemann → flux update
-    Note over R0,RN: CFL new timestep
-    Note over R0,RN: Cycle ends
+    Note right of RN: Reconstruct → Riemann → update → CFL → done
 ```
 
 ### Application Lifetime View
@@ -122,50 +120,15 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(230,245,255)
-        Note over R0,RN: INIT — parse athinput, construct Mesh
-        Note over R0,RN: Each rank allocates phydro->u (rho, rho*v, E)<br/>per MeshBlock + ghost zones
-        Note over R0,RN: ProblemGenerator: blast IC → U(rho, rho*v, E)
-        Note over R0,RN: Block count per rank set by load balancer
-    end
-
-    rect rgb(255,255,230)
-        Note over R0,RN: LOOP — VL2 integration until time ≥ tlim
-        R0->>R1: ghost-zone U (MeshBlock boundaries)
-        R1->>R0: ghost-zone U (MeshBlock boundaries)
-        R1->>RN: ghost-zone U (MeshBlock boundaries)
-        RN->>R1: ghost-zone U (MeshBlock boundaries)
-        Note over R0,RN: Reconstruct → Riemann → flux update
-        Note over R0,RN: U^{n+1} = U^n − dt·div(F)
-        Note over R0,RN: CFL → new dt; ncycle++, time += dt
-    end
-
-    rect rgb(255,230,220)
-        Note over R0,RN: AMR (if enabled) — LoadBalancing + AdaptiveMeshRefinement
-        Note over R0,RN: Blocks may be split/merged/migrated across ranks
-        Note over R0,RN: STATE SIZE CHANGES: per-rank data grows/shrinks
-    end
-
-    rect rgb(255,255,230)
-        Note over R0,RN: LOOP continues (potentially different block counts)
-        R0->>R1: ghost-zone U (new neighbor topology)
-        R1->>R0: ghost-zone U (new neighbor topology)
-        Note over R0,RN: Reconstruct → Riemann → flux update
-    end
-
-    rect rgb(255,230,220)
-        Note over R0,RN: CHECKPOINT — every dt=0.5 time units
-        Note over R0,RN: Write .rst: params + mesh header + block list + per-block U
-        Note over R0,RN: Checkpoint size: VARIABLE (tracks current block count)
-    end
-
-    rect rgb(255,255,230)
-        Note over R0,RN: LOOP continues (AMR may change sizes again)
-    end
-
-    rect rgb(230,255,230)
-        Note over R0,RN: FINALIZE — zone-cycle rates, timing, field diagnostics
-    end
+    Note right of RN: INIT: Mesh + blast IC | LOOP: VL2
+    R0->>R1: ghost-zone U (MeshBlock boundaries)
+    R1->>R0: ghost-zone U (MeshBlock boundaries)
+    R1->>RN: ghost-zone U (MeshBlock boundaries)
+    RN->>R1: ghost-zone U (MeshBlock boundaries)
+    Note right of RN: Reconstruct → Riemann → CFL → AMR
+    R0->>R1: ghost-zone U (new neighbor topology)
+    R1->>R0: ghost-zone U (new neighbor topology)
+    Note right of RN: CKPT dt=0.5 .rst | FINALIZE
 ```
 
 **Key observations:**

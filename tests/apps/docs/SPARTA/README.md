@@ -1,6 +1,6 @@
 # SPARTA — Stochastic PArallel Rarefied-gas Time-accurate Analyzer
 
-**Category:** Task-parallel / Fixed state  
+**Class:** (2) iterative_variable  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native binary restart files
 
@@ -92,13 +92,12 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Ballistic move (advect particles)
+    Note right of RN: Ballistic move (advect particles)
     R0->>R1: migrate crossed particles
     R1->>R0: migrate crossed particles
     R1->>RN: migrate crossed particles
     RN->>R1: migrate crossed particles
-    Note over R0,RN: Collide (cell-local, no communication)
-    Note over R0,RN: Step complete
+    Note right of RN: Collide (cell-local) → step done
 ```
 
 ### Application Lifetime View
@@ -109,35 +108,12 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(200, 220, 245)
-        Note over R0,RN: INIT — create 20×20×20 grid, RCB load balance
-        Note over R0,RN: Place 100K particles (x,v), ~25K per rank
-    end
-
-    rect rgb(255, 245, 200)
-        Note over R0,RN: LOOP — 20,000 timesteps
-        Note over R0,RN: Ballistic move: x += v·dt (particles may cross cells)
-
-        rect rgb(255, 225, 180)
-            Note over R0,RN: COMMUNICATE — particle migration
-            R0->>R1: particles that crossed into R1's cells
-            R1->>R0: particles that crossed into R0's cells
-            R1->>RN: particles that crossed into RN's cells
-            RN->>R1: particles that crossed into R1's cells
-            Note over R0,RN: Per-rank count fluctuates (~24.8K–25.4K)
-        end
-
-        Note over R0,RN: Collide: stochastic pair collisions (cell-local, no comm)
-
-        rect rgb(255, 200, 150)
-            Note over R0,RN: CHECKPOINT — every 2000 steps
-            Note over R0,RN: Write restart.sparta (VARIABLE size per rank)
-        end
-    end
-
-    rect rgb(200, 240, 200)
-        Note over R0,RN: FINALIZE — print stats: step, np, ncoll, T
-    end
+    Note right of RN: INIT: 20x20x20, 100K particles → LOOP
+    R0->>R1: particle migration (crossed cells)
+    R1->>R0: particle migration (crossed cells)
+    R1->>RN: particle migration (crossed cells)
+    RN->>R1: particle migration (crossed cells)
+    Note right of RN: Collide | CKPT every 2000 | FINALIZE
 ```
 
 **Key observations:**

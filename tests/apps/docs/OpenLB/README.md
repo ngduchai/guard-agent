@@ -1,6 +1,6 @@
 # OpenLB — Open Source Lattice Boltzmann
 
-**Category:** Iterative / Fixed state  
+**Class:** (1) iterative_fixed  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native `SuperLattice::save`/`load` (binary serialization)
 
@@ -92,12 +92,10 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Step begins
-    Note over R0,RN: Local BGK collision + streaming
+    Note right of RN: Step begins | BGK collision + stream
     R0->>R1: halo f_i (boundary populations)
     R1->>R0: halo f_i (boundary populations)
-    Note over R0,RN: Boundary conditions applied
-    Note over R0,RN: Step ends
+    Note right of RN: BCs applied → step done
 ```
 
 ### Application Lifetime View
@@ -108,37 +106,16 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(230,245,255)
-        Note over R0,RN: INIT — geometry, lattice, initial f_i
-        Note over R0,RN: Each rank allocates D2Q9 f_i[9] per node + 1-cell ghost layer
-        Note over R0,RN: Array sizes set once and never change
-    end
-
-    rect rgb(255,255,230)
-        Note over R0,RN: LOOP — iT = 0 … ~64100
-        Note over R0,RN: Inflow ramp (first 20% of steps only)
-        Note over R0,RN: BGK collision: f_i → f_i* = f_i − ω(f_i − f_i^eq)
-        Note over R0,RN: Streaming: f_i*(x) → f_i(x + e_i·dt)
-        R0->>R1: halo f_i (boundary populations)
-        R1->>R0: halo f_i (boundary populations)
-        R1->>RN: halo f_i (boundary populations)
-        RN->>R1: halo f_i (boundary populations)
-        Note over R0,RN: Boundary conditions applied
-    end
-
-    rect rgb(255,230,220)
-        Note over R0,RN: CHECKPOINT — every 5000 steps
-        Note over R0,RN: sLattice.save() writes all f_i (binary) + .iter file
-        Note over R0,RN: Checkpoint size: CONSTANT every write
-    end
-
-    rect rgb(255,255,230)
-        Note over R0,RN: LOOP continues (same structure, same sizes)
-    end
-
-    rect rgb(230,255,230)
-        Note over R0,RN: FINALIZE — timer summary + LatticeStatistics
-    end
+    Note right of RN: INIT: D2Q9, f_i[9]/node + ghost (FIXED)
+    R0->>R1: halo f_i (boundary populations)
+    R1->>R0: halo f_i (boundary populations)
+    R1->>RN: halo f_i (boundary populations)
+    RN->>R1: halo f_i (boundary populations)
+    Note right of RN: LOOP ~64100 | BGK → stream → BCs
+    R0->>R1: halo f_i (checkpoint cycle)
+    Note right of RN: CKPT every 5000 (CONSTANT)
+    R0->>R1: halo f_i (continues)
+    Note right of RN: FINALIZE: timer + LatticeStatistics
 ```
 
 **Key observations:**

@@ -1,6 +1,6 @@
 # CoMD — Classical Molecular Dynamics
 
-**Category:** Iterative / Fixed state  
+**Class:** (1) iterative_fixed  
 **Language:** C (MPI)  
 **Checkpoint library:** POSIX file I/O (no external library)
 
@@ -112,13 +112,12 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Velocity half-step + position update
+    Note right of RN: Velocity half-step + position update
     R0->>R1: halo exchange (ghost atoms, 6 faces)
     R1->>R0: halo exchange (ghost atoms, 6 faces)
-    Note over R0,RN: Force computation (LJ/EAM)
-    Note over R0,RN: Velocity half-step
+    Note right of RN: Forces (LJ/EAM) → velocity half-step
     R0-->>RN: MPI_Allreduce (eKinetic, ePotential)
-    Note over R0,RN: Step complete
+    Note right of RN: Step complete
 ```
 
 ### Application Lifetime View
@@ -131,44 +130,23 @@ sequenceDiagram
     participant R1 as Rank 1
     participant R2 as Rank 2
 
-    rect rgb(230,245,255)
-    Note over R0,R2: INIT — allocate SimFlat, link cells
-    Note over R0,R2: Per rank: nLocal ≈ 1000 atoms, r[N], p[N], f[N]
-    end
+    Note right of R2: INIT: ~1000 atoms/rank (FIXED)
+    R0->>R1: halo exchange (6 faces)
+    R1->>R0: halo exchange (6 faces)
+    R1->>R2: halo exchange (6 faces)
+    R2->>R1: halo exchange (6 faces)
+    Note right of R2: TIMESTEP 1..500 | velocity → position → forces
+    R0-->>R2: MPI_Allreduce(eKinetic + ePotential)
 
-    rect rgb(255,255,230)
-    Note over R0,R2: TIMESTEP 1..500 (state size FIXED)
-    loop Every printRate steps
-        R0->>R1: MPI_Isend/Irecv (halo atoms, 6 faces)
-        R1->>R0: MPI_Isend/Irecv (halo atoms, 6 faces)
-        R1->>R2: MPI_Isend/Irecv (halo atoms, 6 faces)
-        R2->>R1: MPI_Isend/Irecv (halo atoms, 6 faces)
-        Note over R0,R2: advanceVelocity, advancePosition, recompute forces
-        R0-->>R2: MPI_Allreduce(eKinetic + ePotential)
-    end
-    end
+    R0->>R0: CKPT step 500 → CoMD_state-{rank}.txt
 
-    rect rgb(255,230,220)
-    Note over R0,R2: CHECKPOINT — step 500
-    Note over R0,R2: Each rank writes r,p,f,U,gid,iSpecies,iter → CoMD_state-{rank}.txt
-    Note over R0,R2: File size: ~200 KB per rank (CONSTANT)
-    end
+    R0->>R1: halo exchange (6 faces)
+    R1->>R2: halo exchange (6 faces)
+    Note right of R2: TIMESTEP 501..nSteps (same pattern)
+    R0-->>R2: MPI_Allreduce(energy)
 
-    rect rgb(255,255,230)
-    Note over R0,R2: TIMESTEP 501..nSteps (same pattern)
-    loop Remaining steps
-        R0->>R1: halo exchange (6 faces)
-        R1->>R2: halo exchange (6 faces)
-        Note over R0,R2: r, p, f evolve (arrays same size)
-        R0-->>R2: MPI_Allreduce(energy)
-    end
-    end
-
-    rect rgb(230,255,230)
-    Note over R0,R2: FINALIZE
+    Note right of R2: FINALIZE: validate energy
     R0-->>R2: MPI_Allreduce(final atom count + energy)
-    Note over R0,R2: Validate: compare final vs initial energy
-    end
 ```
 
 **Key observations:**

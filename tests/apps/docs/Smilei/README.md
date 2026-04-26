@@ -1,6 +1,6 @@
 # Smilei — Particle-in-Cell Plasma Simulator
 
-**Category:** Iterative / Fixed state  
+**Class:** (2) iterative_variable  
 **Language:** C++ (MPI + OpenMP)  
 **Checkpoint library:** Native HDF5 checkpoint (`Checkpoint` class)
 
@@ -108,13 +108,12 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Interpolate fields, push particles, deposit J
+    Note right of RN: Interpolate fields, push, deposit J
     R0->>R1: particle exchange (crossed patch boundaries)
     R1->>R0: particle exchange (crossed patch boundaries)
     R0->>R1: current reduction (shared patch boundaries)
     R1->>R0: current reduction (shared patch boundaries)
-    Note over R0,RN: Maxwell solver (Yee FDTD: update E, B)
-    Note over R0,RN: Step complete
+    Note right of RN: Maxwell FDTD → update E, B → done
 ```
 
 ### Application Lifetime View
@@ -125,39 +124,21 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(200, 220, 245)
-        Note over R0,RN: INIT — parse namelist, create 16-patch hierarchy
-        Note over R0,RN: Initialize E,B grids (fixed per patch) + macro-particles
-        Note over R0,RN: Per rank: 112 field cells + ~500 particles/species
-    end
+    Note right of RN: INIT: 16 patches, E/B + ~500 particles
 
-    rect rgb(255, 245, 200)
-        Note over R0,RN: LOOP — ~1053 timesteps
-        Note over R0,RN: Interpolate E,B → push particles (Boris) → deposit J
+    R0->>R1: particle exchange (crossed patch boundaries)
+    R1->>R0: particle exchange (crossed patch boundaries)
+    R1->>RN: particle exchange (crossed patch boundaries)
+    RN->>R1: particle exchange (crossed patch boundaries)
+    R0->>R1: current reduction (shared patch boundaries)
+    R1->>R0: current reduction (shared patch boundaries)
+    Note right of RN: LOOP ~1053 steps | Maxwell → E, B
 
-        rect rgb(255, 225, 180)
-            Note over R0,RN: PARTICLE EXCHANGE
-            R0->>R1: particles crossed patch boundaries
-            R1->>R0: particles crossed patch boundaries
-            R1->>RN: particles crossed patch boundaries
-            RN->>R1: particles crossed patch boundaries
-            Note over R0,RN: Per-rank particle count fluctuates (~485–520)
-        end
+    R0->>R1: particle exchange (checkpoint cycle)
+    Note right of RN: CKPT every 100 steps (HDF5, VAR)
 
-        R0->>R1: current reduction (shared patch boundaries)
-        R1->>R0: current reduction (shared patch boundaries)
-        Note over R0,RN: Maxwell solver (Yee FDTD): update E, B, B_half
-
-        rect rgb(255, 200, 150)
-            Note over R0,RN: CHECKPOINT — every 100 steps
-            Note over R0,RN: HDF5 per rank: fields (FIXED) + particles (VARIABLE)
-            Note over R0,RN: Also saves RNG state, energy diagnostics
-        end
-    end
-
-    rect rgb(200, 240, 200)
-        Note over R0,RN: FINALIZE — print "END"
-    end
+    R0->>R1: particle exchange (final cycle)
+    Note right of RN: FINALIZE: print "END"
 ```
 
 **Key observations:**

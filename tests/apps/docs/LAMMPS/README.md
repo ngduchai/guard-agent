@@ -1,6 +1,6 @@
 # LAMMPS — Large-scale Atomic/Molecular Massively Parallel Simulator
 
-**Category:** Iterative / Variable state  
+**Class:** (2) iterative_variable  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native restart files
 
@@ -111,15 +111,14 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Velocity half-step + position update
+    Note right of RN: Velocity half-step + position update
     R0->>R1: MPI_Sendrecv (atom migration, 6 faces)
     R1->>R0: MPI_Sendrecv (atom migration, 6 faces)
     R0->>R1: MPI_Sendrecv (ghost atoms for forces)
     R1->>R0: MPI_Sendrecv (ghost atoms for forces)
-    Note over R0,RN: Force computation (LJ pair potential)
-    Note over R0,RN: Velocity half-step
+    Note right of RN: Forces (LJ) → velocity half-step
     R0-->>RN: MPI_Allreduce (KE, PE -> T, P)
-    Note over R0,RN: Step complete
+    Note right of RN: Step complete
 ```
 
 ### Application Lifetime View
@@ -131,48 +130,24 @@ sequenceDiagram
     participant R2 as Rank 2
     participant R3 as Rank 3
 
-    rect rgb(230,245,255)
-    Note over R0,R3: INIT — create FCC lattice atoms in subdomains
-    Note over R0,R3: Per rank: nlocal ≈ 8000 atoms, x[N][3], v[N][3], tag[N]
-    Note over R0,R3: Assign velocities (seed 87287)
+    Note right of R3: INIT: FCC, ~8000 atoms/rank (VARIABLE)
     R0->>R1: MPI_Sendrecv (initial ghost atoms)
     R1->>R0: MPI_Sendrecv (initial ghost atoms)
-    Note over R0,R3: Build neighbor lists + initial force compute
-    end
+    R0->>R1: MPI_Sendrecv (atom migration, 6 faces)
+    R1->>R0: MPI_Sendrecv (atom migration, 6 faces)
+    R0->>R1: MPI_Sendrecv (ghost atoms for forces)
+    R1->>R0: MPI_Sendrecv (ghost atoms for forces)
+    Note right of R3: LOOP | Verlet → forces → half-step
+    R0-->>R3: MPI_Allreduce (KE, PE → T, P)
 
-    rect rgb(255,255,230)
-    Note over R0,R3: MAIN LOOP — state size VARIABLE (nlocal changes every step)
-    loop Steps 1–99
-        Note over R0,R3: Velocity half-step + position update
-        R0->>R1: MPI_Sendrecv (atom migration, 6 faces)
-        R1->>R0: MPI_Sendrecv (atom migration, 6 faces)
-        Note over R0,R3: nlocal fluctuates as atoms cross boundaries
-        R0->>R1: MPI_Sendrecv (ghost atoms for forces)
-        R1->>R0: MPI_Sendrecv (ghost atoms for forces)
-        Note over R0,R3: Force computation (LJ) + velocity half-step
-        R0-->>R3: MPI_Allreduce (KE, PE → T, P)
-    end
-    end
+    R0->>R0: CKPT every 100 → restart.lj.N
 
-    rect rgb(255,230,220)
-    Note over R0,R3: CHECKPOINT — step 100
-    Note over R0,R3: All ranks write local atoms → restart.lj.100 (~2 MB merged binary)
-    end
+    R0->>R1: MPI_Sendrecv (atom migration)
+    R1->>R0: MPI_Sendrecv (atom migration)
+    Note right of R3: LOOP continues (same pattern)
+    R0-->>R3: MPI_Allreduce (KE, PE → T, P)
 
-    rect rgb(255,255,230)
-    Note over R0,R3: MAIN LOOP continues (steps 101–2000, checkpoint every 100)
-    loop Steps 101–2000
-        Note over R0,R3: Verlet integration + exchange + forces
-        R0->>R1: MPI_Sendrecv (atom migration)
-        R1->>R0: MPI_Sendrecv (atom migration)
-        Note over R0,R3: nlocal fluctuates: ~7950–8050 per step
-        R0-->>R3: MPI_Allreduce (KE, PE → T, P)
-    end
-    end
-
-    rect rgb(230,255,230)
-    Note over R0,R3: FINALIZE — print TotEng at step 2000, MPI_Finalize
-    end
+    Note right of R3: FINALIZE: TotEng, MPI_Finalize
 ```
 
 **Key observations:**

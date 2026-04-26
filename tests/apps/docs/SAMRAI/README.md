@@ -1,6 +1,6 @@
 # SAMRAI — Structured Adaptive Mesh Refinement Application Infrastructure
 
-**Category:** Dynamic / Fixed state  
+**Class:** (3) iterative_adaptive  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native RestartManager (HDF5-based)
 
@@ -96,14 +96,13 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Step begins
+    Note right of RN: Step begins
     R0->>R1: RefineSchedule halo (ghost cell fill)
     R1->>R0: RefineSchedule halo (ghost cell fill)
-    Note over R0,RN: Local Godunov advance per patch
+    Note right of RN: Local Godunov advance per patch
     R0->>R1: CoarsenSchedule (fine → coarse sync)
     R1->>R0: CoarsenSchedule (fine → coarse sync)
-    Note over R0,RN: Regrid: patch redistribution (periodic)
-    Note over R0,RN: Step ends
+    Note right of RN: Regrid → step ends
 ```
 
 ### Application Lifetime View
@@ -114,49 +113,18 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(200, 220, 245)
-        Note over R0,RN: INIT — parse input, build PatchHierarchy + GriddingAlgorithm
-        Note over R0,RN: Create initial 3-level AMR hierarchy
-        Note over R0,RN: Tag cells → BergerRigoutsos → CascadePartitioner
-        Note over R0,RN: Per rank: 4–5 patches across 3 levels
-    end
-
-    rect rgb(255, 245, 200)
-        Note over R0,RN: LOOP — TimeRefinementIntegrator
-        Note over R0,RN: Compute dt (CFL per level, local time sub-steps)
-        Note over R0,RN: Advance: Godunov operator per patch (u → fluxes → u)
-
-        rect rgb(255, 225, 180)
-            Note over R0,RN: GHOST CELL FILL (RefineSchedule)
-            R0->>R1: halo exchange (ghost cell data)
-            R1->>R0: halo exchange (ghost cell data)
-            R1->>RN: halo exchange (ghost cell data)
-            RN->>R1: halo exchange (ghost cell data)
-        end
-
-        R0->>R1: CoarsenSchedule (fine u → coarse u sync)
-        R1->>R0: CoarsenSchedule (fine u → coarse u sync)
-
-        Note over R0,RN: REGRID — gradient tags → BergerRigoutsos → CascadePartitioner
-        Note over R0,RN: Patch counts change per rank (split/merge/redistribute)
-
-        rect rgb(255, 225, 180)
-            Note over R0,RN: PATCH REDISTRIBUTION (regrid)
-            R0->>R1: migrate patch data to new owners
-            R1->>RN: migrate patch data to new owners
-            RN->>R0: migrate patch data to new owners
-        end
-
-        rect rgb(255, 200, 150)
-            Note over R0,RN: CHECKPOINT — RestartManager, periodic
-            Note over R0,RN: Write HDF5 restore.NNNNNN/
-            Note over R0,RN: Size VARIES: regridding changes patch layout
-        end
-    end
-
-    rect rgb(200, 240, 200)
-        Note over R0,RN: FINALIZE — print "PASSED", SAMRAIManager::shutdown
-    end
+    Note right of RN: INIT: 3-level AMR → LOOP start
+    R0->>R1: RefineSchedule halo (ghost cells)
+    R1->>R0: RefineSchedule halo (ghost cells)
+    R1->>RN: RefineSchedule halo (ghost cells)
+    RN->>R1: RefineSchedule halo (ghost cells)
+    R0->>R1: CoarsenSchedule (fine → coarse sync)
+    R1->>R0: CoarsenSchedule (fine → coarse sync)
+    Note right of RN: REGRID: patches redistributed (VARIABLE)
+    R0->>R1: migrate patch data to new owners
+    R1->>RN: migrate patch data to new owners
+    RN->>R0: migrate patch data to new owners
+    Note right of RN: CKPT HDF5 (VARIABLE) | FINALIZE
 ```
 
 **Key observations:**

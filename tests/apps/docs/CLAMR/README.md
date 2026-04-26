@@ -1,6 +1,6 @@
 # CLAMR — Cell-based Adaptive Mesh Refinement
 
-**Category:** Dynamic / Fixed state  
+**Class:** (3) iterative_adaptive  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native Crux module (POSIX file I/O)
 
@@ -105,14 +105,14 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Cycle begins
+    Note right of RN: Cycle begins
     R0-->>RN: MPI_Allreduce (CFL → global deltaT)
     R0->>R1: halo H,U,V (ghost cells)
     R1->>R0: halo H,U,V (ghost cells)
-    Note over R0,RN: Local flux compute + state update + AMR
+    Note right of RN: Flux + state update + AMR
     R0->>R1: cell migration (load balance)
     R1->>R0: cell migration (load balance)
-    Note over R0,RN: Cycle ends
+    Note right of RN: Cycle ends
 ```
 
 ### Application Lifetime View
@@ -123,48 +123,20 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(200, 220, 245)
-        Note over R0,RN: INIT — parse params, build uniform coarse grid
-        Note over R0,RN: Initialize dam-break profile → H, U, V
-        Note over R0,RN: Per rank: ncells ≈ 1024 (initial, adaptive cells)
-    end
-
-    rect rgb(255, 245, 200)
-        Note over R0,RN: LOOP — ncycle 0..niter
-        R0-->>RN: MPI_Allreduce (CFL → global deltaT)
-
-        rect rgb(255, 225, 180)
-            Note over R0,RN: HALO EXCHANGE
-            R0->>R1: ghost H,U,V (Isend/Irecv/Waitall)
-            R1->>R0: ghost H,U,V
-            R1->>RN: ghost H,U,V
-            RN->>R1: ghost H,U,V
-        end
-
-        Note over R0,RN: Flux computation + state update (H,U,V in-place)
-        Note over R0,RN: AMR refine/coarsen (gradients → split/merge cells)
-        Note over R0,RN: Per-rank ncells changes (e.g. 1024→896–1280)
-
-        rect rgb(255, 225, 180)
-            Note over R0,RN: LOAD BALANCE (Hilbert curve repartition)
-            R0->>R1: migrate cells to balance load
-            R1->>R0: migrate cells to balance load
-            R1->>RN: migrate cells to balance load
-            RN->>R1: migrate cells to balance load
-            Note over R0,RN: ncells rebalanced across ranks (~1110 each)
-        end
-
-        Note over R0,RN: Rebuild neighbor connectivity (nlft,nrht,nbot,ntop)
-
-        rect rgb(255, 200, 150)
-            Note over R0,RN: CHECKPOINT — periodic via Crux
-            Note over R0,RN: Write backup*.crx (VARIABLE size per rank)
-        end
-    end
-
-    rect rgb(200, 240, 200)
-        Note over R0,RN: FINALIZE — print conservation metrics, MPI_Finalize
-    end
+    Note right of RN: INIT: dam-break H/U/V, ~1024 cells/rank
+    R0-->>RN: MPI_Allreduce (CFL → global deltaT)
+    R0->>R1: ghost H,U,V (halo exchange)
+    R1->>R0: ghost H,U,V (halo exchange)
+    R1->>RN: ghost H,U,V (halo exchange)
+    RN->>R1: ghost H,U,V (halo exchange)
+    Note right of RN: LOOP | Flux → AMR (ncells CHANGES)
+    R0->>R1: migrate cells to balance load
+    R1->>R0: migrate cells to balance load
+    R1->>RN: migrate cells to balance load
+    RN->>R1: migrate cells to balance load
+    Note right of RN: LOAD BALANCE | CKPT (VARIABLE)
+    R0->>R1: ghost H,U,V (next cycle)
+    Note right of RN: FINALIZE: conservation, MPI_Finalize
 ```
 
 **Key observations:**

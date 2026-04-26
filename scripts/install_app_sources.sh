@@ -53,7 +53,6 @@ APPS=(
   "SPPARKS|https://github.com/sandialabs/spparks.git|||"
   "HPCG|https://github.com/hpcg-benchmark/hpcg.git|||"
   "PRK_Stencil|https://github.com/ParRes/Kernels.git|||MPI1/Stencil"
-  "SST|https://github.com/sstsimulator/sst-core.git|||"
   "Athena++|https://github.com/PrincetonUniversity/athena.git|||"
   "SPARTA|https://github.com/sandialabs/sparta.git|||"
   "OpenLB|https://gitlab.com/openlb/release.git|||"
@@ -76,6 +75,7 @@ APPS=(
   # "Nektar++|https://gitlab.nektar.info/nektar/nektar.git|v5.7.0||"  # dropped: build-cost too high for current tier budget
   # "SU2|https://github.com/su2code/SU2.git|v8.1.0|--recurse-submodules|"  # dropped: covered by Athena++ for class (3) AMR
   # "miniVite|https://github.com/Exa-Graph/miniVite.git|||"  # dropped: FTI inlined into source without #ifdef guards (Issue #18)
+  # "SST|https://github.com/sstsimulator/sst-core.git|||"  # dropped 2026-04-26: vanilla+reference are just shell+Python wrappers around the pre-built sst-core binary (3GB external install).  The "checkpoint capability" reference adds vs vanilla is a single --checkpoint-sim-period CLI flag, so the LLM task reduces to "copy a CLI flag" (not real source-code work).  See ISSUES.md #25 for the removal record + decision rationale.
 )
 
 if $LIST_ONLY; then

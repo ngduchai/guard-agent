@@ -1,6 +1,6 @@
 # MMSP — Mesoscale Microstructure Simulation Program (Cahn-Hilliard)
 
-**Category:** Iterative / Variable state  
+**Class:** (1) iterative_fixed  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native MMSP grid serialization (`MMSP::output`/`MMSP::input`)
 
@@ -95,14 +95,13 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Red sweep (Gauss-Seidel update)
+    Note right of RN: Red sweep (Gauss-Seidel)
     R0->>R1: ghostswap (C, mu halo cells)
     R1->>R0: ghostswap (C, mu halo cells)
-    Note over R0,RN: Black sweep (Gauss-Seidel update)
+    Note right of RN: Black sweep (Gauss-Seidel)
     R0->>R1: ghostswap (C, mu halo cells)
     R1->>R0: ghostswap (C, mu halo cells)
-    Note over R0,RN: Convergence check, swap grids
-    Note over R0,RN: Step complete
+    Note right of RN: Converge → swap grids → done
 ```
 
 ### Application Lifetime View
@@ -113,48 +112,19 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(230,245,255)
-    Note over R0,RN: INIT — allocate 400×200 grid partitions
-    Note over R0,RN: Per rank: C[nx_local][ny_local], mu[...] + ghost cells
-    Note over R0,RN: Init C ≈ 0.45 (cosine perturbation), compute mu
-    Note over R0,RN: Write initial grid → test.dat
-    end
+    Note right of RN: INIT: 400x200 grid, C~0.45, mu
 
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP — state size FIXED (400×200 static grid)
-    loop 10 batches of 100 steps each
-        Note over R0,RN: Convex splitting: implicit + explicit terms
-        loop Red-black Gauss-Seidel (up to 10K iters)
-            Note over R0,RN: Red sweep update
-            R0->>R1: ghostswap (C, mu halos)
-            R1->>R0: ghostswap (C, mu halos)
-            Note over R0,RN: Black sweep update
-            R0->>R1: ghostswap (C, mu halos)
-            R1->>R0: ghostswap (C, mu halos)
-        end
-        Note over R0,RN: Values evolve: C → 0.05 and 0.95 phases
-        Note over R0,RN: Swap grids: newGrid → oldGrid
-    end
-    end
+    R0->>R1: ghostswap (C, mu halos) — red sweep
+    R1->>R0: ghostswap (C, mu halos) — red sweep
+    R0->>R1: ghostswap (C, mu halos) — black sweep
+    R1->>R0: ghostswap (C, mu halos) — black sweep
+    Note right of RN: LOOP 10x100 | GS converge → swap
 
-    rect rgb(255,230,220)
-    Note over R0,RN: CHECKPOINT — every 100 steps
-    Note over R0,RN: Each rank serializes local partition via MMSP::output
-    Note over R0,RN: File: test.NNNN.dat (~1.2 MB, CONSTANT size)
-    end
+    R0->>R1: ghostswap (checkpoint cycle)
+    Note right of RN: CKPT every 100 → test.NNNN.dat
 
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP continues (remaining batches)
-    loop Remaining batches
-        Note over R0,RN: Convex splitting → Gauss-Seidel → ghostswap → swap
-        R0->>R1: ghostswap (C, mu halos)
-        R1->>R0: ghostswap (C, mu halos)
-    end
-    end
-
-    rect rgb(230,255,230)
-    Note over R0,RN: FINALIZE — write test.1000.dat, print timing
-    end
+    R0->>R1: ghostswap (final cycle)
+    Note right of RN: FINALIZE: test.1000.dat, timing
 ```
 
 **Key observations:**

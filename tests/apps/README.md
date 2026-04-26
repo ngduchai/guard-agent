@@ -1,6 +1,6 @@
 # Benchmark Applications — Index
 
-This directory holds the 20 applications that the validation pipeline runs against. Every app has three things:
+This directory holds the 18 applications that the validation pipeline runs against. Every app has three things:
 
 ```
 tests/apps/
@@ -10,7 +10,7 @@ tests/apps/
 └── README.md              # ← you are here
 ```
 
-The 20 apps are chosen so that each non-empty cell of the **(loop model × per-rank state behavior)** matrix is covered. Picking one app per class for `validation/veloc/apps_fast.txt` lets a benchmark sweep exercise every distinct **MPI checkpoint protocol** with the minimum number of runs.
+The 18 apps are chosen so that each non-empty cell of the **(loop model × per-rank state behavior)** matrix is covered. Picking one app per class for `validation/veloc/apps_fast.txt` lets a benchmark sweep exercise every distinct **MPI checkpoint protocol** with the minimum number of runs.
 
 ---
 
@@ -23,10 +23,10 @@ Each class corresponds to a distinct MPI checkpoint protocol — what the writer
                           fixed       variable      adaptive
                        ┌──────────┬──────────┬──────────┐
             iterative  │   (1)    │   (2)    │   (3)    │   ← MPI_Barrier-based
-   loop                │   9 apps │   3 apps │   5 apps │
+   loop                │   8 apps │   3 apps │   5 apps │
    model               ├──────────┼──────────┼──────────┤
             async      │    —     │   (4)    │    —     │   ← GVT-based snapshot
-                       │          │   3 apps │          │
+                       │          │   2 apps │          │
                        └──────────┴──────────┴──────────┘
 ```
 
@@ -52,7 +52,7 @@ The four checks are unambiguous; placement is determined by the structure of the
 
 ---
 
-## All 20 Applications
+## All 18 Applications
 
 Grouped by class (then alphabetical within class):
 
@@ -77,7 +77,6 @@ Grouped by class (then alphabetical within class):
 | [WarpX](docs/WarpX/README.md) | (3) iterative_adaptive | C++ | AMReX native | Electromagnetic PIC on AMReX (subcycled AMR + particles) |
 | [PRK_Stencil](docs/PRK_Stencil/README.md) | (4) asynchronous | C | POSIX file I/O | Parallel Research Kernels MPI1 Stencil — barrier-free 2D star-shaped stencil with non-blocking halo |
 | [ROSS](docs/ROSS/README.md) | (4) asynchronous | C | RIO (POSIX) | Parallel discrete-event simulator (PHOLD), optimistic Time Warp |
-| [SST](docs/SST/README.md) | (4) asynchronous | Python (C++ runtime) | sst-core native | Sandia Structural Simulation Toolkit — conservative parallel discrete-event simulator (16-component ring on simpleElementExample) |
 
 Per-app contracts (build commands, MPI rank count, comparison method, run timeout) are declared in `vanillas/<App>/app.yaml` — that is the file the validation pipeline reads.
 
@@ -90,13 +89,12 @@ Class **(4) asynchronous** is now covered by three apps with structurally differ
 | Sub-flavor | Coordination idiom | Example | In suite? |
 |---|---|---|---|
 | Optimistic PDES with rollback | events + anti-messages, GVT computation | ROSS | ✓ |
-| Conservative PDES with sync-window barriers | window-end via `MPI_Allreduce(MIN)` on per-rank min event ts + lookahead; no rollback | SST | ✓ |
 | Barrier-free BSP (asynchronous iterative) | nearest-neighbor MPI_Wait; no per-step MPI_Barrier or MPI_Allreduce | PRK_Stencil | ✓ |
 | Message-driven async execution | Charm++ / AMPI; messages drive computation, no global step | NAMD, ChaNGa | ✗ (deferred — Charm++ build is heavy and source requires academic-license registration) |
 
 PRK_Stencil is *barrier-free BSP* rather than chaotic-async; it still has neighbor synchronization via non-blocking halo. The author of the kernel deliberately removed the per-iteration `MPI_Allreduce`/`MPI_Barrier` so that drift between ranks is uncoordinated. This is the closest "no global step" pattern reachable with vanilla MPI; true chaotic relaxation (e.g. async Jacobi where ranks read stale neighbor data without waiting) would require a custom proxy.
 
-ROSS and SST together cover the two major PDES synchronization disciplines (optimistic vs conservative) — a checkpoint approach that handles ROSS's RIO is not automatically guaranteed to handle SST's `SIZER`/`PACK`/`UNPACK` framework, so both meaningfully broaden the validation surface.
+ROSS covers the optimistic-PDES synchronization discipline; the conservative-PDES counterpart (SST) was dropped 2026-04-26 because its vanilla+reference setup was just shell-wrapper differences around a pre-built binary, not a meaningful resilience-engineering experiment. A replacement candidate for class (4) async is being researched (see ISSUES.md #26).
 
 **Remaining recommendation:** add **NAMD** to (4) when the Charm++ toolchain is available. It is the only major production async-via-messaging code with native checkpoint/restart at petascale.
 
@@ -108,7 +106,7 @@ For batch runs the apps are also tagged by approximate build + run cost:
 
 | Tier | Apps | Use case |
 |------|------|----------|
-| `fast` (8) | CoMD, HPCG, miniVite, SPARTA, Athena++, CLAMR, PRK_Stencil, SST | First-cycle smoke runs; smallest representatives covering all 4 classes |
+| `fast` (7) | CoMD, HPCG, SPARTA, Athena++, CLAMR, PRK_Stencil | First-cycle smoke runs; smallest representatives covering all 4 classes (SST removed 2026-04-26 — see ISSUES #26) |
 | `mid` (6) | MMSP, HyPar, OpenLB, LAMMPS, SAMRAI, ROSS | Second-cycle: native checkpoint, ~few-minute runs, distinct mechanisms |
 | `slow` (6) | SPPARKS, SW4lite, QMCPACK, Smilei, Nyx, WarpX | Third-cycle: HDF5 / AMReX heavyweights with bigger state |
 
@@ -190,7 +188,6 @@ Every benchmark application is open-source upstream code, copied into `vanillas/
 | **SPPARKS** | https://github.com/sandialabs/spparks (also https://spparks.github.io) | Sandia National Laboratories (Steven Plimpton et al.) | Plimpton, Battaile, Chandross, Holm et al., *SPPARKS*, GPL release |
 | **HPCG** | https://github.com/hpcg-benchmark/hpcg | HPCG Benchmark project (Sandia/UTK — Heroux, Dongarra, Luszczek) | Dongarra, Heroux & Luszczek, *HPCG: A new HPC benchmark*, Int. J. HPCA (2016) |
 | **PRK_Stencil** | https://github.com/ParRes/Kernels (subdirectory `MPI1/Stencil`) | Parallel Research Kernels, Intel + IBM (Van der Wijngaart, Mattson et al.) | Van der Wijngaart & Mattson, *The Parallel Research Kernels: A tool for architecture and programming system investigation*, IEEE HPEC (2014) |
-| **SST** | https://github.com/sstsimulator/sst-core (kernel) + https://github.com/sstsimulator/sst-elements (components) | Structural Simulation Toolkit, Sandia National Laboratories | Hammond, Hsieh, Hemmert, Bergman, Huang & Voskuilen, *Towards a Standard Architectural Simulation Framework*, SST Tutorial HPCA 2024.  This benchmark's `bench.py` (16-component ring on `simpleElementExample.basicLinks`) is custom-written for this validation suite, not from SST upstream. |
 | **Athena++** | https://github.com/PrincetonUniversity/athena | Princeton University (Stone, Tomida, White, Felker, Beckwith) | Doi: 10.5281/zenodo.11660592 — Stone et al., *The Athena++ Adaptive Mesh Refinement Framework*, ApJS (2020) |
 | **SPARTA** | https://github.com/sandialabs/sparta | Sandia National Laboratories (Plimpton, Gallis et al.) | Plimpton & Gallis, *SPARTA Direct Simulation Monte Carlo (DSMC) Simulator*, GPL |
 | **OpenLB** | https://gitlab.com/openlb/release (also https://www.openlb.net) | OpenLB Consortium, Karlsruhe Institute of Technology (Krause, Kummerländer et al.) | Krause et al., *OpenLB — Open source lattice Boltzmann code*, Comp. Math. Appl. (2021) |

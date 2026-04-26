@@ -1,6 +1,6 @@
 # SPPARKS — Stochastic Parallel PARticle Kinetic Simulator
 
-**Category:** Iterative / Variable state  
+**Class:** (1) iterative_fixed  
 **Language:** C++ (MPI)  
 **Checkpoint library:** Native `dump sites` output (text format, repurposed as checkpoint)
 
@@ -105,11 +105,10 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: Sweep begins
+    Note right of RN: Sweep begins
     R0->>R1: ghost-site spins (sector boundary)
     R1->>R0: ghost-site spins (sector boundary)
-    Note over R0,RN: Local Monte Carlo trials (independent per sector)
-    Note over R0,RN: Sweep ends
+    Note right of RN: Local MC trials → sweep ends
 ```
 
 ### Application Lifetime View
@@ -120,26 +119,19 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(200, 220, 245)
-        Note over R0,RN: INIT — 500×500 sq lattice, RNG seed 56789<br/>random spins ∈ {1,2}, ~62,500 sites/rank (FIXED)
-    end
+    Note right of RN: INIT: 500x500 lattice, random spins
 
-    rect rgb(255, 245, 200)
-        Note over R0,RN: LOOP — 5000 KMC time units
-        R0->>R1: ghost-site spins (sector boundary)
-        R1->>R0: ghost-site spins (sector boundary)
-        R1->>RN: ghost-site spins (sector boundary)
-        RN->>R1: ghost-site spins (sector boundary)
-        Note over R0,RN: Monte Carlo trials → Metropolis accept/reject → advance time
-    end
+    R0->>R1: ghost-site spins (sector boundary)
+    R1->>R0: ghost-site spins (sector boundary)
+    R1->>RN: ghost-site spins (sector boundary)
+    RN->>R1: ghost-site spins (sector boundary)
+    Note right of RN: LOOP 5000 KMC | MC trials → accept/reject
 
-    rect rgb(255, 200, 150)
-        Note over R0,RN: CHECKPOINT every 100 time units → dump.ising.N (CONSTANT size)
-    end
+    R0->>R1: ghost-site spins (next sweep)
+    Note right of RN: CKPT every 100 t → dump.ising.N
 
-    rect rgb(200, 240, 200)
-        Note over R0,RN: FINALIZE — print "Loop time"
-    end
+    R0->>R1: ghost-site spins (next sweep)
+    Note right of RN: FINALIZE: print "Loop time"
 ```
 
 **Key observations:**

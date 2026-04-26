@@ -1,6 +1,6 @@
 # HyPar — Hyperbolic-Parabolic PDE Solver
 
-**Category:** Iterative / Fixed state  
+**Class:** (1) iterative_fixed  
 **Language:** C (MPI)  
 **Checkpoint library:** Native solution output files (text format, repurposed as checkpoints)
 
@@ -105,13 +105,10 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    Note over R0,RN: RK3 Stage 1
+    Note right of RN: RK3 Stage 1
     R0->>R1: ghost exchange (P stencil halos)
     R1->>R0: ghost exchange (P stencil halos)
-    Note over R0,RN: WENO5 advection + central diffusion
-    Note over R0,RN: RK3 Stages 2-3 (same pattern)
-    Note over R0,RN: Post-step: BCs + normalize
-    Note over R0,RN: Step complete
+    Note right of RN: WENO5 + diffusion → stages 2-3 → BCs → done
 ```
 
 ### Application Lifetime View
@@ -122,45 +119,21 @@ sequenceDiagram
     participant R1 as Rank 1
     participant RN as Rank N
 
-    rect rgb(230,245,255)
-    Note over R0,RN: INIT — ReadInputs (solver.inp)
-    Note over R0,RN: Each rank allocates P(x) segment + 3 ghost pts/side
-    Note over R0,RN: 80 grid points total, ~80/N per rank (FIXED size)
-    Note over R0,RN: Read initial.inp → P(x,0), setup Dirichlet BCs
-    end
+    Note right of RN: INIT: 80-pt 1D grid, P(x) + 3 ghosts
 
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP — 500K steps (state size FIXED)
-    loop Steps 1 to 50,000
-        Note over R0,RN: PreStep → RK3 Stage 1
-        R0->>R1: ghost exchange (3 pts/side)
-        R1->>R0: ghost exchange (3 pts/side)
-        Note over R0,RN: WENO5 advection + central diffusion
-        Note over R0,RN: RK3 Stages 2-3 (same pattern)
-        Note over R0,RN: PostStep: BCs + normalize (∫P = 1)
-    end
-    end
+    R0->>R1: ghost exchange (3 pts/side per RK stage)
+    R1->>R0: ghost exchange (3 pts/side per RK stage)
+    Note right of RN: LOOP 500K | WENO5 + diffusion → BCs
 
-    rect rgb(255,230,220)
-    Note over R0,RN: CHECKPOINT — every 50K steps
-    Note over R0,RN: Each rank writes local P(x) → op_NNNNN.dat
-    Note over R0,RN: File size: ~2 KB (CONSTANT, 80-point grid)
-    end
+    R0->>R1: ghost exchange (checkpoint cycle)
+    Note right of RN: CKPT every 50K → op_NNNNN.dat
 
-    rect rgb(255,255,230)
-    Note over R0,RN: MAIN LOOP continues (steps 50,001–500,000)
-    loop Remaining steps
-        R0->>R1: ghost exchange (P stencil halos)
-        R1->>R0: ghost exchange (P stencil halos)
-        Note over R0,RN: RK3: ghost exchange → WENO5 + diffusion → combine
-    end
-    end
+    R0->>R1: ghost exchange (P stencil halos)
+    R1->>R0: ghost exchange (P stencil halos)
+    Note right of RN: LOOP continues (steps 50K–500K)
 
-    rect rgb(230,255,230)
-    Note over R0,RN: FINALIZE
-    Note over R0,RN: Compute L1/L2/Linf error vs exact.inp
-    Note over R0,RN: Write errors.dat, conservation.dat, print "Finished"
-    end
+    R0->>R1: ghost exchange (final cycle)
+    Note right of RN: FINALIZE: error norms, "Finished"
 ```
 
 **Key observations:**
