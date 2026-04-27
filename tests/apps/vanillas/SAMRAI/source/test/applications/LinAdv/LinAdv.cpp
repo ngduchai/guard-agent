@@ -206,12 +206,10 @@ LinAdv::LinAdv(
    }
 
    /*
-    * Initialize object with data read from given input/restart databases.
+    * Native restart support has been removed from this vanilla, so we always
+    * initialize from input data only and never call getFromRestart().
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
-   if (is_from_restart) {
-      getFromRestart();
-   }
+   const bool is_from_restart = false;
    getFromInput(input_db, is_from_restart);
 
    /*

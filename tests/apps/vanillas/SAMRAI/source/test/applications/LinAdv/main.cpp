@@ -293,14 +293,12 @@ int main(
             main_db->getBoolWithDefault("write_blueprint", false);
 #endif
 
-         int restart_interval = 0;
-         if (main_db->keyExists("restart_interval")) {
-            restart_interval = main_db->getInteger("restart_interval");
-         }
-
-         const std::string restart_write_dirname =
-            main_db->getStringWithDefault("restart_write_dirname",
-               base_name + ".restart");
+         // Native restart support has been removed in this vanilla.
+         // Any `restart_interval` / `restart_write_dirname` value coming from
+         // the input file is ignored so checkpoint files cannot be written.
+         (void) main_db->keyExists("restart_interval");
+         const int restart_interval = 0;
+         const std::string restart_write_dirname;
 
          bool use_refined_timestepping = true;
          if (main_db->keyExists("timestepping")) {
@@ -315,32 +313,18 @@ int main(
             rebalance_coarsest = main_db->getBool("rebalance_coarsest");
          }
 
-#if (TESTING == 1) && !defined(HAVE_HDF5)
-         /*
-          * If we are autotesting on a system w/o HDF5, the read from
-          * restart will result in an error.  We want this to happen
-          * for users, so they know there is a problem with the restart,
-          * but we don't want it to happen when autotesting.
-          */
+         // Native restart support has been removed in this vanilla.
+         // The CLI-positional `<restart dir> <restore number>` form still
+         // parses (so existing wrappers don't break) but the restart-from-disk
+         // path is unconditionally disabled, and no restart file will be
+         // opened or written.
          is_from_restart = false;
-         restart_interval = 0;
-#endif
-
-         const bool write_restart = (restart_interval > 0)
-            && !(restart_write_dirname.empty());
-
-         /*
-          * Get the restart manager and root restart database.  If run is from
-          * restart, open the restart file.
-          */
+         (void) restore_num;
+         (void) restart_read_dirname;
+         const bool write_restart = false;
 
          tbox::RestartManager* restart_manager = tbox::RestartManager::getManager();
-
-         if (is_from_restart) {
-            restart_manager->
-            openRestartFile(restart_read_dirname, restore_num,
-               mpi.getSize());
-         }
+         (void) restart_manager;
 
          /*
           * Create major algorithm and data objects which comprise application.
@@ -513,16 +497,9 @@ int main(
             tbox::pout << "++++++++++++++++++++++++++++++++++++++++++++" << std::endl;
 
             /*
-             * At specified intervals, write restart and visualization files.
+             * Restart-file writing is disabled in this vanilla; only visit
+             * dumps remain.
              */
-            if (write_restart) {
-
-               if ((iteration_num % restart_interval) == 0) {
-                  tbox::RestartManager::getManager()->
-                  writeRestartFile(restart_write_dirname,
-                     iteration_num);
-               }
-            }
 
             /*
              * At specified intervals, write out data files for plotting.
