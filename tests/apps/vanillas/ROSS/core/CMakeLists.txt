@@ -109,12 +109,10 @@ IF(AVL_TREE)
   SET(ross_srcs ${ross_srcs} avl_tree.h avl_tree.c)
 ENDIF(AVL_TREE)
 
-# RIO: Restart IO
-OPTION(USE_RIO "Enable RIO checkpointing library?" OFF)
-IF(USE_RIO)
-  SET(ross_srcs ${ross_srcs} rio/io-mpi.c rio/io-serialize.c)
-  INCLUDE_DIRECTORIES(rio)
-ENDIF(USE_RIO)
+# RIO (Restart IO) checkpointing library has been removed in this vanilla.
+# The USE_RIO option, the rio/ source directory, and every #ifdef USE_RIO
+# branch in the core have all been stripped -- toggling -DUSE_RIO=ON is a
+# no-op.
 
 # Damaris I/O and data management
 OPTION(USE_DAMARIS "Build with Damaris library (for in situ vis/analysis)?" OFF)

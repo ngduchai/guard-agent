@@ -86,9 +86,7 @@ void tw_init(int *argc, char ***argv) {
     tw_opt_add(st_damaris_opts());
 #endif
     tw_opt_add(st_special_lp_opts());
-#ifdef USE_RIO
-    tw_opt_add(io_opts);
-#endif
+    /* RIO removed in this vanilla; io_opts no longer registered. */
 
     // by now all options must be in
     tw_opt_parse(argc, argv);
@@ -118,9 +116,7 @@ void tw_init(int *argc, char ***argv) {
                     "remote_sends,remote_recvs,pe_struct,kp_struct,lp_struct,lp_model_struct,lp_rngs,"
                     "total_lp_size,event_struct,event_struct_model,init_time,pq_time,avl_time,lz4_time,"
                     "buddy_time,");
-#ifdef USE_RIO
-            fprintf(g_tw_csv, "rio_load,rio_init,");
-#endif
+            /* RIO removed in this vanilla; rio_load,rio_init CSV columns dropped. */
             fprintf(g_tw_csv, "event_proc_time,event_cancel_time,event_abort_time,gvt_time,fc_time,"
                     "primary_rb_time,net_read_time,net_other_time,inst_comp_time,inst_write_time,total_time");
             if (g_st_use_analysis_lps)
@@ -525,14 +521,7 @@ static tw_pe * setup_pes(void) {
 
     tw_eventq_alloc(&pe->free_q, num_events_per_pe);
     pe->abort_event = tw_eventq_shift(&pe->free_q);
-#ifdef USE_RIO
-    int i;
-    tw_clock start = tw_clock_read();
-    for (i = 0; i < g_io_events_buffered_per_rank; i++) {
-        tw_eventq_push(&g_io_free_events, tw_eventq_pop(&g_tw_pe->free_q));
-    }
-    pe->stats.s_rio_load = (tw_clock_read() - start);
-#endif
+    /* RIO removed in this vanilla; per-rank IO event-buffer pre-allocation dropped. */
 
     if (g_tw_mynode == g_tw_masternode) {
         printf("\nROSS Core Configuration: \n");

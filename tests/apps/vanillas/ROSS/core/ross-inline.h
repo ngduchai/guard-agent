@@ -3,9 +3,7 @@
 
 #include "ross-types.h"
 #include "tw-eventq.h"
-#ifdef USE_RIO
-#include "rio/io.h"
-#endif
+/* RIO removed in this vanilla; rio/io.h no longer exists. */
 
 static inline tw_event *
 tw_event_grab(tw_pe *pe)
@@ -73,11 +71,8 @@ tw_event_new_user_prio(tw_lpid dest_gid, tw_stime offset_ts, tw_lp * sender, tw_
    * are no more free events available, use abort event.
    */
   if (TW_STIME_DBL(recv_ts) >= g_tw_ts_end) {
-#ifdef USE_RIO
-    e = io_event_grab(send_pe);
-#else
+    /* RIO removed in this vanilla; abort_event path is the only branch. */
     e = send_pe->abort_event;
-#endif
     send_pe->stats.s_events_past_end++;
   } else {
     e = tw_event_grab(send_pe);

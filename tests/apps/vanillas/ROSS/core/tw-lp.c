@@ -101,7 +101,7 @@ tw_init_lps(tw_pe * me)
         for (j = 0; j < 3; j++)
             lp->last_stats[j] = (st_lp_stats*) tw_calloc(TW_LOC, "LP instrumentation", sizeof(st_lp_stats), 1);
 
-#ifndef USE_RIO
+		/* RIO removed in this vanilla; only the plain init branch remains. */
 		if (lp->type->init)
 		{
 			me->cur_event = me->abort_event;
@@ -112,36 +112,8 @@ tw_init_lps(tw_pe * me)
 			if (me->cev_abort)
 				tw_error(TW_LOC, "ran out of events during init");
 		}
-#endif
 	}
-#ifdef USE_RIO
-	// RIO requires that all LPs have been allocated
-	if (g_io_load_at == PRE_INIT || g_io_load_at == INIT) {
-		tw_clock start = tw_clock_read();
-        io_read_checkpoint();
-        me->stats.s_rio_load += (tw_clock_read() - start);
-    }
-    if (g_io_load_at != INIT) {
-    	tw_clock start = tw_clock_read();
-    	for (i = 0; i < g_tw_nlp; i++) {
-			tw_lp * lp = g_tw_lp[i];
-			me->cur_event = me->abort_event;
-			me->cur_event->caused_by_me = NULL;
-
-			(*(init_f)lp->type->init) (lp->cur_state, lp);
-
-			if (me->cev_abort) {
-				tw_error(TW_LOC, "ran out of events during init");
-			}
-		}
-		me->stats.s_rio_lp_init += (tw_clock_read() - start);
-	}
-    if (g_io_load_at == POST_INIT) {
-		tw_clock start = tw_clock_read();
-        io_read_checkpoint();
-        me->stats.s_rio_load += (tw_clock_read() - start);
-    }
-#endif
+	/* RIO read-checkpoint / RIO-staged init blocks removed in this vanilla. */
 }
 
 void tw_pre_run_lps (tw_pe * me) {

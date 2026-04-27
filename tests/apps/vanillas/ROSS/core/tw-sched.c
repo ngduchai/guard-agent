@@ -487,12 +487,7 @@ void tw_sched_init(tw_pe * me) {
     tw_pre_run_lps(me);
     tw_net_barrier();
 
-#ifdef USE_RIO
-    tw_clock start = tw_clock_read();
-    io_load_events(me);
-    me->stats.s_rio_load += (tw_clock_read() - start);
-    tw_net_barrier();
-#endif
+    /* RIO removed in this vanilla; io_load_events() block dropped. */
 
     /*
     * Recv all of the startup events out of the network before

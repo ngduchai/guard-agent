@@ -33,14 +33,7 @@ void tw_event_send(tw_event * event) {
         return;
     }
 
-#ifdef USE_RIO
-    // rio saves events scheduled past end time
-     if (recv_ts >= g_tw_ts_end) {
-        link_causality(event, send_pe->cur_event);
-        INCREASE_ABORTED_COUNT(send_pe->cur_event);
-        return;
-    }
-#endif
+    /* RIO removed in this vanilla; the past-end-time RIO save branch is gone. */
 
      // moved from network-mpi.c in order to give all events a seq_num
      event->event_id = (tw_eventid) ++send_pe->seq_num;
@@ -157,12 +150,7 @@ static inline void event_cancel(tw_event * event) {
         return;
     }
 
-#ifdef USE_RIO
-    if (event->state.owner == IO_buffer) {
-        io_event_cancel(event);
-        return;
-    }
-#endif
+    /* RIO removed in this vanilla; IO_buffer event-cancel branch dropped. */
 
     dest_peid = event->dest_lp->pe->id;
 
