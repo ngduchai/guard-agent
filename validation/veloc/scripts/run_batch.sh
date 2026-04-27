@@ -22,7 +22,7 @@ trap _batch_cleanup EXIT INT TERM
 # App list file format (one app per line, # comments, blank lines ignored):
 #   # Fast apps
 #   CoMD
-#   miniVite
+#  
 #   miniFE
 #   # Slow apps
 #   LAMMPS
@@ -61,16 +61,24 @@ APP_LIST_FILE=""
 EXTRA_ARGS=""
 
 # --- App ordering (shortest → longest build time) ---
-# Only apps with native checkpoint/restart in their reference code.
+# All apps with app.yaml + reference checkpoint/restart code.
+# (Apps without app.yaml were removed; this list is the source of truth.)
 ALL_APPS_ORDERED=(
-  CoMD miniVite CLAMR SW4lite Athena++ SPARTA OpenLB Palabos
-  Smilei incflo GRChombo LAMMPS SAMRAI
-  WarpX Castro AMR-Wind NekRS QMCPACK Nyx
+  CoMD CLAMR SW4lite MMSP HyPar SPPARKS HPCG PRK_Stencil SST
+  Athena++ SPARTA OpenLB
+  Smilei LAMMPS SAMRAI ROSS
+  WarpX QMCPACK Nyx
 )
 
-FAST_APPS=(CoMD miniVite CLAMR SW4lite Athena++ SPARTA OpenLB Palabos)
-MEDIUM_APPS=(Smilei incflo GRChombo LAMMPS SAMRAI)
-HEAVY_APPS=(WarpX Castro AMR-Wind NekRS QMCPACK Nyx)
+# --- Batches for the staged validation workflow ---
+# Each batch picks 1-2 apps per class (with class (1) at 3 because it has 9 apps).
+# Run order: fast → mid → slow.  Generated lists match validation/veloc/apps_<tier>.txt.
+FAST_APPS=(CoMD HPCG SPARTA Athena++ CLAMR PRK_Stencil SST)
+MID_APPS=(MMSP HyPar OpenLB LAMMPS SAMRAI ROSS)
+SLOW_APPS=(SPPARKS SW4lite QMCPACK Smilei Nyx WarpX)
+# Backwards-compatible aliases (older invocations may still pass --generate-list medium/heavy):
+MEDIUM_APPS=("${MID_APPS[@]}")
+HEAVY_APPS=("${SLOW_APPS[@]}")
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
@@ -84,11 +92,13 @@ while [[ $# -gt 0 ]]; do
     --dry-run)      DRY_RUN=true; shift ;;
     --generate-list)
       case "${2:-all}" in
-        all)    printf '%s\n' "${ALL_APPS_ORDERED[@]}" ;;
-        fast)   printf '%s\n' "${FAST_APPS[@]}" ;;
-        medium) printf '%s\n' "${MEDIUM_APPS[@]}" ;;
-        heavy)  printf '%s\n' "${HEAVY_APPS[@]}" ;;
-        *)      echo "Unknown list: $2. Use: all, fast, medium, heavy" >&2; exit 1 ;;
+        all)        printf '%s\n' "${ALL_APPS_ORDERED[@]}" ;;
+        fast)       printf '%s\n' "${FAST_APPS[@]}" ;;
+        mid)        printf '%s\n' "${MID_APPS[@]}" ;;
+        slow)       printf '%s\n' "${SLOW_APPS[@]}" ;;
+        medium)     printf '%s\n' "${MEDIUM_APPS[@]}" ;;  # alias of mid
+        heavy)      printf '%s\n' "${HEAVY_APPS[@]}" ;;   # alias of slow
+        *)          echo "Unknown list: $2. Use: all, fast, mid, slow" >&2; exit 1 ;;
       esac
       exit 0 ;;
     -h|--help)
@@ -118,8 +128,12 @@ if [[ ! -f "$APP_LIST_FILE" ]]; then
   exit 1
 fi
 
-# --- Read app list (strip comments and blank lines) ---
-mapfile -t APPS < <(grep -v '^\s*#' "$APP_LIST_FILE" | grep -v '^\s*$' | sed 's/^\s*//;s/\s*$//')
+# --- Read app list (strip whole-line + inline comments, blank lines) ---
+mapfile -t APPS < <(
+  sed 's/[[:space:]]*#.*$//' "$APP_LIST_FILE" \
+    | grep -v '^[[:space:]]*$' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+)
 
 if [[ ${#APPS[@]} -eq 0 ]]; then
   echo "ERROR: No apps found in $APP_LIST_FILE" >&2
@@ -149,12 +163,16 @@ if [[ ! -f "$RUNNER" ]]; then
   exit 1
 fi
 
-# --- Check if app already has results (for --continue) ---
+# --- Check if app is FULLY done (for --continue) ---
+# For validate mode we no longer skip on directory-exists: the per-app runner
+# has fine-grained per-stage and per-trial resume via pipeline_state.json +
+# benchmark_progress.json.  We just pass --resume through (see _build_cmd).
+# For iterative/evaluate the result.json marker is the only completion
+# signal; absence means we should re-run.
 _has_results() {
   local app="$1"
   case "$MODE" in
     evaluate)
-      # Both baseline and guard-agent results exist
       [[ -f "$BUILD_DIR/iterative_logs/${app}_guard-agent/result.json" ]] && \
       [[ -f "$BUILD_DIR/iterative_logs/${app}_baseline/result.json" ]]
       ;;
@@ -166,11 +184,8 @@ _has_results() {
       fi
       ;;
     validate)
-      case "$APPROACH" in
-        --baseline)   [[ -d "$BUILD_DIR/validation_output/${app}_baseline" ]] ;;
-        --reference)  [[ -d "$BUILD_DIR/validation_output/${app}_reference" ]] ;;
-        *)            [[ -d "$BUILD_DIR/validation_output/${app}" ]] ;;
-      esac
+      # Validate mode resumes in-place; never skip an app entirely on --continue.
+      return 1
       ;;
   esac
 }
@@ -189,6 +204,11 @@ _build_cmd() {
       ;;
     validate)
       cmd="$cmd $APPROACH $app"
+      # Cascade --continue → --resume so the per-app validator picks up at
+      # the next un-done benchmark trial instead of restarting from scratch.
+      if $CONTINUE; then
+        cmd="$cmd --resume"
+      fi
       ;;
   esac
 
@@ -236,7 +256,14 @@ for i in "${!APPS[@]}"; do
   # Re-copy source from original for incomplete apps so that
   # modifications left by a previously interrupted OpenCode run
   # do not poison the next attempt.
-  if $CONTINUE; then
+  #
+  # CRITICAL: Only refresh in iterative/evaluate modes.  In validate mode
+  # we MUST preserve the LLM-modified source produced by the iterative
+  # loop — wiping it would re-build from vanilla and the validate run
+  # would measure vanilla performance, not the LLM solution.  This was
+  # the silent cause of contaminated Phase 3 benchmark data in the
+  # 2026-04-26/27 overnight run.
+  if $CONTINUE && [ "$MODE" != "validate" ]; then
     for _src_root in "$REPO_ROOT/tests/apps/vanillas" "$REPO_ROOT/tests/ecp/vanillas" "$REPO_ROOT/tests/examples/original"; do
       if [ -d "$_src_root/$app" ]; then
         # Only refresh the directory that this run will actually use
