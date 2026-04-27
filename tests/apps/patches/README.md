@@ -64,14 +64,29 @@ without changing the simulation itself. The patch adds those knobs. Examples:
 
 | App | Patch contents |
 |---|---|
-| **Athena++** | Adds `<output3> file_type=rst dt=...` block to athinput |
-| **CoMD** | (CoMD enables state writes via CLI `-d N`, not input file — handled differently; no patch needed here) |
-| **HPCG** | Enables HPCG.dat checkpoint output |
-| **WarpX/Nyx/Smilei** | Enables AMReX/HDF5 checkpoint dumps via input keyword |
-| **LAMMPS** | Adds `restart N file` directive to input |
-| **QMCPACK** | Switches `<qmc>` block's `checkpoint="-1"` (off) to `checkpoint="0"` (every step) |
-| **SAMRAI** | Sets `restart_interval = N` in the application's input deck |
-| **ROSS** | Enables `--io-store=1` via benchmark JSON `resilient_app_args` (already in place) |
+| **Athena++** | Adds `<output3> file_type=rst dt=5.0` block to athinput.blast |
+| **HyPar** | Sets `op_overwrite=no` + `op_file_format=binary` (timestamped op_NNNNN.bin) |
+| **LAMMPS** | Adds `restart 1000 restart.lj` directive |
+| **Nyx** | Sets `amr.checkpoint_files_output=1` + `amr.check_file=chk` + `amr.check_int=50` |
+| **QMCPACK** | Adds `checkpoint="0"` attribute to `<qmc method="linear">` inside `<loop>` |
+| **SAMRAI** | Adds `restart_interval=100` + `restart_write_dirname` to `Main { ... }` block |
+| **SPARTA** | Adds `restart 2000 restart.sparta` directive |
+| **SW4lite** | Adds `checkpoint cycleInterval=50 file=restart` directive |
+| **Smilei** | Appends `Checkpoints(dump_step=100, exit_after_dump=False, ...)` Python block |
+| **WarpX** | Appends `chkpoint` AMReX checkpoint diagnostic (4 lines) |
+
+### Apps with NO file-based patch
+
+| App | How checkpoint is enabled |
+|---|---|
+| **CLAMR** | CLI flag `-c N` already in `validation/veloc/benchmark_configs/CLAMR.json`'s `app_args` |
+| **CoMD** | Hardcoded in reference's `src-mpi/CoMD.c` (`ckptRate=500`, no flag); reference binary auto-writes |
+| **HPCG** | Env vars `CKPT_EVERY` + `HPCG_FIXED_SETS`; `run_validate.sh --reference` exports them per-app |
+| **MMSP** | Reference binary writes timestamped `test.NNNN.dat` files unconditionally per the run-cmd's increment arg |
+| **OpenLB** | Hardcoded in reference's `bstep2d.cpp` (`iT % 5000`); reference binary auto-writes |
+| **PRK_Stencil** | Env var `CKPT_EVERY`; `run_validate.sh --reference` exports it per-app |
+| **ROSS** | CLI flag `--io-store=1` already in `validation/veloc/benchmark_configs/ROSS.json`'s `resilient_app_args` |
+| **SPPARKS** | **No real native checkpoint mechanism upstream** — `dump sites` writes visualization output, not full restart state. `checkpoint_size_bytes` for SPPARKS reference will be 0 / very small (only stats files match POSIX patterns). Documented limitation; treat SPPARKS reference checkpoint-size as not-applicable. |
 
 **Patches must NEVER**:
 - Change the workload size (mesh resolution, time limit, particle count, etc.).
