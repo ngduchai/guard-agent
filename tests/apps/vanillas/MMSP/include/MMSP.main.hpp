@@ -234,118 +234,38 @@ int main(int argc, char* argv[]) {
 
 		input.close();
 
-		// set output file basename
-		int iterations_start(0);
-		if (outfile.find_first_of(".") != outfile.find_last_of(".")) {
-			std::string number = outfile.substr(outfile.find_first_of(".") + 1, outfile.find_last_of(".") - 1);
-			iterations_start = atoi(number.c_str());
-		}
-		std::string base;
-		if (outfile.find(".", outfile.find_first_of(".") + 1) == std::string::npos) // only one dot found
-			base = outfile.substr(0, outfile.find_last_of(".")) + ".";
-		else {
-			int last_dot = outfile.find_last_of(".");
-			int prev_dot = outfile.rfind('.', last_dot - 1);
-			std::string number = outfile.substr(prev_dot + 1, last_dot - prev_dot - 1);
-			bool isNumeric(true);
-			for (unsigned int i = 0; i < number.size(); ++i) {
-				if (!isdigit(number[i])) isNumeric = false;
-			}
-			if (isNumeric)
-				base = outfile.substr(0, outfile.rfind(".", outfile.find_last_of(".") - 1)) + ".";
-			else base = outfile.substr(0, outfile.find_last_of(".")) + ".";
-		}
-
-		// set output file suffix
-		std::string suffix = "";
-		if (outfile.find_last_of(".") != std::string::npos)
-			suffix = outfile.substr(outfile.find_last_of("."), std::string::npos);
-
-		// set output filename length
-		int length = base.length() + suffix.length();
-		if (1) {
-			std::stringstream slength;
-			slength << steps;
-			length += slength.str().length();
-		}
-
+		// Native checkpoint/restart removed: the upstream code parsed an
+		// iteration index out of the input filename to set
+		// `iterations_start`, and wrote `outfile.NNNN` snapshots every
+		// `increment` steps inside the time loop.  That mechanism is the
+		// app's native restart capability and has been stripped from the
+		// vanilla so the LLM cannot bypass injection by relying on it.
+		// The simulation now always runs from step 0 to `steps` and
+		// produces no file output during the run.
 
 		if (dim == 1) {
 			// construct grid object
 			GRID1D grid(argv[1]);
 
 			// perform computation
-			for (int i = iterations_start; i < steps; i += increment) {
+			for (int i = 0; i < steps; i += increment) {
 				MMSP::update(grid, increment);
-
-				// generate output filename
-				std::stringstream outstr;
-				int n = outstr.str().length();
-				for (int j = 0; n < length; j++) {
-					outstr.str("");
-					outstr << base;
-					for (int k = 0; k < j; k++) outstr << 0;
-					outstr << i + increment << suffix;
-					n = outstr.str().length();
-				}
-
-				char filename[FILENAME_MAX] = {}; // initialize null characters
-				for (unsigned int j=0; j<outstr.str().length(); j++)
-					filename[j]=outstr.str()[j];
-
-				// write grid output to file
-				MMSP::output(grid, filename);
 			}
 		} else if (dim == 2) {
 			// construct grid object
 			GRID2D grid(argv[1]);
 
 			// perform computation
-			for (int i = iterations_start; i < steps; i += increment) {
+			for (int i = 0; i < steps; i += increment) {
 				MMSP::update(grid, increment);
-
-				// generate output filename
-				std::stringstream outstr;
-				int n = outstr.str().length();
-				for (int j = 0; n < length; j++) {
-					outstr.str("");
-					outstr << base;
-					for (int k = 0; k < j; k++) outstr << 0;
-					outstr << i + increment << suffix;
-					n = outstr.str().length();
-				}
-
-				char filename[FILENAME_MAX] = {}; // initialize null characters
-				for (unsigned int j=0; j<outstr.str().length(); j++)
-					filename[j]=outstr.str()[j];
-
-				// write grid output to file
-				MMSP::output(grid, filename);
 			}
 		} else if (dim == 3) {
 			// construct grid object
 			GRID3D grid(argv[1]);
 
 			// perform computation
-			for (int i = iterations_start; i < steps; i += increment) {
+			for (int i = 0; i < steps; i += increment) {
 				MMSP::update(grid, increment);
-
-				// generate output filename
-				std::stringstream outstr;
-				int n = outstr.str().length();
-				for (int j = 0; n < length; j++) {
-					outstr.str("");
-					outstr << base;
-					for (int k = 0; k < j; k++) outstr << 0;
-					outstr << i + increment << suffix;
-					n = outstr.str().length();
-				}
-				char filename[FILENAME_MAX] = {}; // initialize null characters
-				for (unsigned int j=0; j<outstr.str().length(); j++)
-					filename[j]=outstr.str()[j];
-
-				// write grid output to file
-				MMSP::output(grid, filename);
 			}
 		}
 	}
