@@ -115,9 +115,9 @@ FullDiagnostics::ReadParameters ()
     const amrex::ParmParse pp_diag_name(m_diag_name);
     WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
         m_format == "plotfile" || m_format == "openpmd" ||
-        m_format == "checkpoint" || m_format == "ascent" ||
+        m_format == "ascent" ||
         m_format == "sensei" || m_format == "catalyst",
-        "<diag>.format must be plotfile or openpmd or checkpoint or ascent or catalyst or sensei");
+        "<diag>.format must be plotfile or openpmd or ascent or catalyst or sensei");
     std::vector<std::string> intervals_string_vec = {"0"};
     pp_diag_name.getarr("intervals", intervals_string_vec);
     m_intervals = utils::parser::IntervalsParser(intervals_string_vec);

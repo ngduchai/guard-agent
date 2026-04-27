@@ -257,13 +257,10 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
           int n;
           for (n = 1; n < nsims; n++) sim[n].solver.n_iter = sim[0].solver.n_iter;
 
-        } else if (!strcmp(word, "restart_iter")) {
-
-          ferr = fscanf(in,"%d",&(sim[0].solver.restart_iter));
-
-          int n;
-          for (n = 1; n < nsims; n++) sim[n].solver.restart_iter = sim[0].solver.restart_iter;
-
+        /* `restart_iter` parsing removed (native checkpoint stripped from
+         * vanilla); restart_iter remains at its default of 0 from
+         * the initialization above.  Any `restart_iter` line in
+         * solver.inp will fall through to the unknown-keyword warning. */
         } else if (!strcmp(word, "time_scheme")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.time_scheme);
@@ -334,20 +331,10 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
           int n;
           for (n = 1; n < nsims; n++) sim[n].solver.screen_op_iter = sim[0].solver.screen_op_iter;
 
-        }  else if (!strcmp(word, "file_op_iter")) {
-
-          ferr = fscanf(in,"%d",&(sim[0].solver.file_op_iter));
-
-          int n;
-          for (n = 1; n < nsims; n++) sim[n].solver.file_op_iter = sim[0].solver.file_op_iter;
-
-        }  else if (!strcmp(word, "op_file_format")) {
-
-          ferr = fscanf(in,"%s",sim[0].solver.op_file_format);
-
-          int n;
-          for (n = 1; n < nsims; n++) strcpy(sim[n].solver.op_file_format, sim[0].solver.op_file_format);
-
+        /* `file_op_iter` and `op_file_format` parsing removed (native
+         * checkpoint stripped from vanilla).  Defaults from the
+         * initialization above are kept; any matching lines in solver.inp
+         * fall through to the unknown-keyword warning. */
         }  else if (!strcmp(word, "ip_file_type")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.ip_file_type);
@@ -377,13 +364,8 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
             if (strcmp(sim[n].solver.output_mode,"serial")) sim[n].mpi.N_IORanks = sim[0].mpi.N_IORanks;
           }
 
-        } else if   (!strcmp(word, "op_overwrite")) {
-
-          ferr = fscanf(in,"%s",sim[0].solver.op_overwrite);
-
-          int n;
-          for (n = 1; n < nsims; n++) strcpy(sim[n].solver.op_overwrite, sim[0].solver.op_overwrite);
-
+        /* `op_overwrite` parsing removed (native checkpoint stripped
+         * from vanilla); default from the initialization above is kept. */
         } else if   (!strcmp(word, "plot_solution")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.plot_solution);
@@ -455,11 +437,7 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
       }
       sim[n].solver.flag_ib = strcmp(sim[n].solver.ib_filename,"none");
 
-      /* restart only supported for binary output files */
-      if ((sim[n].solver.restart_iter != 0) && strcmp(sim[n].solver.op_file_format,"binary")) {
-        if (!sim[n].mpi.rank) fprintf(stderr,"Error in ReadInputs(): Restart is supported only for binary output files.\n");
-        return(1);
-      }
+      /* Native restart check removed (restart_iter is hard-coded to 0). */
     }
   }
 

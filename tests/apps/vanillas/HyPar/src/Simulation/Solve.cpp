@@ -93,23 +93,16 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
     TimeInitialize(sim, nsims, rank, nproc, &TS);
     double ti_runtime = 0.0;
 
-    if (!rank) printf("Solving in time (from %d to %d iterations)\n",TS.restart_iter,TS.n_iter);
-    for (TS.iter = TS.restart_iter; TS.iter < TS.n_iter; TS.iter++) {
-
-      /* Write initial solution to file if this is the first iteration */
-      if (!TS.iter) {
-        for (int ns = 0; ns < nsims; ns++) {
-          if (sim[ns].solver.PhysicsOutput) {
-            sim[ns].solver.PhysicsOutput( &(sim[ns].solver),
-                                          &(sim[ns].mpi),
-                                          TS.waqt );
-          }
-        }
-        OutputSolution(sim, nsims, TS.waqt);
-#ifdef with_librom
-        op_times_arr.push_back(TS.waqt);
-#endif
-      }
+    /* Native checkpoint/restart removed: the upstream loop started from
+     * TS.restart_iter (a parameter loaded from solver.inp), and emitted
+     * intermediate `op_NNNNN.dat` snapshots every `file_op_iter` steps via
+     * OutputSolution()/WriteArray().  Both behaviours (the resume-from-snapshot
+     * start point and the periodic snapshot writes) constituted the app's
+     * native restart capability and have been stripped from the vanilla.
+     * The loop now always runs from 0 to n_iter and produces no
+     * intermediate solution files. */
+    if (!rank) printf("Solving in time (from %d to %d iterations)\n", 0, TS.n_iter);
+    for (TS.iter = 0; TS.iter < TS.n_iter; TS.iter++) {
 
 #ifdef with_librom
       if ((rom_mode == _ROM_MODE_TRAIN_) && (TS.iter%rom_interface.samplingFrequency() == 0)) {
@@ -136,21 +129,7 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
       /* Print information to screen */
       TimePrintStep(&TS);
 
-      /* Write intermediate solution to file */
-      if (      ((TS.iter+1)%sim[0].solver.file_op_iter == 0)
-            &&  ((TS.iter+1) < TS.n_iter) ) {
-        for (int ns = 0; ns < nsims; ns++) {
-          if (sim[ns].solver.PhysicsOutput) {
-            sim[ns].solver.PhysicsOutput( &(sim[ns].solver),
-                                          &(sim[ns].mpi),
-                                          TS.waqt );
-          }
-        }
-        OutputSolution(sim, nsims, TS.waqt);
-#ifdef with_librom
-        op_times_arr.push_back(TS.waqt);
-#endif
-      }
+      /* Periodic intermediate-solution write removed (native checkpoint). */
 
     }
 
@@ -169,15 +148,7 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
                      &(sim[ns].mpi) );
     }
 
-    /* write a final solution file */
-    for (int ns = 0; ns < nsims; ns++) {
-      if (sim[ns].solver.PhysicsOutput) {
-        sim[ns].solver.PhysicsOutput( &(sim[ns].solver),
-                                      &(sim[ns].mpi),
-                                      t_final );
-      }
-    }
-    OutputSolution(sim, nsims, t_final);
+    /* Final-solution file write removed (native checkpoint). */
 
 #ifdef with_librom
     op_times_arr.push_back(TS.waqt);
@@ -248,7 +219,7 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
     rom_interface.projectInitialSolution(sim);
 
     {
-      int start_iter = sim[0].solver.restart_iter;
+      int start_iter = 0; /* native restart removed */
       int n_iter = sim[0].solver.n_iter;
       double dt = sim[0].solver.dt;
 

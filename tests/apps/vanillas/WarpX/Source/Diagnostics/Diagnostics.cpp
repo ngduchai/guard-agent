@@ -6,7 +6,6 @@
 #include "Diagnostics/ParticleDiag/ParticleDiag.H"
 #include "FlushFormats/FlushFormatCatalyst.H"
 #include "FlushFormats/FlushFormatAscent.H"
-#include "FlushFormats/FlushFormatCheckpoint.H"
 #ifdef WARPX_USE_OPENPMD
 #   include "FlushFormats/FlushFormatOpenPMD.H"
 #endif
@@ -531,9 +530,6 @@ Diagnostics::InitBaseData ()
     // Construct Flush class.
     if        (m_format == "plotfile"){
         m_flush_format = std::make_unique<FlushFormatPlotfile>() ;
-    } else if (m_format == "checkpoint"){
-        // creating checkpoint format
-        m_flush_format = std::make_unique<FlushFormatCheckpoint>() ;
     } else if (m_format == "ascent"){
         m_flush_format = std::make_unique<FlushFormatAscent>();
     } else if (m_format == "catalyst") {
