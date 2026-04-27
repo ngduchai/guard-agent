@@ -11,7 +11,6 @@
 
 #include "DiagnosticScalar.h"
 
-#include "Checkpoint.h"
 #include "OpenPMDparams.h"
 #include "SmileiMPI.h"
 #include "SimWindow.h"
@@ -443,7 +442,7 @@ public :
     
     void checkMemoryConsumption( SmileiMPI *smpi, VectorPatch *region_vecpatches );
     
-    void checkExpectedDiskUsage( SmileiMPI *smpi, Params &params, Checkpoint &checkpoint );
+    void checkExpectedDiskUsage( SmileiMPI *smpi, Params &params );
     
     // Keep track if we need the needsRhoJsNow
     int diag_flag;

@@ -226,13 +226,9 @@ Params::Params( SmileiMPI *smpi, std::vector<std::string> namelistsFiles ) :
     // --------------
     // Stop & Restart
     // --------------
-
+    // Checkpoint/restart support has been removed from this vanilla; the
+    // `Checkpoints` Python namelist component is no longer parsed.
     restart = false;
-    std::vector<std::string> _unused_restart_files;
-    if( PyTools::nComponents( "Checkpoints" )>0 && PyTools::extractV( "restart_files", _unused_restart_files, "Checkpoints" ) ) {
-        MESSAGE( 1, "Code will restart" );
-        restart=true;
-    }
 
     // ---------------------
     // Normalisation & units

@@ -29,7 +29,6 @@
 #include "Params.h"
 #include "PatchesFactory.h"
 #include "SyncVectorPatch.h"
-#include "Checkpoint.h"
 #include "Solver.h"
 #include "SimWindow.h"
 #include "Diagnostic.h"
@@ -158,8 +157,8 @@ int main( int argc, char *argv[] )
     // Print in stdout MPI, OpenMP, patchs parameters
     params.print_parallelism_params( &smpi );
 
-    TITLE( "Initializing the restart environment" );
-    Checkpoint checkpoint( params, &smpi );
+    // Checkpoint/restart support has been removed from this vanilla.
+    const unsigned int this_run_start_step = 0;
 
     // ------------------------------------------------------------------------
     // Initialize the simulation times time_prim at n=0 and time_dual at n=+1/2
@@ -191,7 +190,7 @@ int main( int argc, char *argv[] )
     // Special test mode
     // ---------------------------------------------------
     if( smpi.test_mode ) {
-        executeTestMode( vecPatches, region, &smpi, simWindow, params, checkpoint, openPMD, &radiation_tables_ );
+        executeTestMode( vecPatches, region, &smpi, simWindow, params, openPMD, &radiation_tables_ );
         return 0;
     }
 
@@ -206,72 +205,8 @@ int main( int argc, char *argv[] )
     // ---------------------------------------------------------------------
     multiphoton_Breit_Wheeler_tables_.initialization( params, &smpi );
 
-    // reading from dumped file the restart values
-    if( params.restart ) {
-        // smpi.patch_count recomputed in readPatchDistribution
-        checkpoint.readPatchDistribution( &smpi, simWindow );
-        // allocate patches according to smpi.patch_count
-        PatchesFactory::createVector( vecPatches, params, &smpi, openPMD, &radiation_tables_, checkpoint.this_run_start_step+1, simWindow->getNmoved() );
-
-        // allocate region according to dump
-        if( params.multiple_decomposition ) {
-            TITLE( "Create SDMD grids" );
-            // read region hindex
-            checkpoint.readRegionDistribution( region );
-
-            // Build params.map_rank contains MPI ranks assuming that regions are distributed linearly
-            int target_map[smpi.getSize()];
-            MPI_Allgather(&(region.vecPatch_.refHindex_), 1, MPI_INT,
-                          target_map, 1, MPI_INT,
-                          MPI_COMM_WORLD);
-            region.define_regions_map(target_map, &smpi, params);
-
-            // params.map_rank used to defined regions neighborood
-            region.build( params, &smpi, vecPatches, false, simWindow->getNmoved() );
-            region.identify_additional_patches( &smpi, vecPatches, params, simWindow );
-            region.identify_missing_patches( &smpi, vecPatches, params );
-        }
-
-        // vecPatches data read in restartAll according to smpi.patch_count
-
-        // if (params.multiple_decomposition) {
-        //     region.vecPatch_.refHindex_ = smpi.getRank();
-        //     region.build( params, &smpi, vecPatches, false );
-        //     region.identify_additional_patches( &smpi, vecPatches, params, simWindow );
-        //     region.identify_missing_patches( &smpi, vecPatches, params );
-
-        //     region.reset_fitting( &smpi, params );
-
-        //     region.clean();
-        //     region.reset_mapping();
-
-        //     region.build( params, &smpi, vecPatches, false );
-        //     region.identify_additional_patches( &smpi, vecPatches, params, simWindow );
-        //     region.identify_missing_patches( &smpi, vecPatches, params );
-        // }
-
-        checkpoint.restartAll( vecPatches, region, &smpi, params );
-
-#if !defined( SMILEI_ACCELERATOR_GPU )
-        // CPU only, its too early to sort on GPU
-        vecPatches.initialParticleSorting( params );
-#endif
-
-        TITLE( "Minimum memory consumption (does not include all temporary buffers)" );
-        vecPatches.checkMemoryConsumption( &smpi, &region.vecPatch_ );
-
-        // Patch reconfiguration for the adaptive vectorization
-        if( params.has_adaptive_vectorization ) {
-            vecPatches.configuration( params, timers, 0 );
-        }
-
-        // time at integer time-steps (primal grid)
-        time_prim = checkpoint.this_run_start_step * params.timestep;
-        // time at half-integer time-steps (dual grid)
-        time_dual = ( checkpoint.this_run_start_step +0.5 ) * params.timestep;
-
-    // No restart, we initialize a new simulation
-    } else {
+    // Restart support has been removed from this vanilla; always initialize a fresh simulation.
+    {
 
         PatchesFactory::createVector( vecPatches, params, &smpi, openPMD, &radiation_tables_, 0 );
 
@@ -455,7 +390,7 @@ int main( int argc, char *argv[] )
     // Check expected disk usage
     // ------------------------------------------------------------------------
     TITLE( "Expected disk usage (approximate)" );
-    vecPatches.checkExpectedDiskUsage( &smpi, params, checkpoint );
+    vecPatches.checkExpectedDiskUsage( &smpi, params );
 
     // ------------------------------------------------------------------------
     // check here if we can close the python interpreter
@@ -465,7 +400,7 @@ int main( int argc, char *argv[] )
 
     /*tommaso
         // save latestTimeStep (used to test if we are at the latest timestep when running diagnostics at run's end)
-        unsigned int latestTimeStep=checkpoint.this_run_start_step;
+        unsigned int latestTimeStep=this_run_start_step;
     */
     // ------------------------------------------------------------------
     //                     HERE STARTS THE PIC LOOP
@@ -478,8 +413,8 @@ int main( int argc, char *argv[] )
 
     int count_dlb = 0;
 
-    unsigned int itime=checkpoint.this_run_start_step+1;
-    while( ( itime <= params.n_time ) && ( !checkpoint.exit_asap ) ) {
+    unsigned int itime=this_run_start_step+1;
+    while( itime <= params.n_time ) {
         
         // calculate new times
         // -------------------
@@ -489,7 +424,7 @@ int main( int argc, char *argv[] )
             PyTools::setIteration( itime ); // sets python variable "Main.iteration" for users
         }
         
-        #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, checkpoint, itime)
+        #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, itime)
         {
             
             // Patch reconfiguration
@@ -537,7 +472,7 @@ int main( int argc, char *argv[] )
         // solve Maxwell's equations
         if (!params.multiple_decomposition) {
             if( time_dual > params.time_fields_frozen ) {
-                #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, checkpoint, itime)
+                #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, itime)
                 {
                     // de-apply prescribed fields if requested
                     if ( vecPatches(0)->EMfields->prescribedFields.size() ) {
@@ -605,7 +540,7 @@ int main( int argc, char *argv[] )
                     }
 
                     // Currents and densities not corrected on regions
-                    #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, checkpoint, itime)
+                    #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, itime)
                     {
                         if( params.geometry != "AMcylindrical" ) {
                             SyncVectorPatch::sumRhoJ( params, vecPatches, &smpi ); // MPI
@@ -635,7 +570,7 @@ int main( int argc, char *argv[] )
             region.vecPatch_.resetRhoJ(old);
         }
 
-        #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, checkpoint, itime)
+        #pragma omp parallel shared (time_dual,smpi,params, vecPatches, region, simWindow, itime)
         {
             // finalize particle exchanges and sort particles
             vecPatches.finalizeExchParticlesAndSort( params, &smpi, simWindow, time_dual, timers, itime );
@@ -670,10 +605,7 @@ int main( int argc, char *argv[] )
             // Move window
             vecPatches.moveWindow( params, &smpi, region, simWindow, time_dual, timers, itime );
 
-            // Checkpointing: dump data
-            #pragma omp master
-            checkpoint.dump( vecPatches, region, itime, &smpi, simWindow, params );
-            #pragma omp barrier
+            // Checkpointing has been removed from this vanilla.
             // ----------------------------------------------------------------------
 
         } //End omp parallel region
@@ -822,32 +754,19 @@ int executeTestMode( VectorPatch &vecPatches,
                      SmileiMPI *smpi,
                      SimWindow *simWindow,
                      Params &params,
-                     Checkpoint &checkpoint,
                      OpenPMDparams &openPMD,
                      RadiationTables * radiation_tables_ )
 {
+    // Restart support has been removed from this vanilla.
     int itime = 0;
     int moving_window_movement = 0;
-
-    if( params.restart ) {
-        checkpoint.readPatchDistribution( smpi, simWindow );
-        itime = checkpoint.this_run_start_step+1;
-        moving_window_movement = simWindow->getNmoved();
-    }
+    (void) region;
 
     PatchesFactory::createVector( vecPatches, params, smpi, openPMD, radiation_tables_, itime, moving_window_movement );
 
-    if( params.restart ) {
-        if (params.multiple_decomposition) {
-            checkpoint.readRegionDistribution( region );
-            region.build( params, smpi, vecPatches, false, simWindow->getNmoved() );
-        }
-        checkpoint.restartAll( vecPatches, region, smpi, params );
-    }
-
     if( params.print_expected_disk_usage ) {
         TITLE( "Expected disk usage (approximate)" );
-        vecPatches.checkExpectedDiskUsage( smpi, params, checkpoint );
+        vecPatches.checkExpectedDiskUsage( smpi, params );
     }
 
     // If test mode enable, code stops here
