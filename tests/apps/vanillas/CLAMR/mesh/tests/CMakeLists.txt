@@ -17,7 +17,7 @@ add_executable(mesh_mpi_test EXCLUDE_FROM_ALL ${mesh_test_SRCS})
 set_target_properties(mesh_mpi_test PROPERTIES COMPILE_DEFINITIONS HAVE_MPI)
 set_target_properties(mesh_mpi_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
 set_target_properties(mesh_mpi_test PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD TRUE)
-target_link_libraries(mesh_mpi_test pmesh crux hash hsfc kdtree zorder s7 timer memstats l7 genmalloc pMallocPlus m)
+target_link_libraries(mesh_mpi_test pmesh hash hsfc kdtree zorder s7 timer memstats l7 genmalloc pMallocPlus m)
 target_link_libraries(mesh_mpi_test ${MPE_LIBS} ${X11_LIBS})
 target_link_libraries(mesh_mpi_test ${MPI_LIBRARIES})
 target_link_libraries(mesh_mpi_test ${OPENGL_LIBRARIES} ${GLUT_LIBRARIES})
@@ -26,7 +26,7 @@ set(face_test_SRCS face_tests.cpp)
 
 add_executable(face_test EXCLUDE_FROM_ALL ${face_test_SRCS})
 
-target_link_libraries(face_test mesh crux hash hsfc kdtree zorder s7 timer memstats l7 genmalloc MallocPlus m)
+target_link_libraries(face_test mesh hash hsfc kdtree zorder s7 timer memstats l7 genmalloc MallocPlus m)
 target_link_libraries(mesh_mpi_test ${MPE_LIBS} ${X11_LIBS})
 target_link_libraries(mesh_mpi_test ${OPENGL_LIBRARIES} ${GLUT_LIBRARIES})
 

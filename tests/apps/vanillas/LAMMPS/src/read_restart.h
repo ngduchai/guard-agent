@@ -11,10 +11,15 @@
    See the README file in the top-level LAMMPS directory.
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   This vanilla build has had its native checkpoint/restart implementation
+   removed.  Only a minimal type-stub remains; the CommandStyle macro that
+   would register `read_restart` as an input-script command has been
+   stripped.
+------------------------------------------------------------------------- */
+
 #ifdef COMMAND_CLASS
-// clang-format off
-CommandStyle(read_restart,ReadRestart);
-// clang-format on
+// CommandStyle(read_restart,ReadRestart) was here; intentionally removed.
 #else
 
 #ifndef LMP_READ_RESTART_H
@@ -28,41 +33,6 @@ class ReadRestart : public Command {
  public:
   ReadRestart(class LAMMPS *);
   void command(int, char **) override;
-
- private:
-  int me, nprocs;
-  FILE *fp;
-
-  int multiproc;         // 0 = restart file is a single file
-                         // 1 = restart file is parallel (multiple files)
-  int multiproc_file;    // # of parallel files in restart
-  int nprocs_file;       // total # of procs that wrote restart file
-  int revision;          // revision number of the restart file format
-
-  // MPI-IO values
-
-  int mpiioflag;                // 1 for MPIIO output, else 0
-  class RestartMPIIO *mpiio;    // MPIIO for restart file input
-  bigint assignedChunkSize;
-  MPI_Offset assignedChunkOffset, headerOffset;
-
-  std::string file_search(const std::string &);
-  void header();
-  void type_arrays();
-  void force_fields();
-
-  void magic_string();
-  void endian();
-  void format_revision();
-  void check_eof_magic();
-  void file_layout();
-
-  int read_int();
-  bigint read_bigint();
-  double read_double();
-  char *read_string();
-  void read_int_vec(int, int *);
-  void read_double_vec(int, double *);
 };
 
 }    // namespace LAMMPS_NS

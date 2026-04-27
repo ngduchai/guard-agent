@@ -61,7 +61,6 @@
 #include <list>
 #include "MallocPlus/MallocPlus.h"
 #include "mesh/mesh.h"
-#include "crux/crux.h"
 #ifdef HAVE_OPENCL
 #include "ezcl/ezcl.h"
 #endif
@@ -450,9 +449,6 @@ public:
    void print(void);
    void print_data_dump(int ncycle);
 
-   size_t get_checkpoint_size(void);
-   void store_checkpoint(Crux *crux);
-   void restore_checkpoint(Crux *crux);
    //Added to for second print for every interation: Brian Atkinson (5-29-14)
    void print(int iteration, double simTime, double initial_mass, double iteration_mass, double mass_diff_percentage);  
    void print_local(int ncycle);

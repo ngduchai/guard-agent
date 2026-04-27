@@ -499,10 +499,6 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/hash" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/hash
    add_subdirectory(hash)
 endif (EXISTS "${CMAKE_SOURCE_DIR}/hash" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/hash")
 
-if (EXISTS "${CMAKE_SOURCE_DIR}/crux" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/crux")
-   add_subdirectory(crux)
-endif (EXISTS "${CMAKE_SOURCE_DIR}/crux" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/crux")
-
 if (EXISTS "${CMAKE_SOURCE_DIR}/PowerParser" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/PowerParser")
    add_subdirectory(PowerParser)
 endif (EXISTS "${CMAKE_SOURCE_DIR}/PowerParser" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/PowerParser")
@@ -512,115 +508,6 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/state_kernel.inc
                   COMMAND ${CMAKE_SOURCE_DIR}/embed_source.pl ${CMAKE_SOURCE_DIR}/state_kern.cl > state_kernel.inc
                   DEPENDS state_kern.cl ${CMAKE_SOURCE_DIR}/embed_source.pl)
 add_custom_target(state_kernel_source ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/state_kernel.inc)
-
-########### clamr target ###############
-
-if (OpenCL_FOUND AND MPI_FOUND)
-   set(clamr_CXX_SRCS clamr.cpp state.cpp input.cpp)
-   set(clamr_H_SRCS state.h input.h)
-   set(clamr_SRCS ${clamr_CXX_SRCS} ${clamr_C_SRCS} ${clamr_H_SRCS})
-
-   add_executable(clamr ${clamr_SRCS})
-
-   set_target_properties(clamr PROPERTIES COMPILE_DEFINITIONS "HAVE_MPI;HAVE_OPENCL")
-   target_link_libraries(clamr dpmesh hsfc kdtree zorder pcrux dhash pezcl pgraphics timer memstats powerstats dl7 genmalloc dpMallocPlus m)
-   target_link_libraries(clamr ${OpenCL_LIBRARIES})
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   if (LTTRACE_FOUND)
-      target_link_libraries(clamr ${LTTRACE_LIBRARIES})
-   endif (LTTRACE_FOUND)
-   target_link_libraries(clamr ${MPI_LIBRARIES})
-   add_dependencies(clamr state_kernel_source)
-
-   install(TARGETS clamr DESTINATION bin)
-endif (OpenCL_FOUND AND MPI_FOUND)
-
-########### clamr_kokkosonly target ###############
-
-if(KOKKOS_ENABLE)
-
-    #if (EXISTS "${CMAKE_SOURCE_DIR}/kokkos" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/kokkos")
-      set(clamr_kokkosonly_CXX_SRCS clamr_kokkosonly.cpp state.cpp input.cpp)
-      set(clamr_kokkosonly_H_SRCS state.h input.h)
-
-      set(clamr_kokkosonly_SRCS ${clamr_kokkosonly_CXX_SRCS} ${clamr_kokkosonly_C_SRCS} ${clamr_kokkosonly_H_SRCS})
-
-      add_executable(clamr_kokkosonly ${clamr_kokkosonly_SRCS})
-
-      add_subdirectory(kokkos)
-
-      target_link_libraries(clamr_kokkosonly Kokkos::kokkos)
-
-      target_link_libraries(clamr_kokkosonly PowerParser mesh hsfc kdtree zorder crux hash graphics timer memstats powerstats genmalloc MallocPlus m)
-      if (REPROBLAS_FOUND)
-         target_link_libraries(clamr_kokkosonly ${REPROBLAS_LIBRARIES})
-      endif (REPROBLAS_FOUND)
-      add_dependencies(clamr_kokkosonly state_kernel_source)
-
-      if (POWER_GADGET_FOUND)
-         target_link_libraries(clamr_kokkosonly ${POWER_GADGET})
-      endif (POWER_GADGET_FOUND)
-
-      #target_link_libraries(clamr_cpuonly ${OPENGL_LIBRARIES} ${GLUT_LIBRARIES})
-
-      install(TARGETS clamr_kokkosonly DESTINATION bin)
-      #endif (EXISTS "${CMAKE_SOURCE_DIR}/kokkos" AND IS_DIRECTORY "${CMAKE_SOURCE_DIR}/kokkos")
-endif(KOKKOS_ENABLE)
-
-########### drawit target ###############
-
-add_executable(drawit drawit.cpp)
-
-target_link_libraries(drawit graphics)
-
-target_link_libraries(drawit ${OPENGL_LIBRARIES} ${GLUT_LIBRARIES})
-
-install(TARGETS drawit DESTINATION bin)
-
-########### clamr_cpuonly target ###############
-
-set(clamr_cpuonly_CXX_SRCS clamr_cpuonly.cpp state.cpp input.cpp)
-set(clamr_cpuonly_H_SRCS state.h input.h)
-
-set(clamr_cpuonly_SRCS ${clamr_cpuonly_CXX_SRCS} ${clamr_cpuonly_C_SRCS} ${clamr_cpuonly_H_SRCS})
-
-add_executable(clamr_cpuonly ${clamr_cpuonly_SRCS})
-
-target_link_libraries(clamr_cpuonly PowerParser mesh hsfc kdtree zorder crux hash graphics timer memstats powerstats genmalloc MallocPlus m)
-if (REPROBLAS_FOUND)
-   target_link_libraries(clamr_cpuonly ${REPROBLAS_LIBRARIES})
-endif (REPROBLAS_FOUND)
-   add_dependencies(clamr_cpuonly state_kernel_source)
-
-if (POWER_GADGET_FOUND)
-   target_link_libraries(clamr_cpuonly ${POWER_GADGET})
-endif (POWER_GADGET_FOUND)
-
-#target_link_libraries(clamr_cpuonly ${OPENGL_LIBRARIES} ${GLUT_LIBRARIES})
-
-install(TARGETS clamr_cpuonly DESTINATION bin)
-
-########### clamr_gpuonly target ###############
-if (OpenCL_FOUND)
-   set(clamr_gpuonly_CXX_SRCS clamr_gpuonly.cpp state.cpp input.cpp)
-   set(clamr_gpuonly_H_SRCS state.h input.h)
-   set(clamr_gpuonly_SRCS ${clamr_gpuonly_CXX_SRCS} ${clamr_gpuonly_C_SRCS} ${clamr_gpuonly_H_SRCS})
-
-   add_executable(clamr_gpuonly ${clamr_gpuonly_SRCS})
-
-   set_target_properties(clamr_gpuonly PROPERTIES COMPILE_DEFINITIONS HAVE_OPENCL)
-
-   target_link_libraries(clamr_gpuonly PowerParser dmesh hsfc kdtree zorder crux dhash ezcl graphics timer memstats powerstats genmalloc dMallocPlus m)
-   target_link_libraries(clamr_gpuonly ${OpenCL_LIBRARIES})
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_gpuonly ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   add_dependencies(clamr_gpuonly state_kernel_source)
-
-   install(TARGETS clamr_gpuonly DESTINATION bin)
-endif (OpenCL_FOUND)
 
 ########### clamr_mpionly target ###############
 if (MPI_FOUND)
@@ -632,7 +519,7 @@ if (MPI_FOUND)
    add_executable(clamr_mpionly ${clamr_mpionly_SRCS})
 
    set_target_properties(clamr_mpionly PROPERTIES COMPILE_DEFINITIONS HAVE_MPI)
-   target_link_libraries(clamr_mpionly pPowerParser pmesh hsfc kdtree zorder pcrux hash pgraphics timer memstats powerstats l7 genmalloc pMallocPlus m)
+   target_link_libraries(clamr_mpionly pPowerParser pmesh hsfc kdtree zorder hash pgraphics timer memstats powerstats l7 genmalloc pMallocPlus m)
    if (REPROBLAS_FOUND)
       target_link_libraries(clamr_mpionly ${REPROBLAS_LIBRARIES})
    endif (REPROBLAS_FOUND)
@@ -644,183 +531,6 @@ if (MPI_FOUND)
 
    install(TARGETS clamr_mpionly DESTINATION bin)
 endif (MPI_FOUND)
-
-########### clamr_openmponly target ###############
-# This shares the clamr_cpuonly.cpp source file
-if(OPENMP_FOUND)
-   set(clamr_openmponly_CXX_SRCS clamr_cpuonly.cpp state.cpp input.cpp)
-   set(clamr_openmponly_H_SRCS state.h input.h)
-
-   set(clamr_openmponly_SRCS ${clamr_openmponly_CXX_SRCS} ${clamr_openmponly_C_SRCS} ${clamr_openmponly_H_SRCS})
-
-   add_executable(clamr_openmponly ${clamr_openmponly_SRCS})
-
-   set_target_properties(clamr_openmponly PROPERTIES COMPILE_FLAGS ${OpenMP_C_FLAGS})
-   set_target_properties(clamr_openmponly PROPERTIES COMPILE_FLAGS ${OpenMP_CXX_FLAGS})
-   set_target_properties(clamr_openmponly PROPERTIES LINK_FLAGS "${OpenMP_C_FLAGS}")
-
-   target_link_libraries(clamr_openmponly PowerParser mpmesh hsfc kdtree zorder crux mphash graphics mptimer memstats powerstats genmalloc mpMallocPlus m)
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_openmponly ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-
-   if (POWER_GADGET_FOUND)
-      target_link_libraries(clamr_openmponly ${POWER_GADGET})
-   endif (POWER_GADGET_FOUND)
-
-   install(TARGETS clamr_openmponly DESTINATION bin)
-endif(OPENMP_FOUND)
-
-########### clamr_mpiopenmponly target ###############
-# This uses the clamr_mpionly driver with the OpenMP compile flag set
-if (MPI_FOUND AND OPENMP_FOUND)
-   set(clamr_mpiopenmponly_CXX_SRCS clamr_mpionly.cpp state.cpp input.cpp)
-   set(clamr_mpiopenmponly_H_SRCS state.h input.h)
-
-   set(clamr_mpiopenmponly_SRCS ${clamr_mpiopenmponly_CXX_SRCS} ${clamr_mpiopenmponly_C_SRCS} ${clamr_mpiopenmponly_H_SRCS})
-
-   add_executable(clamr_mpiopenmponly ${clamr_mpiopenmponly_SRCS})
-
-   set_target_properties(clamr_mpiopenmponly PROPERTIES COMPILE_DEFINITIONS "HAVE_MPI")
-
-   set(clamr_mpiopenmponly_link_flags "${OpenMP_CXX_FLAGS}")
-   set_target_properties(clamr_mpiopenmponly PROPERTIES COMPILE_FLAGS ${OpenMP_C_FLAGS})
-   set_target_properties(clamr_mpiopenmponly PROPERTIES COMPILE_FLAGS ${OpenMP_CXX_FLAGS})
-   set_target_properties(clamr_mpiopenmponly PROPERTIES LINK_FLAGS "${clamr_mpiopenmponly_link_flags}")
-
-   target_link_libraries(clamr_mpiopenmponly pPowerParser pmpmesh hsfc kdtree zorder pcrux mphash pgraphics mptimer memstats powerstats mpl7 genmalloc pmpMallocPlus m)
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_mpiopenmponly ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   if (LTTRACE_FOUND)
-      target_link_libraries(clamr_mpiopenmponly ${LTTRACE_LIBRARIES})
-   endif (LTTRACE_FOUND)
-   target_link_libraries(clamr_mpiopenmponly ${MPI_LIBRARIES})
-
-   install(TARGETS clamr_mpiopenmponly DESTINATION bin)
-
-endif (MPI_FOUND AND OPENMP_FOUND)
-
-########### clamr_quo target ###############
-# only build this thing if we have QUO, MPI, and OpenMP
-
-if (QUO_FOUND AND MPI_FOUND AND OPENMP_FOUND AND Boost_FOUND)
-    # doing this way because we only want j7 if doing quo (for now)
-    # this only enables experimental software if the user has all the things
-    message(STATUS "Adding J7 Support")
-    add_subdirectory(j7)
-    message(STATUS "clamr_quo Minimum Requires Met")
-
-    set(clamr_quo_CXX_SRCS clamr_quo.cpp state.cpp input.cpp)
-    set(clamr_quo_H_SRCS state.h input.h)
-
-    set(clamr_quo_SRCS ${clamr_quo_CXX_SRCS} ${clamr_quo_C_SRCS} ${clamr_quo_H_SRCS})
-
-    add_executable(clamr_quo ${clamr_quo_SRCS})
-
-    # these sets HAVE_J7 and HAVE_QUO in config.h
-    set(HAVE_J7 ON)
-    set(HAVE_QUO ON)
-    set_target_properties(clamr_quo PROPERTIES COMPILE_DEFINITIONS "HAVE_MPI")
-
-    set(clamr_quo_link_flags "${OpenMP_CXX_FLAGS}")
-    set_target_properties(clamr_quo PROPERTIES COMPILE_FLAGS ${OpenMP_C_FLAGS})
-    set_target_properties(clamr_quo PROPERTIES COMPILE_FLAGS ${OpenMP_CXX_FLAGS})
-
-    set(clamr_quo_link_flags "${clamr_quo_link_flags} -L$ENV{QUO_HOME}/lib")
-
-    set_target_properties(clamr_quo PROPERTIES LINK_FLAGS "${clamr_quo_link_flags}")
-
-    target_link_libraries(clamr_quo pmesh hsfc kdtree zorder crux hash pgraphics timer memstats powerstats l7 genmalloc pMallocPlus m)
-    target_link_libraries(clamr_quo quo)
-    target_link_libraries(clamr_quo j7)
-    if (REPROBLAS_FOUND)
-       target_link_libraries(clamr_quo ${REPROBLAS_LIBRARIES})
-    endif (REPROBLAS_FOUND)
-    if (LTTRACE_FOUND)
-       target_link_libraries(clamr_quo ${LTTRACE_LIBRARIES})
-    endif (LTTRACE_FOUND)
-    target_link_libraries(clamr_quo ${MPI_LIBRARIES})
-
-    install(TARGETS clamr_quo DESTINATION bin)
-
-    # XXX add load imbalance code here for now
-    set(load_imbl_CXX_SRCS QUO.cpp QUO.hpp load-imbl.cpp)
-    add_executable(load-imbl ${load_imbl_CXX_SRCS})
-
-    set_target_properties(load-imbl PROPERTIES COMPILE_FLAGS ${OpenMP_CXX_FLAGS})
-    set_target_properties(load-imbl PROPERTIES LINK_FLAGS
-                          "${OpenMP_CXX_FLAGS} -L$ENV{QUO_HOME}/lib")
-    target_link_libraries(load-imbl ${MPI_LIBRARIES})
-    target_link_libraries(load-imbl j7 quo)
-endif()
-
-########### clamr_gpucheck target ###############
-if (OpenCL_FOUND)
-   set(clamr_gpucheck_CXX_SRCS clamr_gpucheck.cpp state.cpp input.cpp)
-   set(clamr_gpucheck_H_SRCS state.h input.h)
-
-   set(clamr_gpucheck_SRCS ${clamr_gpucheck_CXX_SRCS} ${clamr_gpucheck_C_SRCS} ${clamr_gpucheck_H_SRCS})
-
-   add_executable(clamr_gpucheck ${clamr_gpucheck_SRCS})
-
-   set_target_properties(clamr_gpucheck PROPERTIES COMPILE_DEFINITIONS HAVE_OPENCL)
-
-   target_link_libraries(clamr_gpucheck PowerParser dmesh hsfc kdtree zorder crux dhash ezcl graphics timer memstats powerstats genmalloc dMallocPlus m)
-   target_link_libraries(clamr_gpucheck ${OpenCL_LIBRARIES})
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_gpucheck ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   add_dependencies(clamr_gpucheck state_kernel_source)
-
-   install(TARGETS clamr_gpucheck DESTINATION bin)
-endif (OpenCL_FOUND)
-
-########### clamr_mpicheck target ###############
-if (MPI_FOUND)
-   set(clamr_mpicheck_CXX_SRCS clamr_mpicheck.cpp state.cpp input.cpp)
-   set(clamr_mpicheck_H_SRCS state.h input.h)
-
-   set(clamr_mpicheck_SRCS ${clamr_mpicheck_CXX_SRCS} ${clamr_mpicheck_C_SRCS} ${clamr_mpicheck_H_SRCS})
-
-   add_executable(clamr_mpicheck ${clamr_mpicheck_SRCS})
-
-   set_target_properties(clamr_mpicheck PROPERTIES COMPILE_DEFINITIONS HAVE_MPI)
-   target_link_libraries(clamr_mpicheck pPowerParser pmesh hsfc kdtree zorder pcrux hash pgraphics timer memstats powerstats l7 genmalloc pMallocPlus m)
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_mpicheck ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   if (LTTRACE_FOUND)
-      target_link_libraries(clamr_mpicheck ${LTTRACE_LIBRARIES})
-   endif (LTTRACE_FOUND)
-   target_link_libraries(clamr_mpicheck ${MPI_LIBRARIES})
-
-   install(TARGETS clamr_mpicheck DESTINATION bin)
-endif (MPI_FOUND)
-
-########### clamr_checkall target ###############
-if (MPI_FOUND AND OpenCL_FOUND)
-   set(clamr_checkall_CXX_SRCS clamr_checkall.cpp state.cpp input.cpp)
-   set(clamr_checkall_H_SRCS state.h input.h)
-
-   set(clamr_checkall_SRCS ${clamr_checkall_CXX_SRCS} ${clamr_checkall_C_SRCS} ${clamr_checkall_H_SRCS})
-
-   add_executable(clamr_checkall ${clamr_checkall_SRCS})
-
-   set_target_properties(clamr_checkall PROPERTIES COMPILE_DEFINITIONS "HAVE_MPI;HAVE_OPENCL")
-   target_link_libraries(clamr_checkall dpmesh hsfc kdtree zorder pcrux dhash pezcl pgraphics timer memstats powerstats dl7 genmalloc dpMallocPlus m)
-   target_link_libraries(clamr_checkall ${OpenCL_LIBRARIES})
-   if (REPROBLAS_FOUND)
-      target_link_libraries(clamr_checkall ${REPROBLAS_LIBRARIES})
-   endif (REPROBLAS_FOUND)
-   if (LTTRACE_FOUND)
-      target_link_libraries(clamr_checkall ${LTTRACE_LIBRARIES})
-   endif (LTTRACE_FOUND)
-   target_link_libraries(clamr_checkall ${MPI_LIBRARIES})
-   add_dependencies(clamr_checkall state_kernel_source)
-
-   install(TARGETS clamr_checkall DESTINATION bin)
-endif (MPI_FOUND AND OpenCL_FOUND)
 
 ########### install files ###############
 
@@ -849,8 +559,7 @@ set (CMAKE_DOC_COMMAND #make CLAMR_doc       &&
                        make Hash_doc        &&
                        make memstats_doc    &&
                        make powerstats_doc  &&
-                       make Mesh_doc        &&
-                       make Crux_doc)
+                       make Mesh_doc)
 
 add_custom_target(doc COMMAND ${CMAKE_DOC_COMMAND})
 

@@ -93,11 +93,6 @@ static const char *state_timer_descriptor[STATE_TIMER_SIZE] = {
    "state_timer_write"
 };
 
-const int CRUX_STATE_VERSION = 102;
-const int num_int_vals       = 1;
-
-int int_vals[num_int_vals] = {CRUX_STATE_VERSION};
-
 #ifdef HAVE_OPENCL
 #include "state_kernel.inc"
 #endif
@@ -363,7 +358,6 @@ inline real_t U_reggrid_halfstep(// XXX Fix the subindices to be more intuitive 
 
 State::State(Mesh *mesh_in)
 {
-   state_memory.memory_add(int_vals,   (size_t)num_int_vals,     4, "state_int_vals",   RESTART_DATA | REPLICATED_DATA);
    state_memory.memory_add(cpu_timers, (size_t)STATE_TIMER_SIZE, 8, "state_cpu_timers", RESTART_DATA);
    state_memory.memory_add(gpu_timers, (size_t)STATE_TIMER_SIZE, 8, "state_gpu_timers", RESTART_DATA);
    for (int i = 0; i < STATE_TIMER_SIZE; i++){
@@ -514,7 +508,6 @@ void State::terminate(void)
    state_memory.memory_delete(H);
    state_memory.memory_delete(U);
    state_memory.memory_delete(V);
-   state_memory.memory_remove(int_vals);
    state_memory.memory_remove(cpu_timers);
    state_memory.memory_remove(gpu_timers);
 
@@ -8503,86 +8496,6 @@ fprintf(fp,"%d:\tindex\tglobal\ti\tj\tlev\tnlft\tnrht\tnbot\tntop\tH\tHhex\tU\tU
 
 	}
    fclose(fp);
-}
-
-size_t State::get_checkpoint_size(void)
-{
-#ifdef FULL_PRECISION
-   size_t nsize = mesh->ncells*3*sizeof(double);
-#else
-   size_t nsize = mesh->ncells*3*sizeof(float);
-#endif
-   nsize += num_int_vals*sizeof(int);
-   nsize += mesh->get_checkpoint_size();
-   return(nsize);
-}
-
-void State::store_checkpoint(Crux *crux)
-{
-   // Store mesh data first
-   mesh->store_checkpoint(crux);
-
-   size_t save_size = state_memory.get_memory_capacity(H);
-   state_memory.set_restart_length(H,mesh->ncells);
-   state_memory.set_restart_length(U,mesh->ncells);
-   state_memory.set_restart_length(V,mesh->ncells);
-   crux->store_MallocPlus(state_memory);
-   state_memory.set_restart_length(H,save_size);
-   state_memory.set_restart_length(U,save_size);
-   state_memory.set_restart_length(V,save_size);
-}
-
-void State::restore_checkpoint(Crux *crux)
-{
-   // Restore mesh data first
-   mesh->restore_checkpoint(crux);
-
-   // Clear memory for restoring data into
-   int_vals[0] = 0;
-
-   // allocate is a state method
-
-   state_memory.memory_delete(H);
-   state_memory.memory_delete(U);
-   state_memory.memory_delete(V);
-   allocate(mesh->ncells);
-   memory_reset_ptrs();
-
-   // Restore memory database
-   crux->restore_MallocPlus(state_memory);
-
-   // Check version number
-   if (int_vals[ 0] != CRUX_STATE_VERSION) {
-      printf("CRUX version mismatch for state data, version on file is %d, version in code is %d\n",
-         int_vals[0], CRUX_STATE_VERSION);
-      exit(0);
-   }
-
-#ifdef DEBUG_RESTORE_VALS
-   if (DEBUG_RESTORE_VALS) {
-      printf("\n");
-      printf("       === Restored state cpu timers ===\n");
-      for (int i = 0; i < STATE_TIMER_SIZE; i++){
-         printf("       %-30s %lg\n",state_timer_descriptor[i], cpu_timers[i]);
-      }
-      printf("       === Restored state cpu timers ===\n");
-      printf("\n");
-   }
-#endif
-
-#ifdef DEBUG_RESTORED_VALS
-   if (DEBUG_RESTORED_VALS) {
-      printf("\n");
-      printf("       === Restored state gpu timers ===\n");
-      for (int i = 0; i < STATE_TIMER_SIZE; i++){
-         printf("       %-30s %lld\n",state_timer_descriptor[i], gpu_timers[i]);
-      }
-      printf("       === Restored state gpu_timers ===\n");
-      printf("\n");
-   }
-#endif
-
-   memory_reset_ptrs();
 }
 
 // Added overloaded print to get mesh information to print in each cycle

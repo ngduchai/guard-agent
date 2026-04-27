@@ -70,7 +70,6 @@
 #include "mesh/partition.h"
 #include "mesh/mesh.h"
 #include "hash/hash.h"
-#include "crux/crux.h"
 #include "graphics/display.h"
 #include "graphics/graphics.h"
 
@@ -100,10 +99,8 @@ extern bool verbose,
             face_based,
             dynamic_load_balance_on,
             h5_spoutput,
-            restart,
             phantom_debug;
 extern int  outputInterval,
-            crux_type,
             enhanced_precision_sum,
             tmax,
             levmx,
@@ -120,17 +117,13 @@ extern int  outputInterval,
             initial_order,
             graphic_outputInterval,
             graphics_type,
-            checkpoint_outputInterval,
             neighbor_remap,
-            num_of_rollback_states,
             output_cuts,
             cycle_reorder;
 extern float
             mem_opt_factor;
 extern double
             upper_mass_diff_percentage;
-
-extern char* restart_file;
 
 void outputHelp()
 {   cout << "CLAMR is an experimental adaptive mesh refinement code for the GPU." << endl
@@ -143,10 +136,7 @@ void outputHelp()
          << "      \"face-in-place\"" << endl
          << "      \"regular-grid\"" << endl
          << "      \"regular-grid-by-faces\"" << endl
-         << "  -b <B>            Number of rollback images, disk or in memory (default 2);" << endl
          << "  -B                bits to truncate;" << endl
-         << "  -c <C>            Checkpoint to disk at interval specified;" << endl
-         << "  -C <C>            Checkpoint to memory at interval specified;" << endl
          << "  -D                digits to truncate;" << endl
          << "  -e <E>            force hash_method, ie linear, quadratic..." <<endl          
          << "      \"perfect\"" << endl
@@ -192,7 +182,6 @@ void outputHelp()
          << "      \"z_order\"" << endl
          << "  -q                turn on quo;" << endl
          << "  -r                regular sum instead of enhanced precision sum (Kahan sum);" << endl
-         << "  -R                restart simulation from the backup file specified;" << endl
          << "  -s <s>            specify space-filling curve method S;" << endl
          << "  -S                write out double precision data as single precision;" << endl
          << "  -T                execute with TVD;" << endl
@@ -236,10 +225,7 @@ void parseInput(const int argc, char** argv)
     do_quo_setup            = 0;
 #endif
     dynamic_load_balance_on = false;
-    crux_type               = CRUX_NONE;
     face_based              = false;
-    restart                 = false;
-    restart_file            = NULL;
     outputInterval          = OUTPUT_INTERVAL;
     nx                      = COARSE_GRID_RES;
     ny                      = COARSE_GRID_RES;
@@ -256,8 +242,6 @@ void parseInput(const int argc, char** argv)
     cycle_reorder           = ORIGINAL_ORDER;
     graphic_outputInterval  = INT_MAX;
     graphics_type           = GRAPHICS_NONE;
-    checkpoint_outputInterval = INT_MAX;
-    num_of_rollback_states  = 2;
     levmx                   = 1;
     mem_opt_factor          = 1.0;
     upper_mass_diff_percentage = -1.0;
@@ -287,32 +271,9 @@ void parseInput(const int argc, char** argv)
                        printf("AMR method must be either \"cell\", \"cell-in-place\", \"face\", \"face-in-place\", \"regular-grid\" or \"regular-grid-by-faces\"\n");
                     }
                     break;
-               case 'b':     //  Number of rollback images, disk or in memory (default 2)
-                    sprintf(val,"0");
-                    if (i < argc) val = strtok(argv[i++], " ,");
-                    if(atoi(val) < 1){
-                        printf("backup number must be at least 1, setting to default value 2\n");
-                    }
-                    else{
-                        num_of_rollback_states = atoi(val);
-                    }
-                    break;
-
                 case 'B':   //  number of bits to truncate at end of burst loop
                     val = strtok(argv[i++], " ,.-");
                     nbits = atoi(val);
-                    break;
-
-                case 'c':   //  Checkpoint to disk at interval specified
-                    val = strtok(argv[i++], " ,.-");
-                    checkpoint_outputInterval = atoi(val);
-                    crux_type = CRUX_DISK;
-                    break;
-
-                case 'C':   //  Checkpoint to memory at interval specified
-                    val = strtok(argv[i++], " ,.-");
-                    checkpoint_outputInterval = atoi(val);
-                    crux_type = CRUX_IN_MEMORY;
                     break;
 
                 case 'D':   //  number of digits to truncate at end of burst loop
@@ -481,17 +442,6 @@ void parseInput(const int argc, char** argv)
                        enhanced_precision_sum = SUM_KAHAN;
                     } else {
                        printf("Error with sum argument %s\n",val);
-                       exit(0);
-                    }
-                    break;
-
-                case 'R':  //  Restart application from last checkpoint
-                    restart = true;
-                    restart_file = strtok(argv[i++], " ,");
-
-                    struct stat stat_descriptor;
-                    if (stat(restart_file,&stat_descriptor) == -1){
-                       printf("Error -- restart file %s does not exist\n",restart_file);
                        exit(0);
                     }
                     break;

@@ -130,7 +130,7 @@ class Input : protected Pointers {
   void processors();
   void region();
   void reset_timestep();
-  void restart();
+  // restart() removed (native checkpoint/restart stripped in this vanilla)
   void run_style();
   void special_bonds();
   void suffix();
