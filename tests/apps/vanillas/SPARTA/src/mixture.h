@@ -73,8 +73,6 @@ class Mixture : protected Pointers {
   int init_fraction(int *, double *, double *, double *);
   void add_species_default(char *);
   int find_group(const char *);
-  void write_restart(FILE *fp);
-  void read_restart(FILE *fp);
 
  private:
   int maxspecies,maxgroup;

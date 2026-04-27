@@ -97,7 +97,6 @@ class Input : protected Pointers {
   void react_modify();
   void region();
   void reset_timestep();
-  void restart();
   void seed();
   void species();
   void species_modify();

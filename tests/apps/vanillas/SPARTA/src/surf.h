@@ -236,11 +236,6 @@ class Surf : protected Pointers {
   int add_group(const char *);
   int find_group(const char *);
 
-  void write_restart(FILE *);
-  void read_restart(FILE *);
-  int size_restart_one();
-  int size_restart();
-  int pack_restart(char *);
 
   virtual void grow(int);
   virtual void grow_own(int);
@@ -293,8 +288,6 @@ class Surf : protected Pointers {
   virtual void spread_inverse_custom(int);
   int extract_custom(double **&);
 
-  void write_restart_custom(FILE *);
-  void read_restart_custom(FILE *);
   int sizeof_custom();
   virtual int pack_custom(int, char *);
   virtual int unpack_custom(char *, double *);

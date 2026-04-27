@@ -160,17 +160,7 @@ class Particle : protected Pointers {
   double erot(int, double, class RanKnuth *);
   double evib(int, double, class RanKnuth *);
 
-  void write_restart_species(FILE *fp);
-  void read_restart_species(FILE *fp);
-  void write_restart_mixture(FILE *fp);
-  void read_restart_mixture(FILE *fp);
 
-  int size_restart();
-  bigint size_restart_big();
-  int pack_restart(char *);
-  void pack_restart(char *, int, int);
-  int unpack_restart(char *);
-  void unpack_restart(char *, int &, int, int);
 
   int find_custom(char *);
   void error_custom();
@@ -179,8 +169,6 @@ class Particle : protected Pointers {
   virtual void remove_custom(int);
   virtual void zero_custom(int);
   virtual void copy_custom(int, int);
-  void write_restart_custom(FILE *fp);
-  void read_restart_custom(FILE *fp);
   int sizeof_custom();
   virtual void pack_custom(int, char *);
   virtual void unpack_custom(char *, int);

@@ -251,12 +251,6 @@ class Grid : protected Pointers {
   int find_group(const char *);
   int check_uniform_group(int, int *, double *, double *);
 
-  void write_restart(FILE *);
-  void read_restart(FILE *);
-  int size_restart();
-  int size_restart(int);
-  int pack_restart(char *);
-  int unpack_restart(char *);
 
   bigint memory_usage();
 
@@ -293,8 +287,6 @@ class Grid : protected Pointers {
   virtual void remove_custom(int);
   virtual void copy_custom(int, int);
 
-  void write_restart_custom(FILE *);
-  void read_restart_custom(FILE *);
   int sizeof_custom();
   virtual int pack_custom(int, char *, int);
   virtual int unpack_custom(char *, int);

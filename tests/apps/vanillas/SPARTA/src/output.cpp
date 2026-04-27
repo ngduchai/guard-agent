@@ -28,7 +28,6 @@
 #include "modify.h"
 #include "stats.h"
 #include "dump.h"
-#include "write_restart.h"
 #include "memory.h"
 #include "error.h"
 
@@ -57,13 +56,6 @@ Output::Output(SPARTA *sparta) : Pointers(sparta)
   var_dump = NULL;
   ivar_dump = NULL;
   dump = NULL;
-
-  restart_flag = restart_flag_single = restart_flag_double = 0;
-  restart_every_single = restart_every_double = 0;
-  last_restart = -1;
-  restart1 = restart2a = restart2b = NULL;
-  var_restart_single = var_restart_double = NULL;
-  restart = NULL;
 }
 
 /* ----------------------------------------------------------------------
@@ -83,13 +75,6 @@ Output::~Output()
   memory->destroy(ivar_dump);
   for (int i = 0; i < ndump; i++) delete dump[i];
   memory->sfree(dump);
-
-  delete [] restart1;
-  delete [] restart2a;
-  delete [] restart2b;
-  delete [] var_restart_single;
-  delete [] var_restart_double;
-  delete restart;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -115,20 +100,6 @@ void Output::init()
         error->all(FLERR,"Variable for dump every is invalid style");
     }
 
-  if (restart_flag_single && restart_every_single == 0) {
-    ivar_restart_single = input->variable->find(var_restart_single);
-    if (ivar_restart_single < 0)
-      error->all(FLERR,"Variable name for restart does not exist");
-    if (!input->variable->equal_style(ivar_restart_single))
-      error->all(FLERR,"Variable for restart is invalid style");
-  }
-  if (restart_flag_double && restart_every_double == 0) {
-    ivar_restart_double = input->variable->find(var_restart_double);
-    if (ivar_restart_double < 0)
-      error->all(FLERR,"Variable name for restart does not exist");
-    if (!input->variable->equal_style(ivar_restart_double))
-      error->all(FLERR,"Variable for restart is invalid style");
-  }
 }
 
 /* ----------------------------------------------------------------------
@@ -187,41 +158,6 @@ void Output::setup(int memflag)
     }
   } else next_dump_any = update->laststep + 1;
 
-  // do not write restart files at start of run
-  // set next_restart values to multiple of every or variable value
-  // wrap variable eval with clear/add
-  // if no restarts, set next_restart to last+1 so will not influence next
-
-  if (restart_flag) {
-    if (restart_flag_single) {
-      if (restart_every_single)
-        next_restart_single =
-          (ntimestep/restart_every_single)*restart_every_single +
-          restart_every_single;
-      else {
-        bigint nextrestart = static_cast<bigint>
-          (input->variable->compute_equal(ivar_restart_single));
-        if (nextrestart <= ntimestep)
-          error->all(FLERR,"Restart variable returned a bad timestep");
-        next_restart_single = nextrestart;
-      }
-    } else next_restart_single = update->laststep + 1;
-    if (restart_flag_double) {
-      if (restart_every_double)
-        next_restart_double =
-          (ntimestep/restart_every_double)*restart_every_double +
-          restart_every_double;
-      else {
-        bigint nextrestart = static_cast<bigint>
-          (input->variable->compute_equal(ivar_restart_double));
-        if (nextrestart <= ntimestep)
-          error->all(FLERR,"Restart variable returned a bad timestep");
-        next_restart_double = nextrestart;
-      }
-    } else next_restart_double = update->laststep + 1;
-    next_restart = MIN(next_restart_single,next_restart_double);
-  } else next_restart = update->laststep + 1;
-
   // print memory usage unless being called between multiple runs
 
   if (memflag) memory_usage();
@@ -250,14 +186,13 @@ void Output::setup(int memflag)
 
   // next = next timestep any output will be done
 
-  next = MIN(next_dump_any,next_restart);
-  next = MIN(next,next_stats);
+  next = MIN(next_dump_any,next_stats);
 }
 
 /* ----------------------------------------------------------------------
    perform all output for this timestep
    only perform output if next matches current step and last output doesn't
-   do dump/restart before stats so stats CPU time will include them
+   do dump before stats so stats CPU time will include them
 ------------------------------------------------------------------------- */
 
 void Output::write(bigint ntimestep)
@@ -291,55 +226,6 @@ void Output::write(bigint ntimestep)
     }
   }
 
-  // next_restart does not force output on last step of run
-  // for toggle = 0, replace "*" with current timestep in restart filename
-  // eval of variable may invoke computes so wrap with clear/add
-
-  if (next_restart == ntimestep) {
-    if (next_restart_single == ntimestep) {
-      char *file = new char[strlen(restart1) + 16];
-      char *ptr = strchr(restart1,'*');
-      *ptr = '\0';
-      sprintf(file,"%s" BIGINT_FORMAT "%s",restart1,ntimestep,ptr+1);
-      *ptr = '*';
-      if (last_restart != ntimestep) restart->write(file);
-      delete [] file;
-      if (restart_every_single) next_restart_single += restart_every_single;
-      else {
-        modify->clearstep_compute();
-        bigint nextrestart = static_cast<bigint>
-          (input->variable->compute_equal(ivar_restart_single));
-        if (nextrestart <= ntimestep)
-          error->all(FLERR,"Restart variable returned a bad timestep");
-        next_restart_single = nextrestart;
-        modify->addstep_compute(next_restart_single);
-      }
-    }
-    if (next_restart_double == ntimestep) {
-      if (last_restart != ntimestep) {
-        if (restart_toggle == 0) {
-          restart->write(restart2a);
-          restart_toggle = 1;
-        } else {
-          restart->write(restart2b);
-          restart_toggle = 0;
-        }
-      }
-      if (restart_every_double) next_restart_double += restart_every_double;
-      else {
-        modify->clearstep_compute();
-        bigint nextrestart = static_cast<bigint>
-          (input->variable->compute_equal(ivar_restart_double));
-        if (nextrestart <= ntimestep)
-          error->all(FLERR,"Restart variable returned a bad timestep");
-        next_restart_double = nextrestart;
-        modify->addstep_compute(next_restart_double);
-      }
-    }
-    last_restart = ntimestep;
-    next_restart = MIN(next_restart_single,next_restart_double);
-  }
-
   // insure next_thermo forces output on last step of run
   // thermo may invoke computes so wrap with clear/add
 
@@ -360,8 +246,7 @@ void Output::write(bigint ntimestep)
 
   // next = next timestep any output will be done
 
-  next = MIN(next_dump_any,next_restart);
-  next = MIN(next,next_stats);
+  next = MIN(next_dump_any,next_stats);
 }
 
 /* ----------------------------------------------------------------------
@@ -377,37 +262,8 @@ void Output::write_dump(bigint ntimestep)
 }
 
 /* ----------------------------------------------------------------------
-   force restart file(s) to be written
-------------------------------------------------------------------------- */
-
-void Output::write_restart(bigint ntimestep)
-{
-  if (restart_flag_single) {
-    char *file = new char[strlen(restart1) + 16];
-    char *ptr = strchr(restart1,'*');
-    *ptr = '\0';
-    sprintf(file,"%s" BIGINT_FORMAT "%s",restart1,ntimestep,ptr+1);
-    *ptr = '*';
-    restart->write(file);
-    delete [] file;
-  }
-
-  if (restart_flag_double) {
-    if (restart_toggle == 0) {
-      restart->write(restart2a);
-      restart_toggle = 1;
-    } else {
-      restart->write(restart2b);
-      restart_toggle = 0;
-    }
-  }
-
-  last_restart = ntimestep;
-}
-
-/* ----------------------------------------------------------------------
    timestep is being changed, called by update->reset_timestep()
-   reset next timestep values for dumps, restart, thermo output
+   reset next timestep values for dumps, thermo output
    reset to smallest value >= new timestep
    if next timestep set by variable evaluation,
      eval for ntimestep-1, so current ntimestep can be returned if needed
@@ -436,46 +292,6 @@ void Output::reset_timestep(bigint ntimestep)
     next_dump_any = MIN(next_dump_any,next_dump[idump]);
   }
 
-  if (restart_flag_single) {
-    if (restart_every_single) {
-      next_restart_single =
-        (ntimestep/restart_every_single)*restart_every_single;
-      if (next_restart_single < ntimestep)
-        next_restart_single += restart_every_single;
-    } else {
-      modify->clearstep_compute();
-      update->ntimestep--;
-      bigint nextrestart = static_cast<bigint>
-        (input->variable->compute_equal(ivar_restart_single));
-      if (nextrestart < ntimestep)
-        error->all(FLERR,"Restart variable returned a bad timestep");
-      update->ntimestep++;
-      next_restart_single = nextrestart;
-      modify->addstep_compute(next_restart_single);
-    }
-  } else next_restart_single = update->laststep + 1;
-
-  if (restart_flag_double) {
-    if (restart_every_double) {
-      next_restart_double =
-        (ntimestep/restart_every_double)*restart_every_double;
-      if (next_restart_double < ntimestep)
-        next_restart_double += restart_every_double;
-    } else {
-      modify->clearstep_compute();
-      update->ntimestep--;
-      bigint nextrestart = static_cast<bigint>
-        (input->variable->compute_equal(ivar_restart_double));
-      if (nextrestart < ntimestep)
-        error->all(FLERR,"Restart variable returned a bad timestep");
-      update->ntimestep++;
-      next_restart_double = nextrestart;
-      modify->addstep_compute(next_restart_double);
-    }
-  } else next_restart_double = update->laststep + 1;
-
-  next_restart = MIN(next_restart_single,next_restart_double);
-
   if (var_stats) {
     modify->clearstep_compute();
     update->ntimestep--;
@@ -492,8 +308,7 @@ void Output::reset_timestep(bigint ntimestep)
     next_stats = MIN(next_stats,update->laststep);
   } else next_stats = update->laststep;
 
-  next = MIN(next_dump_any,next_restart);
-  next = MIN(next,next_stats);
+  next = MIN(next_dump_any,next_stats);
 }
 
 /* ----------------------------------------------------------------------
@@ -618,104 +433,6 @@ void Output::create_stats(int narg, char **arg)
 {
   if (narg < 1) error->all(FLERR,"Illegal stats_style command");
   stats->set_fields(narg,arg);
-}
-
-/* ----------------------------------------------------------------------
-   setup restart capability
-   if only one filename and it contains no "*", then append ".*"
-------------------------------------------------------------------------- */
-
-void Output::create_restart(int narg, char **arg)
-{
-  if (narg < 1) error->all(FLERR,"Illegal restart command");
-
-  int every = 0;
-  int varflag = 0;
-
-  if (strstr(arg[0],"v_") == arg[0]) varflag = 1;
-  else every = atoi(arg[0]);
-
-  if (!varflag && every == 0) {
-    if (narg != 1) error->all(FLERR,"Illegal restart command");
-
-    restart_flag = restart_flag_single = restart_flag_double = 0;
-    last_restart = -1;
-
-    delete restart;
-    restart = NULL;
-    delete [] restart1;
-    delete [] restart2a;
-    delete [] restart2b;
-    restart1 = restart2a = restart2b = NULL;
-    delete [] var_restart_single;
-    delete [] var_restart_double;
-    var_restart_single = var_restart_double = NULL;
-
-    return;
-  }
-
-  if (narg < 2) error->all(FLERR,"Illegal restart command");
-
-  int nfile = 0;
-  if (narg % 2 == 0) nfile = 1;
-  else nfile = 2;
-
-  if (nfile == 1) {
-    restart_flag = restart_flag_single = 1;
-
-    if (varflag) {
-      delete [] var_restart_single;
-      int n = strlen(&arg[0][2]) + 1;
-      var_restart_single = new char[n];
-      strcpy(var_restart_single,&arg[0][2]);
-      restart_every_single = 0;
-    } else restart_every_single = every;
-
-    int n = strlen(arg[1]) + 3;
-    restart1 = new char[n];
-    strcpy(restart1,arg[1]);
-    if (strchr(restart1,'*') == NULL) strcat(restart1,".*");
-  }
-
-  if (nfile == 2) {
-    restart_flag = restart_flag_double = 1;
-
-    if (varflag) {
-      delete [] var_restart_double;
-      int n = strlen(&arg[0][2]) + 1;
-      var_restart_double = new char[n];
-      strcpy(var_restart_double,&arg[0][2]);
-      restart_every_double = 0;
-    } else restart_every_double = every;
-
-    restart_toggle = 0;
-    int n = strlen(arg[1]) + 3;
-    restart2a = new char[n];
-    strcpy(restart2a,arg[1]);
-    n = strlen(arg[2]) + 1;
-    restart2b = new char[n];
-    strcpy(restart2b,arg[2]);
-  }
-
-  // check for multiproc output and an MPI-IO filename
-  // if 2 filenames, must be consistent
-
-  int multiproc;
-  if (strchr(arg[1],'%')) multiproc = comm->nprocs;
-  else multiproc = 0;
-  if (nfile == 2) {
-    if (multiproc && !strchr(arg[2],'%'))
-      error->all(FLERR,"Both restart files must use % or neither");
-    if (!multiproc && strchr(arg[2],'%'))
-      error->all(FLERR,"Both restart files must use % or neither");
-  }
-
-  // setup output style and process optional args
-
-  delete restart;
-  restart = new WriteRestart(sparta);
-  int iarg = nfile+1;
-  restart->multiproc_options(multiproc,narg-iarg,&arg[iarg]);
 }
 
 /* ----------------------------------------------------------------------

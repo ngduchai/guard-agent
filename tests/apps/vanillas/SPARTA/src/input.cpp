@@ -863,7 +863,6 @@ int Input::execute_command()
   else if (!strcmp(command,"react_modify")) react_modify();
   else if (!strcmp(command,"region")) region();
   else if (!strcmp(command,"reset_timestep")) reset_timestep();
-  else if (!strcmp(command,"restart")) restart();
   else if (!strcmp(command,"seed")) seed();
   else if (!strcmp(command,"species")) species();
   else if (!strcmp(command,"species_modify")) species_modify();
@@ -1572,13 +1571,6 @@ void Input::region()
 void Input::reset_timestep()
 {
   update->reset_timestep(narg,arg);
-}
-
-/* ---------------------------------------------------------------------- */
-
-void Input::restart()
-{
-  output->create_restart(narg,arg);
 }
 
 /* ---------------------------------------------------------------------- */
