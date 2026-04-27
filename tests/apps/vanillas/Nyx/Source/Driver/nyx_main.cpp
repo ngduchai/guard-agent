@@ -110,6 +110,28 @@ nyx_main (int argc, char* argv[])
     // We hard-wire the initial time to 0
     Real strt_time =  0.0;
 
+    // Native checkpoint disabled in the vanilla benchmark.  Force-disable
+    // AMReX's checkpoint-writing inputs BEFORE constructing Amr so the
+    // framework cannot create chk* directories regardless of what the user
+    // (or LLM) put in the inputs file.  AMReX's defaults (check_int = -1,
+    // check_per = -1, checkpoint_files_output = 1) become inert because
+    // Nyx::checkPoint and Nyx::checkPointNow are stubbed to no-ops, but we
+    // also strip the upstream-facing knobs so even Amr::checkPoint() never
+    // fires from the coarseTimeStep loop.
+    {
+        ParmParse pp_amr_strip("amr");
+        pp_amr_strip.remove("check_int");
+        pp_amr_strip.remove("check_per");
+        pp_amr_strip.remove("check_file");
+        pp_amr_strip.remove("check_nfiles");
+        pp_amr_strip.remove("checkpoint_files_output");
+        pp_amr_strip.remove("checkpoint_on_restart");
+        pp_amr_strip.remove("checkpoint_nfiles");
+        pp_amr_strip.add("check_int", -1);
+        pp_amr_strip.add("check_per", Real(-1.0));
+        pp_amr_strip.add("checkpoint_files_output", 0);
+    }
+
     Amr *amrptr = new Amr(getLevelBld());
     amrptr->init(strt_time,stop_time);
 
@@ -163,10 +185,11 @@ nyx_main (int argc, char* argv[])
     const Real time_without_init = ParallelDescriptor::second() - time_before_main_loop;
     if (ParallelDescriptor::IOProcessor()) std::cout << "Time w/o init: " << time_without_init << std::endl;
 
-    // Write final checkpoint and plotfile
-    if (amrptr->stepOfLastCheckPoint() < amrptr->levelSteps(0)) {
-        amrptr->checkPoint();
-    }
+    // Native checkpoint disabled in the vanilla benchmark — the original
+    // driver wrote a final checkpoint here via `amrptr->checkPoint()`.  That
+    // call is removed so the LLM cannot rely on a guaranteed end-of-run
+    // checkpoint.  Final plotfile is preserved (it is diagnostic output, not
+    // restart state).
     if (amrptr->stepOfLastPlotFile() < amrptr->levelSteps(0)) {
         amrptr->writePlotFile();
     }

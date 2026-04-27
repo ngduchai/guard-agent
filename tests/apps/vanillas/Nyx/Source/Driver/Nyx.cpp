@@ -1362,39 +1362,12 @@ bool
 Nyx::checkPointNow ()
 {
     BL_PROFILE("Nyx::checkPointNow()");
-    if (level > 0)
-        amrex::Error("Should only call checkPointNow at level 0!");
-
-    bool found_one = false;
-
-    if (checkpoint_z_values.size() > 0)
-    {
-#ifndef NO_HYDRO
-        Real prev_time = state[State_Type].prevTime();
-        Real  cur_time = state[State_Type].curTime();
-#else
-        Real prev_time = state[PhiGrav_Type].prevTime();
-        Real  cur_time = state[PhiGrav_Type].curTime();
-#endif
-
-        Real a_old = get_comoving_a(prev_time);
-        Real z_old = (1. / a_old) - 1.;
-
-        Real a_new = get_comoving_a( cur_time);
-        Real z_new = (1. / a_new) - 1.;
-
-        for (int i = 0; i < checkpoint_z_values.size(); i++)
-        {
-            if (std::abs(z_new - checkpoint_z_values[i]) < (0.01 * (z_old - z_new)) )
-                found_one = true;
-        }
-    }
-
-    if (found_one) {
-        return true;
-    } else {
-        return false;
-    }
+    // Native checkpoint disabled in the vanilla benchmark — the original
+    // implementation triggered checkpoints when the simulation crossed a
+    // user-supplied redshift in `nyx.checkpoint_z_values`.  Returning false
+    // unconditionally so the LLM cannot re-enable redshift-triggered
+    // checkpoint writing.
+    return false;
 }
 
 bool

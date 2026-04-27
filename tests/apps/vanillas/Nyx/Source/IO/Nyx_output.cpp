@@ -876,165 +876,33 @@ Nyx::writeMultiFabAsPlotFile(const std::string& pltfile,
 }
 
 void
-Nyx::checkPoint (const std::string& dir,
-                 std::ostream&      os,
-                 VisMF::How         how,
+Nyx::checkPoint (const std::string& /*dir*/,
+                 std::ostream&      /*os*/,
+                 VisMF::How         /*how*/,
                  bool               /*dump_old_default*/)
 {
-
-  for (int s = 0; s < desc_lst.size(); ++s) {
-      if (dump_old && state[s].hasOldData()) {
-          MultiFab& old_MF = get_old_data(s);
-          amrex::prefetchToHost(old_MF);
-      }
-      MultiFab& new_MF = get_new_data(s);
-      amrex::prefetchToHost(new_MF);
-  }
-
-  AmrLevel::checkPoint(dir, os, how, dump_old);
-
-  for (int s = 0; s < desc_lst.size(); ++s) {
-      if (dump_old && state[s].hasOldData()) {
-          MultiFab& old_MF = get_old_data(s);
-          amrex::prefetchToDevice(old_MF);
-      }
-      MultiFab& new_MF = get_new_data(s);
-      amrex::prefetchToDevice(new_MF);
-  }
-
-  particle_check_point(dir);
-
-  if (level == 0 && ParallelDescriptor::IOProcessor())
-  {
-      writeJobInfo(dir);
-  }
-
-#ifndef NO_HYDRO
-  if (do_forcing)
-      forcing_check_point(dir);
-#endif
-
-  if (level == 0 && ParallelDescriptor::IOProcessor())
-    {
-      {
-        // store elapsed CPU time
-        std::ofstream CPUFile;
-        std::string FullPathCPUFile = dir;
-        FullPathCPUFile += "/CPUtime";
-        CPUFile.open(FullPathCPUFile.c_str(), std::ios::out);
-
-        CPUFile << std::setprecision(15) << getCPUTime();
-        CPUFile.close();
-      }
-    }
-#ifdef AMREX_PARTICLES
-    if(Nyx::theDMPC()) {
-      Nyx::theDMPC()->SetLevelDirectoriesCreated(false);
-    }
-#ifdef AGN
-    if(Nyx::theAPC()) {
-      Nyx::theAPC()->SetLevelDirectoriesCreated(false);
-    }
-#endif
-#ifdef NEUTRINO_DARK_PARTICLES
-    if(Nyx::theNPC()) {
-      Nyx::theNPC()->SetLevelDirectoriesCreated(false);
-    }
-#endif
-#endif
-
+  // Native checkpoint disabled in the vanilla benchmark — this override no
+  // longer calls AmrLevel::checkPoint, write_*JobInfo, particle_check_point,
+  // forcing_check_point, or CPUtime.  Amr::checkPoint() may still be invoked
+  // by the framework when amr.check_int / amr.check_per > 0, but those input
+  // parameters are stripped in nyx_main() before the Amr ctor runs (see
+  // Source/Driver/nyx_main.cpp).  No file is written from this method.
 }
 
 void
 Nyx::checkPointPre (const std::string& /*dir*/,
                     std::ostream&      /*os*/)
 {
-#ifdef AMREX_PARTICLES
-  if(Nyx::theDMPC()) {
-    Nyx::theDMPC()->CheckpointPre();
-  }
-#ifdef AGN
-  if(Nyx::theAPC()) {
-    Nyx::theAPC()->CheckpointPre();
-  }
-#endif
-#ifdef NEUTRINO_DARK_PARTICLES
-  if(Nyx::theNPC()) {
-    Nyx::theNPC()->CheckpointPre();
-  }
-#endif
-#endif
+  // Native checkpoint disabled in the vanilla benchmark.
 }
 
 
 void
-Nyx::checkPointPost (const std::string& dir,
+Nyx::checkPointPost (const std::string& /*dir*/,
                      std::ostream&      /*os*/)
 {
-#ifdef AMREX_PARTICLES
-  if(Nyx::theDMPC()) {
-    Nyx::theDMPC()->CheckpointPost();
-  }
-#ifdef AGN
-  if(Nyx::theAPC()) {
-    Nyx::theAPC()->CheckpointPost();
-  }
-#endif
-#ifdef NEUTRINO_DARK_PARTICLES
-  if(Nyx::theNPC()) {
-    Nyx::theNPC()->CheckpointPost();
-  }
-#endif
-#endif
-#ifdef NO_HYDRO
-        Real cur_time = state[PhiGrav_Type].curTime();
-#else
-        Real cur_time = state[State_Type].curTime();
-#endif
-  if(level==0)
-    {
-        if (ParallelDescriptor::IOProcessor())
-        {
-            std::string FileName = dir + "/comoving_a";
-            std::ofstream File;
-            File.open(FileName.c_str(), std::ios::out|std::ios::trunc);
-            if ( ! File.good()) {
-                amrex::FileOpenFailed(FileName);
-            }
-            File.precision(15);
-            if (cur_time == 0)
-            {
-               File << old_a << '\n';
-            } else {
-               File << new_a << '\n';
-            }
-        }
-
-        if (ParallelDescriptor::IOProcessor())
-        {
-            std::string FileName = dir + "/first_max_steps";
-            std::ofstream File;
-            File.open(FileName.c_str(), std::ios::out|std::ios::trunc);
-            if ( ! File.good()) {
-                amrex::FileOpenFailed(FileName);
-            }
-            File.precision(15);
-            File << old_max_sundials_steps << '\n';
-        }
-
-        if (ParallelDescriptor::IOProcessor())
-        {
-            std::string FileName = dir + "/second_max_steps";
-            std::ofstream File;
-            File.open(FileName.c_str(), std::ios::out|std::ios::trunc);
-            if ( ! File.good()) {
-                amrex::FileOpenFailed(FileName);
-            }
-            File.precision(15);
-            File << old_max_sundials_steps << '\n';
-        }
-    }
-
+  // Native checkpoint disabled in the vanilla benchmark — no comoving_a,
+  // first_max_steps, or second_max_steps sentinels are written.
 }
 
 #ifndef NO_HYDRO
