@@ -358,8 +358,11 @@ def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
                 "test.5", "test.6", "test.7", "test.8", "test.9",
                 "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
                 "restart_dir", "dump-")
+    # NOTE: do not put ".txt" here — CoMD reference's checkpoint format is
+    # CoMD_state-N.txt (POSIX text checkpoint, real state file).  stdout.txt /
+    # stderr.txt are still excluded via the "stdout"/"stderr" substring rules.
     EXCLUDE = ("injection_success.flag", "stdout", "stderr", ".gitkeep",
-               "_validate", ".log", ".txt", ".yaml", ".cfg", ".json",
+               "_validate", ".log", ".yaml", ".cfg", ".json",
                "athinput", "in.", ".vtk", ".tab", ".hst")
     total = 0
     for f in run_cwd.rglob("*"):
