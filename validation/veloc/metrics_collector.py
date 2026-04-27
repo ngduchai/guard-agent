@@ -357,7 +357,13 @@ def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
                 "test.0", "test.1", "test.2", "test.3", "test.4",
                 "test.5", "test.6", "test.7", "test.8", "test.9",
                 "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
-                "restart_dir", "dump-")
+                "restart_dir", "dump-",
+                # CLAMR Crux native: checkpoint_output/backupNNNNN.crx
+                ".crx", "backup",
+                # HyPar timestamped output (op_overwrite=no + binary format)
+                "op_0",
+                # SPPARKS dump.ising.* if treated as state proxy
+                "dump.ising")
     # NOTE: do not put ".txt" here — CoMD reference's checkpoint format is
     # CoMD_state-N.txt (POSIX text checkpoint, real state file).  stdout.txt /
     # stderr.txt are still excluded via the "stdout"/"stderr" substring rules.
