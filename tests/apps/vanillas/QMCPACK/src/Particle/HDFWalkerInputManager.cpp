@@ -14,48 +14,29 @@
 //////////////////////////////////////////////////////////////////////////////////////
 
 
+/** @file
+ * @brief STRIPPED definition of HDFWalkerInputManager.  The original
+ *        implementation read .config.h5 walker checkpoints via
+ *        HDFWalkerInput_0_4.  In the vanilla benchmark this restart capability
+ *        is intentionally disabled so the LLM cannot re-enable native
+ *        checkpoint/restart by toggling input flags.  put() always returns
+ *        false (no walker set was loaded), and getFileRoot() returns "".
+ */
 #include "HDFWalkerInputManager.h"
-#include "OhmmsData/AttributeSet.h"
-#include "Particle/HDFWalkerInput_0_4.h"
 #include "Message/Communicate.h"
-#include "hdf/HDFVersion.h"
 
 namespace qmcplusplus
 {
-HDFWalkerInputManager::HDFWalkerInputManager(WalkerConfigurations& wc_list, size_t num_ptcls, Communicate* c) : wc_list_(wc_list), num_ptcls_(num_ptcls), myComm(c) {}
+HDFWalkerInputManager::HDFWalkerInputManager(WalkerConfigurations& wc_list, size_t num_ptcls, Communicate* c)
+    : wc_list_(wc_list), num_ptcls_(num_ptcls), myComm(c) {}
 
 HDFWalkerInputManager::~HDFWalkerInputManager() {}
 
-bool HDFWalkerInputManager::put(xmlNodePtr cur)
+bool HDFWalkerInputManager::put(xmlNodePtr /*cur*/)
 {
-  //reference revision number
-  HDFVersion start_version(0, 4);
-  //current node
-  int pid = myComm->rank();
-  std::string froot("0"), cfile("0");
-  //string  target("e"), collect("no");
-  int anode = -1, nprocs = 1;
-  HDFVersion in_version(0, 4); //set to be old version
-  OhmmsAttributeSet pAttrib;
-  pAttrib.add(cfile, "href");
-  pAttrib.add(cfile, "file");
-  pAttrib.add(froot, "fileroot");
-  pAttrib.add(anode, "node");
-  pAttrib.add(nprocs, "nprocs");
-  //pAttrib.add(collect,"collected");
-  pAttrib.add(in_version, "version");
-  pAttrib.put(cur);
-  bool success = false;
-  if (in_version >= start_version)
-  {
-    HDFWalkerInput_0_4 win(wc_list_, num_ptcls_, myComm, in_version);
-    success = win.put(cur);
-    cfile   = win.FileName_noext;
-  }
-  else
-    myComm->barrier_and_abort("Outdated restart file!");
-  if (success)
-    CurrentFileRoot = cfile;
-  return success;
+  // Native checkpoint/restart disabled in the vanilla benchmark.  Returning
+  // false signals that no walker configurations were loaded from file; the
+  // caller falls back to fresh walker initialization.
+  return false;
 }
 } // namespace qmcplusplus

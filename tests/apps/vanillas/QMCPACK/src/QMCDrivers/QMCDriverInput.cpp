@@ -38,7 +38,10 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
 
   std::string debug_checks_str;
   std::string measure_imbalance_str;
-  int Period4CheckPoint{0};
+  // Native checkpoint disabled in the vanilla benchmark — pinned at -1
+  // (no dump) so the LLM cannot re-enable native restart by toggling the
+  // <qmc> @c checkpoint XML attribute.
+  int Period4CheckPoint{-1};
   int dummy_int = 0;
 
   ParameterSet parameter_set;
@@ -80,7 +83,7 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   aAttrib.add(qmc_method_, "method");
   aAttrib.add(update_mode_, "move");
   aAttrib.add(scoped_profiling_, "profiling");
-  aAttrib.add(Period4CheckPoint, "checkpoint");
+  // Native checkpoint disabled — `checkpoint` attribute parsing removed.
   // This does all the parameter parsing setup in the constructor
   aAttrib.put(cur);
 
@@ -108,10 +111,8 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
       }
       else if (cname == "checkpoint")
       {
-        OhmmsAttributeSet rAttrib;
-        rAttrib.add(check_point_period_.stride, "stride");
-        rAttrib.add(check_point_period_.period, "period");
-        rAttrib.put(tcur);
+        // Native checkpoint disabled — child <checkpoint> element is silently
+        // ignored so the LLM cannot re-enable native restart by adding it.
       }
       else if (cname == "dumpconfig")
       {

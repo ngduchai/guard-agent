@@ -398,10 +398,12 @@ bool QMCDriver::putQMCInfo(xmlNodePtr cur)
   //int oldSteps=nSteps;
 
   //set the default walker to the number of threads times 10
-  Period4CheckPoint = 0;
+  // Native checkpoint disabled in the vanilla benchmark — pinned at -1
+  // (no dump) so the LLM cannot re-enable native restart by toggling the
+  // <qmc> @c checkpoint XML attribute.  Attribute parsing removed.
+  Period4CheckPoint = -1;
   int defaultw      = omp_get_max_threads();
   OhmmsAttributeSet aAttrib;
-  aAttrib.add(Period4CheckPoint, "checkpoint");
   aAttrib.put(cur);
   if (cur != NULL)
   {
@@ -423,11 +425,8 @@ bool QMCDriver::putQMCInfo(xmlNodePtr cur)
       }
       else if (cname == "checkpoint")
       {
-        OhmmsAttributeSet rAttrib;
-        rAttrib.add(Period4CheckPoint, "stride");
-        rAttrib.add(Period4CheckPoint, "period");
-        rAttrib.put(tcur);
-        //DumpConfig=(Period4CheckPoint>0);
+        // Native checkpoint disabled — child <checkpoint> element is silently
+        // ignored so the LLM cannot re-enable native restart by adding it.
       }
       else if (cname == "dumpconfig")
       {
