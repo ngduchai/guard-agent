@@ -62,38 +62,23 @@ bool* Serializer::getNextBlock(std::size_t& sizeBlock, bool loadingMode)
 }
 
 template<bool includeLogOutputDir>
-bool Serializer::load(std::string fileName, bool enforceUint)
+bool Serializer::load(std::string /*fileName*/, bool /*enforceUint*/)
 {
-  validateFileName(fileName);
-  std::ifstream istr(getFullFileName<includeLogOutputDir>(fileName).c_str());
-  if (istr) {
-    istr2serializer(*this, istr, enforceUint);
-    istr.close();
-    _serializable.postLoad();
-    return true;
-  }
-  else {
-    return false;
-  }
+  // Native checkpoint/restart disabled in the vanilla benchmark.  The
+  // upstream implementation read a `<fileName>.dat` checkpoint produced by
+  // Serializer::save and rebuilt the Serializable's state.  Stripping this
+  // path so the LLM cannot delegate restart to OpenLB's native API by
+  // calling `sLattice.load("checkpoint")`.  Returns false (no state loaded).
+  return false;
 }
 
 template<bool includeLogOutputDir>
-bool Serializer::save(std::string fileName, bool enforceUint)
+bool Serializer::save(std::string /*fileName*/, bool /*enforceUint*/)
 {
-  validateFileName(fileName);
-
-  // Determine binary size through `getSerializableSize()` method
-  computeSize();
-
-  std::ofstream ostr (getFullFileName<includeLogOutputDir>(fileName).c_str());
-  if (ostr) {
-    serializer2ostr(*this, ostr, enforceUint);
-    ostr.close();
-    return true;
-  }
-  else {
-    return false;
-  }
+  // Native checkpoint disabled in the vanilla benchmark — see Serializer::load.
+  // Returns false (no file written).  The buffer-based save(uint8_t*) below is
+  // preserved because OpenLB uses it for in-process MPI state exchange.
+  return false;
 }
 
 bool Serializer::load(const std::uint8_t* buffer)
@@ -142,17 +127,17 @@ const std::string Serializer::getFullFileName(const std::string& fileName)
 /////////////// Serializable //////////////////////////
 
 template<bool includeLogOutputDir>
-bool Serializable::save(std::string fileName, const bool enforceUint)
+bool Serializable::save(std::string /*fileName*/, const bool /*enforceUint*/)
 {
-  Serializer tmpSerializer(*this, fileName);
-  return tmpSerializer.save<includeLogOutputDir>();
+  // Native checkpoint disabled — see Serializer::save above.
+  return false;
 }
 
 template<bool includeLogOutputDir>
-bool Serializable::load(std::string fileName, const bool enforceUint)
+bool Serializable::load(std::string /*fileName*/, const bool /*enforceUint*/)
 {
-  Serializer tmpSerializer(*this, fileName);
-  return tmpSerializer.load<includeLogOutputDir>();
+  // Native checkpoint disabled — see Serializer::load above.
+  return false;
 }
 
 bool Serializable::save(std::uint8_t* buffer)
