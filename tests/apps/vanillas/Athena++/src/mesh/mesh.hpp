@@ -73,7 +73,6 @@ FluidFormulation GetFluidFormulation(const std::string& input_string);
 //! \brief data/functions associated with a single block
 
 class MeshBlock {
-  friend class RestartOutput;
   friend class BoundaryValues;
   friend class CellCenteredBoundaryVariable;
   friend class FaceCenteredBoundaryVariable;
@@ -204,7 +203,6 @@ class MeshBlock {
 //! \brief data/functions associated with the overall mesh
 
 class Mesh {
-  friend class RestartOutput;
   friend class HistoryOutput;
   friend class MeshBlock;
   friend class MeshBlockTree;

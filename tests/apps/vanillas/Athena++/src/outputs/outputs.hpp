@@ -164,16 +164,6 @@ class VTKOutput : public OutputType {
   void WriteOutputFile(Mesh *pm, ParameterInput *pin, bool flag) override;
 };
 
-//----------------------------------------------------------------------------------------
-//! \class RestartOutput
-//! \brief derived OutputType class for restart dumps
-
-class RestartOutput : public OutputType {
- public:
-  explicit RestartOutput(OutputParameters oparams) : OutputType(oparams) {}
-  void WriteOutputFile(Mesh *pm, ParameterInput *pin, bool flag) override;
-};
-
 #ifdef HDF5OUTPUT
 //----------------------------------------------------------------------------------------
 //! \class ATHDF5Output

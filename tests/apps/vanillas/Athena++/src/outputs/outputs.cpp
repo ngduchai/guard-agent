@@ -20,7 +20,7 @@
 //! Required parameters that must be specified in an <output[n]> block are:
 //!   - variable     = cons,prim,D,d,E,e,m,m1,m2,m3,v,v1=vx,v2=vy,v3=vz,p,
 //!                    bcc,bcc1,bcc2,bcc3,b,b1,b2,b3,phi,uov
-//!   - file_type    = rst,tab,vtk,hst,hdf5
+//!   - file_type    = tab,vtk,hst,hdf5
 //!   - dt           = problem time between outputs
 //!
 //! EXAMPLE of an <output[n]> block for a VTK dump:
@@ -190,7 +190,7 @@ Outputs::Outputs(Mesh *pm, ParameterInput *pin) {
   InputBlock *pib = pin->pfirst_block;
   OutputType *pnew_type;
   OutputType *plast = pfirst_type_;
-  int num_hst_outputs=0, num_rst_outputs=0; // number of history and restart outputs
+  int num_hst_outputs=0; // number of history outputs
 
   // loop over input block names.  Find those that start with "output", read parameters,
   // and construct singly linked list of OutputTypes.
@@ -310,7 +310,7 @@ Outputs::Outputs(Mesh *pm, ParameterInput *pin) {
           op.cartesian_vector = false;
 
         // set output variable and optional data format string used in formatted writes
-        if (op.file_type.compare("hst") != 0 && op.file_type.compare("rst") != 0) {
+        if (op.file_type.compare("hst") != 0) {
           op.variable = pin->GetString(op.block_name, "variable");
         }
 
@@ -327,9 +327,6 @@ Outputs::Outputs(Mesh *pm, ParameterInput *pin) {
           pnew_type = new FormattedTableOutput(op);
         } else if (op.file_type.compare("vtk") == 0) {
           pnew_type = new VTKOutput(op);
-        } else if (op.file_type.compare("rst") == 0) {
-          pnew_type = new RestartOutput(op);
-          num_rst_outputs++;
         } else if (op.file_type.compare("ath5") == 0
                    || op.file_type.compare("hdf5") == 0) {
 #ifdef HDF5OUTPUT
@@ -424,45 +421,13 @@ Outputs::Outputs(Mesh *pm, ParameterInput *pin) {
     pib = pib->pnext;  // move to next input block name
   }
 
-  // check there were no more than one history or restart files requested
-  if (num_hst_outputs > 1 || num_rst_outputs > 1) {
+  // check there was no more than one history file requested
+  if (num_hst_outputs > 1) {
     msg << "### FATAL ERROR in Outputs constructor" << std::endl
-        << "More than one history or restart output block detected in input file"
+        << "More than one history output block detected in input file"
         << std::endl;
     ATHENA_ERROR(msg);
   }
-
-  // Move restarts to the tail end of the OutputType list, so file counters for other
-  // output types are up-to-date in restart file
-  int pos = 0, found = 0;
-  OutputType *pot = pfirst_type_;
-  OutputType *prst = pot;
-  while (pot != nullptr) {
-    if (pot->output_params.file_type.compare("rst") == 0) {
-      prst = pot;
-      found = 1;
-      if (pot->pnext_type == nullptr) found = 2;
-      break;
-    }
-    pos++;
-    pot = pot->pnext_type;
-  }
-  if (found == 1) {
-    // remove the restarting block
-    pot = pfirst_type_;
-    if (pos == 0) { // head node/first block
-      pfirst_type_ = pfirst_type_->pnext_type;
-    } else {
-      for (int j=0; j<pos-1; j++) // seek the list
-        pot = pot->pnext_type;
-      pot->pnext_type = prst->pnext_type; // remove it
-    }
-    while (pot->pnext_type != nullptr)
-      pot = pot->pnext_type; // find the tail node
-    prst->pnext_type = nullptr;
-    pot->pnext_type = prst;
-  }
-  // if found == 2, do nothing; it's already at the tail node/end of the list
 }
 
 // destructor - iterates through singly linked list of OutputTypes and deletes nodes
@@ -1500,8 +1465,7 @@ void Outputs::MakeOutputs(Mesh *pm, ParameterInput *pin, bool wtflag) {
         || (ptype->output_params.dt > 0.0 && pm->time >= ptype->output_params.next_time)
         || (ptype->output_params.dcycle > 0
             && pm->ncycle%ptype->output_params.dcycle == 0)
-        || (pm->time >= pm->tlim)
-        || (wtflag && ptype->output_params.file_type == "rst")) {
+        || (pm->time >= pm->tlim)) {
       if (rad_mom && (NR_RADIATION_ENABLED || IM_RADIATION_ENABLED)) {
         for(int b=0; b<pm->nblocal; ++b) {
           pmb = pm->my_blocks(b);
