@@ -31,11 +31,19 @@ export PYTHONPATH="${REPO_ROOT}"
 # --- Parse approach flag ---
 USE_BASELINE=false
 USE_REFERENCE=false
+USE_AUDIT_VANILLA=false
 if [ "${1:-}" = "--baseline" ]; then
   USE_BASELINE=true
   shift
 elif [ "${1:-}" = "--reference" ]; then
   USE_REFERENCE=true
+  shift
+elif [ "${1:-}" = "--audit-vanilla" ]; then
+  # Audit mode: validate the vanilla against itself.  We expect the failure-free
+  # run to PASS (vanilla works) and the failure-injected run's resilience proof
+  # to FAIL (vanilla cannot recover).  This proves the vanilla is properly
+  # stripped of all checkpoint capability before we use it as the agent's input.
+  USE_AUDIT_VANILLA=true
   shift
 fi
 
@@ -132,10 +140,14 @@ if [ -f "$APP_CONFIG" ]; then
 elif [ -n "$APP_YAML" ]; then
   # Fall back to app.yaml (20-app format)
   EXE_NAME=$(_read_yaml "executable_name")
+  RESILIENT_EXE=$(_read_yaml "ckpt_executable_name")
   APP_ARGS=$(_read_yaml "app_args")
   COMPARISON=$(_read_yaml "comparison_flags")
   ORIGINAL_BUILD_CMD=$(_read_yaml "build_cmd")
   RESILIENT_BUILD_CMD=$(_read_yaml "ckpt_build_cmd")
+  NUM_PROCS_FROM_YAML=$(_read_yaml "num_procs")
+  APP_INPUT_SUBDIR=$(_read_yaml "app_input_subdir")
+  INJECTION_DELAY_FROM_YAML=$(_read_yaml "injection_delay")
 fi
 
 # Fallback: try to extract from CMakeLists.txt
@@ -173,6 +185,12 @@ if [ "$USE_REFERENCE" = true ]; then
 elif [ "$USE_BASELINE" = true ]; then
   RESILIENT_SRC="$BUILD_DIR/tests_baseline/$APP_NAME"
   LABEL="baseline (no guard-agent)"
+elif [ "$USE_AUDIT_VANILLA" = true ]; then
+  # Point "resilient" at the same vanilla source so the failure-injected run
+  # exercises the unmodified code; if it actually recovers we know the vanilla
+  # still has hidden checkpoint capability.
+  RESILIENT_SRC="$ORIGINAL_SRC"
+  LABEL="audit (vanilla vs vanilla)"
 else
   RESILIENT_SRC="$BUILD_DIR/tests/$APP_NAME"
   LABEL="with guard-agent"
@@ -194,6 +212,8 @@ if [ "$USE_REFERENCE" = true ]; then
   OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_reference"
 elif [ "$USE_BASELINE" = true ]; then
   OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline"
+elif [ "$USE_AUDIT_VANILLA" = true ]; then
+  OUTPUT_DIR="$BUILD_DIR/audit_output/$APP_NAME"
 else
   OUTPUT_DIR="$BUILD_DIR/validation_output/$APP_NAME"
 fi
@@ -217,9 +237,91 @@ CMD="python -m validation.veloc.validate \
   $COMPARISON \
   $BENCH_CONFIG"
 
+# Reference-mode benchmarks: force vanilla input files to take precedence over
+# the reference checkpointed code's own.  Reference upstream inputs are tuned
+# for tiny demo scales (e.g. Athena++ blast: 1 mesh block) and fail or run a
+# different workload than vanilla under our scenarios.
+#
+# If a per-app reference input patch exists at tests/apps/patches/<APP>/, we
+# also build a tmp overlay (vanilla + patch) and pass it as the highest-
+# priority input source.  This injects the extra parameters needed to enable
+# the reference's native checkpoint mechanism (e.g. <output3> file_type=rst
+# for Athena++) so the resilient run actually writes checkpoint files we can
+# measure.  See tests/apps/patches/README.md for the convention.
+_REF_OVERLAY_DIR=""
+if [ "$USE_REFERENCE" = true ]; then
+  CMD="$CMD --reference-input-priority"
+  _REF_PATCH_DIR="$REPO_ROOT/tests/apps/patches/$APP_NAME"
+  if [ -d "$_REF_PATCH_DIR" ]; then
+    _REF_OVERLAY_DIR=$(mktemp -d -t "ref_input_overlay.${APP_NAME}.XXXXXX")
+    # Layer vanilla first (full input tree), then patch (sparse, overwrites).
+    cp -a "$ORIGINAL_SRC/." "$_REF_OVERLAY_DIR/"
+    cp -a "$_REF_PATCH_DIR/." "$_REF_OVERLAY_DIR/"
+    CMD="$CMD --reference-input-overlay-dir $_REF_OVERLAY_DIR"
+    echo "  Reference input overlay: $_REF_OVERLAY_DIR"
+    echo "    (vanilla + patches from $_REF_PATCH_DIR)"
+  fi
+fi
+# Make sure the overlay is cleaned up when run_validate.sh exits.
+_cleanup_overlay() {
+  if [ -n "$_REF_OVERLAY_DIR" ] && [ -d "$_REF_OVERLAY_DIR" ]; then
+    rm -rf "$_REF_OVERLAY_DIR"
+  fi
+}
+trap _cleanup_overlay EXIT INT TERM
+
+# When the resilient build produces a different binary name than vanilla
+# (e.g. ROSS: vanilla 'phold' vs resilient 'pholdio'), pass it explicitly.
+if [ -n "${RESILIENT_EXE:-}" ] && [ "$RESILIENT_EXE" != "$EXE_NAME" ]; then
+  CMD="$CMD --resilient-executable-name \"$RESILIENT_EXE\""
+fi
+
 # Append original/resilient args if set
 if [ -n "$APP_ARGS" ]; then
   CMD="$CMD --original-args \"$APP_ARGS\" --resilient-args \"$APP_ARGS\""
+fi
+
+# Pass num_procs from app.yaml so apps with restrictive rank counts (e.g.
+# HyPar's 1D/FPDoubleWell example pinned to iproc=1) honor that in the
+# correctness stage.  Benchmarks already drive their own num_procs via the
+# per-scenario JSON.
+if [ -n "${NUM_PROCS_FROM_YAML:-}" ]; then
+  CMD="$CMD --num-procs $NUM_PROCS_FROM_YAML"
+fi
+
+# Pass app_input_subdir so the runner knows where to find input data files
+# for apps whose run.cmd starts with `cd <subdir> && mpirun ...` (SPARTA,
+# SPPARKS, HyPar, OpenLB, MMSP, QMCPACK).  The contents of that subdirectory
+# are flattened into the per-run cwd so the binary finds inputs by simple
+# cwd-relative names.
+if [ -n "${APP_INPUT_SUBDIR:-}" ]; then
+  CMD="$CMD --app-input-subdir \"$APP_INPUT_SUBDIR\""
+fi
+
+# Pass per-app injection_delay override when set in app.yaml (run.injection_delay).
+# Useful when the adaptive 1/3-of-baseline default would overshoot the resilient
+# run because system load makes baseline much slower than resilient (CLAMR).
+# Skip if user already supplied --injection-delay on the command line.
+if [ -n "${INJECTION_DELAY_FROM_YAML:-}" ] && ! [[ "$*" =~ "--injection-delay" ]]; then
+  CMD="$CMD --injection-delay $INJECTION_DELAY_FROM_YAML"
+fi
+
+# In audit-vanilla mode the resilient source is the same vanilla, so the
+# resilient build command must match the original.  Without this override the
+# resilient side would either lack a build command or pick up a stale
+# ckpt_build_cmd from app.yaml (none should exist on a properly-stripped
+# vanilla, but be defensive).  We also force the report/benchmark stages off
+# since the audit only cares about correctness + the resilience proof, and we
+# discard per-app injection_delay overrides — those are tuned for production
+# runs (often early kills to stress recovery) and would defeat the audit's
+# 0.95×baseline late-kill policy that makes the wall-time bound discriminating.
+if [ "$USE_AUDIT_VANILLA" = true ]; then
+  RESILIENT_BUILD_CMD="$ORIGINAL_BUILD_CMD"
+  INJECTION_DELAY_FROM_YAML=""
+  # --vanilla-audit switches the correctness stage to Validation A
+  # (accuracy vs reference + non-recovery signal); validate.py auto-derives
+  # the reference path from tests/apps/vanillas/<APP> → tests/apps/checkpointed/<APP>.
+  CMD="$CMD --skip-benchmarks --skip-report --vanilla-audit"
 fi
 
 # Append any extra user args
@@ -260,7 +362,12 @@ trap _cleanup EXIT INT TERM
 # "run_validate.sh --reference miniVite"), causing self-kill.
 pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
 
-eval $CMD
+# Quote $CMD so embedded `"   pattern   "` (multi-space-leading patterns from
+# app.yaml's keep_patterns) survive word-splitting.  Without quotes bash drops
+# the inner double-quotes during word-split, collapsing leading whitespace and
+# breaking apps whose stable comparison line is identified by indentation
+# (LAMMPS' "      2000", SPARTA's "   20000").
+eval "$CMD"
 _exit=$?
 
 exit $_exit

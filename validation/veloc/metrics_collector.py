@@ -77,6 +77,18 @@ class BenchmarkScenario:
     num_runs: int = 3               # repetitions for statistical stability
     injection_delay: float = 5.0
     max_attempts: int = 10
+    # Number of distinct failures injected within ONE run (Interpretation C
+    # of "failure frequency" — see ISSUES.md #4).  Default 1 reproduces the
+    # original correctness-test behavior; set higher to drive low/mid/high
+    # failure rates per single run.
+    failures_per_run: int = 1
+    # Optional per-codebase overrides for app_args.  Used when the vanilla
+    # binary takes different flags than the resilient one (e.g. ROSS:
+    # phold vs pholdio with --io-store=1; QMCPACK: he_simple_opt.xml vs
+    # he_simple_opt_ckpt.xml).  When set, takes precedence over `app_args`
+    # for that codebase.  Default None falls back to `app_args`.
+    original_app_args: list[str] | None = None
+    resilient_app_args: list[str] | None = None
 
 
 @dataclass
@@ -190,6 +202,13 @@ def load_benchmark_config(
             num_runs = int(entry["num_runs"])
         else:
             num_runs = default_num_runs
+        # Optional per-codebase overrides — let vanilla vs resilient run
+        # different binaries / different inputs without forking the scenario.
+        def _expand_list(raw: list | None) -> list[str] | None:
+            if raw is None:
+                return None
+            return [_expand_arg(str(a)) for a in raw]
+
         scenarios.append(
             BenchmarkScenario(
                 name=entry["name"],
@@ -199,6 +218,9 @@ def load_benchmark_config(
                 num_runs=num_runs,
                 injection_delay=float(entry.get("injection_delay", 5.0)),
                 max_attempts=int(entry.get("max_attempts", 10)),
+                failures_per_run=int(entry.get("failures_per_run", 1)),
+                original_app_args=_expand_list(entry.get("original_app_args")),
+                resilient_app_args=_expand_list(entry.get("resilient_app_args")),
             )
         )
     if not scenarios:
@@ -306,6 +328,54 @@ def _measure_checkpoint_size(veloc_cfg_path: Path) -> int | None:
     return total
 
 
+def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
+    """Sum bytes of checkpoint-pattern files under *run_cwd* for apps whose
+    checkpoint logic writes to cwd-relative paths (POSIX).  Used as a fallback
+    when no veloc.cfg is present (every reference app in our suite, as well
+    as agent-generated baselines that opt into cwd-relative writes).
+
+    Returns 0 (not None) when the dir exists but has no matching files, so
+    raw_metrics distinguishes "no measurement attempted" (None) from
+    "measured, found nothing" (0).
+    """
+    if not run_cwd.is_dir():
+        return None
+    # All patterns lowercase: filename is lowercased at the match site below,
+    # so an uppercase pattern (e.g. legacy "Blast.") would never match.
+    # Per-app native checkpoint conventions covered:
+    #   ckpt / veloc / checkpoint / _state- / restart. / .sstcpt — generic
+    #   .rst                                                    — Athena++ HDF5 restart
+    #   comd_state                                              — CoMD POSIX state files
+    #   prk_stencil_state                                       — PRK Stencil POSIX
+    #   chk                                                     — AMReX checkpoint dirs (WarpX, Nyx)
+    #   plt                                                     — AMReX plotfile dirs (also count as state)
+    #   .h5 / .hdf5                                             — generic HDF5 (Smilei dump-*, SW4lite *.cycle.*)
+    #   .cont.xml                                               — QMCPACK continuation
+    #   restart_dir / sstcpt                                    — SAMRAI / SST
+    PATTERNS = ("ckpt", "veloc", ".rst", "checkpoint", "_state-",
+                "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
+                "test.0", "test.1", "test.2", "test.3", "test.4",
+                "test.5", "test.6", "test.7", "test.8", "test.9",
+                "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
+                "restart_dir", "dump-")
+    EXCLUDE = ("injection_success.flag", "stdout", "stderr", ".gitkeep",
+               "_validate", ".log", ".txt", ".yaml", ".cfg", ".json",
+               "athinput", "in.", ".vtk", ".tab", ".hst")
+    total = 0
+    for f in run_cwd.rglob("*"):
+        try:
+            if not f.is_file() or f.is_symlink():
+                continue
+            n = f.name.lower()
+            if any(e in n for e in EXCLUDE):
+                continue
+            if any(p in n for p in PATTERNS):
+                total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Recovery time estimation
 # ---------------------------------------------------------------------------
@@ -405,16 +475,49 @@ def _run_scenario_once(
     run_install: bool = False,
     install_prefix: str | None = None,
     dmtcp_coord_port: int = 0,
+    app_input_subdir: str | None = None,
+    extra_source_dirs: list[Path] | None = None,
+    priority_source_dirs: list[Path] | None = None,
 ) -> RunMetrics:
-    """Execute one run of *scenario* for *codebase* and collect metrics."""
+    """Execute one run of *scenario* for *codebase* and collect metrics.
+
+    *app_input_subdir* and *extra_source_dirs* mirror the correctness-mode
+    runner: when set, the contents of ``source_dir/<app_input_subdir>`` are
+    flattened into the per-run cwd (covers SPARTA, SPPARKS, HyPar, OpenLB,
+    MMSP, QMCPACK, HPCG whose ``run.cmd`` uses ``cd <subdir> && ...``), and
+    the extra source dirs are searched as fallbacks when an input file is
+    missing under *source_dir* (covers LAMMPS' ``bench/in.lj_long`` which
+    lives only in the vanilla source).
+    """
     from .runner import _symlink_input_data
+
+    # Per-codebase app_args override (for apps where vanilla and resilient
+    # take different flags or input files — ROSS, QMCPACK, LAMMPS).
+    if codebase == "original" and scenario.original_app_args is not None:
+        effective_args = scenario.original_app_args
+    elif codebase == "resilient" and scenario.resilient_app_args is not None:
+        effective_args = scenario.resilient_app_args
+    else:
+        effective_args = scenario.app_args
 
     run_output_dir = output_dir / codebase / scenario.name / f"run_{run_index}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Symlink input data files referenced by relative paths in app_args
-    # so they resolve from the benchmark output directory.
-    _symlink_input_data(source_dir, build_dir, run_output_dir, scenario.app_args)
+    # so they resolve from the benchmark output directory.  The subdir-flatten
+    # and extra-source-dir fallback are skipped for the *original* codebase
+    # (no fallback search makes sense) but kept for any other codebase.
+    # priority_source_dirs is only meaningful for non-original codebases, where
+    # we want to force input files from a different tree (e.g. vanilla inputs
+    # winning over reference's upstream-default inputs that are tuned for a
+    # smaller demo workload — see Athena++ blast: vanilla 200x200 AMR vs
+    # reference 50x100 demo, mesh-block / rank mismatch on the latter).
+    _symlink_input_data(
+        source_dir, build_dir, run_output_dir, effective_args,
+        extra_source_dirs=extra_source_dirs if codebase != "original" else None,
+        input_subdir=app_input_subdir,
+        priority_source_dirs=priority_source_dirs if codebase != "original" else None,
+    )
 
     # Locate veloc.cfg for checkpoint size measurement (resilient only).
     veloc_cfg: Path | None = None
@@ -438,7 +541,7 @@ def _run_scenario_once(
                 build_dir=build_dir,
                 executable_name=executable_name,
                 num_procs=scenario.num_procs,
-                app_args=scenario.app_args,
+                app_args=effective_args,
                 output_dir=run_output_dir,
                 ckpt_dir=ckpt_dir,
                 coord_port=coord_port,
@@ -454,7 +557,7 @@ def _run_scenario_once(
                 build_dir=build_dir,
                 executable_name=executable_name,
                 num_procs=scenario.num_procs,
-                app_args=scenario.app_args,
+                app_args=effective_args,
                 output_dir=run_output_dir,
                 ckpt_dir=ckpt_dir,
                 coord_port=coord_port,
@@ -490,7 +593,7 @@ def _run_scenario_once(
                 build_dir=build_dir,
                 executable_name=executable_name,
                 num_procs=scenario.num_procs,
-                app_args=scenario.app_args,
+                app_args=effective_args,
                 output_dir=run_output_dir,
                 ckpt_dir=ckpt_dir,
                 injection_delay=scenario.injection_delay,
@@ -504,7 +607,7 @@ def _run_scenario_once(
                 build_dir=build_dir,
                 executable_name=executable_name,
                 num_procs=scenario.num_procs,
-                app_args=scenario.app_args,
+                app_args=effective_args,
                 output_dir=run_output_dir,
                 ckpt_dir=ckpt_dir,
                 run_cwd=run_output_dir,
@@ -527,27 +630,39 @@ def _run_scenario_once(
         # ── Resilient run with failure injection ───────────────────────
         # Memory is monitored per-attempt inside run_with_failure_injection;
         # samples are accumulated across all attempts and returned via
-        # result.memory_samples_bytes.
+        # result.memory_samples_bytes.  ``failures_per_run`` controls the
+        # failure-frequency axis (1 = low, 3 = mid, 6 = high in the standard
+        # benchmark matrix).
         result = run_with_failure_injection(
             source_dir=source_dir,
             build_dir=build_dir,
             output_dir=run_output_dir,
             executable_name=executable_name,
             num_procs=scenario.num_procs,
-            app_args=scenario.app_args,
+            app_args=effective_args,
             max_attempts=scenario.max_attempts,
             injection_delay=scenario.injection_delay,
+            target_failures=scenario.failures_per_run,
             run_install=run_install,
             veloc_config_name=veloc_config_name,
-            require_injection=False,  # benchmarking: OK if app finishes before injection
+            require_injection=False,  # benchmarking: OK if some injections miss
             memory_monitor_fn=_monitor_memory_samples,
             memory_stop_event=mem_stop_event,
             memory_samples_holder=mem_samples_holder,
+            app_input_subdir=app_input_subdir,
+            extra_source_dirs=extra_source_dirs,
         )
-        # VeloC checkpoint size.
+        # Checkpoint size.  Prefer VeloC scratch/persistent total when a
+        # veloc.cfg is present; otherwise fall back to scanning the per-run
+        # cwd for POSIX-style checkpoint files (matches how every reference
+        # app and many agent baselines store state).
         ckpt_size = None
         if veloc_cfg is not None:
             ckpt_size = _measure_checkpoint_size(veloc_cfg)
+        if ckpt_size is None or ckpt_size == 0:
+            posix_size = _measure_posix_checkpoint_size(run_output_dir)
+            if posix_size:
+                ckpt_size = posix_size
 
     else:
         # ── Clean run (no failure injection) ───────────────────────────
@@ -557,7 +672,7 @@ def _run_scenario_once(
             build_dir=build_dir,
             executable_name=executable_name,
             num_procs=scenario.num_procs,
-            app_args=scenario.app_args,
+            app_args=effective_args,
             output_dir=run_output_dir,
             run_cwd=run_output_dir,
             veloc_config_sources=veloc_sources,
@@ -576,10 +691,16 @@ def _run_scenario_once(
                 exit_code=result.exit_code,
                 output_dir=run_output_dir,
             )
-        # VeloC checkpoint size (resilient clean runs only).
+        # Checkpoint size for resilient clean runs (same VeloC-or-POSIX
+        # fallback as the failure-injection branch).
         ckpt_size = None
-        if veloc_cfg is not None:
-            ckpt_size = _measure_checkpoint_size(veloc_cfg)
+        if codebase == "resilient":
+            if veloc_cfg is not None:
+                ckpt_size = _measure_checkpoint_size(veloc_cfg)
+            if ckpt_size is None or ckpt_size == 0:
+                posix_size = _measure_posix_checkpoint_size(run_output_dir)
+                if posix_size:
+                    ckpt_size = posix_size
 
     # Memory samples: prefer result.memory_samples_bytes (filled by
     # run_with_failure_injection / dmtcp runners), fall back to
@@ -749,6 +870,8 @@ def run_benchmark_sweep(
     extra_approaches: list[ApproachConfig] | None = None,
     original_build_cmd: str | None = None,
     resilient_build_cmd: str | None = None,
+    app_input_subdir: str | None = None,
+    resilient_priority_source_dirs: list[Path] | None = None,
 ) -> BenchmarkResults:
     """Execute all scenarios for all codebases and collect RunMetrics.
 
@@ -911,6 +1034,7 @@ def run_benchmark_sweep(
                     output_dir=benchmarks_dir,
                     executable_name=original_executable_name,
                     veloc_config_name=veloc_config_name,
+                    app_input_subdir=app_input_subdir,
                 )
                 all_runs.append(orig_metrics)
                 completed_keys.add(orig_key)
@@ -943,6 +1067,9 @@ def run_benchmark_sweep(
                     executable_name=resilient_executable_name,
                     veloc_config_name=veloc_config_name,
                     run_install=install_resilient,
+                    app_input_subdir=app_input_subdir,
+                    extra_source_dirs=[original_source_dir],
+                    priority_source_dirs=resilient_priority_source_dirs,
                 )
                 all_runs.append(res_metrics)
                 completed_keys.add(res_key)
@@ -980,6 +1107,8 @@ def run_benchmark_sweep(
                         executable_name=a_exe,
                         dmtcp_coord_port=coord_port,
                         install_prefix=approach.install_prefix,
+                        app_input_subdir=app_input_subdir,
+                        extra_source_dirs=[original_source_dir],
                     )
                     all_runs.append(a_metrics)
                     completed_keys.add(a_key)

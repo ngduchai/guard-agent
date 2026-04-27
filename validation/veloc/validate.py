@@ -811,6 +811,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip the graphical reporting stage.",
     )
     ctrl_grp.add_argument(
+        "--reference-input-priority",
+        action="store_true",
+        help=(
+            "When the resilient codebase is the upstream reference (rather "
+            "than LLM-modified vanilla), force vanilla input files to take "
+            "precedence over the reference's own. Required for reference "
+            "benchmarks because reference inputs are tuned to the upstream "
+            "demo scale (e.g. Athena++ blast: 1 mesh block, fails with 4 "
+            "ranks). No-op for --baseline (LLM-modified) runs."
+        ),
+    )
+    ctrl_grp.add_argument(
+        "--reference-input-overlay-dir",
+        default=None,
+        help=(
+            "Optional directory whose input files take HIGHER precedence "
+            "than vanilla and reference for the resilient (reference) run. "
+            "Used to apply per-app reference input patches that enable the "
+            "app's native checkpoint mechanism (e.g. Athena++ <output3> "
+            "file_type=rst block) so checkpoint_size_bytes is non-zero. "
+            "Typically built at run time by run_validate.sh as a tmp overlay "
+            "of (vanilla + tests/apps/patches/<APP>). No-op when "
+            "--reference-input-priority is unset."
+        ),
+    )
+    ctrl_grp.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -1796,6 +1822,27 @@ def _stage_benchmarks(
             else 3,
         )
 
+    # Reference-mode (--reference-input-priority): force vanilla input files to
+    # take precedence over the resilient codebase's own.  Used when the
+    # "resilient" arm is the upstream reference checkpointed code (different
+    # input file conventions than vanilla — e.g. Athena++ reference's blast
+    # input uses 1 mesh block, fails with 4 ranks; SW4lite reference uses
+    # tlim=2 vs vanilla's tlim=15).  Without this, the reference run would
+    # crash on startup or run a completely different (smaller) workload than
+    # vanilla, making the benchmark uninformative.  No-op for --baseline
+    # (LLM-modified) runs because the LLM may have legitimately created or
+    # modified input files that we want it to use.
+    #
+    # An optional --reference-input-overlay-dir adds an even-higher-priority
+    # source above vanilla, used to inject per-app patches that enable the
+    # reference's native checkpoint output (so checkpoint_size_bytes > 0).
+    resilient_priority: list[Path] = []
+    overlay_dir = getattr(args, "reference_input_overlay_dir", None)
+    if overlay_dir:
+        resilient_priority.append(Path(overlay_dir))
+    if getattr(args, "reference_input_priority", False):
+        resilient_priority.append(original_src)
+    resilient_priority_param: list[Path] | None = resilient_priority or None
     return run_benchmark_sweep(
         original_source_dir=original_src,
         original_build_dir=original_build,
@@ -1812,6 +1859,7 @@ def _stage_benchmarks(
         original_build_cmd=_resolve_build_cmd(getattr(args, 'original_build_cmd', None)),
         resilient_build_cmd=_resolve_build_cmd(getattr(args, 'resilient_build_cmd', None)),
         app_input_subdir=getattr(args, 'app_input_subdir', None),
+        resilient_priority_source_dirs=resilient_priority_param,
     )
 
 
