@@ -261,6 +261,24 @@ if [ "$USE_REFERENCE" = true ]; then
     echo "  Reference input overlay: $_REF_OVERLAY_DIR"
     echo "    (vanilla + patches from $_REF_PATCH_DIR)"
   fi
+  # Per-app env-var-driven checkpoint enables.  Some reference apps
+  # (HPCG, PRK_Stencil) read checkpoint cadence from env vars rather
+  # than an input file, so a patch is N/A — we set them here instead.
+  case "$APP_NAME" in
+    HPCG)
+      # HPCG reference's src/hpcg_ckpt.cpp reads CKPT_EVERY/HPCG_FIXED_SETS.
+      # CKPT_EVERY=10 fires within first 10 CG-sets, well before injection.
+      export CKPT_EVERY=10
+      export HPCG_FIXED_SETS=180
+      echo "  Reference env: CKPT_EVERY=$CKPT_EVERY HPCG_FIXED_SETS=$HPCG_FIXED_SETS"
+      ;;
+    PRK_Stencil)
+      # PRK Stencil reference reads CKPT_EVERY (default 500).  Tighten so
+      # first per-rank state file lands well before failure injection.
+      export CKPT_EVERY=200
+      echo "  Reference env: CKPT_EVERY=$CKPT_EVERY"
+      ;;
+  esac
 fi
 # Make sure the overlay is cleaned up when run_validate.sh exits.
 _cleanup_overlay() {
