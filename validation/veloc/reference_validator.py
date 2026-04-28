@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -187,12 +188,18 @@ def _filter_lines(
     text: str,
     ignore_patterns: list[str],
     keep_patterns: list[str] | None = None,
+    strip_patterns: list[str] | None = None,
 ) -> str:
     """Filter output lines for comparison.
 
     If ``keep_patterns`` is non-empty, only lines matching at least one
     keep pattern survive (allowlist).  ``ignore_patterns`` is ignored in
     this case (with a warning if both are specified).
+
+    If ``strip_patterns`` is non-empty, each surviving line has every
+    matching regex substring removed (replaced with empty string) BEFORE
+    the comparison runs.  Used to strip volatile substrings (timestamps,
+    rank IDs, hostnames) without dropping the whole line.
     """
     lines = text.splitlines()
     if keep_patterns and ignore_patterns:
@@ -201,6 +208,14 @@ def _filter_lines(
         lines = [ln for ln in lines if any(pat in ln for pat in keep_patterns)]
     elif ignore_patterns:
         lines = [ln for ln in lines if not any(pat in ln for pat in ignore_patterns)]
+    if strip_patterns:
+        compiled = [re.compile(p) for p in strip_patterns]
+        out = []
+        for ln in lines:
+            for c in compiled:
+                ln = c.sub("", ln)
+            out.append(ln)
+        lines = out
     return "\n".join(lines)
 
 
@@ -213,6 +228,7 @@ def _compare_outputs(
     test_file: str | None = None,
     ignore_patterns: list[str] | None = None,
     keep_patterns: list[str] | None = None,
+    strip_patterns: list[str] | None = None,
 ) -> ComparisonResult:
     """Compare golden output against test output."""
     if golden_file and test_file:
@@ -225,8 +241,9 @@ def _compare_outputs(
 
     patterns = ignore_patterns or []
     keeps = keep_patterns or []
-    golden_filtered = _filter_lines(golden_stdout, patterns, keeps or None)
-    test_filtered = _filter_lines(test_stdout, patterns, keeps or None)
+    strips = strip_patterns or None
+    golden_filtered = _filter_lines(golden_stdout, patterns, keeps or None, strips)
+    test_filtered = _filter_lines(test_stdout, patterns, keeps or None, strips)
 
     if method == "text":
         passed = golden_filtered.strip() == test_filtered.strip()
