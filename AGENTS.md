@@ -566,15 +566,6 @@ The `tests/apps/checkpointed/` directory contains **reference implementations** 
 - Do not change build commands, source files, or configuration in reference apps
 - If a reference app does not build or run correctly, report the issue — do not patch it
 
-### Vanilla code is derived from reference
-
-The `tests/apps/vanillas/` directory contains **vanilla versions** — reference code with checkpoint/restart logic removed. These represent the "before" state that the guard-agent will transform.
-
-- Vanilla code is created by removing checkpoint logic from the reference implementation
-- Only `app.yaml`, `prompt.txt`, and build system wrappers (`CMakeLists.txt`) may be added to vanillas
-- Build system changes (CMakeLists.txt, Makefile modifications for portability) are allowed in vanillas
-- Application source code (`.c`, `.cpp`, `.h`, `.hpp`, `.f90`) must not be modified beyond checkpoint removal
-
 ### Application selection criteria
 
 Every benchmark application **must** have native checkpoint/restart support in its original upstream source. An application qualifies only if:
