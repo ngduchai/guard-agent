@@ -33,12 +33,20 @@ def parse_run_cmd(run_cmd: str, mpi_ranks: int = 4) -> tuple[str, str, str]:
       "mpirun --oversubscribe -np {mpi_ranks} ./_build/app args"
       "./_build/Tests/CLZ/3d/Test_CLZ_3d"
       "LD_LIBRARY_PATH=... mpirun -np {mpi_ranks} ./app args"
+      "cd <subdir> && mpirun -np {mpi_ranks} ./app args"
+      "cd <subdir> && LD_LIBRARY_PATH=... mpirun -np {mpi_ranks} ./app args"
     """
     # Substitute {mpi_ranks}
     cmd = run_cmd.replace("{mpi_ranks}", str(mpi_ranks))
 
+    # Strip leading "cd <subdir> && " prefix.  The subdir itself is recovered
+    # via extract_input_subdir() and forwarded as --app-input-subdir; here we
+    # only need the post-cd command so executable/args parsing isn't fooled
+    # into returning "cd" as the executable.
+    cmd_stripped = re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", cmd)
+
     # Strip env var prefixes (FOO=bar ...)
-    tokens = cmd.split()
+    tokens = cmd_stripped.split()
     start = 0
     for i, t in enumerate(tokens):
         if "=" in t and not t.startswith("-"):
