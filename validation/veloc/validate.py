@@ -997,10 +997,14 @@ def _stage_correctness(
         # (e.g. one checkpoint per inner loop iteration) can hang for hours
         # instead of failing fast.  Floor of 60 s so very short baselines
         # still leave room for normal startup variance.
-        attempt_timeout_s = max(60.0, baseline_elapsed * 3.0)
+        # Per-attempt cap: 3× baseline, floor 60s, ABSOLUTE CEILING 900s
+        # (15 min).  No legitimate attempt — even with one failure
+        # injection — should exceed 15 min, since failure-free is < 5 min
+        # and recovery doubles wall time at most.
+        attempt_timeout_s = min(900.0, max(60.0, baseline_elapsed * 3.0))
         print(
             f"[validate] Per-attempt wallclock cap: {attempt_timeout_s:.1f}s "
-            f"(3x baseline, floor 60s)",
+            f"(3x baseline, floor 60s, ceiling 900s)",
             flush=True,
         )
         fp_result = run_with_failure_injection(
@@ -1032,7 +1036,9 @@ def _stage_correctness(
         # Recovery timeout: 1.5x baseline, with a 60 s floor so MPI startup
         # + recovery has room on very short baselines (e.g. CoMD ~10 s)
         # without tripping the safety kill before recovery can even begin.
-        recovery_timeout_s = max(60.0, baseline_elapsed * 1.5)
+        # Recovery cap: 1.5× baseline, floor 60s, ABSOLUTE CEILING 900s
+        # (15 min) — same ceiling as legacy attempt timeout.
+        recovery_timeout_s = min(900.0, max(60.0, baseline_elapsed * 1.5))
         print(
             f"[validate] Checkpoint-observed config: poll after "
             f"{baseline_elapsed * 0.5:.1f}s (50% of baseline), "
@@ -1122,6 +1128,9 @@ def _stage_correctness(
         run_cwd=resilient_clean_out,
         veloc_config_sources=[resilient_src, resilient_build],
         veloc_config_name=args.veloc_config_name,
+        # 5-minute hard cap on failure-free runs.  No app's failure-free
+        # baseline exceeds 2-3 min; anything > 5 min is an LLM runaway.
+        timeout_s=300.0,
     )
     if not clean_result.succeeded:
         print(
