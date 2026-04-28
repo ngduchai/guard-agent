@@ -77,10 +77,13 @@ class BenchmarkScenario:
     num_runs: int = 3               # repetitions for statistical stability
     injection_delay: float = 5.0
     max_attempts: int = 10
-    # Number of distinct failures injected within ONE run (Interpretation C
-    # of "failure frequency" — see ISSUES.md #4).  Default 1 reproduces the
-    # original correctness-test behavior; set higher to drive low/mid/high
-    # failure rates per single run.
+    # Cap on injections within ONE run.  Default 1 = the "once" scenario
+    # (single mid-run failure).  This field is intentionally NOT meant to
+    # be set in benchmark_configs JSON — failure frequency should be driven
+    # by injection_delay (the inter-failure period); how many failures
+    # actually fire is a measured statistic, not a configured cap.  Kept
+    # here as a safety bound to prevent runaway injection in pathological
+    # scenarios (e.g. injection_delay too small relative to recovery time).
     failures_per_run: int = 1
     # Optional per-codebase overrides for app_args.  Used when the vanilla
     # binary takes different flags than the resilient one (e.g. ROSS:
@@ -812,9 +815,13 @@ def _run_scenario_once(
         # ── Resilient run with failure injection ───────────────────────
         # Memory is monitored per-attempt inside run_with_failure_injection;
         # samples are accumulated across all attempts and returned via
-        # result.memory_samples_bytes.  ``failures_per_run`` controls the
-        # failure-frequency axis (1 = low, 3 = mid, 6 = high in the standard
-        # benchmark matrix).
+        # result.memory_samples_bytes.  ``failures_per_run`` defaults to 1
+        # (the "once" scenario — single mid-run failure).  For higher-frequency
+        # scenarios (multi/burst), the inter-failure period is set by
+        # injection_delay (e.g. T_golden/4 for multi); the runner stops
+        # injecting at the first of {max_attempts, run completion}.  How many
+        # failures actually fire is the measurement output, not a configured
+        # cap.
         result = run_with_failure_injection(
             source_dir=source_dir,
             build_dir=build_dir,
