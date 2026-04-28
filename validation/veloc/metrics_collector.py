@@ -447,39 +447,51 @@ def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
     return total
 
 
-_FRAME_SUFFIX_RE = re.compile(r"[._-]?\d+(?=(\.[a-z0-9]+)?$)", re.IGNORECASE)
-_AMREX_DIR_RE = re.compile(r"^(chk|plt)\d+", re.IGNORECASE)
+_FRAME_SUFFIX_RE = re.compile(r"[._-](\d+)(?=(\.[a-z0-9]+)?$)", re.IGNORECASE)
+_AMREX_DIR_RE = re.compile(r"^(chk|plt)(\d+)", re.IGNORECASE)
 
 
-def _frame_key(path: Path, run_cwd: Path) -> str:
-    """Return a 'frame group' key for *path*.  Files belonging to the same
-    checkpoint write event collapse to the same key.
+def _frame_key(path: Path, run_cwd: Path, num_procs: int = 4) -> str:
+    """Return a 'frame group' key for *path*.
 
-    Heuristics:
-      * AMReX dirs ``chk00050/...`` / ``plt00100/...`` → frame = first dir
-        component (strip trailing digits to ``chk`` / ``plt``).
-      * Numbered files ``restart.sparta.5000`` / ``backup00500.crx`` /
-        ``Blast.00001.rst`` → strip the numeric segment from the basename.
-      * Per-rank files ``CoMD_state-2.txt`` / ``hpcg_ckpt.0003`` →
-        strip rank-tail digits.  Files in the same checkpoint event
-        across N ranks group together as ONE frame.
+    A "frame" = a complete checkpoint write event.  Files written by N ranks
+    at the SAME timestep belong to the same frame; files at DIFFERENT
+    timesteps are different frames.
+
+    Heuristics (in priority order):
+      1. AMReX dirs ``chk00050/<rank-files>`` → key = "chk00050"
+         (each chk* dir = one frame; per-rank files inside collapse).
+      2. Numbered file ``<base>.<N>`` or ``<base>_<N>``:
+         * If N is "small" (≤ 2 × num_procs) → looks like a rank ID.
+           Files in the same group share a frame: key = "<base>".
+         * If N is "large" (> 2 × num_procs) → looks like a step number.
+           Each unique N is a separate frame: key = "<base>:<N>".
     """
     try:
         rel = path.relative_to(run_cwd)
     except ValueError:
         rel = path
-    # Top-level dir component when it matches AMReX chk/plt convention.
     parts = rel.parts
+    # AMReX: top-level dir like "chk00050" — keep the digits in the key.
     if parts:
         m = _AMREX_DIR_RE.match(parts[0])
         if m:
-            # all files inside chk00050/ collapse to "chk"
-            return m.group(1).lower()
-    # Otherwise group by stripped basename.
+            return f"{m.group(1).lower()}{m.group(2)}"
     name = path.name
-    base = _FRAME_SUFFIX_RE.sub("", name)
-    # Drop rank-tail digits (e.g. "CoMD_state-" + digit was already stripped).
-    return f"{rel.parent}/{base}".lower() if rel.parent != Path(".") else base.lower()
+    suffix_match = _FRAME_SUFFIX_RE.search(name)
+    if suffix_match is None:
+        return f"{rel.parent}/{name}".lower() if rel.parent != Path(".") else name.lower()
+    digits = suffix_match.group(1)
+    base = name[: suffix_match.start()] + name[suffix_match.end():]
+    base_key = f"{rel.parent}/{base}".lower() if rel.parent != Path(".") else base.lower()
+    n = int(digits)
+    rank_threshold = max(num_procs * 2, 8)  # generous floor
+    if n <= rank_threshold:
+        # Per-rank file at the (single) latest checkpoint — group across ranks.
+        return base_key
+    else:
+        # Per-step file — separate frame per timestep.
+        return f"{base_key}:{n}"
 
 
 def _measure_posix_checkpoint_metrics(run_cwd: Path) -> dict | None:
