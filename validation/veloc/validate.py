@@ -1241,6 +1241,52 @@ def _stage_correctness(
             flush=True,
         )
 
+    # Test 3: REFERENCE (upstream checkpointed code, cached from audit) vs
+    # resilient (failure-free).  This is the cross-implementation correctness
+    # check: does the LLM-generated resiliency produce output equivalent to
+    # the human-written upstream's output?  If audit's vanilla-vs-reference
+    # accuracy passed, vanilla ≡ reference, so this is logically transitive
+    # with Test 2 — but it's a stronger guard against vanilla-and-LLM both
+    # being wrong in the same way.
+    #
+    # Source: build/audit_output/<APP>/correctness/reference_baseline/<output>
+    # (populated once per app by the audit's Validation A reference run).
+    if resilient_clean_file.exists():
+        ref_cached = None
+        # Audit output path follows pattern: build/audit_output/<APP>/correctness/reference_baseline/<output_file>
+        # Try to derive APP from original_src (tests/apps/vanillas/<APP>) or output_dir.
+        try:
+            parts = list(original_src.parts)
+            if "vanillas" in parts:
+                app = parts[parts.index("vanillas") + 1]
+                ref_candidate = (Path(__file__).resolve().parents[2] /
+                                 "build" / "audit_output" / app /
+                                 "correctness" / "reference_baseline" /
+                                 args.output_file_name)
+                if ref_candidate.exists():
+                    ref_cached = ref_candidate
+        except (ValueError, IndexError):
+            pass
+
+        if ref_cached:
+            print(
+                f"\n[validate] Comparing outputs (REFERENCE upstream vs LLM, failure-free):\n"
+                f"  reference: {ref_cached}\n"
+                f"  resilient: {resilient_clean_file}",
+                flush=True,
+            )
+            result3 = _do_compare("REFERENCE upstream vs LLM, failure-free",
+                                  ref_cached, resilient_clean_file)
+            print(f"[validate] Test 3 (REFERENCE vs LLM, failure-free): {result3}", flush=True)
+            results.append(result3)
+        else:
+            print(
+                f"[validate] Skipping reference-vs-LLM comparison: no cached "
+                f"upstream reference output found at build/audit_output/<APP>/"
+                f"correctness/reference_baseline/  (audit must run first)",
+                flush=True,
+            )
+
     # --- Resilience policy enforcement ---
     # Validation A (vanilla audit): also build the reference checkpointed
     # code, run it failure-free, and compare its output to the vanilla
