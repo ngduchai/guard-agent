@@ -1,16 +1,28 @@
 """
-yaml_to_config.py – Convert app.yaml to the format expected by run_validate.sh.
+yaml_to_config.py – CLI shim that emits per-app config fields for run_validate.sh.
 
 Usage:
     python -m validation.veloc.yaml_to_config <app_yaml_path> <field>
 
+When `<app_yaml_path>` points at a vanilla app.yaml under
+`tests/apps/vanillas/<APP>/`, the script auto-routes to the unified
+single-source-of-truth at `tests/apps/configs/<APP>.yaml` instead of
+reading the legacy app.yaml.  This way consumers that already pass an
+app.yaml path (run_validate.sh, etc.) automatically pick up the unified
+config without any change to the calling code.
+
 Fields:
-    executable_name   – Binary name extracted from run.cmd
-    app_args          – Arguments extracted from run.cmd
-    num_procs         – MPI rank count
-    comparison_flags  – CLI flags for validate.py comparison settings
-    build_cmd         – Build command from app.yaml
-    run_cmd           – Full run command (with {mpi_ranks} substituted)
+    executable_name        – binary basename
+    ckpt_executable_name   – optional resilient binary basename (usually empty)
+    app_args               – validation-size args, space-joined
+    num_procs              – MPI rank count
+    comparison_flags       – CLI flags for validate.py comparison settings
+    build_cmd              – build command
+    ckpt_build_cmd         – build command for resilient binary (defaults to build_cmd)
+    run_cmd                – full run command (with {mpi_ranks} substituted)
+    timeout                – per-run timeout fallback
+    app_input_subdir       – cd-prefix subdir (or empty)
+    injection_delay        – manual injection-delay override (or empty; consumer derives from baseline)
 """
 
 import re
@@ -20,9 +32,89 @@ from pathlib import Path
 import yaml
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+UNIFIED_DIR = REPO_ROOT / "tests" / "apps" / "configs"
+LEGACY_VANILLAS = REPO_ROOT / "tests" / "apps" / "vanillas"
+
+
+def _derive_app_name(yaml_path: str) -> str | None:
+    """If yaml_path is a vanilla app.yaml under tests/apps/vanillas/<APP>/,
+    return APP. Otherwise None (caller falls back to legacy YAML read)."""
+    p = Path(yaml_path).resolve()
+    try:
+        rel = p.relative_to(LEGACY_VANILLAS)
+    except ValueError:
+        return None
+    # rel = "<APP>/app.yaml"
+    if rel.name == "app.yaml" and len(rel.parts) == 2:
+        return rel.parts[0]
+    return None
+
+
 def load_app_yaml(yaml_path: str) -> dict:
+    """Load config dict.
+
+    Auto-routes vanilla app.yaml paths to the unified config file at
+    tests/apps/configs/<APP>.yaml (single source of truth).  Falls back
+    to direct YAML load for any other path.
+    """
+    app = _derive_app_name(yaml_path)
+    if app:
+        unified = UNIFIED_DIR / f"{app}.yaml"
+        if unified.exists():
+            return _unified_to_legacy_view(yaml.safe_load(unified.read_text()), app)
+    # Fallback: read the YAML as-is (preserves the legacy contract)
     with open(yaml_path) as f:
         return yaml.safe_load(f)
+
+
+def _unified_to_legacy_view(unified: dict, app: str) -> dict:
+    """Project the unified-config schema onto the legacy app.yaml schema so
+    downstream code (parse_run_cmd, get_comparison_flags, main()) keeps
+    working unchanged.
+
+    Mapping:
+      unified.executable + unified.input_subdir + sizes.validation.app_args
+        → legacy.run.cmd  (synthesized as
+                           [cd <subdir> && ] mpirun -np {mpi_ranks} <exe> <args>)
+      unified.build.cmd            → legacy.build.cmd
+      unified.mpi_ranks            → legacy.mpi_ranks
+      unified.comparison           → legacy.comparison
+      unified.timeout_fallback_s   → legacy.run.timeout
+      unified.category, language, description, name → mirror as-is
+    """
+    val_args = (unified.get("sizes", {}).get("validation", {}) or {}).get("app_args", [])
+    if val_args is None:
+        val_args = []
+    args_str = " ".join(str(a) for a in val_args)
+    exe = unified.get("executable", "")
+    subdir = unified.get("input_subdir")
+    if subdir:
+        run_cmd = f"cd {subdir} && mpirun -np {{mpi_ranks}} {exe} {args_str}".strip()
+    else:
+        run_cmd = f"mpirun -np {{mpi_ranks}} {exe} {args_str}".strip()
+    return {
+        "name": unified.get("name", app),
+        "category": unified.get("category", ""),
+        "language": unified.get("language", ""),
+        "description": unified.get("description", ""),
+        "mpi_ranks": int(unified.get("mpi_ranks", 4)),
+        "build": {
+            "system": unified.get("build", {}).get("system", "make"),
+            "cmd": unified.get("build", {}).get("cmd", ""),
+        },
+        "run": {
+            "cmd": run_cmd,
+            "timeout": int(unified.get("timeout_fallback_s", 360)),
+        },
+        "comparison": unified.get("comparison", {"method": "text"}),
+        # Optional fields the loader may peek for; keep them None so the
+        # `_read_yaml` callers gracefully default.
+        "ckpt_executable_name": unified.get("ckpt_executable", ""),
+        "ckpt_build": unified.get("ckpt_build", {}),
+        "app_input_subdir": subdir,
+        "injection_delay": unified.get("injection_delay", ""),
+    }
 
 
 def parse_run_cmd(run_cmd: str, mpi_ranks: int = 4) -> tuple[str, str, str]:
