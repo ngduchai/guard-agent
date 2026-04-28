@@ -85,7 +85,10 @@ def tune_one(app: str, dry_run: bool = False) -> dict:
         }
 
     if not dry_run:
-        new_raw = json.dumps(d, indent=2)
+        # ensure_ascii=False so em-dashes / × / → in _comment fields stay as
+        # readable UTF-8 instead of getting escaped to — / × / →
+        # (which would balloon the diff with cosmetic noise)
+        new_raw = json.dumps(d, indent=2, ensure_ascii=False)
         cfg.write_text(new_raw + "\n")
 
     return {
