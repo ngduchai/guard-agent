@@ -101,6 +101,21 @@ class RunMetrics:
     injected: bool
     num_attempts: int
     checkpoint_size_bytes: int | None = None
+    # Per-checkpoint-frame breakdown (so cadence-driven cumulative size can be
+    # normalized for fair comparison).  All three default None when no
+    # checkpoint state is found.
+    #   checkpoint_per_frame_bytes — bytes for ONE complete checkpoint write
+    #     (= the storage you'd need for a single successful recovery).  For
+    #     VeloC: (total / num_versions / num_dirs).  For POSIX: total / number
+    #     of distinct frames inferred by grouping filenames on stripped
+    #     numeric suffix.
+    #   checkpoint_frames_on_disk — how many distinct frames are retained
+    #     end-of-run.  VeloC: max_versions × num_dirs.  POSIX: count of
+    #     distinct stripped-basename groups.
+    #   checkpoint_files_count — raw number of files matched by the scanner.
+    checkpoint_per_frame_bytes: int | None = None
+    checkpoint_frames_on_disk: int | None = None
+    checkpoint_files_count: int | None = None
     recovery_time_s: float | None = None
     peak_memory_bytes: int | None = None    # kept for backward compat with saved data
     memory_samples_bytes: list[int] = field(default_factory=list)
@@ -311,11 +326,49 @@ def load_approaches_config(
 # ---------------------------------------------------------------------------
 
 def _measure_checkpoint_size(veloc_cfg_path: Path) -> int | None:
-    """Sum the total bytes in VeloC scratch/persistent directories."""
+    """Sum the total bytes in VeloC scratch/persistent directories.
+
+    Kept for backwards compatibility — returns just the cumulative byte total.
+    For the per-frame breakdown use :func:`_measure_checkpoint_metrics`.
+    """
+    m = _measure_checkpoint_metrics(veloc_cfg_path)
+    return m["total_bytes"] if m is not None else None
+
+
+def _parse_veloc_max_versions(veloc_cfg_path: Path) -> int:
+    """Return ``max_versions`` from veloc.cfg, defaulting to 3 if absent."""
+    try:
+        for line in veloc_cfg_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            if key.strip() == "max_versions":
+                return int(val.strip())
+    except (OSError, ValueError):
+        pass
+    return 3  # VeloC's documented default
+
+
+def _measure_checkpoint_metrics(veloc_cfg_path: Path) -> dict | None:
+    """Compute VeloC checkpoint metrics: total + per-frame + frame count.
+
+    Returns ``None`` when veloc.cfg has no resolvable scratch/persistent
+    dirs.  Otherwise a dict with:
+        total_bytes:        sum of all bytes in scratch/persistent dirs
+        files_count:        number of files
+        frames_on_disk:     max_versions × num_dirs (configured retention)
+        per_frame_bytes:    total_bytes / frames_on_disk (size of ONE
+                            complete checkpoint write — what you'd need
+                            to recover from a single checkpoint)
+    """
     dirs = extract_checkpoint_dirs_from_veloc_cfg(veloc_cfg_path)
     if not dirs:
         return None
     total = 0
+    file_count = 0
     for d in dirs:
         if not d.exists():
             continue
@@ -323,9 +376,18 @@ def _measure_checkpoint_size(veloc_cfg_path: Path) -> int | None:
             for fname in files:
                 try:
                     total += (Path(root) / fname).stat().st_size
+                    file_count += 1
                 except OSError:
                     pass
-    return total
+    max_versions = _parse_veloc_max_versions(veloc_cfg_path)
+    frames_on_disk = max_versions * len([d for d in dirs if d.exists()])
+    per_frame = (total // frames_on_disk) if (frames_on_disk and total) else None
+    return {
+        "total_bytes": total,
+        "files_count": file_count,
+        "frames_on_disk": frames_on_disk if frames_on_disk else None,
+        "per_frame_bytes": per_frame,
+    }
 
 
 def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
@@ -383,6 +445,98 @@ def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
         except OSError:
             continue
     return total
+
+
+_FRAME_SUFFIX_RE = re.compile(r"[._-]?\d+(?=(\.[a-z0-9]+)?$)", re.IGNORECASE)
+_AMREX_DIR_RE = re.compile(r"^(chk|plt)\d+", re.IGNORECASE)
+
+
+def _frame_key(path: Path, run_cwd: Path) -> str:
+    """Return a 'frame group' key for *path*.  Files belonging to the same
+    checkpoint write event collapse to the same key.
+
+    Heuristics:
+      * AMReX dirs ``chk00050/...`` / ``plt00100/...`` → frame = first dir
+        component (strip trailing digits to ``chk`` / ``plt``).
+      * Numbered files ``restart.sparta.5000`` / ``backup00500.crx`` /
+        ``Blast.00001.rst`` → strip the numeric segment from the basename.
+      * Per-rank files ``CoMD_state-2.txt`` / ``hpcg_ckpt.0003`` →
+        strip rank-tail digits.  Files in the same checkpoint event
+        across N ranks group together as ONE frame.
+    """
+    try:
+        rel = path.relative_to(run_cwd)
+    except ValueError:
+        rel = path
+    # Top-level dir component when it matches AMReX chk/plt convention.
+    parts = rel.parts
+    if parts:
+        m = _AMREX_DIR_RE.match(parts[0])
+        if m:
+            # all files inside chk00050/ collapse to "chk"
+            return m.group(1).lower()
+    # Otherwise group by stripped basename.
+    name = path.name
+    base = _FRAME_SUFFIX_RE.sub("", name)
+    # Drop rank-tail digits (e.g. "CoMD_state-" + digit was already stripped).
+    return f"{rel.parent}/{base}".lower() if rel.parent != Path(".") else base.lower()
+
+
+def _measure_posix_checkpoint_metrics(run_cwd: Path) -> dict | None:
+    """Compute POSIX checkpoint metrics: total + per-frame + frame count.
+
+    Returns ``None`` if dir doesn't exist; otherwise a dict with:
+        total_bytes      — sum of matched file sizes
+        files_count      — number of matched files
+        frames_on_disk   — distinct frames (= recovery snapshots) inferred
+                           by grouping filenames on stripped numeric suffix
+        per_frame_bytes  — total_bytes / frames_on_disk (size of ONE
+                           complete checkpoint write across all ranks)
+    """
+    if not run_cwd.is_dir():
+        return None
+    PATTERNS = ("ckpt", "veloc", ".rst", "checkpoint", "_state-",
+                "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
+                "test.0", "test.1", "test.2", "test.3", "test.4",
+                "test.5", "test.6", "test.7", "test.8", "test.9",
+                "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
+                "restart_dir", "dump-", ".crx", "backup", "op_0",
+                "dump.ising")
+    EXCLUDE = ("injection_success.flag", "stdout", "stderr", ".gitkeep",
+               "_validate", ".log", ".yaml", ".cfg", ".json",
+               "athinput", "in.", ".vtk", ".tab", ".hst")
+    matched: list[tuple[Path, int]] = []
+    for f in run_cwd.rglob("*"):
+        try:
+            if not f.is_file() or f.is_symlink():
+                continue
+            n = f.name.lower()
+            if any(e in n for e in EXCLUDE):
+                continue
+            if any(p in n for p in PATTERNS):
+                matched.append((f, f.stat().st_size))
+        except OSError:
+            continue
+    total = sum(sz for _, sz in matched)
+    if not matched:
+        return {"total_bytes": 0, "files_count": 0,
+                "frames_on_disk": None, "per_frame_bytes": None}
+    # Group by frame-key.  Frame count = unique groups.
+    groups: dict[str, int] = {}
+    for path, sz in matched:
+        k = _frame_key(path, run_cwd)
+        groups[k] = groups.get(k, 0) + sz
+    # Heuristic for "per-frame size": median group total (robust to outliers
+    # like a single large initial-state file vs many small per-step writes).
+    sorted_sizes = sorted(groups.values())
+    n = len(sorted_sizes)
+    median = sorted_sizes[n // 2] if n else 0
+    return {
+        "total_bytes": total,
+        "files_count": len(matched),
+        "frames_on_disk": n,
+        "per_frame_bytes": median,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +739,12 @@ def _run_scenario_once(
                     exit_code=result.exit_code,
                     output_dir=run_output_dir,
                 )
-        # DMTCP checkpoint size.
+        # DMTCP checkpoint size.  Per-frame metrics use POSIX scan of the
+        # ckpt_dir (DMTCP writes one .dmtcp file per process per checkpoint).
         ckpt_size: int | None = dmtcp_measure_checkpoint_size(ckpt_dir)
+        ckpt_metrics = _measure_posix_checkpoint_metrics(ckpt_dir) if ckpt_dir.exists() else None
+        if ckpt_metrics:
+            ckpt_metrics["total_bytes"] = ckpt_size  # trust dmtcp's helper
 
     elif codebase == "criu":
         # ── CRIU run ──────────────────────────────────────────────────
@@ -634,6 +792,9 @@ def _run_scenario_once(
                     output_dir=run_output_dir,
                 )
         ckpt_size = criu_measure_checkpoint_size(ckpt_dir)
+        ckpt_metrics = _measure_posix_checkpoint_metrics(ckpt_dir) if ckpt_dir.exists() else None
+        if ckpt_metrics:
+            ckpt_metrics["total_bytes"] = ckpt_size
 
     elif scenario.inject_failures and codebase == "resilient":
         # ── Resilient run with failure injection ───────────────────────
@@ -661,17 +822,17 @@ def _run_scenario_once(
             app_input_subdir=app_input_subdir,
             extra_source_dirs=extra_source_dirs,
         )
-        # Checkpoint size.  Prefer VeloC scratch/persistent total when a
+        # Checkpoint metrics.  Prefer VeloC scratch/persistent when a
         # veloc.cfg is present; otherwise fall back to scanning the per-run
-        # cwd for POSIX-style checkpoint files (matches how every reference
-        # app and many agent baselines store state).
-        ckpt_size = None
+        # cwd for POSIX-style checkpoint files.
+        ckpt_metrics = None
         if veloc_cfg is not None:
-            ckpt_size = _measure_checkpoint_size(veloc_cfg)
-        if ckpt_size is None or ckpt_size == 0:
-            posix_size = _measure_posix_checkpoint_size(run_output_dir)
-            if posix_size:
-                ckpt_size = posix_size
+            ckpt_metrics = _measure_checkpoint_metrics(veloc_cfg)
+        if ckpt_metrics is None or ckpt_metrics.get("total_bytes", 0) == 0:
+            posix_metrics = _measure_posix_checkpoint_metrics(run_output_dir)
+            if posix_metrics and posix_metrics.get("total_bytes", 0) > 0:
+                ckpt_metrics = posix_metrics
+        ckpt_size = ckpt_metrics.get("total_bytes") if ckpt_metrics else None
 
     else:
         # ── Clean run (no failure injection) ───────────────────────────
@@ -700,16 +861,17 @@ def _run_scenario_once(
                 exit_code=result.exit_code,
                 output_dir=run_output_dir,
             )
-        # Checkpoint size for resilient clean runs (same VeloC-or-POSIX
+        # Checkpoint metrics for resilient clean runs (same VeloC-or-POSIX
         # fallback as the failure-injection branch).
-        ckpt_size = None
+        ckpt_metrics = None
         if codebase == "resilient":
             if veloc_cfg is not None:
-                ckpt_size = _measure_checkpoint_size(veloc_cfg)
-            if ckpt_size is None or ckpt_size == 0:
-                posix_size = _measure_posix_checkpoint_size(run_output_dir)
-                if posix_size:
-                    ckpt_size = posix_size
+                ckpt_metrics = _measure_checkpoint_metrics(veloc_cfg)
+            if ckpt_metrics is None or ckpt_metrics.get("total_bytes", 0) == 0:
+                posix_metrics = _measure_posix_checkpoint_metrics(run_output_dir)
+                if posix_metrics and posix_metrics.get("total_bytes", 0) > 0:
+                    ckpt_metrics = posix_metrics
+        ckpt_size = ckpt_metrics.get("total_bytes") if ckpt_metrics else None
 
     # Memory samples: prefer result.memory_samples_bytes (filled by
     # run_with_failure_injection / dmtcp runners), fall back to
@@ -728,6 +890,9 @@ def _run_scenario_once(
         injected=result.injected,
         num_attempts=result.num_attempts,
         checkpoint_size_bytes=ckpt_size,
+        checkpoint_per_frame_bytes=(ckpt_metrics or {}).get("per_frame_bytes"),
+        checkpoint_frames_on_disk=(ckpt_metrics or {}).get("frames_on_disk"),
+        checkpoint_files_count=(ckpt_metrics or {}).get("files_count"),
         recovery_time_s=None,
         peak_memory_bytes=peak_mem,
         memory_samples_bytes=mem_samples,
