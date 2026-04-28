@@ -28,10 +28,17 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = REPO_ROOT / "tests" / "apps" / "configs"
+FREQUENCIES_FILE = CONFIGS_DIR / "_frequencies.yaml"
 BASELINE_CACHE = REPO_ROOT / "build" / "baseline_cache"
 
 VALID_SIZES = ("validation", "small", "medium", "large")
 VALID_FREQS = ("nofail", "once", "multi", "burst")
+
+
+def load_frequencies() -> dict:
+    """Load the shared failure-injection frequency taxonomy (single source of
+    truth — applies uniformly to ALL apps)."""
+    return yaml.safe_load(FREQUENCIES_FILE.read_text())["frequencies"]
 
 
 @dataclass
@@ -78,8 +85,8 @@ def load_unified(app: str) -> dict:
 
 
 def list_apps() -> list[str]:
-    """All apps with a unified config."""
-    return sorted(p.stem for p in CONFIGS_DIR.glob("*.yaml"))
+    """All apps with a unified config (excludes shared meta files like _frequencies.yaml)."""
+    return sorted(p.stem for p in CONFIGS_DIR.glob("*.yaml") if not p.name.startswith("_"))
 
 
 def load_cell(app: str, size: str = "validation", frequency: str = "nofail") -> AppCell:
@@ -100,7 +107,9 @@ def load_cell(app: str, size: str = "validation", frequency: str = "nofail") -> 
 
     cfg = load_unified(app)
     sz = cfg["sizes"].get(size, {})
-    fq = cfg["frequencies"].get(frequency, {})
+    # Frequencies are now sourced from the SHARED _frequencies.yaml — apps no
+    # longer carry their own frequency definitions.
+    fq = load_frequencies().get(frequency, {})
 
     app_args = sz.get("app_args")
     if app_args is None:
