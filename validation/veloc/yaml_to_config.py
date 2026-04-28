@@ -132,6 +132,16 @@ def get_comparison_flags(config: dict) -> str:
         patterns_str = " ".join(f'"{p}"' for p in ignore_patterns)
         flags.append(f"--text-ignore-patterns {patterns_str}")
 
+    keep_patterns = comp.get("keep_patterns")
+    if keep_patterns:
+        patterns_str = " ".join(f'"{p}"' for p in keep_patterns)
+        flags.append(f"--text-keep-patterns {patterns_str}")
+
+    strip_patterns = comp.get("strip_patterns")
+    if strip_patterns:
+        patterns_str = " ".join(f'"{p}"' for p in strip_patterns)
+        flags.append(f"--text-strip-patterns {patterns_str}")
+
     output_file = comp.get("output_file")
     if output_file:
         flags.append(f"--output-file-name {output_file}")
