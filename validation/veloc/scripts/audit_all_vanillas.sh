@@ -28,7 +28,15 @@ APPS_FILE="${APPS_FILE:-$REPO_ROOT/validation/veloc/apps_all.txt}"
 if [ "$#" -gt 0 ]; then
   apps=("$@")
 else
-  mapfile -t apps < <(grep -v '^[[:space:]]*$' "$APPS_FILE")
+  # Strip inline comments + whole-line comments + blank lines + leading/trailing
+  # whitespace. Mirrors run_batch.sh:130-135 so tier files (which use both
+  # whole-line `#` headers and inline `# explanation` after each app name)
+  # parse identically across the two launchers.
+  mapfile -t apps < <(
+    sed 's/[[:space:]]*#.*$//' "$APPS_FILE" \
+      | grep -v '^[[:space:]]*$' \
+      | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  )
 fi
 
 mkdir -p "$BUILD_DIR/audit_output"
