@@ -1128,9 +1128,11 @@ def _stage_correctness(
         run_cwd=resilient_clean_out,
         veloc_config_sources=[resilient_src, resilient_build],
         veloc_config_name=args.veloc_config_name,
-        # 5-minute hard cap on failure-free runs.  No app's failure-free
-        # baseline exceeds 2-3 min; anything > 5 min is an LLM runaway.
-        timeout_s=300.0,
+        # 15-min hard cap on failure-free runs.  Per user policy: failure-
+        # free should be < 5 min nominally, but heavy native checkpointing
+        # (PRK_Stencil reference: ~10 GB I/O) can push to 8-12 min legitimately.
+        # 15 min is the absolute ceiling — anything beyond is a runaway.
+        timeout_s=900.0,
     )
     if not clean_result.succeeded:
         print(

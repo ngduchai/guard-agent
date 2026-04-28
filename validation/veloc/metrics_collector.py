@@ -862,10 +862,11 @@ def _run_scenario_once(
             memory_monitor_fn=_monitor_memory_samples,
             memory_stop_event=mem_stop_event,
             memory_samples_holder=mem_samples_holder,
-            # 5-minute cap on a single failure-free benchmark run.  Sane
-            # apps in our suite finish in 75-200s; anything > 5 min is
-            # a runaway in the LLM solution.
-            timeout_s=300.0,
+            # 15-minute cap on a single failure-free benchmark run.  Most
+            # apps finish in 75-200s, but heavy native checkpointing
+            # (PRK_Stencil reference: ~10 GB I/O) can take 8-12 min
+            # legitimately.  15 min is absolute ceiling for runaway detection.
+            timeout_s=900.0,
         )
         if not result.succeeded:
             raise ValidationError(
