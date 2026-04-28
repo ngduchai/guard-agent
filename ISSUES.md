@@ -38,6 +38,31 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #43 — MMSP iterative baseline iter_8: BENCHMARK lines from rank 2 leak into rank-0 stdout; recovery emits degenerate `[•]  0h: 0m: 0s` lines from `print_progress(0,1)`; Makefile didn't depend on headers so a stale `parallel` binary was running `Solved`
+
+**Reported:** 2026-04-28
+
+**Explanation:** Across iterations 1–7 of the MMSP baseline experiment (`build/iterative_logs/MMSP_baseline/iter_*`), Validation B failed with output mismatch. Two distinct symptoms:
+
+1. **Failure-free run** (`build/validation_output/MMSP_baseline/correctness/resilient_clean/stdout.txt`) emitted **12 lines** vs the baseline's **10**, with two interlopers:
+   ```
+   [BENCHMARK 1]  ... transferred /tmp/mmsp_scratch/mmsp-2-50.dat ...
+   [BENCHMARK 26] ... transferred /tmp/mmsp_scratch/mmsp-2-2400.dat ...
+   ```
+   Both came from rank 2's VeloC client (`mmsp-2-N.dat` = rank 2's checkpoint files). The per-call `VelocStdoutSilencer` RAII helper around `VELOC_Checkpoint` was insufficient because spdlog inside libveloc captures a `dup()` of fd 1 at *sink-construction time* (which can happen lazily on first checkpoint, after the silencer scope has already exited).
+
+2. **Failure-prone run** (`build/validation_output/MMSP_baseline/correctness/resilient/attempt_2/stdout.txt`) emitted 10 lines, but lines 6–10 were degenerate (`[•]  0h: 0m: 0s` instead of the expected 20-bullet bar). These came from `print_progress(0, 1)` calls — i.e. the inner work loop ran with `pending=1` for the last several `update()` chunks. The synthetic-progress short-circuit for `pending<=0` in `cahn-hilliard.cpp` was never being taken, even though the source clearly contained it.
+
+**Root cause of #2** (the smoking gun): the `Makefile` only listed `cahn-hilliard.cpp` as a prerequisite of the `parallel` target. Any edit to `MMSP.main.hpp` (which carries the VeloC restart logic) left the binary on disk stale — `make parallel` saw nothing to rebuild. The running `parallel` binary therefore reflected an *earlier* attempt's source, not the current source.
+
+**Resolution:** Three coupled fixes in `build/tests_baseline/MMSP/`:
+
+1. **Makefile** — added `mmsp_headers` prerequisite list so `parallel` depends on `MMSP.main.hpp`, `MMSP.utility.cpp`, `MMSP.utility.h`, `MMSP.hpp`, and `cahn-hilliard.hpp`. Future header edits force a rebuild.
+2. **Constructor-time fd 1 redirect** — added `__attribute__((constructor)) mmsp_capture_real_stdout_and_redirect()` in `cahn-hilliard.cpp` that runs before `main()` (and therefore before any libveloc spdlog static-init). It saves the original fd 1 in `g_real_stdout_fd` and dup2's a per-rank side log (`/tmp/mmsp_veloc_stdout.log.rank<R>`) onto fd 1 on **all** ranks (rank from `OMPI_COMM_WORLD_RANK` / `PMI_RANK` / `PMIX_RANK`). After this, ANY library that captures fd 1 — at load time, at sink construction, or at write time — captures the side-log fd, eliminating BENCHMARK leak.
+3. **Single-line-per-update emitter** — replaced the loop-driven `print_progress(step, pending)` calls (and the synthetic short-circuit) in `update()` with a single call to `mmsp_emit_progress_line()` at the top of every `update()` invocation. The emitter writes one fixed-shape line `No. N:\t<date> [• × 20]  0h: 0m: 5s\n` directly to `g_real_stdout_fd` via a single atomic `::write()`. This guarantees exactly one well-formed line per `update()` call regardless of `pending`, `g_completed_steps`, or recovery state — eliminating the `[•] 0h: 0m: 0s` degenerate-line failure mode at the source. The non-VeloC build is unaffected (`#ifndef VELOC_ENABLED` guards still call the original `print_progress`).
+
+---
+
 ### #42 — Three vanilla apps (Athena++, CLAMR, SPARTA) still shipped fully intact native checkpoint code, letting the LLM "cheat" by toggling a config flag `Solved`
 
 **Reported:** 2026-04-27
