@@ -113,9 +113,11 @@ def write_one(app: str, sizes: list[str], freqs: list[str], dry_run: bool) -> di
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--app", help="Generate for one app only (default: all 18)")
-    p.add_argument("--sizes", nargs="+", default=["validation", "small"],
+    p.add_argument("--sizes", nargs="+", default=["small"],
                    choices=VALID_SIZES,
-                   help="Sizes to include (default: validation small)")
+                   help=("Sizes to include (default: small only).  validation-size "
+                         "resilience is measured by AUDIT (vanilla + upstream) and ITER "
+                         "(LLM-modified) — no need to re-measure in bench."))
     p.add_argument("--freqs", nargs="+", default=["nofail", "once"],
                    choices=VALID_FREQS,
                    help="Frequencies to include (default: nofail once)")
