@@ -50,10 +50,19 @@ echo "════════════════════════�
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+FORCE="${FORCE:-0}"
 for app in "${apps[@]}"; do
   echo ""
-  echo "── auditing $app ──"
   log="$LOG_DIR/${app}.log"
+  # Per-app skip: if a prior audit log shows "All stages completed successfully"
+  # AND this isn't a forced re-audit, skip.  Audit results are deterministic
+  # (vanilla source + audit framework haven't changed), so re-running wastes
+  # ~10 min per app for no new information.  Override with FORCE=1.
+  if [ -f "$log" ] && grep -q "All stages completed successfully" "$log" 2>/dev/null && [ "$FORCE" != "1" ]; then
+    echo "── $app: SKIP (already audited; set FORCE=1 to re-run) ──"
+    continue
+  fi
+  echo "── auditing $app ──"
   # Run the audit; record exit code but never abort the loop on it.  A
   # nonzero exit is expected when the resilience proof fails (the audit
   # success path).  audit_aggregate_report.py is the source of truth.
