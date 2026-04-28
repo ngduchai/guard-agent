@@ -213,15 +213,88 @@ if [ -d "$REPO_ROOT/tests/apps/vanillas" ]; then
   done
 fi
 
-# --- OpenCode MCP config + AGENTS.md for each test app ---
+# --- OpenCode parent-dir config + AGENTS.md/CLAUDE.md sentinels ---
+#
+# Placed at the PARENT of the per-app dirs (build/tests_baseline/, build/tests/)
+# instead of inside each per-app dir.  Two reasons:
+#
+#   1. Avoid duplicating identical config 18× per variant (36 files vs. 6).
+#   2. Empty AGENTS.md / CLAUDE.md at the parent SHORT-CIRCUITS OpenCode's
+#      walk-up search.  When the LLM runs in build/tests_baseline/CoMD/,
+#      OpenCode walks up looking for AGENTS.md and stops at the first match
+#      (per https://opencode.ai/docs/rules: "first matching file wins").
+#      Empty files at the parent block the walk from ever reaching the
+#      repo-root AGENTS.md / CLAUDE.md, which carry rules from broader
+#      contexts (test design, agent dev) that mislead the LLM about its
+#      injection task.  Same trick for opencode.json: parent-level wins,
+#      tightens read/edit permission scope to JUST the variant's tree.
+#
+# The two variants get different opencode.json:
+#   * tests_baseline/  — no MCP server (LLM works alone, naive baseline)
+#   * tests/           — guard-agent MCP server (assisted iteration)
+# Both share the same strict deny rules (only the variant's own subtree
+# is readable; everything else in the repo is denied).
 GUARD_AGENT_BIN="$BUILD_DIR/venv/bin/guard-agent"
 echo ""
-echo "Writing opencode.json and AGENTS.md into each test app ..."
-for app_dir in "$TESTS_DIR"/*/; do
-  [ -d "$app_dir" ] || continue
-  cat > "$app_dir/opencode.json" << OCEOF
+echo "Writing parent-dir opencode.json + AGENTS.md/CLAUDE.md sentinels ..."
+
+# --- LLM-baseline variant: strict deny, no guard-agent MCP ---
+cat > "$BASELINE_DIR/opencode.json" << OCEOF
 {
   "\$schema": "https://opencode.ai/config.json",
+  "_comment": "Parent-dir OpenCode config for the LLM-baseline experiment. Auto-loaded when OpenCode runs in any subdir of build/tests_baseline/. Strict scope: the LLM only sees build/tests_baseline/** plus system include/lib paths for VeloC. All other repo paths are denied — especially AGENTS.md / CLAUDE.md / ISSUES.md / tests/apps / validation / docs which would mislead the LLM about its task. No MCP server: this variant tests the LLM working alone without guard-agent help.",
+  "permission": {
+    "edit": {
+      "$BASELINE_DIR/**": "allow",
+      "**": "deny"
+    },
+    "bash": "deny",
+    "external_directory": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "read": {
+      "$BASELINE_DIR/**": "allow",
+      "/usr/include/**": "allow",
+      "/usr/local/include/**": "allow",
+      "/usr/lib/**": "allow",
+      "/usr/local/lib/**": "allow",
+      "/home/ndhai/usr/**": "allow",
+      "**": "deny"
+    },
+    "list": {
+      "$BASELINE_DIR/**": "allow",
+      "/usr/include/**": "allow",
+      "/usr/local/include/**": "allow",
+      "/home/ndhai/usr/**": "allow",
+      "**": "deny"
+    },
+    "grep": {
+      "$BASELINE_DIR/**": "allow",
+      "**": "deny"
+    },
+    "glob": {
+      "$BASELINE_DIR/**": "allow",
+      "**": "deny"
+    },
+    "codesearch": "deny",
+    "lsp": "allow",
+    "task": "allow",
+    "todowrite": "allow",
+    "skill": "allow",
+    "question": "allow",
+    "doom_loop": "allow"
+  }
+}
+OCEOF
+: > "$BASELINE_DIR/AGENTS.md"
+: > "$BASELINE_DIR/CLAUDE.md"
+echo "  $BASELINE_DIR/{opencode.json,AGENTS.md,CLAUDE.md}  (LLM-baseline: strict deny, no MCP)"
+
+# --- Guard-agent-assisted variant: strict deny + MCP server + injection rules ---
+cat > "$TESTS_DIR/opencode.json" << OCEOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "_comment": "Parent-dir OpenCode config for the guard-agent-assisted experiment. Auto-loaded when OpenCode runs in any subdir of build/tests/. Strict scope: the LLM only sees build/tests/** plus system include/lib paths for VeloC. All other repo paths are denied. MCP server enabled so the LLM can call guard-agent tools (e.g. validate_injection) during iteration.",
   "mcp": {
     "guard-agent": {
       "type": "local",
@@ -232,10 +305,51 @@ for app_dir in "$TESTS_DIR"/*/; do
   },
   "experimental": {
     "mcp_timeout": 600000
+  },
+  "permission": {
+    "edit": {
+      "$TESTS_DIR/**": "allow",
+      "**": "deny"
+    },
+    "bash": "deny",
+    "external_directory": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "read": {
+      "$TESTS_DIR/**": "allow",
+      "/usr/include/**": "allow",
+      "/usr/local/include/**": "allow",
+      "/usr/lib/**": "allow",
+      "/usr/local/lib/**": "allow",
+      "/home/ndhai/usr/**": "allow",
+      "**": "deny"
+    },
+    "list": {
+      "$TESTS_DIR/**": "allow",
+      "/usr/include/**": "allow",
+      "/usr/local/include/**": "allow",
+      "/home/ndhai/usr/**": "allow",
+      "**": "deny"
+    },
+    "grep": {
+      "$TESTS_DIR/**": "allow",
+      "**": "deny"
+    },
+    "glob": {
+      "$TESTS_DIR/**": "allow",
+      "**": "deny"
+    },
+    "codesearch": "deny",
+    "lsp": "allow",
+    "task": "allow",
+    "todowrite": "allow",
+    "skill": "allow",
+    "question": "allow",
+    "doom_loop": "allow"
   }
 }
 OCEOF
-  cat > "$app_dir/AGENTS.md" << 'AGENTSEOF'
+cat > "$TESTS_DIR/AGENTS.md" << 'AGENTSEOF'
 # Rules
 
 - After injecting VeloC checkpointing, you MUST call `validate_injection` to verify the injection works.
@@ -243,8 +357,8 @@ OCEOF
 - The task is NOT done until `validate_injection` returns `passed: true`.
 - In veloc.cfg, use scratch=/tmp/scratch and persistent=/tmp/persistent unless the user specifies otherwise.
 AGENTSEOF
-  echo "  $(basename "$app_dir")/"
-done
+: > "$TESTS_DIR/CLAUDE.md"
+echo "  $TESTS_DIR/{opencode.json,AGENTS.md,CLAUDE.md}     (guard-agent: strict deny + MCP + rules)"
 
 # --- Test data (HDF5 files, etc.) ---
 DATA_DIR="$BUILD_DIR/data"
