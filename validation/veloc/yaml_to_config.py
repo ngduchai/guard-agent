@@ -69,6 +69,24 @@ def parse_run_cmd(run_cmd: str, mpi_ranks: int = 4) -> tuple[str, str, str]:
     return cmd, exe, args
 
 
+def extract_input_subdir(run_cmd: str, mpi_ranks: int = 4) -> str | None:
+    """Extract the input subdir from a run command's leading ``cd <subdir> &&`` prefix.
+
+    Some apps (HPCG, SPARTA, …) ship their inputs alongside the binary in a
+    subdir of the source tree, and their app.yaml encodes that with a
+    ``cd <subdir> && mpirun …`` prefix.  Returns the subdir relative to the
+    app source root, or None when run.cmd has no ``cd`` prefix.
+
+    Examples:
+        "cd bin && mpirun -np 4 ./xhpcg_run --rt=120"          → "bin"
+        "cd examples/free && mpirun -np 4 ./spa_mpi -in foo"   → "examples/free"
+        "mpirun -np 4 ./bin/CoMD-mpi -x 70"                    → None
+    """
+    cmd = run_cmd.replace("{mpi_ranks}", str(mpi_ranks)).strip()
+    m = re.match(r"^\s*cd\s+(\S+)\s*&&\s*", cmd)
+    return m.group(1) if m else None
+
+
 def get_comparison_flags(config: dict) -> str:
     """Build validate.py CLI flags from comparison config.
 
