@@ -167,6 +167,22 @@ def main():
         print(full_cmd)
     elif field == "timeout":
         print(config.get("run", {}).get("timeout", 120))
+    elif field == "ckpt_executable_name":
+        # Optional in app.yaml; empty when the resilient binary uses the same
+        # name as the vanilla one.
+        print(config.get("ckpt_executable_name", ""))
+    elif field == "app_input_subdir":
+        # Optional explicit override; otherwise infer from the leading
+        # "cd <subdir> &&" prefix in run.cmd.
+        explicit = config.get("app_input_subdir")
+        if explicit:
+            print(explicit)
+        else:
+            sub = extract_input_subdir(run_cmd_raw, mpi_ranks)
+            print(sub or "")
+    elif field == "injection_delay":
+        # Optional per-app override of the default adaptive injection delay.
+        print(config.get("injection_delay", ""))
     else:
         print(f"Unknown field: {field}", file=sys.stderr)
         sys.exit(1)
