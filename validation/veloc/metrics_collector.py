@@ -1070,6 +1070,8 @@ def run_benchmark_sweep(
     resilient_build_cmd: str | None = None,
     app_input_subdir: str | None = None,
     resilient_priority_source_dirs: list[Path] | None = None,
+    skip_original_codebase: bool = False,
+    skip_original_inject_scenarios: bool = True,
 ) -> BenchmarkResults:
     """Execute all scenarios for all codebases and collect RunMetrics.
 
@@ -1082,6 +1084,16 @@ def run_benchmark_sweep(
 
     Each scenario is repeated ``scenario.num_runs`` times for statistical
     stability.
+
+    Skip flags (avoid wasted compute on duplicate measurements):
+      - ``skip_original_codebase``: when True, never run the *original*
+        codebase at all.  Set this in BENCH-BASELINE mode (--baseline);
+        the vanilla baseline is shared from BENCH-REF's measurements.
+      - ``skip_original_inject_scenarios``: when True (default), skip
+        running the *original* codebase for any scenario where
+        ``inject_failures=True`` (vanilla can't recover, so the framework
+        would route it to a clean run = duplicate of the nofail measurement).
+        Comparison reports use synthetic vanilla.once = vanilla.nofail × 1.5.
 
     Parameters
     ----------
@@ -1209,10 +1221,25 @@ def run_benchmark_sweep(
             flush=True,
         )
 
+        # Decide whether to run the *original* codebase for this scenario.
+        # See run_benchmark_sweep docstring for skip-flag semantics.
+        skip_original_for_this = (
+            skip_original_codebase
+            or (skip_original_inject_scenarios and scenario.inject_failures)
+        )
+
         for run_idx in range(1, scenario.num_runs + 1):
             # --- Original run ---
             orig_key = _bench_progress_key(scenario.name, "original", run_idx)
-            if orig_key in completed_keys:
+            if skip_original_for_this:
+                _why = ("baseline-mode (vanilla measured by BENCH-REF)" if skip_original_codebase
+                        else "inject_failures=True (vanilla.once is synthetic = vanilla.nofail × 1.5)")
+                print(
+                    f"[metrics] --- original run {run_idx}/{scenario.num_runs} "
+                    f"[SKIPPED – {_why}] ---",
+                    flush=True,
+                )
+            elif orig_key in completed_keys:
                 print(
                     f"[metrics] --- original run {run_idx}/{scenario.num_runs} "
                     f"[SKIPPED – already completed] ---",

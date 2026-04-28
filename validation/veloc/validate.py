@@ -1854,6 +1854,17 @@ def _stage_benchmarks(
     if getattr(args, "reference_input_priority", False):
         resilient_priority.append(original_src)
     resilient_priority_param: list[Path] | None = resilient_priority or None
+
+    # Detect mode by looking at where resilient_src points.
+    # BENCH-BASELINE (resilient = build/tests_baseline/<APP>, LLM-modified):
+    #   skip the *original* codebase entirely — vanilla baseline is shared
+    #   with BENCH-REF's measurements (vanilla source is identical).  The
+    #   comparison report joins BENCH-REF.original.<size>.nofail with
+    #   BENCH-BASELINE.resilient.<size>.* for the LLM comparison.
+    # BENCH-REF (resilient = tests/apps/checkpointed/<APP>, upstream):
+    #   keep *original* (= vanilla baseline that BENCH-BASELINE will reuse).
+    is_baseline_mode = "tests_baseline" in str(Path(resilient_src).resolve())
+
     return run_benchmark_sweep(
         original_source_dir=original_src,
         original_build_dir=original_build,
@@ -1871,6 +1882,10 @@ def _stage_benchmarks(
         resilient_build_cmd=_resolve_build_cmd(getattr(args, 'resilient_build_cmd', None)),
         app_input_subdir=getattr(args, 'app_input_subdir', None),
         resilient_priority_source_dirs=resilient_priority_param,
+        skip_original_codebase=is_baseline_mode,
+        # always skip original.<inject> — vanilla can't recover, value is
+        # synthetic = vanilla.nofail × (1 + delay_fraction).
+        skip_original_inject_scenarios=True,
     )
 
 
