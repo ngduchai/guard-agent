@@ -194,6 +194,74 @@ class TestApplyPerturbation:
         assert (src / "input.txt").read_text() == "dt = 0.001\n", "source preserved"
         assert not (cwd / "input.txt").is_symlink(), "symlink replaced with real file"
 
+    @pytest.mark.parametrize("app", [
+        "SAMRAI", "Nyx", "Athena++", "HyPar", "LAMMPS", "QMCPACK",
+        "SW4lite", "SPARTA", "SPPARKS", "Smilei", "WarpX",
+    ])
+    def test_real_yamls_never_touch_vanilla_source(self, app, tmp_path):
+        """Regression: apply each committed YAML's regex_replace perturbation
+        against the actual vanilla source file and confirm the source is
+        byte-identical before and after.
+
+        Catches three classes of future bug:
+          1. A YAML accidentally specifies an absolute file path (which
+             would make ``cwd / spec.file`` escape cwd and overwrite
+             source).
+          2. apply_perturbation is modified to write to source_dir
+             instead of cwd.
+          3. A new method is added that writes to a file outside cwd.
+
+        Limited to method=regex_replace (the only method that touches
+        files); app_arg_override + env_var_set + disabled are
+        file-agnostic by construction.
+        """
+        import hashlib
+        from validation.veloc.app_config import load_cell
+
+        cell = load_cell(app, size="validation", frequency="nofail")
+        spec = cell.perturbation
+        if spec is None or spec.method != "regex_replace":
+            pytest.skip(f"{app} has no regex_replace perturbation")
+        # File path must be relative (absolute would escape cwd)
+        assert not spec.file.startswith("/"), (
+            f"{app}: perturbation file path must be relative, got {spec.file!r}"
+        )
+        src_dir = Path("tests/apps/vanillas") / app
+        src_file = (src_dir / spec.file).resolve()
+        if not src_file.exists():
+            pytest.skip(f"{app}: source file missing at {src_file}")
+        pre_hash = hashlib.sha256(src_file.read_bytes()).hexdigest()
+        pre_mtime = src_file.stat().st_mtime
+
+        # Mirror what the runner does: create the cwd symlink, then perturb
+        target = tmp_path / spec.file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(src_file)
+        value = resolve_perturbation_value(spec, seed=12345)
+        apply_perturbation(
+            spec, value, cwd=tmp_path, source_dir=src_dir, app_args=[], env={},
+        )
+
+        post_hash = hashlib.sha256(src_file.read_bytes()).hexdigest()
+        post_mtime = src_file.stat().st_mtime
+        assert pre_hash == post_hash, (
+            f"{app}: source file hash CHANGED — apply_perturbation wrote to source: "
+            f"{src_file}"
+        )
+        assert pre_mtime == post_mtime, (
+            f"{app}: source file mtime CHANGED — even if content matches, source "
+            f"was opened in write mode: {src_file}"
+        )
+        # Sanity: the cwd file should now be a real file (not a symlink) with
+        # different content than the source
+        assert not target.is_symlink(), (
+            f"{app}: cwd target {target} is still a symlink — apply_perturbation "
+            f"did not replace it as expected"
+        )
+        assert target.read_text() != src_file.read_text(), (
+            f"{app}: cwd file content matches source — perturbation had no effect"
+        )
+
     def test_regex_replace_no_match_raises(self, tmp_path):
         src = tmp_path / "src"
         cwd = tmp_path / "cwd"
