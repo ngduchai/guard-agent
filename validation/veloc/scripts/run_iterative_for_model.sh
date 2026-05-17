@@ -105,7 +105,68 @@ if [ -n "${OPENCODE_INPUT_TRUNC_TOKENS:-}" ]; then
   echo "[run_iterative_for_model] context cap: OPENCODE_INPUT_TRUNC_TOKENS=$OPENCODE_INPUT_TRUNC_TOKENS"
 fi
 
-# Forward everything else to the base script.  exec replaces the wrapper
-# process so signals (TERM/INT) reach run_iterative.sh's own trap handlers
-# rather than dying in the wrapper layer.
-exec "$SCRIPT_DIR/run_iterative.sh" "${FORWARD_ARGS[@]}"
+# ---------------------------------------------------------------------------
+# Inter-tag read isolation (defense-in-depth against cross-cell leakage)
+#
+# When cell N runs after cells 1..N-1, those earlier cells' tagged source
+# dirs (build/tests_baseline_<OTHER_TAG>/) sit on disk. OpenCode's read/
+# grep/glob tools have full FS visibility, so cell N's LLM could read
+# those earlier solutions and crib from them, contaminating the experiment.
+#
+# Mitigation: temporarily mv every OTHER cell's tagged dir to a .hidden_*
+# sibling before run_iterative.sh launches, restore on any exit (normal,
+# error, signal). Mirrors the existing reference-hiding pattern at
+# run_iterative.sh:474-493 for tests/apps/checkpointed/.
+#
+# NOT hidden:
+#   - This cell's own tests_baseline_${MODEL_TAG}/ (obviously)
+#   - The un-suffixed tests_baseline/ (Opus 4.7 1M baseline) — covered by
+#     OpenCode permission.read deny at ~/.config/opencode/opencode.json
+#     so defense-in-depth is via the config, not by hiding
+# ---------------------------------------------------------------------------
+
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
+HIDDEN_DIRS=()  # entries: "<hidden_path>|<original_path>"
+
+if [ -d "$BUILD_DIR" ]; then
+  for d in "$BUILD_DIR"/tests_baseline_*/; do
+    [ -d "$d" ] || continue
+    base=$(basename "${d%/}")
+    tag="${base#tests_baseline_}"
+    # Skip this cell's own dir and any pre-existing .hidden_* (left over
+    # from a crashed prior run that didn't restore — we ignore those, the
+    # operator can clean up manually).
+    if [ "$tag" = "$MODEL_TAG" ] || [[ "$tag" == .hidden_* ]]; then
+      continue
+    fi
+    hidden="${BUILD_DIR}/.hidden_tests_baseline_${tag}_$$"
+    if mv "$d" "$hidden" 2>/dev/null; then
+      HIDDEN_DIRS+=("$hidden|$d")
+      echo "[run_iterative_for_model] hid other-cell dir (${d%/} → $hidden)"
+    else
+      echo "[run_iterative_for_model] WARN: failed to hide ${d%/} — cell may read it"
+    fi
+  done
+fi
+
+_restore_hidden_dirs() {
+  local entry hidden orig
+  for entry in "${HIDDEN_DIRS[@]}"; do
+    hidden="${entry%%|*}"
+    orig="${entry##*|}"
+    if [ -d "$hidden" ]; then
+      if mv "$hidden" "$orig" 2>/dev/null; then
+        echo "[run_iterative_for_model] restored other-cell dir ($hidden → $orig)"
+      else
+        echo "[run_iterative_for_model] WARN: failed to restore $hidden — manual: mv $hidden $orig"
+      fi
+    fi
+  done
+}
+trap _restore_hidden_dirs EXIT INT TERM
+
+# Forward everything else to the base script.  Run (not exec) so the
+# trap above fires after run_iterative.sh exits and the hidden dirs get
+# restored before the wrapper returns.
+"$SCRIPT_DIR/run_iterative.sh" "${FORWARD_ARGS[@]}"
