@@ -315,11 +315,12 @@ class TestCalibrateEndToEnd:
         assert any("sensitivity" in r for r in result.failure_reasons)
 
     def test_timing_failure_min(self, fake_app_env):
-        """Min run takes 30% longer → timing invariant fails."""
+        """Min run takes 50% longer → timing invariant fails even under the
+        loose 30% default threshold."""
         app, scratch, _ = fake_app_env
         run_once = _RunOnceMock({
             "unperturbed": (10.0, 0, _make_doubles_bytes([1.0, 2.0, 3.0])),
-            "min":         (13.0, 0, _make_doubles_bytes([1.0, 3.0, 3.0])),  # +30%
+            "min":         (15.0, 0, _make_doubles_bytes([1.0, 3.0, 3.0])),  # +50%
             "max":         (10.1, 0, _make_doubles_bytes([1.0, 1.0, 3.0])),
         })
         result = calibrate(
@@ -330,16 +331,17 @@ class TestCalibrateEndToEnd:
         )
         assert result.passed is False
         assert result.timing_stability_ok is False
-        assert result.timing_delta_min_pct == pytest.approx(0.30)
+        assert result.timing_delta_min_pct == pytest.approx(0.50)
         assert any("timing" in r for r in result.failure_reasons)
 
     def test_timing_failure_max(self, fake_app_env):
-        """Max run takes 25% longer → timing invariant fails."""
+        """Max run takes 50% longer → timing invariant fails even under the
+        loose 30% default threshold."""
         app, scratch, _ = fake_app_env
         run_once = _RunOnceMock({
             "unperturbed": (10.0, 0, _make_doubles_bytes([1.0, 2.0, 3.0])),
             "min":         (10.0, 0, _make_doubles_bytes([1.0, 3.0, 3.0])),
-            "max":         (12.5, 0, _make_doubles_bytes([1.0, 1.0, 3.0])),
+            "max":         (15.0, 0, _make_doubles_bytes([1.0, 1.0, 3.0])),  # +50%
         })
         result = calibrate(
             app,
@@ -349,7 +351,7 @@ class TestCalibrateEndToEnd:
         )
         assert result.passed is False
         assert result.timing_stability_ok is False
-        assert result.timing_delta_max_pct == pytest.approx(0.25)
+        assert result.timing_delta_max_pct == pytest.approx(0.50)
 
     def test_safety_failure_short_circuits_other_invariants(self, fake_app_env):
         """If any run crashes, calibrator FAILs immediately and does NOT
@@ -378,10 +380,10 @@ class TestCalibrateEndToEnd:
         app, scratch, _ = fake_app_env
         run_once = _RunOnceMock({
             "unperturbed": (10.0, 0, _make_doubles_bytes([1.0, 2.0, 3.0])),
-            "min":         (11.5, 0, _make_doubles_bytes([1.0, 3.0, 3.0])),  # +15%
+            "min":         (13.0, 0, _make_doubles_bytes([1.0, 3.0, 3.0])),  # +30%
             "max":         (10.0, 0, _make_doubles_bytes([1.0, 1.0, 3.0])),
         })
-        # Default threshold 0.15 → exactly at boundary, considered passing
+        # Default threshold 0.30 → exactly at boundary, considered passing
         # because the check is "<= threshold" not "< threshold"
         result = calibrate(
             app,

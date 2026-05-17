@@ -93,7 +93,7 @@ class CalibrationResult:
     # Invariant 2: timing stability
     timing_delta_min_pct: "float | None" = None
     timing_delta_max_pct: "float | None" = None
-    timing_stability_threshold_pct: float = 0.15  # default 15%
+    timing_stability_threshold_pct: float = 0.30  # default 30% (see calibrate() docstring)
     timing_stability_ok: "bool | None" = None
 
     # Invariant 3: safety (no crashes)
@@ -315,7 +315,7 @@ def calibrate(
     *,
     scratch_root: "Path | None" = None,
     output_diff_threshold: "float | None" = None,
-    timing_stability_threshold_pct: float = 0.15,
+    timing_stability_threshold_pct: float = 0.30,
     timeout_s: "float | None" = None,
     run_once_fn: "Callable | None" = None,
     apply_perturbation_fn: "Callable | None" = None,
@@ -333,9 +333,17 @@ def calibrate(
         Minimum required ``|Z_P(extreme) - Z_unperturbed|`` for the
         sensitivity invariant. Defaults to ``1000 × app's tolerance``.
     timing_stability_threshold_pct
-        Maximum allowed wall-time delta vs unperturbed. Default 0.15
-        (15%) — looser than the plan's nominal 5% because run-to-run
-        noise on shared hosts is real.
+        Maximum allowed wall-time delta vs unperturbed. Default 0.30
+        (30%) — much looser than the plan's nominal 5% because the
+        slope test's ratio metric is invariant to uniform timing shifts
+        induced by perturbation (both numerator and denominator scale
+        by the same factor, so the ratio is unchanged). The remaining
+        concern is only (a) kill-time-to-fraction mapping drift if the
+        perturbation makes Z_P timing very different from the kill
+        leg's timing, and (b) the per-app `production_cap_ratio` cap.
+        Both are mild concerns; 30% leaves plenty of headroom. Use
+        ``--timing-threshold-pct 0.15`` (tighter) if you want extra
+        rigor.
     timeout_s
         Per-run timeout. Defaults to ``5 × nominal_runtime`` from the
         app's YAML.
@@ -612,8 +620,10 @@ def main(argv: "list[str] | None" = None) -> int:
     parser.add_argument(
         "--timing-threshold-pct",
         type=float,
-        default=0.15,
-        help="Max |t_P - t_X|/t_X for timing stability (default: 0.15 = 15%%)",
+        default=0.30,
+        help="Max |t_P - t_X|/t_X for timing stability (default: 0.30 = 30%%; "
+             "loose because slope-test ratios are invariant to uniform perturbation "
+             "timing shifts -- see calibrate() docstring)",
     )
     parser.add_argument(
         "--timeout-s",
