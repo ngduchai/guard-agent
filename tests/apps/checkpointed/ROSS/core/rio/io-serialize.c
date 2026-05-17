@@ -50,24 +50,34 @@ size_t io_lp_deserialize (tw_lp *lp, void *buffer) {
 }
 
 size_t io_event_serialize (tw_event *e, void *buffer) {
-    int i;
-
     io_event_store tmp;
 
     memcpy(&(tmp.cv), &(e->cv), sizeof(tw_bf));
     tmp.critical_path = e->critical_path;
-    tmp.dest_lp = (tw_lpid)e->dest_lp; // ROSS HACK: dest_lp is gid
+    // guard-agent 2026-05-08: events drained from pe->pq carry real
+    // tw_lp* pointers, not the gid bit-cast that the original RIO
+    // path produced via io_load_events.  Use the explicit ->dest_lpid
+    // field (always a tw_lpid, set on send) so we serialize the gid
+    // regardless of which path the event came from.
+    tmp.dest_lp = e->dest_lpid;
     tmp.src_lp = e->src_lp->gid;
-    tmp.recv_ts = e->recv_ts - g_tw_ts_end;
+    // guard-agent 2026-05-08: store recv_ts as-is.  The original
+    // `e->recv_ts - g_tw_ts_end` offset assumed the load run would
+    // restart at simulated time 0 with events relative-to-end; that's
+    // never compensated for on the read side, so the loaded events
+    // landed at negative recv_ts and the simulator skipped them.
+    tmp.recv_ts = e->recv_ts;
+    tmp.event_id = e->event_id;
+    tmp.send_pe = e->send_pe;
+#ifdef USE_RAND_TIEBREAKER
+    tmp.sig = e->sig;
+#endif
 
     memcpy(buffer, &tmp, sizeof(io_event_store));
-    // printf("Storing event going to %lu at %f\n", tmp.dest_lp, tmp.recv_ts);
     return sizeof(io_event_store);
 }
 
 size_t io_event_deserialize (tw_event *e, void *buffer) {
-    int i;
-
     io_event_store tmp;
     memcpy(&tmp, buffer, sizeof(io_event_store));
     e->critical_path = tmp.critical_path;
@@ -83,6 +93,12 @@ size_t io_event_deserialize (tw_event *e, void *buffer) {
         tw_error(TW_LOC, "RIO ERROR: Unsupported mapping");
     }
     e->recv_ts = tmp.recv_ts;
-    // printf("Loading event going to %lu at %f\n", tmp.dest_lp, tmp.recv_ts);
+    // guard-agent 2026-05-08: restore framework identity fields so the
+    // restored event is unique inside the priority queue.
+    e->event_id = tmp.event_id;
+    e->send_pe = tmp.send_pe;
+#ifdef USE_RAND_TIEBREAKER
+    e->sig = tmp.sig;
+#endif
     return sizeof(io_event_store);
 }

@@ -206,16 +206,32 @@ void io_read_checkpoint() {
             ((deserialize_f)g_io_lp_types[0].deserialize)(g_tw_lp[all_lp_i]->cur_state, b, g_tw_lp[all_lp_i]);
             b += model_sizes[all_lp_i];
         }
-        assert(my_partitions[cur_part].ev_count <= g_io_free_events.size);
+        // guard-agent 2026-05-08: enqueue restored events DIRECTLY into
+        // g_tw_pe->pq, bypassing g_io_buffered_events (whose 8000-slot
+        // capacity may be smaller than ev_count for queue-heavy models).
+        // Use tw_event_grab to pull a fresh event handle from the
+        // framework's per-PE free pool — same pool used by tw_event_send.
+        // This is symmetric with the new write-side drain that captures
+        // events directly from g_tw_pe->pq.
         for (i = 0; i < my_partitions[cur_part].ev_count; i++) {
-            // SEND THESE EVENTS
-            tw_event *ev = tw_eventq_pop(&g_io_free_events);
+            tw_event *ev = tw_event_grab(g_tw_pe);
+            if (!ev || ev == g_tw_pe->abort_event) {
+                printf("ERROR: ran out of free events during io_read_checkpoint (need %d, got %d)\n",
+                       my_partitions[cur_part].ev_count, i);
+                break;
+            }
             b += io_event_deserialize(ev, b);
             void * msg = tw_event_data(ev);
             memcpy(msg, b, g_tw_msg_sz);
             b += g_tw_msg_sz;
-            // buffer event to send after initialization
-            tw_eventq_push(&g_io_buffered_events, ev);
+            // guard-agent 2026-05-08: io_event_deserialize leaves
+            // ev->dest_lp as a gid bit-cast (the original RIO HACK
+            // expected io_load_events to convert it via tw_event_new).
+            // For direct-pq enqueue we must convert here, otherwise
+            // the scheduler segfaults dereferencing dest_lp->kp.
+            ev->dest_lpid = (tw_lpid) ev->dest_lp;
+            ev->dest_lp = tw_getlocal_lp((tw_lpid) ev->dest_lp);
+            tw_pq_enqueue(g_tw_pe->pq, ev);
         }
     }
 
@@ -306,7 +322,16 @@ void io_store_checkpoint(char * master_filename, int data_file_number) {
         int sum_event_size = 0;
         if (cur_kp == 0) {
             // Event Metadata
-            event_count = g_io_buffered_events.size;
+            // guard-agent 2026-05-08: replaced g_io_buffered_events.size with
+            // tw_pq_get_size(g_tw_pe->pq).  g_io_buffered_events is only
+            // populated when models call io_event_grab() instead of
+            // tw_event_send() — most ROSS models (incl. pholdio) use
+            // tw_event_send so g_io_buffered_events.size is always 0,
+            // making checkpoints contain no events and recovery a no-op.
+            // Reading from the live priority queue captures all pending
+            // events.  See draining loop below for symmetric write-side
+            // change.
+            event_count = (int) tw_pq_get_size(g_tw_pe->pq);
             sum_event_size = event_count * (g_tw_msg_sz + sizeof(io_event_store));
         }
 
@@ -354,13 +379,56 @@ void io_store_checkpoint(char * master_filename, int data_file_number) {
         }
 
         // Events
-        for (i = 0; i < event_count; i++) {
-            tw_event *ev = tw_eventq_pop(&g_io_buffered_events);
-            b += io_event_serialize(ev, b);
-            void * msg = tw_event_data(ev);
-            memcpy(b, msg, g_tw_msg_sz);
-            tw_eventq_push(&g_io_free_events, ev);
-            b += g_tw_msg_sz;
+        // guard-agent 2026-05-08: drain g_tw_pe->pq instead of
+        // g_io_buffered_events (which is empty for tw_event_send-based
+        // models).  Sequence: dequeue all → serialize each → enqueue back.
+        // Since tw_pq is sorted by recv_ts, the re-enqueued queue is
+        // identical to the original — caller (gvt_hook) sees no change.
+        //
+        // Network-received events have e->src_lp set as a tw_lpid
+        // bit-cast to a pointer (recv_finish in network-mpi.c only
+        // converts dest_lp; src_lp stays as a gid).  io_event_serialize
+        // dereferences e->src_lp->gid which segfaults on bit-cast gids.
+        // Compute the local g_tw_lp[] address range and, for events
+        // whose src_lp falls outside that range, temporarily swap
+        // src_lp to a known-local LP for the serialize call, then
+        // restore the original bit-cast value before re-enqueue so
+        // event semantics are unchanged.
+        if (event_count > 0) {
+            uintptr_t lp_min = (uintptr_t) g_tw_lp[0];
+            uintptr_t lp_max = (uintptr_t) g_tw_lp[0];
+            for (c = 1; c < (int) g_tw_nlp; c++) {
+                uintptr_t a = (uintptr_t) g_tw_lp[c];
+                if (a < lp_min) lp_min = a;
+                if (a > lp_max) lp_max = a;
+            }
+
+            tw_event **drain_buf = (tw_event **) malloc(event_count * sizeof(tw_event *));
+            for (i = 0; i < event_count; i++) {
+                drain_buf[i] = tw_pq_dequeue(g_tw_pe->pq);
+            }
+            for (i = 0; i < event_count; i++) {
+                tw_lp *original_src = drain_buf[i]->src_lp;
+                int swapped = 0;
+                if ((uintptr_t) original_src < lp_min ||
+                    (uintptr_t) original_src > lp_max) {
+                    /* Network-received event with bit-cast gid in src_lp. */
+                    drain_buf[i]->src_lp = g_tw_lp[0];
+                    swapped = 1;
+                }
+                b += io_event_serialize(drain_buf[i], b);
+                void * msg = tw_event_data(drain_buf[i]);
+                memcpy(b, msg, g_tw_msg_sz);
+                b += g_tw_msg_sz;
+                if (swapped) {
+                    drain_buf[i]->src_lp = original_src;
+                }
+            }
+            // Restore: re-enqueue every drained event.
+            for (i = 0; i < event_count; i++) {
+                tw_pq_enqueue(g_tw_pe->pq, drain_buf[i]);
+            }
+            free(drain_buf);
         }
 
         // Write

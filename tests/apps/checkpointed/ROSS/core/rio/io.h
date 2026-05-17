@@ -82,6 +82,16 @@ typedef struct {
 	tw_lpid dest_lp;
 	tw_lpid src_lp;
 	tw_stime recv_ts;
+	// guard-agent 2026-05-08: persist the framework-managed identity
+	// fields so the splay-tree / AVL queue can re-enqueue checkpointed
+	// events without identity collisions.  tw_event_grab zeroes
+	// event_id and leaves sig stale, so the live values must come from
+	// the checkpoint.
+	tw_eventid event_id;
+	unsigned int send_pe;
+#ifdef USE_RAND_TIEBREAKER
+	tw_event_sig sig;
+#endif
 	// NOTE: not storing tw_memory or tw_out
 } io_event_store;
 
