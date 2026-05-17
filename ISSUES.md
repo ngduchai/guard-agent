@@ -39,6 +39,27 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #80 — Per-app perturbation specs for the remaining 15 apps (uncalibrated) `Solved`
+
+**Reported:** 2026-05-17
+
+**Explanation:** The cold-replay detector (issue #78) requires every protected app to have a `perturbation:` block in `tests/apps/configs/<APP>.yaml`. SAMRAI + Nyx were committed in `a6d96fcc5`; the remaining 15 apps (CoMD, CLAMR, SW4lite, HyPar, SPPARKS, HPCG, PRK_Stencil, Athena++, SPARTA, OpenLB, Smilei, LAMMPS, ROSS, WarpX, QMCPACK) needed draft specs so the rollout phase has YAMLs ready when the user GOes — calibration is blocked until the 3-D Phase 0 agent finishes its serial `mpirun` smoke runs (OP-8).
+
+**Resolution:** Drafted and committed perturbation YAML blocks for all 15 apps. Each block follows the SAMRAI/Nyx pattern: multi-line rationale comment + `perturbation:` block validated against the `PerturbationSpec` schema in `validation/veloc/app_config.py`.
+
+Method distribution: 9 `regex_replace`, 2 `app_arg_override`, 0 `env_var_set`, 4 `disabled` (CLAMR, HPCG, PRK_Stencil, ROSS). The four disabled apps either expose only `--key=value`-syntax CLI flags (incompatible with `app_arg_override`'s `str(value)` substitution — HPCG, ROSS) or expose only grid/timestep knobs (timing-unstable — PRK_Stencil) or have no continuous physics knob at all (CLAMR).
+
+Two apps (CoMD, OpenLB) needed two new CLI args appended to `sizes.*.app_args` so `app_arg_override` has a space-separated value slot to perturb. The added flag uses the binary's default value, so unperturbed behaviour is unchanged.
+
+Verification before commit:
+- All 15 YAMLs parse via `load_cell(<app>, 'validation', 'nofail')` without `ValueError`
+- Each `regex_replace` spec matches exactly one line in its vanilla input file via `re.subn(pattern, template.format(value=mid), content, count=1)` returning `n=1`
+- Existing tests still pass (106/106 across `tests/test_perturbation.py` + `tests/test_perturbation_calibrator.py`)
+
+Calibration with `validation/veloc/perturbation_calibrator.py` is queued after Phase 0 completes. Summary report at `build/_experiment_state/PERTURBATION_KNOB_PROPOSALS.md` lists per-app knob choices, fallback candidates, and the suggested calibration order (Tier 1 = HyPar/QMCPACK/SW4lite; Tier 4 = WarpX flagged for extra timing-stability attention).
+
+---
+
 ### #79 — Perturbation calibrator: pre-flight check for per-app YAML specs `Solved`
 
 **Reported:** 2026-05-17
