@@ -2209,48 +2209,204 @@ def _stage_correctness(
         kill_attempt_elapsed_for_signals: float | None = None
         recovery_attempt_elapsed_for_signals: float | None = None
     else:
+        # --- Hard cutover (2026-05-17): multi-fraction kill orchestrator ---
+        # Replaces the single-point F-19 path with a 3-kill sweep
+        # (default fractions 0.25, 0.50, 0.75) so the recovery-elapsed/
+        # nofail-elapsed ratio is regressed against kill_fraction.  Slope
+        # ≈ -1 → honest mid-sim resume; slope ≈ 0 → cold-start replay.
+        # See compute_recovery_slope + _enforce_validation_b for the gate.
+        #
+        # When the per-app YAML declares a `perturbation:` block, we also
+        # compute a fresh Z_P (perturbed-vanilla output) once per cycle
+        # and use it as the comparison ground truth.  This defeats every
+        # cache-class gaming pattern (the LLM cannot pre-cache outputs
+        # for an input it does not know in advance).  Apps without a
+        # perturbation spec still go through multi-fraction with the
+        # cached baseline; `perturbation_active=False` is recorded so
+        # _enforce_validation_b knows to keep the legacy F-20 path live.
+        _app_name_for_pert = _strip_output_dir_suffix(output_dir.name)
+        perturbation_spec = _load_perturbation_spec_for_app(_app_name_for_pert)
+        perturbation_active = perturbation_spec is not None
+        # One seed per validation cycle, shared across the 3 fractions so
+        # both the perturbed-vanilla Z_P and every resilient leg see the
+        # same perturbed input.  Logged so the run is forensically
+        # reproducible.
+        perturbation_seed: "int | None" = None
+        z_p_output_file: "Path | None" = None
+        if perturbation_active:
+            import random as _random
+            perturbation_seed = _random.SystemRandom().randint(1, 2**31)
+            print(
+                f"[validate] Perturbation active for {_app_name_for_pert}: "
+                f"method={perturbation_spec.method} "
+                f"seed={perturbation_seed} "
+                f"(file={perturbation_spec.file or ''} "
+                f"range={perturbation_spec.value_range})",
+                flush=True,
+            )
+            # Compute Z_P once; reused by all 3 fractions via the seed-keyed
+            # cache inside _compute_perturbed_baseline.
+            z_p_elapsed, z_p_output_file, z_p_value = _compute_perturbed_baseline(
+                original_src=original_src,
+                build_dir=original_build,
+                executable_name=(
+                    getattr(args, "original_executable_name", None)
+                    or args.executable_name
+                ),
+                num_procs=args.num_procs,
+                app_args=orig_app_args,
+                perturbation_spec=perturbation_spec,
+                perturbation_seed=perturbation_seed,
+                scratch_root=output_dir / "correctness" / "_perturbed_baseline",
+                veloc_config_name=args.veloc_config_name,
+                app_input_subdir=app_input_subdir,
+                extra_source_dirs=None,
+                output_file_name=args.output_file_name,
+                timeout_s=min(1800.0, max(60.0, baseline_elapsed * 3.0)),
+            )
+            print(
+                f"[validate] Perturbed baseline (Z_P) computed: "
+                f"elapsed={z_p_elapsed:.2f}s value={z_p_value} "
+                f"output={z_p_output_file}",
+                flush=True,
+            )
+            # The slope test's denominator is the perturbed failure-free
+            # wall-time (matches the perturbed input the resilient legs
+            # run with).  Replaces the cached vanilla baseline.
+            baseline_elapsed = z_p_elapsed
+        else:
+            print(
+                f"[validate] No perturbation spec for {_app_name_for_pert} "
+                f"(legacy path: cached vanilla baseline used as ground truth).",
+                flush=True,
+            )
+
+        # Kill fractions for the slope sweep.  CLI override
+        # --perturbation-fractions wins; default (0.25, 0.50, 0.75) lives
+        # at _DEFAULT_KILL_FRACTIONS.
+        kill_fractions = tuple(
+            getattr(args, "perturbation_fractions", None) or _DEFAULT_KILL_FRACTIONS
+        )
+        if len(kill_fractions) < 2:
+            raise ValidationError(
+                f"--perturbation-fractions must have at least 2 fractions "
+                f"to fit a slope; got {kill_fractions}",
+                stdout="", stderr="", exit_code=-1, output_dir=output_dir,
+            )
+
         print(
-            "\n[validate] Running resilient application with failure injection "
-            "(checkpoint-observed strategy — production mode)...",
+            f"\n[validate] Multi-fraction kill sweep: fractions={kill_fractions} "
+            f"baseline_elapsed={baseline_elapsed:.1f}s "
+            f"perturbation_active={perturbation_active}",
             flush=True,
         )
-        # Recovery timeout: 1.5x baseline, with a 60 s floor so MPI startup
-        # + recovery has room on very short baselines (e.g. CoMD ~10 s)
-        # without tripping the safety kill before recovery can even begin.
-        # Recovery cap: 1.5× baseline, floor 60s, ABSOLUTE CEILING 900s
-        # (15 min) — same ceiling as legacy attempt timeout.
-        recovery_timeout_s = min(900.0, max(60.0, baseline_elapsed * 1.5))
-        print(
-            f"[validate] Checkpoint-observed config: poll after "
-            f"{baseline_elapsed * 0.5:.1f}s (50% of baseline), "
-            f"5s post-checkpoint wait, recovery timeout "
-            f"{recovery_timeout_s:.1f}s (1.5x baseline, floor 60s). "
-            f"Verdict cap: kill+recovery total < "
-            f"{baseline_elapsed * 1.2:.1f}s (1.2x baseline).",
-            flush=True,
-        )
-        fp_result = run_with_checkpoint_observed_injection(
-            source_dir=resilient_src,
-            build_dir=resilient_build,
-            output_dir=resilient_out,
-            executable_name=res_exe,
-            num_procs=args.num_procs,
-            app_args=res_app_args,
-            failure_free_elapsed=baseline_elapsed,
-            observation_threshold_fraction=0.5,
-            poll_interval_s=1.0,
-            post_checkpoint_wait_s=5.0,
-            recovery_timeout_s=recovery_timeout_s,
-            run_install=args.install_resilient,
-            success_output_filename=args.output_file_name,
-            veloc_config_name=args.veloc_config_name,
-            build_cmd=resilient_build_cmd,
-            app_input_subdir=app_input_subdir,
-            extra_source_dirs=[original_src],
-        )
+
+        per_fraction_results: list[dict] = []
+        # The middle fraction (0.50 by convention) provides the
+        # `fp_result` used downstream for resilience signals, checkpoint
+        # metrics capture, F-16 sidecar scan, and stdout comparison.
+        # The other fractions only contribute timing data points.
+        primary_fp_result = None
+        primary_fraction = 0.50 if 0.50 in kill_fractions else kill_fractions[len(kill_fractions) // 2]
+        for fraction in kill_fractions:
+            # Per-fraction recovery timeout: less work remains for larger
+            # kill_fraction, so cap accordingly.  Floor 60s for MPI startup.
+            # Ceiling 900s mirrors the legacy single-point cap.
+            recovery_timeout_s = min(
+                900.0,
+                max(60.0, baseline_elapsed * (1.0 - fraction) * 1.5 + 60.0),
+            )
+            output_dir_frac = resilient_out / f"fraction_{int(round(fraction * 100))}"
+            output_dir_frac.mkdir(parents=True, exist_ok=True)
+            print(
+                f"\n[validate] --- Fraction {fraction:.2%} kill "
+                f"(delay~{baseline_elapsed * fraction:.1f}s, "
+                f"recovery timeout {recovery_timeout_s:.1f}s) ---",
+                flush=True,
+            )
+            fp_result_f = run_with_checkpoint_observed_injection(
+                source_dir=resilient_src,
+                build_dir=resilient_build,
+                output_dir=output_dir_frac,
+                executable_name=res_exe,
+                num_procs=args.num_procs,
+                app_args=res_app_args,
+                failure_free_elapsed=baseline_elapsed,
+                # NOTE: observation_threshold_fraction controls when polling
+                # starts.  The actual kill lands ~observation_threshold +
+                # post_checkpoint_wait once a checkpoint is detected.  For
+                # the slope test we treat this as "kill near fraction X".
+                observation_threshold_fraction=fraction,
+                poll_interval_s=1.0,
+                post_checkpoint_wait_s=5.0,
+                recovery_timeout_s=recovery_timeout_s,
+                run_install=args.install_resilient,
+                success_output_filename=args.output_file_name,
+                veloc_config_name=args.veloc_config_name,
+                build_cmd=resilient_build_cmd,
+                app_input_subdir=app_input_subdir,
+                extra_source_dirs=[original_src],
+                perturbation_spec=perturbation_spec,
+                perturbation_seed=perturbation_seed,
+            )
+            # Only include data points where the recovery attempt
+            # actually ran (checkpoint observed → kill+recovery).  If a
+            # fraction's kill attempt never saw a checkpoint, omit it
+            # from the slope; downstream gate will FAIL on
+            # checkpoint_observed=False anyway via the primary fraction.
+            if fp_result_f.recovery_attempt_elapsed_s is not None:
+                per_fraction_results.append({
+                    "fraction": float(fraction),
+                    "recovery_elapsed_s": float(fp_result_f.recovery_attempt_elapsed_s),
+                    "failure_free_elapsed_s": float(baseline_elapsed),
+                })
+            else:
+                print(
+                    f"[validate] Fraction {fraction:.2%}: no recovery elapsed "
+                    f"(checkpoint_observed={fp_result_f.checkpoint_observed}, "
+                    f"exit={fp_result_f.exit_code}); omitting from slope.",
+                    flush=True,
+                )
+            if fraction == primary_fraction or primary_fp_result is None:
+                primary_fp_result = fp_result_f
+                # Mirror the primary fraction's artifacts into the
+                # legacy resilient_out paths so downstream comparators
+                # (stdout, output file) read from the expected location.
+                # Mirror to resilient_out's top level: stdout.txt /
+                # stderr.txt / success outputs / attempt_* / etc.
+                for entry in output_dir_frac.iterdir():
+                    dst = resilient_out / entry.name
+                    try:
+                        if dst.is_symlink() or dst.exists():
+                            if dst.is_dir() and not dst.is_symlink():
+                                shutil.rmtree(dst)
+                            else:
+                                dst.unlink()
+                        if entry.is_dir():
+                            shutil.copytree(entry, dst)
+                        else:
+                            shutil.copy2(entry, dst)
+                    except OSError as exc:
+                        print(
+                            f"[validate] WARNING: failed to mirror "
+                            f"{entry} → {dst}: {exc}",
+                            flush=True,
+                        )
+
+        # primary_fp_result is guaranteed non-None: at least one fraction
+        # ran in the loop above.  Use it for the legacy `fp_result`
+        # contract the downstream code (signals, snapshots, comparisons)
+        # depends on.
+        fp_result = primary_fp_result
         ckpt_observed_for_signals = fp_result.checkpoint_observed
         kill_attempt_elapsed_for_signals = fp_result.kill_attempt_elapsed_s
         recovery_attempt_elapsed_for_signals = fp_result.recovery_attempt_elapsed_s
+
+        # When perturbation is active, the comparison ground-truth becomes
+        # the Z_P file (perturbed-vanilla output); otherwise the cached
+        # baseline is used.  Plumbed below into the comparison stage by
+        # overriding baseline_out's role for the failure-prone leg.
+        perturbed_baseline_output_file = z_p_output_file
 
     # --- Measure resilience signals (raw, policy-free) ---
     # Compute wall-time ratio + checkpoint-file count for the failure-injected
@@ -2296,7 +2452,7 @@ def _stage_correctness(
         "\n[validate] Running resilient application without failure injection (failure-free check)...",
         flush=True,
     )
-    from .runner import run_once, _symlink_input_data
+    from .runner import run_once, _symlink_input_data, _resolve_and_apply_perturbation
 
     resilient_clean_out = output_dir / "correctness" / "resilient_clean"
     resilient_clean_out.mkdir(parents=True, exist_ok=True)
@@ -2308,13 +2464,34 @@ def _stage_correctness(
         extra_source_dirs=[original_src],
         input_subdir=app_input_subdir,
     )
+    # When perturbation is active for this cycle, the clean leg must run
+    # against the same perturbed input as the failure-prone legs so its
+    # output is comparable to Z_P (otherwise Test 2 trivially fails:
+    # resilient_clean runs on unperturbed input but Z_P came from
+    # perturbed input).  No-op when perturbation_active is False.
+    _clean_app_args = list(res_app_args)
+    _clean_env: dict = {}
+    if (
+        not getattr(args, "vanilla_audit", False)
+        and locals().get("perturbation_active", False)
+        and locals().get("perturbation_spec") is not None
+    ):
+        _clean_app_args, _clean_env, _ = _resolve_and_apply_perturbation(
+            perturbation_spec, perturbation_seed,
+            source_dir=resilient_src, output_dir=resilient_clean_out,
+            app_args=res_app_args, env={},
+        )
+    _clean_run_env = dict(os.environ)
+    if _clean_env:
+        _clean_run_env.update(_clean_env)
     clean_result = run_once(
         build_dir=resilient_build,
         executable_name=res_exe,
         num_procs=args.num_procs,
-        app_args=res_app_args,
+        app_args=_clean_app_args,
         output_dir=resilient_clean_out,
         run_cwd=resilient_clean_out,
+        env=_clean_run_env,
         veloc_config_sources=[resilient_src, resilient_build],
         veloc_config_name=args.veloc_config_name,
         # 30-min hard cap on failure-free runs (bumped from 15-min on
@@ -2419,15 +2596,29 @@ def _stage_correctness(
     results: list[CompareResult] = []
 
     # Test 1: baseline vs resilient (with failure injection)
+    # When perturbation is active, the ground truth is the freshly-computed
+    # Z_P (perturbed-vanilla output), not the cached vanilla baseline —
+    # the resilient legs ran against the perturbed input, so they must be
+    # compared to the perturbed-vanilla output.  The legacy baseline_file
+    # is kept available for F-20's cache-content scan in the inactive case.
     baseline_file = baseline_out / args.output_file_name
+    if locals().get("perturbed_baseline_output_file") is not None:
+        comparison_golden_file = perturbed_baseline_output_file
+        print(
+            f"[validate] Using perturbed-vanilla output (Z_P) as ground "
+            f"truth: {comparison_golden_file}",
+            flush=True,
+        )
+    else:
+        comparison_golden_file = baseline_file
     resilient_file = resilient_out / args.output_file_name
     print(
         f"\n[validate] Comparing outputs (VeloC, failure-prone):\n"
-        f"  baseline:  {baseline_file}\n"
+        f"  baseline:  {comparison_golden_file}\n"
         f"  resilient: {resilient_file}",
         flush=True,
     )
-    result1 = _do_compare("VeloC, failure-prone", baseline_file, resilient_file)
+    result1 = _do_compare("VeloC, failure-prone", comparison_golden_file, resilient_file)
     print(f"[validate] Test 1 (VeloC, failure-prone): {result1}", flush=True)
     results.append(result1)
 
@@ -2436,11 +2627,11 @@ def _stage_correctness(
     if resilient_clean_file.exists():
         print(
             f"\n[validate] Comparing outputs (VeloC, failure-free):\n"
-            f"  baseline:  {baseline_file}\n"
+            f"  baseline:  {comparison_golden_file}\n"
             f"  resilient: {resilient_clean_file}",
             flush=True,
         )
-        result2 = _do_compare("VeloC, failure-free", baseline_file, resilient_clean_file)
+        result2 = _do_compare("VeloC, failure-free", comparison_golden_file, resilient_clean_file)
         print(f"[validate] Test 2 (VeloC, failure-free): {result2}", flush=True)
         results.append(result2)
     else:
@@ -2673,6 +2864,13 @@ def _stage_correctness(
                         _legitimate_output_paths.append(str(_att / args.output_file_name))
             except OSError:
                 pass
+        # Plumb the multi-fraction slope inputs.  Hard cutover (2026-05-17):
+        # the production branch above always populates these; the
+        # vanilla_audit branch never reaches _enforce_validation_b (it
+        # uses _enforce_validation_a instead).  locals().get() keeps the
+        # call resilient if a future refactor changes the upstream init.
+        _per_fraction_results = locals().get("per_fraction_results")
+        _perturbation_active = locals().get("perturbation_active", False)
         _enforce_validation_b(
             signals=resilience_signals,
             output_correct=bool(result1.passed),
@@ -2687,6 +2885,8 @@ def _stage_correctness(
             executable_name=res_exe,
             tracked_tmp_files=_tracked_tmp_files,
             legitimate_output_paths=_legitimate_output_paths,
+            per_fraction_results=_per_fraction_results,
+            perturbation_active=bool(_perturbation_active),
         )
 
     # --- Approach correctness checks ---
@@ -3063,6 +3263,34 @@ def _default_baseline_cache_dir(original_src: Path) -> Path:
     """
     repo_root = Path(__file__).resolve().parents[2]
     return repo_root / "build" / "baseline_cache" / Path(original_src).name
+
+
+def _strip_output_dir_suffix(name: str) -> str:
+    """Map an output_dir basename like ``SAMRAI_baseline`` to the app name
+    ``SAMRAI`` used as the key in ``tests/apps/configs/<APP>.yaml``."""
+    for suf in ("_baseline", "_reference", "_audit"):
+        if name.endswith(suf):
+            return name[: -len(suf)]
+    return name
+
+
+def _load_perturbation_spec_for_app(app_name: str) -> "object | None":
+    """Load the ``PerturbationSpec`` for *app_name* if the YAML defines one.
+
+    Returns ``None`` when the per-app config file is missing, has no
+    ``perturbation:`` block, or marks the spec as ``method: disabled``.
+    Any parse error is surfaced (callers must fail loudly rather than
+    silently disable perturbation).
+    """
+    from .app_config import load_cell
+    try:
+        cell = load_cell(app_name, size="validation", frequency="once")
+    except (FileNotFoundError, ValueError):
+        return None
+    spec = cell.perturbation
+    if spec is None or getattr(spec, "method", None) == "disabled":
+        return None
+    return spec
 
 
 def _autodetect_or_collect_baseline_cache(

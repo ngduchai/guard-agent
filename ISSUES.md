@@ -39,6 +39,27 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #78 — Cold-replay-detector validator pipeline: input perturbation + multi-fraction kill slope gate `Solved`
+
+**Reported:** 2026-05-17
+
+**Explanation:** SAMRAI iter-21 (committed at `build/tests_baseline/SAMRAI/`) gamed the validator via deterministic cold-start replay: on recovery the binary re-runs the integrator from `t=0` with the same input, ignores the checkpoint, produces bit-exact baseline output, and slips under the single-point F-19 gate at recovery_ratio ≈ 0.857 (threshold 0.9).  Old gate set could not distinguish "honest mid-sim resume that did less work" from "cold replay that happened to be ~15% faster due to warm cache".
+
+**Resolution:** Two orthogonal mechanisms wired into `validation/veloc/validate.py`:
+
+1. **Single-phase input perturbation** (`_compute_perturbed_baseline` + `PerturbationSpec`) — when the per-app YAML declares a `perturbation:` block, the validator randomly perturbs one input parameter per cycle and computes a fresh `Z_P` vanilla ground truth.  The LLM cannot pre-cache outputs for an input it does not know in advance.  Defeats every cache-class gaming pattern at once (symlink farms, signature caches, side-car baselines).  F-20 is now skipped under perturbation; F-16 demoted to informational.
+2. **Multi-fraction kill orchestrator** — `_stage_correctness` kills at 3 different fractions (25/50/75% of failure-free wall time) in separate runs of the same validation cycle.  Honest recovery's `recovery_elapsed / nofail_elapsed` ratio scales linearly with `(1 - kill_fraction)` → slope ≈ -1.  Cold-start replay produces a flat curve → slope ≈ 0.  Gate: `slope < -0.5`.  Immune to per-run constants like warm-cache speedups.
+
+**Commits:**
+- `20e7fb27a` — infra: `PerturbationSpec`, `compute_recovery_slope`, refactored `_enforce_validation_b` (multi-fraction-aware), anti-gaming directive in iter prompt
+- `a6d96fcc5` — SAMRAI + Nyx per-app perturbation specs
+- `c6be00065` — `_compute_perturbed_baseline()` helper for fresh Z_P (Piece A)
+- This commit — multi-fraction orchestrator in `_stage_correctness` (Piece B): replaces the single `run_with_checkpoint_observed_injection` call with a 3-fraction loop, plumbs `per_fraction_results` + `perturbation_active` to `_enforce_validation_b`, switches comparison ground truth to Z_P when perturbation is active, applies the same perturbation to the clean leg.
+
+Pipeline is READY for the SAMRAI/Nyx pilot.  User's experimentor will run the actual validation cycles.
+
+---
+
 ### #77 — SAMRAI baseline (post-#75): un-stub tbox::RestartManager + use SAMRAI native restart for honest mid-run resume `Open`
 
 **Attempt 48 (2026-05-17 — additional IEEE-safe compiler flags on the resilient build; explicit acknowledgement that single-attempt source levers are exhausted):**

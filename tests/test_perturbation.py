@@ -30,6 +30,8 @@ from validation.veloc.validate import (
     ValidationError,
     _compute_perturbed_baseline,
     _enforce_validation_b,
+    _load_perturbation_spec_for_app,
+    _strip_output_dir_suffix,
     compute_recovery_slope,
     kill_fractions_for_bench,
 )
@@ -671,3 +673,71 @@ class TestComputePerturbedBaseline:
             output_file_name="out.bin",
         )
         assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Multi-fraction orchestrator helpers (Piece B)
+# ---------------------------------------------------------------------------
+
+
+class TestStripOutputDirSuffix:
+    """``_strip_output_dir_suffix`` maps validation output dir names back to
+    the canonical app name used as the key in tests/apps/configs/<APP>.yaml.
+    """
+
+    def test_baseline_suffix(self):
+        assert _strip_output_dir_suffix("SAMRAI_baseline") == "SAMRAI"
+
+    def test_reference_suffix(self):
+        assert _strip_output_dir_suffix("Nyx_reference") == "Nyx"
+
+    def test_audit_suffix(self):
+        assert _strip_output_dir_suffix("CoMD_audit") == "CoMD"
+
+    def test_no_suffix_unchanged(self):
+        assert _strip_output_dir_suffix("HPCG") == "HPCG"
+
+    def test_internal_underscore_preserved(self):
+        # PRK_Stencil_baseline → PRK_Stencil (only the trailing _baseline
+        # is stripped; intra-name underscores survive).
+        assert _strip_output_dir_suffix("PRK_Stencil_baseline") == "PRK_Stencil"
+
+    def test_empty_string(self):
+        assert _strip_output_dir_suffix("") == ""
+
+
+class TestLoadPerturbationSpecForApp:
+    """``_load_perturbation_spec_for_app`` reads the per-app YAML and
+    returns a ``PerturbationSpec`` when the YAML defines one.
+    """
+
+    def test_unknown_app_returns_none(self):
+        # No YAML file exists for this name → returns None (not raise).
+        assert _load_perturbation_spec_for_app("__nonexistent_app__") is None
+
+    def test_samrai_returns_spec(self):
+        # SAMRAI.yaml has a perturbation: block (committed in a6d96fcc5).
+        spec = _load_perturbation_spec_for_app("SAMRAI")
+        # If the spec was ever removed/changed this gracefully degrades to
+        # None — the test only asserts the loader does not crash and
+        # returns the right type when the spec is present.
+        if spec is not None:
+            assert spec.method != "disabled"
+            assert spec.file or spec.arg_index is not None or spec.env_var
+
+    def test_disabled_spec_returns_none(self, tmp_path, monkeypatch):
+        # Inject a fake unified-config loader that returns a perturbation
+        # block marked 'disabled' — loader must filter it out.
+        from validation.veloc import app_config as _ac
+        fake_cfg = {
+            "mpi_ranks": 1,
+            "executable": "app",
+            "sizes": {"validation": {"app_args": ["a"]}},
+            "perturbation": {"method": "disabled", "reason": "test"},
+        }
+        monkeypatch.setattr(_ac, "load_unified", lambda app: fake_cfg)
+        monkeypatch.setattr(_ac, "load_frequencies",
+                            lambda: {"once": {"inject_failures": False}})
+        assert _load_perturbation_spec_for_app("X") is None
+
+
