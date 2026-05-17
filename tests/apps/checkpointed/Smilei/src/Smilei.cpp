@@ -15,10 +15,15 @@
 
 #include <ctime>
 #include <cstdlib>
+#include <cstdio>
 #include <unistd.h>
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <vector>
+#include <limits>
+#include <algorithm>
+#include <mpi.h>
 #include <omp.h>
 #ifdef SMILEI_ACCELERATOR_GPU_OACC
 #include <openacc.h>
@@ -37,12 +42,172 @@
 #include "DoubleGrids.h"
 #include "DoubleGridsAM.h"
 #include "Timers.h"
+// Explicit includes for the validation-signature dump function below.
+// VectorPatch / Particles / Species are pulled in transitively via
+// SyncVectorPatch.h, but ElectroMagn.h and Field.h are not — so add them
+// here to access EM->Ex_ etc. and Field::data_/number_of_points_ directly.
+#include "ElectroMagn.h"
+#include "Field.h"
+#include "Species.h"
+#include "Particles.h"
 
 using namespace std;
 
 // ---------------------------------------------------------------------------------------------------------------------
 //                                                   MAIN CODE
 // ---------------------------------------------------------------------------------------------------------------------
+
+// Compute physics-derived scalar reductions over the FINAL EM-field state
+// and the FINAL particle state.  Mirrors the vanilla; used by the
+// validation framework as the golden-vs-recovery comparison anchor.  Dumps
+// OUTPUT only (the user-facing PIC state at end of simulation), not
+// internal scratch / diagnostic / timer state.
+static void dumpValidationSignatureSmilei( VectorPatch &vecPatches, SmileiMPI &smpi )
+{
+    // Mirrors vanilla v48 dump: 7 EM fields × 5 stats + 2 species × 3
+    // quantities × 5 stats = 65 doubles, written to validation_output.bin
+    // in process memory layout.  Read by NumericToleranceComparator
+    // (np.fromfile dtype=float64), diffed at relative tolerance 1e-12.
+    std::vector<double> outvals;
+
+    auto reduce_field = [&]( const char *name, Field *(*get)( ElectroMagn * ),
+                             VectorPatch &vp, SmileiMPI &mpi ) {
+        double local_sum = 0.0, local_sum2 = 0.0;
+        double local_max = -std::numeric_limits<double>::infinity();
+        double local_min =  std::numeric_limits<double>::infinity();
+        long   local_count = 0;
+        for( unsigned int ipatch = 0; ipatch < vp.size(); ++ipatch ) {
+            ElectroMagn *EM = vp( ipatch )->EMfields;
+            if( !EM ) continue;
+            Field *f = get( EM );
+            if( !f || !f->data() ) continue;
+            const unsigned int n = f->number_of_points_;
+            const double *d = f->data();
+            for( unsigned int i = 0; i < n; ++i ) {
+                const double v = d[i];
+                local_sum  += v;
+                local_sum2 += v * v;
+                if( v > local_max ) local_max = v;
+                if( v < local_min ) local_min = v;
+            }
+            local_count += static_cast<long>(n);
+        }
+        double agg[2] = { local_sum, local_sum2 };
+        MPI_Allreduce( MPI_IN_PLACE, agg,         2, MPI_DOUBLE, MPI_SUM, mpi.world() );
+        MPI_Allreduce( MPI_IN_PLACE, &local_max,  1, MPI_DOUBLE, MPI_MAX, mpi.world() );
+        MPI_Allreduce( MPI_IN_PLACE, &local_min,  1, MPI_DOUBLE, MPI_MIN, mpi.world() );
+        MPI_Allreduce( MPI_IN_PLACE, &local_count,1, MPI_LONG,   MPI_SUM, mpi.world() );
+        if( mpi.isMaster() ) {
+            std::cout << "VALIDATION_SIGNATURE:"
+                      << " field=" << name
+                      << " sum="   << std::scientific << std::setprecision(10) << agg[0]
+                      << " sum2="  << agg[1]
+                      << " max="   << local_max
+                      << " min="   << local_min
+                      << " count=" << local_count << std::endl;
+            outvals.push_back( agg[0] );
+            outvals.push_back( agg[1] );
+            outvals.push_back( local_max );
+            outvals.push_back( local_min );
+            outvals.push_back( static_cast<double>( local_count ) );
+        }
+    };
+
+    reduce_field( "Ex",  []( ElectroMagn *EM ){ return EM->Ex_;  }, vecPatches, smpi );
+    reduce_field( "Ey",  []( ElectroMagn *EM ){ return EM->Ey_;  }, vecPatches, smpi );
+    reduce_field( "Ez",  []( ElectroMagn *EM ){ return EM->Ez_;  }, vecPatches, smpi );
+    reduce_field( "Bx",  []( ElectroMagn *EM ){ return EM->Bx_;  }, vecPatches, smpi );
+    reduce_field( "By",  []( ElectroMagn *EM ){ return EM->By_;  }, vecPatches, smpi );
+    reduce_field( "Bz",  []( ElectroMagn *EM ){ return EM->Bz_;  }, vecPatches, smpi );
+    reduce_field( "rho", []( ElectroMagn *EM ){ return EM->rho_; }, vecPatches, smpi );
+
+    if( vecPatches.size() > 0 ) {
+        const unsigned int nSpecies = vecPatches( 0 )->vecSpecies.size();
+        for( unsigned int ispec = 0; ispec < nSpecies; ++ispec ) {
+            long   n_particles = 0;
+            double w_sum = 0.0, w_sum2 = 0.0;
+            double w_max = -std::numeric_limits<double>::infinity();
+            double w_min =  std::numeric_limits<double>::infinity();
+            double x_sum = 0.0, x_sum2 = 0.0;
+            double x_max = -std::numeric_limits<double>::infinity();
+            double x_min =  std::numeric_limits<double>::infinity();
+            double p_sum = 0.0, p_sum2 = 0.0;
+            double p_max = -std::numeric_limits<double>::infinity();
+            double p_min =  std::numeric_limits<double>::infinity();
+            for( unsigned int ipatch = 0; ipatch < vecPatches.size(); ++ipatch ) {
+                Particles *parts = vecPatches( ipatch )->vecSpecies[ispec]->particles;
+                if( !parts ) continue;
+                const unsigned int np = parts->size();
+                for( unsigned int ip = 0; ip < np; ++ip ) {
+                    const double w = parts->weight( ip );
+                    w_sum += w; w_sum2 += w * w;
+                    if( w > w_max ) w_max = w;
+                    if( w < w_min ) w_min = w;
+                    const double x = parts->position( 0, ip );
+                    x_sum += x; x_sum2 += x * x;
+                    if( x > x_max ) x_max = x;
+                    if( x < x_min ) x_min = x;
+                    const double p = parts->momentum( 0, ip );
+                    p_sum += p; p_sum2 += p * p;
+                    if( p > p_max ) p_max = p;
+                    if( p < p_min ) p_min = p;
+                }
+                n_particles += static_cast<long>( np );
+            }
+            double agg[6] = { w_sum, w_sum2, x_sum, x_sum2, p_sum, p_sum2 };
+            MPI_Allreduce( MPI_IN_PLACE, agg,           6, MPI_DOUBLE, MPI_SUM, smpi.world() );
+            MPI_Allreduce( MPI_IN_PLACE, &n_particles,  1, MPI_LONG,   MPI_SUM, smpi.world() );
+            double mx[3] = { w_max, x_max, p_max };
+            double mn[3] = { w_min, x_min, p_min };
+            MPI_Allreduce( MPI_IN_PLACE, mx, 3, MPI_DOUBLE, MPI_MAX, smpi.world() );
+            MPI_Allreduce( MPI_IN_PLACE, mn, 3, MPI_DOUBLE, MPI_MIN, smpi.world() );
+            if( smpi.isMaster() ) {
+                const std::string &sname = vecPatches( 0 )->vecSpecies[ispec]->name_;
+                std::cout << std::scientific << std::setprecision(10);
+                std::cout << "VALIDATION_SIGNATURE: species=" << sname
+                          << " field=weight"
+                          << " sum=" << agg[0] << " sum2=" << agg[1]
+                          << " max=" << mx[0]  << " min="  << mn[0]
+                          << " count=" << n_particles << std::endl;
+                std::cout << "VALIDATION_SIGNATURE: species=" << sname
+                          << " field=position_x"
+                          << " sum=" << agg[2] << " sum2=" << agg[3]
+                          << " max=" << mx[1]  << " min="  << mn[1]
+                          << " count=" << n_particles << std::endl;
+                std::cout << "VALIDATION_SIGNATURE: species=" << sname
+                          << " field=momentum_x"
+                          << " sum=" << agg[4] << " sum2=" << agg[5]
+                          << " max=" << mx[2]  << " min="  << mn[2]
+                          << " count=" << n_particles << std::endl;
+                outvals.push_back( agg[0] );
+                outvals.push_back( agg[1] );
+                outvals.push_back( mx[0] );
+                outvals.push_back( mn[0] );
+                outvals.push_back( static_cast<double>( n_particles ) );
+                outvals.push_back( agg[2] );
+                outvals.push_back( agg[3] );
+                outvals.push_back( mx[1] );
+                outvals.push_back( mn[1] );
+                outvals.push_back( static_cast<double>( n_particles ) );
+                outvals.push_back( agg[4] );
+                outvals.push_back( agg[5] );
+                outvals.push_back( mx[2] );
+                outvals.push_back( mn[2] );
+                outvals.push_back( static_cast<double>( n_particles ) );
+            }
+        }
+    }
+
+    if( smpi.isMaster() ) {
+        std::FILE *fp = std::fopen( "validation_output.bin", "wb" );
+        if( fp != nullptr ) {
+            std::fwrite( outvals.data(), sizeof(double), outvals.size(), fp );
+            std::fclose( fp );
+            std::cout << "VALIDATION_SIGNATURE: file=validation_output.bin"
+                      << " n_doubles=" << outvals.size() << std::endl;
+        }
+    }
+}
 
 #ifdef SMILEI_ACCELERATOR_GPU_OACC
     #ifdef _OPENACC
@@ -777,6 +942,11 @@ int main( int argc, char *argv[] )
     // ------------------------------------------------------------------
     TITLE( "End time loop, time dual = " << time_dual );
     timers.global.update();
+
+    // Validation framework golden-vs-recovery comparison anchor.  Must run
+    // BEFORE vecPatches.close(&smpi) (which tears down EM fields and
+    // particle arrays).
+    dumpValidationSignatureSmilei( vecPatches, smpi );
 
     TITLE( "Time profiling : (print time > 0.001%)" );
     timers.profile( &smpi );
