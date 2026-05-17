@@ -175,18 +175,53 @@ def resolve_nodes(
 # Process discovery (local and remote)
 # ---------------------------------------------------------------------------
 
-def _find_rank_pids_local(executable_name: str) -> list[int]:
-    """Return PIDs of rank processes on the **local** machine."""
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid,cmd", "--no-headers"],
-            text=True,
-        )
-    except Exception:
-        return []
+_MPI_LAUNCHERS = {"mpirun", "mpiexec", "mpioptions", "orterun", "orted",
+                  "hydra_pmi_proxy", "srun", "prterun", "prted"}
+_SHELL_INTERPRETERS = {"bash", "sh", "zsh", "ksh", "dash"}
+_PYTHON_INTERPRETERS = {"python", "python2", "python3"}
 
+
+def _argv_basename(token: str) -> str:
+    """Return the basename of an argv token, stripping any path and
+    common version suffixes (``python3.12`` → ``python3``)."""
+    name = os.path.basename(token)
+    # Strip a trailing ``.<digits>`` suffix only for python3.x style.
+    if name.startswith("python3.") and name[8:].isdigit():
+        return "python3"
+    return name
+
+
+def match_rank_pids(ps_output: str, executable_name: str) -> list[int]:
+    """Return PIDs whose command-line indicates they are the *executable_name*
+    rank process.
+
+    *ps_output* is the output of ``ps -eo pid,cmd --no-headers`` (one
+    process per line, ``pid <space> cmdline``).  The match logic:
+
+      * If ``argv[0]`` basename is an MPI launcher, **skip** — never a
+        rank, always the parent of one.
+      * If ``argv[0]`` basename is a Python interpreter, **skip** — the
+        injector must not kill the validation harness or a stray
+        ``python validate.py --executable-name <X>`` whose argv contains
+        the binary name as a flag value.
+      * If ``argv[0]`` basename is a shell interpreter (bash/sh/zsh/...),
+        treat ``argv[1]`` basename as the effective executable name —
+        this covers MMSP / HPCG / SST style wrappers.  The ``argv[0]``
+        basename of the wrapper script (``mmsp_run.sh``, ``xhpcg_run``)
+        is what the caller passes as ``executable_name``.  The ``bash
+        run_validate.sh`` wrapper is filtered out here because its
+        ``argv[1]`` basename is ``run_validate.sh``, not the app
+        name — even if the app name appears later in argv.
+      * Otherwise, match when ``argv[0]`` basename equals
+        *executable_name*.
+
+    The matcher is intentionally pure — it takes a string in, returns
+    pids out — so that the friendly-fire regression suite can drive it
+    with synthetic ps output without touching the OS.
+    """
+    target = os.path.basename(executable_name)
     pids: list[int] = []
-    for line in out.splitlines():
+    for line in ps_output.splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) < 2:
             continue
@@ -195,27 +230,131 @@ def _find_rank_pids_local(executable_name: str) -> list[int]:
         except ValueError:
             continue
         cmd = parts[1]
-        if executable_name in cmd and "mpirun" not in cmd and "python" not in cmd:
+        argv = cmd.split()
+        if not argv:
+            continue
+        argv0 = _argv_basename(argv[0])
+        if argv0 in _MPI_LAUNCHERS or argv0 in _PYTHON_INTERPRETERS:
+            continue
+        if argv0 in _SHELL_INTERPRETERS:
+            # Shell wrapper: the "real" rank is identified by argv[1].
+            if len(argv) < 2:
+                continue
+            argv1 = _argv_basename(argv[1])
+            if argv1 == target:
+                pids.append(pid)
+            continue
+        if argv0 == target:
             pids.append(pid)
     return pids
 
 
-def _find_rank_pids_remote(host: str, executable_name: str) -> list[int]:
+def _build_descendants(ppid_of: dict[int, int], parent_pid: int) -> set[int]:
+    """Return all PIDs whose ancestry chain reaches *parent_pid*."""
+    descendants: set[int] = set()
+    for pid in ppid_of:
+        cur = pid
+        seen: set[int] = set()
+        while cur in ppid_of:
+            if cur in seen:  # ppid loop guard (shouldn't happen, but defensive)
+                break
+            seen.add(cur)
+            parent = ppid_of[cur]
+            if parent == parent_pid:
+                descendants.add(pid)
+                break
+            if parent == 0 or parent == 1:
+                break
+            cur = parent
+    return descendants
+
+
+def _ps_with_ppid_local() -> tuple[str, dict[int, int]]:
+    """Run ``ps -eo pid,ppid,cmd --no-headers`` locally; return
+    ``(pid_cmd_output, ppid_map)`` where ``pid_cmd_output`` is in the
+    ``pid cmd`` format that :func:`match_rank_pids` expects.
+    """
+    out = subprocess.check_output(
+        ["ps", "-eo", "pid,ppid,cmd", "--no-headers"],
+        text=True,
+    )
+    return _split_ppid_from_pscmd(out)
+
+
+def _split_ppid_from_pscmd(raw_out: str) -> tuple[str, dict[int, int]]:
+    """Take ``pid ppid cmd`` lines and return ``(pid cmd, ppid_map)``.
+
+    Defensive against malformed lines: any line that doesn't have at
+    least three whitespace-separated fields is dropped from both
+    outputs.
+    """
+    pid_cmd_lines: list[str] = []
+    ppid_of: dict[int, int] = {}
+    for line in raw_out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        ppid_of[pid] = ppid
+        pid_cmd_lines.append(f"{parts[0]} {parts[2]}")
+    return "\n".join(pid_cmd_lines), ppid_of
+
+
+def _find_rank_pids_local(
+    executable_name: str,
+    parent_pid: int | None = None,
+) -> list[int]:
+    """Return PIDs of rank processes on the **local** machine.
+
+    Uses :func:`match_rank_pids` to identify candidates by argv structure
+    (rejects MPI launchers, python interpreters, and the validation
+    wrapper).  When *parent_pid* is given, candidates are further
+    restricted to descendants of *parent_pid* — defence in depth against
+    a second unrelated mpirun job running the same binary on the same
+    machine.
+    """
+    try:
+        pid_cmd_out, ppid_of = _ps_with_ppid_local()
+    except Exception:
+        return []
+    candidates = match_rank_pids(pid_cmd_out, executable_name)
+    if parent_pid is None:
+        return candidates
+    descendants = _build_descendants(ppid_of, parent_pid)
+    return [pid for pid in candidates if pid in descendants]
+
+
+def _find_rank_pids_remote(
+    host: str,
+    executable_name: str,
+    parent_pid: int | None = None,
+) -> list[int]:
     """Return PIDs of rank processes on a **remote** node via SSH.
 
     Uses ``ssh -o BatchMode=yes`` so that it never hangs waiting for a
     password prompt (assumes passwordless SSH is configured, which is
     standard on HPC clusters).
+
+    The *parent_pid* descendant filter only applies when the parent
+    process actually lives on the remote node — typically not the case
+    in multi-node MPI (mpirun runs on one node, ranks on others).  When
+    that mismatch happens, the descendant filter would yield an empty
+    set and the matcher's argv-based rejection alone is what guards
+    against friendly-fire.
     """
     try:
-        out = subprocess.check_output(
+        raw = subprocess.check_output(
             [
                 "ssh",
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "ConnectTimeout=5",
                 host,
-                "ps", "-eo", "pid,cmd", "--no-headers",
+                "ps", "-eo", "pid,ppid,cmd", "--no-headers",
             ],
             text=True,
             stderr=subprocess.DEVNULL,
@@ -223,31 +362,31 @@ def _find_rank_pids_remote(host: str, executable_name: str) -> list[int]:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return []
-
-    pids: list[int] = []
-    for line in out.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        cmd = parts[1]
-        if executable_name in cmd and "mpirun" not in cmd and "python" not in cmd:
-            pids.append(pid)
-    return pids
+    pid_cmd_out, ppid_of = _split_ppid_from_pscmd(raw)
+    candidates = match_rank_pids(pid_cmd_out, executable_name)
+    if parent_pid is None:
+        return candidates
+    descendants = _build_descendants(ppid_of, parent_pid)
+    if not descendants:
+        # Parent likely doesn't live on this node (multi-node MPI);
+        # fall back to the argv-based match alone.
+        return candidates
+    return [pid for pid in candidates if pid in descendants]
 
 
-def find_rank_pids(host: str, executable_name: str) -> list[int]:
+def find_rank_pids(
+    host: str,
+    executable_name: str,
+    parent_pid: int | None = None,
+) -> list[int]:
     """Return PIDs of rank processes on *host*.
 
     Dispatches to local or remote discovery depending on whether *host*
     refers to the current machine.
     """
     if _is_local(host):
-        return _find_rank_pids_local(executable_name)
-    return _find_rank_pids_remote(host, executable_name)
+        return _find_rank_pids_local(executable_name, parent_pid)
+    return _find_rank_pids_remote(host, executable_name, parent_pid)
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +469,9 @@ def inject_failure_once(
         random.shuffle(shuffled)
 
         for host in shuffled:
-            pids = find_rank_pids(host, executable_name)
+            # Pass parent_pid to scope the search to descendants of mpirun
+            # on the local node (defence in depth on top of comm matching).
+            pids = find_rank_pids(host, executable_name, parent_pid=parent_pid)
             if not pids:
                 continue
 

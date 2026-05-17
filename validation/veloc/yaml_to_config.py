@@ -199,6 +199,10 @@ def get_comparison_flags(config: dict) -> str:
     _METHOD_MAP: dict[str, str] = {
         "numeric": "numeric-tolerance",
         "text": "text-diff",
+        # Streaming variants pass through unchanged; CLI accepts them
+        # directly (validate.py --comparison-method choices include them).
+        "streaming-text": "streaming-text",
+        "streaming-numeric": "streaming-numeric",
     }
 
     comp = config.get("comparison", {})
@@ -207,7 +211,9 @@ def get_comparison_flags(config: dict) -> str:
     flags = [f"--comparison-method {method}"]
 
     tol = comp.get("tolerance")
-    if tol is not None and method == "numeric-tolerance":
+    # Apply tolerance to numeric-tolerance AND streaming-numeric (the
+    # streaming variant uses the same numeric tolerance pathway).
+    if tol is not None and method in ("numeric-tolerance", "streaming-numeric"):
         flags.append(f"--numeric-atol {tol}")
         flags.append(f"--numeric-rtol {tol}")
 

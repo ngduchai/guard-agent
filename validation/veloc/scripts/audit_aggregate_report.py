@@ -57,6 +57,11 @@ class AppAudit:
     appears_resilient: bool | None
     proof_passed: bool | None
     log_path: str | None
+    vanilla_failure_free_elapsed_s: float | None = None
+    reference_failure_free_elapsed_s: float | None = None
+    workload_parity_ratio: float | None = None
+    workload_parity_floor: float | None = None
+    workload_parity_ok: bool | None = None
 
 
 def _read_json(path: Path) -> dict | None:
@@ -95,6 +100,11 @@ def _audit_one(name: str, output_root: Path) -> AppAudit:
     accuracy_match: bool | None = None
     appears_resilient: bool | None = None
     proof_passed: bool | None = None
+    vanilla_ff_elapsed: float | None = None
+    reference_ff_elapsed: float | None = None
+    workload_parity_ratio: float | None = None
+    workload_parity_floor: float | None = None
+    workload_parity_ok: bool | None = None
 
     if proof is not None:
         base_elapsed = proof.get("original_elapsed_s")
@@ -105,6 +115,11 @@ def _audit_one(name: str, output_root: Path) -> AppAudit:
         accuracy_match = proof.get("accuracy_match")
         appears_resilient = proof.get("appears_resilient")
         proof_passed = proof.get("passed")
+        vanilla_ff_elapsed = proof.get("vanilla_failure_free_elapsed_s")
+        reference_ff_elapsed = proof.get("reference_failure_free_elapsed_s")
+        workload_parity_ratio = proof.get("workload_parity_ratio")
+        workload_parity_floor = proof.get("workload_parity_floor")
+        workload_parity_ok = proof.get("workload_parity_ok")
 
     base_kw = dict(
         baseline_elapsed_s=base_elapsed,
@@ -116,6 +131,11 @@ def _audit_one(name: str, output_root: Path) -> AppAudit:
         appears_resilient=appears_resilient,
         proof_passed=proof_passed,
         log_path=str(log_path) if log_path.exists() else None,
+        vanilla_failure_free_elapsed_s=vanilla_ff_elapsed,
+        reference_failure_free_elapsed_s=reference_ff_elapsed,
+        workload_parity_ratio=workload_parity_ratio,
+        workload_parity_floor=workload_parity_floor,
+        workload_parity_ok=workload_parity_ok,
     )
 
     # 1) Vanilla must at least build + run failure-free.  The cache's
@@ -180,6 +200,21 @@ def _audit_one(name: str, output_root: Path) -> AppAudit:
             reason=(
                 f"Vanilla recovered from failure injection (ratio {ratio:.2f}x, "
                 f"checkpoint files={ckpt_count}); strip-out is incomplete."
+            ),
+            **base_kw,
+        )
+
+    if workload_parity_ok is False:
+        return AppAudit(
+            name=name,
+            status="FAIL_WORKLOAD_MISMATCH",
+            reason=(
+                f"Reference failure-free run faster than vanilla "
+                f"(vanilla={vanilla_ff_elapsed}s, reference={reference_ff_elapsed}s, "
+                f"ratio={workload_parity_ratio} < {workload_parity_floor}). "
+                "Reference cannot legitimately outrun vanilla — checkpoint I/O "
+                "only adds work. Likely cause: per-app env var (HPCG_FIXED_SETS, "
+                "CKPT_EVERY) or input overlay shrank reference's workload."
             ),
             **base_kw,
         )

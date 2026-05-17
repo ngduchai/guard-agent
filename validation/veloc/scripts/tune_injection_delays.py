@@ -68,15 +68,20 @@ def tune_one(app: str, dry_run: bool = False) -> dict:
             continue
         old = s.get("injection_delay")
         if old is None:
-            continue
-        try:
-            old_f = float(old)
-        except (TypeError, ValueError):
-            continue
-        if abs(old_f - suggested_delay) < 0.5:
+            old_f = None  # null sentinel = "resolve at runtime"; we must populate now
+        else:
+            try:
+                old_f = float(old)
+            except (TypeError, ValueError):
+                old_f = None
+        if old_f is not None and abs(old_f - suggested_delay) < 0.5:
             continue  # already close enough
         s["injection_delay"] = suggested_delay
-        changes.append({"scenario": s.get("name", "?"), "old": old_f, "new": suggested_delay})
+        changes.append({
+            "scenario": s.get("name", "?"),
+            "old": old_f if old_f is not None else "null",
+            "new": suggested_delay,
+        })
 
     if not changes:
         return {
@@ -123,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         for r in updated:
             print(f"  {r['app']:14}  baseline={r['baseline']:.1f}s  → injection_delay={r['suggested']:.1f}s")
             for ch in r["changes"]:
-                print(f"     {ch['scenario']}: {ch['old']:.1f}s → {ch['new']:.1f}s")
+                old_str = f"{ch['old']:.1f}s" if isinstance(ch["old"], (int, float)) else str(ch["old"])
+                print(f"     {ch['scenario']}: {old_str} → {ch['new']:.1f}s")
 
     if no_change:
         print(f"\n=== Already correct: {len(no_change)} app(s) ===")

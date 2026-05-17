@@ -316,6 +316,14 @@ class NumericToleranceComparator(BaseComparator):
     def _load(self, path: Path, np):
         if path.suffix in {".npy", ".npz"}:
             return np.load(path)
+        # Raw binary doubles, in process memory layout (no header, no
+        # padding).  Used by the v48 file-based golden-output dumps for
+        # SAMRAI / Nyx / Smilei: the C++ side writes via std::fwrite of
+        # an array of doubles, this side reads via np.fromfile.  No
+        # precision loss, length parity enforced by the caller's shape
+        # check above.
+        if path.suffix == ".bin":
+            return np.fromfile(path, dtype=np.float64)
         # Try HDF5 first, fall back to text (np.loadtxt) for plain-text
         # numeric files (e.g. .xy output from PENNANT).
         try:

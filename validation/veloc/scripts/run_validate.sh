@@ -250,7 +250,16 @@ CMD="python -m validation.veloc.validate \
 # measure.  See tests/apps/patches/README.md for the convention.
 _REF_OVERLAY_DIR=""
 if [ "$USE_REFERENCE" = true ]; then
-  CMD="$CMD --reference-input-priority"
+  # Reference apps use their NATIVE checkpoint mechanism (e.g. ROSS RIO,
+  # SAMRAI restart, HDF5 plotfiles), NOT VeloC.  None ship a veloc.cfg.
+  # The correctness stage's checkpoint-observed strategy requires veloc.cfg
+  # (runner.py raises ValidationError otherwise — added 2026-04-28).
+  # All 16 prior successful reference runs have stages=['benchmarks','report']
+  # — correctness was always skipped.  Match that pattern.  Reference
+  # benchmarks use inject_failures=false scenarios so they don't need
+  # checkpoint-observed either; only failure-free wallclock + checkpoint
+  # size are measured.
+  CMD="$CMD --reference-input-priority --skip-correctness"
   _REF_PATCH_DIR="$REPO_ROOT/tests/apps/patches/$APP_NAME"
   if [ -d "$_REF_PATCH_DIR" ]; then
     _REF_OVERLAY_DIR=$(mktemp -d -t "ref_input_overlay.${APP_NAME}.XXXXXX")
@@ -261,25 +270,78 @@ if [ "$USE_REFERENCE" = true ]; then
     echo "  Reference input overlay: $_REF_OVERLAY_DIR"
     echo "    (vanilla + patches from $_REF_PATCH_DIR)"
   fi
-  # Per-app env-var-driven checkpoint enables.  Some reference apps
-  # (HPCG, PRK_Stencil) read checkpoint cadence from env vars rather
-  # than an input file, so a patch is N/A — we set them here instead.
+  # Reference-only env vars: bulk-output pruning, etc.
   case "$APP_NAME" in
-    HPCG)
-      # HPCG reference's src/hpcg_ckpt.cpp reads CKPT_EVERY/HPCG_FIXED_SETS.
-      # CKPT_EVERY=10 fires within first 10 CG-sets, well before injection.
-      export CKPT_EVERY=10
-      export HPCG_FIXED_SETS=180
-      echo "  Reference env: CKPT_EVERY=$CKPT_EVERY HPCG_FIXED_SETS=$HPCG_FIXED_SETS"
-      ;;
-    PRK_Stencil)
-      # PRK Stencil reference reads CKPT_EVERY (default 500).  Tighten so
-      # first per-rank state file lands well before failure injection.
-      export CKPT_EVERY=200
-      echo "  Reference env: CKPT_EVERY=$CKPT_EVERY"
+    WarpX)
+      # WarpX writes 30-50 GB of AMReX chkpoint files PER run.  With 3
+      # nofail runs × 2 codebases that is up to ~300 GB concurrent — exceeds
+      # typical disk budgets.  Enable PRUNE_BENCH_ARTIFACTS so the
+      # metrics_collector deletes the bulk under benchmarks/.../run_N/diags
+      # immediately after the run's elapsed/checkpoint metrics are persisted
+      # to benchmark_progress.json.  Trust-gate inspection still has stdout/
+      # stderr.  Recorded numbers are unaffected.
+      #
+      # WarpX-only by deliberate user decision: other apps' run-output is
+      # small enough to keep around for inspection.  Do NOT add other apps
+      # to this branch without re-confirming.
+      export PRUNE_BENCH_ARTIFACTS=1
+      echo "  Reference env: PRUNE_BENCH_ARTIFACTS=1 (heavy AMReX checkpoint output, WarpX-only)"
       ;;
   esac
 fi
+
+# Workload-pin env vars: applied UNIVERSALLY (vanilla baseline, reference,
+# LLM-baseline, audit) so vanilla and the comparison binary run the same
+# numerical workload.  Without this, vanilla auto-computes a different
+# iteration count than reference (HPCG: numberOfCgSets via opt_worst_time)
+# and the bench comparison silently runs different workloads.
+#
+# Vanilla source has been edited to also read these env vars (HPCG
+# tests/apps/vanillas/HPCG/src/main.cpp) — they are workload knobs, not
+# checkpoint code, so they don't violate the vanilla-strip invariant.
+# Other binaries that don't read them (LLM baseline, audit's vanilla)
+# harmlessly ignore the env var.
+case "$APP_NAME" in
+  HPCG)
+    # HPCG: pin numberOfCgSets so vanilla and reference run identical
+    # workloads + reference's checkpoint format stays dimension-stable
+    # across kill/restart pairs.  CKPT_EVERY is reference-only-relevant
+    # (vanilla lacks the checkpoint code path) but harmless if exported.
+    export CKPT_EVERY=10
+    export HPCG_FIXED_SETS=180
+    echo "  Workload-pin env (universal): CKPT_EVERY=$CKPT_EVERY HPCG_FIXED_SETS=$HPCG_FIXED_SETS"
+    ;;
+  PRK_Stencil)
+    # PRK Stencil: CKPT_EVERY only controls checkpoint cadence, not
+    # workload size.  Exporting universally is harmless to vanilla.
+    # 2026-05-16: bumped 1000 -> 10000 per longer-interval sweep that
+    # showed thrashing kicks in around 5+ ckpts. At 33000-iter run with
+    # CKPT_EVERY=10000: 3 ckpts x ~256MB = ~768MB I/O — well below
+    # thrashing threshold. Probe wall = 246.19s vs vanilla 249.28s
+    # (zero overhead). Sweep data:
+    # build/_experiment_state/prk_longer_interval_sweep.log.
+    # Use ":=" so external CKPT_EVERY (e.g., from a manual probe) wins.
+    : "${CKPT_EVERY:=10000}"
+    export CKPT_EVERY
+    echo "  Workload-pin env (universal): CKPT_EVERY=$CKPT_EVERY"
+    ;;
+esac
+
+# Per-app stdout truncation env (HyPar Fix B, 2026-05-03).  Apps that
+# emit hundreds of MB of stdout per run cause OOM when the runner reads
+# the full file into a Python string for the RunResult.stdout field.
+# Bound the in-memory copy to the last N lines (on-disk file is
+# unchanged — streaming comparator reads from disk).
+case "$APP_NAME" in
+  HyPar)
+    # HyPar's n_iter=2.5M produces 375 MB stdout per run.  Per-step output
+    # ('iter=N t=X ...') × 2.5M lines.  Last 1000 lines covers the
+    # 'Completed time integration', 'L1 Error', 'L2 Error', 'Linfinity Error'
+    # signature plus generous margin.
+    export BENCH_STDOUT_TRUNCATE_LINES=1000
+    echo "  Stdout truncation: BENCH_STDOUT_TRUNCATE_LINES=$BENCH_STDOUT_TRUNCATE_LINES (HyPar 375MB stdout OOM mitigation)"
+    ;;
+esac
 # Make sure the overlay is cleaned up when run_validate.sh exits.
 _cleanup_overlay() {
   if [ -n "$_REF_OVERLAY_DIR" ] && [ -d "$_REF_OVERLAY_DIR" ]; then
@@ -290,7 +352,16 @@ trap _cleanup_overlay EXIT INT TERM
 
 # When the resilient build produces a different binary name than vanilla
 # (e.g. ROSS: vanilla 'phold' vs resilient 'pholdio'), pass it explicitly.
-if [ -n "${RESILIENT_EXE:-}" ] && [ "$RESILIENT_EXE" != "$EXE_NAME" ]; then
+# RESILIENT_EXE (read from app.yaml's ckpt_executable field) only applies when
+# the resilient codebase is the upstream REFERENCE checkpointed source — that's
+# where the variant-binary lives (e.g. ROSS reference uses `pholdio` from its
+# native RIO model; vanilla and LLM-baseline only have `phold`).
+# In --baseline mode the LLM-modified code is built from vanilla source which
+# does NOT contain the variant-binary target, so passing this flag would force
+# the LLM to invent infrastructure it doesn't have access to (saw this break
+# ROSS_baseline iter 1 with `make: *** No rule to make target 'pholdio'`).
+# In --audit-vanilla mode the resilient side IS the vanilla, also has no variant.
+if [ "$USE_REFERENCE" = true ] && [ -n "${RESILIENT_EXE:-}" ] && [ "$RESILIENT_EXE" != "$EXE_NAME" ]; then
   CMD="$CMD --resilient-executable-name \"$RESILIENT_EXE\""
 fi
 

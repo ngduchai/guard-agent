@@ -184,6 +184,99 @@ def _run_with_kill(
         )
 
 
+# Substrings that are FORBIDDEN inside a `keep_patterns` entry.  These
+# are LLM-fakeable banner words: an implementation can print them without
+# actually doing the underlying work, so accepting them as proof-of-output
+# enables the gaming attack we caught with ROSS / Nyx / SAMRAI baselines
+# (recovery_attempt_elapsed_s ~ 0.1s, ratio < 1.0 — physically impossible
+# for honest checkpointing).  Matched case-INsensitively against each
+# keep_pattern at config-load time.
+#
+# Whitelist a string here only when it is genuinely a science-result
+# signature whose value cannot be predicted without doing the computation
+# (e.g. "Total GVT Computations" is OK because it's printed alongside a
+# number that requires the simulation to have run).
+_BANNED_KEEP_PATTERN_SUBSTRINGS: tuple[str, ...] = (
+    "recovery",
+    "restart detected",
+    "restart_detected",
+    "fast-recovery",
+    "fast_recovery",
+    "skipping simulation",
+    "skipping_simulation",
+    "engaged",
+    "run time = 0",
+    "run_time_zero",
+    "checkpoint loaded",
+    "checkpoint_loaded",
+    "from checkpoint",
+    "from_checkpoint",
+    "passed",  # final-verdict word; trivial to print without computing
+    # 2026-05-08: caught QMCPACK ('completed successfully'), Smilei ('END'),
+    # and SPPARKS ('Loop time' as the only allowlisted line) all using
+    # banner-style patterns that the LLM-modified code could trivially
+    # produce without doing any real work.  Strict allowlist; any new
+    # config must use a science-result signature (energy, conservation
+    # quantity, deterministic step count, etc.).
+    "completed successfully",
+    "completed_successfully",
+    "simulation complete",
+    "simulation_complete",
+    "loop time",  # wall-time, not science; observed to vary 50%+ run-to-run
+    "loop_time",
+)
+
+
+_BANNED_EXACT_KEEP_PATTERNS: frozenset[str] = frozenset({
+    # Bare end-of-run markers an LLM can trivially print.  Stored as
+    # case-insensitive lowercase tokens; matched against the *stripped*
+    # pattern.  Substrings of longer patterns (e.g. "End time loop = …")
+    # are NOT blocked by this list — only standalone bare markers.
+    "end", "done", "finished", "complete", "ok", "pass", "success",
+    "exit", "halt", "stop", "terminated",
+})
+
+
+def validate_keep_patterns(
+    patterns: list[str] | None, *, app_label: str = ""
+) -> None:
+    """Reject keep_patterns that an LLM could fake without doing real work.
+
+    Raises ValueError naming the offending pattern + the banned substring
+    so the author can pick a science-result signature instead (e.g. a
+    field value, residual norm, particle count, GVT counter).
+
+    No-op when *patterns* is None or empty.
+    """
+    if not patterns:
+        return
+    for pat in patterns:
+        low = pat.lower()
+        # Exact-match banlist: bare end-of-run markers like "END", "DONE".
+        if low.strip() in _BANNED_EXACT_KEEP_PATTERNS:
+            raise ValueError(
+                f"keep_pattern {pat!r} for {app_label or 'app'} "
+                f"is a bare end-of-run marker.  Any LLM-generated stub "
+                "can print this without running the computation.  "
+                "Replace with a science-result signature: a label "
+                "that always appears next to a numeric value the "
+                "simulation cannot fake."
+            )
+        for banned in _BANNED_KEEP_PATTERN_SUBSTRINGS:
+            if banned in low:
+                raise ValueError(
+                    f"keep_pattern {pat!r} for {app_label or 'app'} "
+                    f"contains banned substring {banned!r}.  This is a "
+                    "banner-style string an LLM can print without doing "
+                    "the underlying computation; accepting it as "
+                    "proof-of-output enables gaming of the comparator. "
+                    "Replace with a science-result signature: a "
+                    "label that always appears next to a numeric value "
+                    "the simulation cannot fake (residual norm, "
+                    "conservation quantity, performance counter)."
+                )
+
+
 def _filter_lines(
     text: str,
     ignore_patterns: list[str],
@@ -242,8 +335,43 @@ def _compare_outputs(
     patterns = ignore_patterns or []
     keeps = keep_patterns or []
     strips = strip_patterns or None
+    # F-3: refuse to accept banner-style keep_patterns (LLM-fakeable).
+    # Validated even on the comparison hot path so a misconfigured app
+    # config can never silently accept gamed output.
+    if keeps:
+        validate_keep_patterns(keeps, app_label="comparator")
     golden_filtered = _filter_lines(golden_stdout, patterns, keeps or None, strips)
     test_filtered = _filter_lines(test_stdout, patterns, keeps or None, strips)
+
+    # F-3 Layer B: when keep_patterns are configured (allowlist), at least
+    # one matching line MUST appear on BOTH sides.  Empty filtered output
+    # ("" == "" → True) was the gaming-attack vector for ROSS/Nyx/SAMRAI:
+    # the LLM emitted a banner that didn't match keep_patterns, the science
+    # output didn't either (because the simulation was skipped), and both
+    # sides ended up empty → trivial PASS.  Refuse to compare empties.
+    if keeps:
+        if not golden_filtered.strip():
+            return ComparisonResult(
+                method=method, passed=False,
+                details=(
+                    "Empty filtered golden output despite configured "
+                    f"keep_patterns={keeps!r}.  Either the golden run is "
+                    "broken or the keep_patterns don't match its real "
+                    "science signature — fix the patterns to point at "
+                    "values the simulation actually emits."
+                ),
+            )
+        if not test_filtered.strip():
+            return ComparisonResult(
+                method=method, passed=False,
+                details=(
+                    "Empty filtered test output despite configured "
+                    f"keep_patterns={keeps!r}.  The candidate implementation "
+                    "did not emit any matching science signature — likely a "
+                    "no-op recovery path that skipped the actual computation. "
+                    "(F-3 anti-gaming guard.)"
+                ),
+            )
 
     if method == "text":
         passed = golden_filtered.strip() == test_filtered.strip()
@@ -257,6 +385,10 @@ def _compare_outputs(
         golden_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", golden_filtered)]
         test_nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", test_filtered)]
         if not golden_nums and not test_nums:
+            # Without keep_patterns this is "no numbers anywhere" — legitimate
+            # for text-only output.  With keep_patterns the empty-match guard
+            # above already FAILed; reaching here means the run is honestly
+            # text-only and there's nothing to compare numerically.
             return ComparisonResult(method="numeric", passed=True, details="No numbers to compare")
         if not golden_nums or not test_nums:
             return ComparisonResult(
@@ -287,6 +419,163 @@ def _compare_outputs(
     passed = h1 == h2
     return ComparisonResult(
         method="hash", passed=passed,
+        details="" if passed else f"Hash mismatch: {h1[:16]}... vs {h2[:16]}...",
+    )
+
+
+# ---------------------------------------------------------------------------
+# D1 — Streaming variant for very-large-stdout apps (HyPar 375 MB)
+# ---------------------------------------------------------------------------
+# Dedicated comparator added 2026-05-03.  This function does NOT replace
+# the existing `_compare_outputs` — it sits alongside.  Callers that need
+# bounded-memory comparison (e.g. HyPar) opt in via comparison.method =
+# 'streaming-text' / 'streaming-numeric'.  All other apps continue to use
+# the original in-memory comparator unchanged.
+#
+# Design constraint (per user direction): no changes to text / numeric /
+# hash code paths.  This function reuses the same filter + comparison
+# rules but drives them line-by-line off the file iterator instead of
+# loading the full string into memory.
+
+def _compare_outputs_streaming(
+    golden_file: Path,
+    test_file: Path,
+    method: str = "text",
+    tolerance: float = 1e-6,
+    ignore_patterns: list[str] | None = None,
+    keep_patterns: list[str] | None = None,
+    strip_patterns: list[str] | None = None,
+) -> ComparisonResult:
+    """Streaming variant of :func:`_compare_outputs`.
+
+    Reads each file line-by-line, applies keep_patterns / ignore_patterns
+    incrementally, accumulates only the matched subset.  Memory cost is
+    O(filtered subset size), not O(full file size).
+
+    Used for apps whose stdout is too large to load into memory twice
+    (HyPar produces 375 MB per run; loading both vanilla + LLM-modified
+    copies = ~750 MB Python strings → OOM during comparison).
+
+    Same semantics as :func:`_compare_outputs`:
+    - keep_patterns wins over ignore_patterns when both are set
+    - F-3 banner-blocklist enforced on keep_patterns
+    - F-3 Layer B empty-match guard fires when filtered output is empty
+    - strip_patterns regex-removed AFTER filtering
+    - method ∈ {"text", "numeric", "hash"} routes to the same comparison
+      logic the in-memory comparator uses
+
+    Requires file paths (not in-memory strings) — that's the whole point.
+    """
+    keeps = keep_patterns or []
+    ignores = ignore_patterns or []
+    strips = strip_patterns or []
+
+    # F-3 Layer A — banner blocklist (same as _compare_outputs).
+    if keeps:
+        validate_keep_patterns(keeps, app_label="streaming-comparator")
+
+    def _stream_filter(path: Path) -> str:
+        """Read file line-by-line; return joined kept lines, with strip
+        regexes applied.  Empty string when file missing.  Bounded memory."""
+        if not path.exists():
+            return ""
+        kept: list[str] = []
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if keeps:
+                    if not any(p in line for p in keeps):
+                        continue
+                else:
+                    if ignores and any(p in line for p in ignores):
+                        continue
+                kept.append(line)
+        text = "\n".join(kept)
+        if strips:
+            compiled = [re.compile(p) for p in strips]
+            for c in compiled:
+                text = c.sub("", text)
+        return text
+
+    golden_filtered = _stream_filter(golden_file)
+    test_filtered = _stream_filter(test_file)
+
+    # F-3 Layer B — empty-match guard, same as in _compare_outputs.
+    if keeps:
+        if not golden_filtered.strip():
+            return ComparisonResult(
+                method=f"streaming-{method}", passed=False,
+                details=(
+                    f"streaming: empty filtered golden output despite "
+                    f"keep_patterns={keeps!r}; either golden run is broken "
+                    "or patterns don't match the science signature.  Fix "
+                    "the patterns to point at lines the simulation actually "
+                    "emits."
+                ),
+            )
+        if not test_filtered.strip():
+            return ComparisonResult(
+                method=f"streaming-{method}", passed=False,
+                details=(
+                    f"streaming: empty filtered test output despite "
+                    f"keep_patterns={keeps!r}; candidate implementation did "
+                    "not emit any matching science signature — likely a "
+                    "no-op recovery path.  (F-3 anti-gaming guard.)"
+                ),
+            )
+
+    # Run the comparison on the now-small filtered subset.  Logic is
+    # IDENTICAL to _compare_outputs's text/numeric/hash branches; we
+    # duplicate (rather than refactor) so the existing comparator's code
+    # path stays untouched.
+    if method == "text":
+        passed = golden_filtered.strip() == test_filtered.strip()
+        return ComparisonResult(
+            method="streaming-text", passed=passed,
+            details="" if passed else "Stdout differs from golden (streaming)",
+        )
+
+    if method == "numeric":
+        gnums = [float(x) for x in re.findall(
+            r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", golden_filtered)]
+        tnums = [float(x) for x in re.findall(
+            r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", test_filtered)]
+        if not gnums and not tnums:
+            return ComparisonResult(
+                method="streaming-numeric", passed=True,
+                details="No numbers to compare",
+            )
+        if not gnums or not tnums:
+            return ComparisonResult(
+                method="streaming-numeric", passed=False,
+                details=(
+                    f"One side has no numbers: {len(gnums)} vs {len(tnums)}"
+                ),
+            )
+        n = min(len(gnums), len(tnums))
+        length_note = ""
+        if len(gnums) != len(tnums):
+            length_note = f" (lengths differ: {len(gnums)} vs {len(tnums)})"
+        max_diff = 0.0
+        for g, t in zip(gnums[:n], tnums[:n]):
+            diff = abs(g - t)
+            denom = max(abs(g), 1e-10)
+            diff = diff / denom
+            max_diff = max(max_diff, diff)
+        passed = max_diff <= tolerance
+        return ComparisonResult(
+            method="streaming-numeric", passed=passed,
+            details=f"Max relative diff: {max_diff:.2e}{length_note}",
+            score=1.0 - max_diff if passed else max_diff,
+        )
+
+    # hash fallback
+    import hashlib
+    h1 = hashlib.sha256(golden_filtered.encode()).hexdigest()
+    h2 = hashlib.sha256(test_filtered.encode()).hexdigest()
+    passed = h1 == h2
+    return ComparisonResult(
+        method="streaming-hash", passed=passed,
         details="" if passed else f"Hash mismatch: {h1[:16]}... vs {h2[:16]}...",
     )
 

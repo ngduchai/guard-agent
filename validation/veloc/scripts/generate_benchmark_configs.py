@@ -49,6 +49,68 @@ def build_scenarios(app: str, sizes: list[str], freqs: list[str]) -> list[dict]:
     freq_defs = load_frequencies()
     num_runs = int(cfg.get("benchmark", {}).get("num_runs_per_cell", 3))
     cap_factor = float(cfg.get("wallclock_cap_factor", 3.0))
+    # Upstream-only opt-in flags that enable the reference's native
+    # checkpointer (e.g. CLAMR's Crux needs `-c <interval>`).  Appended to
+    # the base app_args ONLY for the upstream-resilient codebase via
+    # `resilient_app_args`; vanilla and the LLM-baseline never see them, so
+    # the LLM's task and the vanilla strip-out audit remain unaffected.
+    #
+    # Canonical source is `tests/apps/patches/<APP>/_extra_args.txt` (one
+    # arg per line, blank lines and `# comments` ignored) — same file
+    # `dry_run.py:upstream_extra_args()` displays.  Fallback to a YAML
+    # `reference_extra_args` field is supported for callers that prefer
+    # keeping all app config in one place.
+    reference_extra_args: list[str] = []
+    patches_extra_args = REPO_ROOT / "tests" / "apps" / "patches" / app / "_extra_args.txt"
+    if patches_extra_args.exists():
+        for ln in patches_extra_args.read_text().splitlines():
+            ln = ln.split("#", 1)[0].strip()
+            if ln:
+                reference_extra_args.append(ln)
+    elif cfg.get("reference_extra_args"):
+        reference_extra_args = [str(a) for a in cfg["reference_extra_args"]]
+
+    # Reference-mode args FULL REPLACEMENT (not append).  Used when the
+    # vanilla `app_args` is incompatible with the upstream-checkpointed
+    # binary's input format — e.g. QMCPACK vanilla uses
+    # `he_simple_opt.xml` (no checkpoint attribute) but the upstream
+    # binary requires `he_simple_opt_ckpt.xml` (which has the
+    # `<qmc checkpoint="0">` attribute).  When set, OVERRIDES
+    # `reference_extra_args` for resilient_app_args derivation.
+    # Sourced from YAML `reference_extra_args_replace` (no _extra_args
+    # equivalent — replacement is rare and per-app design choice).
+    reference_extra_args_replace: list[str] | None = None
+    if cfg.get("reference_extra_args_replace"):
+        reference_extra_args_replace = [
+            str(a) for a in cfg["reference_extra_args_replace"]
+        ]
+
+    # Recovery-attempt args (attempt_2+).  Most upstream-checkpointed
+    # binaries need different CLI args / input files on the recovery
+    # attempt to actually restore a checkpoint instead of starting fresh
+    # (LAMMPS read_restart, SPARTA read_restart, SW4lite restart=,
+    # Athena++ -r <file>, QMCPACK He.cont.xml, Smilei restart_dir=...).
+    # When the file is absent we leave recovery_extra_args == None and
+    # the runner falls back to attempt_1 args on attempt_2 (correct for
+    # auto-detecting binaries: HPCG, MMSP, OpenLB, CoMD).  Per-app file:
+    #   tests/apps/patches/<APP>/_extra_args_recovery.txt
+    # One arg per line; "# comments" stripped.  When set, the args
+    # FULLY REPLACE the resilient_app_args on attempt_2+ — they are not
+    # appended to the base, because the recovery flags often need the
+    # primary input file substituted (e.g. -in in.lj_restart instead of
+    # -in in.lj_long), not just additional flags.
+    recovery_extra_args: list[str] | None = None
+    patches_recovery_args = (
+        REPO_ROOT / "tests" / "apps" / "patches" / app / "_extra_args_recovery.txt"
+    )
+    if patches_recovery_args.exists():
+        recovery_extra_args = []
+        for ln in patches_recovery_args.read_text().splitlines():
+            ln = ln.split("#", 1)[0].strip()
+            if ln:
+                recovery_extra_args.append(ln)
+    elif cfg.get("reference_recovery_args"):
+        recovery_extra_args = [str(a) for a in cfg["reference_recovery_args"]]
 
     scenarios = []
     for size in sizes:
@@ -57,19 +119,42 @@ def build_scenarios(app: str, sizes: list[str], freqs: list[str]) -> list[dict]:
         # (e.g., HyPar reads everything from cwd) — keep.
         if sz.get("app_args") is None:
             continue
+        # Nominal runtime: prefer the YAML estimate, but if absent fall back
+        # to the measured baseline_cache (populated by the validation-size
+        # audit).  load_cell uses the same precedence.  This pre-resolves
+        # injection_delay at generate-time so the consumer (metrics_collector
+        # load_benchmark_config) doesn't need to handle null at load.
         nominal = sz.get("nominal_runtime_s")
+        if nominal is None:
+            from validation.veloc.app_config import _baseline_elapsed
+            nominal = _baseline_elapsed(app)
         for freq in freqs:
             fq = freq_defs.get(freq, {})
             inject = bool(fq.get("inject_failures", False))
+            base_args = list(sz["app_args"])
             scenario = {
                 "name": f"{size}-{freq}",
                 "_size": size,
                 "_frequency": freq,
                 "num_procs": int(cfg.get("mpi_ranks", 4)),
-                "app_args": list(sz["app_args"]),
+                "app_args": base_args,
                 "inject_failures": inject,
                 "num_runs": num_runs,
             }
+            if reference_extra_args_replace is not None:
+                # Full replacement (rare; QMCPACK uses this for the ckpt
+                # input file).  Overrides reference_extra_args.
+                scenario["resilient_app_args"] = list(reference_extra_args_replace)
+            elif reference_extra_args:
+                # `original_app_args` left null = vanilla uses default `app_args`;
+                # `resilient_app_args` carries the upstream-only opt-in flags.
+                scenario["resilient_app_args"] = base_args + reference_extra_args
+            if recovery_extra_args is not None:
+                # Recovery args fully replace the attempt_1 args on attempt_2+.
+                # The framework only applies these when codebase=="resilient"
+                # and source_dir is the upstream-checkpointed tree (NOT the
+                # LLM baseline) — see metrics_collector._run_scenario_once.
+                scenario["resilient_app_args_recovery"] = list(recovery_extra_args)
             if inject:
                 delay_fraction = float(fq.get("delay_fraction", 0.5))
                 # Nominal runtime preferred from baseline_cache at consumer time;

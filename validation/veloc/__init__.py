@@ -7,6 +7,19 @@
 # metrics_collector – benchmarking and metrics collection
 # reporter          – graphical plots and summary report generation
 # validate          – main entry point (python -m validation.veloc.validate)
+#
+# F-10 — Framework version invariant
+# ----------------------------------
+# Bump FRAMEWORK_VERSION on EVERY commit that touches the measurement
+# stack: validate.py, runner.py, metrics_collector.py, reporter.py,
+# reference_validator.py.  Every result artifact records this version so
+# the trust gate can refuse to accept a unit whose recorded version
+# doesn't match the current code's — forcing demote-to-UNTRUSTED + re-
+# measure on framework change (Operating Principle 9).
+#
+# Format: "YYYY-MM-DD" (date of the most recent measurement-stack edit).
+# Bumped in lockstep with _decisions.log "framework_change" entries.
+FRAMEWORK_VERSION = "2026-05-15"
 
 from .runner import (
     RunResult,

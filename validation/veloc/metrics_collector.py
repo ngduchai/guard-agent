@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import statistics
 import threading
 import time
@@ -35,6 +36,7 @@ from typing import Any
 from .runner import (
     RunResult,
     ValidationError,
+    clear_checkpoint_dirs,
     configure_and_build,
     extract_checkpoint_dirs_from_veloc_cfg,
     run_baseline,
@@ -92,6 +94,15 @@ class BenchmarkScenario:
     # for that codebase.  Default None falls back to `app_args`.
     original_app_args: list[str] | None = None
     resilient_app_args: list[str] | None = None
+    # Recovery-attempt args (attempt_2+) for the *resilient* codebase.
+    # Many upstream-checkpointed binaries (LAMMPS, SPARTA, SW4lite,
+    # Athena++, QMCPACK, Smilei) need different CLI args / input files on
+    # the recovery attempt to actually restore from a checkpoint, instead
+    # of starting fresh.  When this field is set the runner uses it for
+    # _launch_attempt(2); when it's None the runner falls back to
+    # resilient_app_args (or app_args).  Sourced from
+    # tests/apps/patches/<APP>/_extra_args_recovery.txt.
+    resilient_app_args_recovery: list[str] | None = None
 
 
 @dataclass
@@ -135,7 +146,11 @@ class BenchmarkResults:
     summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        # F-10: stamp every artifact with the framework version so the
+        # trust gate can refuse units measured on outdated code.
+        from . import FRAMEWORK_VERSION
         return {
+            "framework_version": FRAMEWORK_VERSION,
             "scenarios": [asdict(s) for s in self.scenarios],
             "runs": [r.to_dict() for r in self.runs],
             "summary": self.summary,
@@ -239,6 +254,9 @@ def load_benchmark_config(
                 failures_per_run=int(entry.get("failures_per_run", 1)),
                 original_app_args=_expand_list(entry.get("original_app_args")),
                 resilient_app_args=_expand_list(entry.get("resilient_app_args")),
+                resilient_app_args_recovery=_expand_list(
+                    entry.get("resilient_app_args_recovery")
+                ),
             )
         )
     if not scenarios:
@@ -393,6 +411,120 @@ def _measure_checkpoint_metrics(veloc_cfg_path: Path) -> dict | None:
     }
 
 
+# Native-checkpoint conventions per app:
+#   AMReX (Nyx, WarpX):   chk00010/Header, chk00010/Level_0/Cell_H, …
+#   SAMRAI:               restart_linadv/restore.000000000.00/HF_data
+#   CLAMR (Crux):         checkpoint_output/backupNNNNN.crx
+#   Athena++:             Blast.00001.rst (loose file)
+#   CoMD:                 CoMD_state-N.txt (loose file)
+#   QMCPACK:              *.cont.xml (loose file)
+#   Smilei:               dump-N.h5 (loose file)
+#   PRK_Stencil:          prk_stencil_state-* (loose file)
+#   SPPARKS:              dump.ising.N (loose file)
+#   HyPar:                op_0_NNNNN.bin (loose file)
+#   SW4lite:              *.sw4checkpoint, *.cycle.* HDF5 (loose file)
+#
+# Two routes — both apply, dedup'd by resolved path:
+#   (a) anything under a top-level dir matching _BENCH_CKPT_DIR_PREFIXES
+#       (chk*, plt*, restart_*, checkpoint_output, dmtcp_ckpt, ckpt*, veloc*)
+#       — handles AMReX, SAMRAI, CLAMR.
+#   (b) loose file whose basename matches one of _CHECKPOINT_FILE_PATTERNS
+#       — handles Athena++, CoMD, QMCPACK, Smilei, PRK, SPPARKS, HyPar, SW4lite.
+_CHECKPOINT_FILE_PATTERNS = (
+    "ckpt", "veloc", ".rst", "checkpoint", "_state-",
+    "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
+    "test.0", "test.1", "test.2", "test.3", "test.4",
+    "test.5", "test.6", "test.7", "test.8", "test.9",
+    "blast.", ".h5", ".hdf5", ".cont.xml",
+    "restart_dir", "dump-", ".crx", "backup", "op_0",
+    "dump.ising", "restore.",
+)
+# NOTE: do not put ".txt" here — CoMD reference's checkpoint format is
+# CoMD_state-N.txt (POSIX text checkpoint, real state file).  stdout.txt /
+# stderr.txt are still excluded via the "stdout"/"stderr" substring rules.
+_CHECKPOINT_FILE_EXCLUDE = (
+    "injection_success.flag", "stdout", "stderr", ".gitkeep",
+    "_validate", ".log", ".yaml", ".cfg", ".json",
+    "athinput", "in.", ".vtk", ".tab", ".hst",
+)
+
+
+def _scan_checkpoint_files(run_cwd: Path) -> list[tuple[Path, int]] | None:
+    """Walk *run_cwd* and return [(file, size_bytes), ...] for every
+    checkpoint artifact.
+
+    Two-route discovery (dedup'd):
+      (a) every file under a top-level dir whose name starts with a known
+          checkpoint-dir prefix (chk*, plt*, restart_*, checkpoint_output,
+          dmtcp_ckpt, ckpt*, veloc*) — handles AMReX (chk00010/Header) and
+          SAMRAI (restart_linadv/restore.*/HF_data).
+      (b) loose files whose basename matches a checkpoint-file pattern
+          (.rst, _state-, dump-, .crx, …) and is not in the exclude list
+          — handles Athena++, CoMD, QMCPACK, Smilei, PRK, SPPARKS, HyPar,
+          SW4lite.
+
+    Returns ``None`` if *run_cwd* doesn't exist; an empty list if it
+    exists but has no checkpoint artifacts.
+    """
+    if not run_cwd.is_dir():
+        return None
+    matched: list[tuple[Path, int]] = []
+    seen: set[Path] = set()
+
+    # Route (a): checkpoint dirs at ANY depth under run_cwd — sweep each
+    # matching dir's entire subtree.  Top-level dirs cover AMReX (chk*/Header)
+    # and SAMRAI (restart_*/restore.*/HF_data).  Nested dirs cover WarpX
+    # which writes to diags/chkpoint00000500/Level_0/Bx_fp_H — `diags/` is
+    # not itself a ckpt dir but `chkpoint*` underneath is.
+    try:
+        for d in run_cwd.rglob("*"):
+            try:
+                if not d.is_dir() or d.is_symlink():
+                    continue
+                low = d.name.lower()
+                if not any(low.startswith(p) for p in _BENCH_CKPT_DIR_PREFIXES):
+                    continue
+                # Skip nested ckpt dirs whose parent is itself already a
+                # ckpt dir — the outer sweep already covers them.
+                parent_low = d.parent.name.lower() if d.parent != run_cwd else ""
+                if parent_low and any(parent_low.startswith(p) for p in _BENCH_CKPT_DIR_PREFIXES):
+                    continue
+                for f in d.rglob("*"):
+                    try:
+                        if not f.is_file() or f.is_symlink():
+                            continue
+                        rp = f.resolve()
+                        if rp in seen:
+                            continue
+                        seen.add(rp)
+                        matched.append((f, f.stat().st_size))
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    # Route (b): loose files matching checkpoint-file patterns at any depth.
+    for f in run_cwd.rglob("*"):
+        try:
+            if not f.is_file() or f.is_symlink():
+                continue
+            rp = f.resolve()
+            if rp in seen:
+                continue
+            n = f.name.lower()
+            if any(e in n for e in _CHECKPOINT_FILE_EXCLUDE):
+                continue
+            if any(p in n for p in _CHECKPOINT_FILE_PATTERNS):
+                seen.add(rp)
+                matched.append((f, f.stat().st_size))
+        except OSError:
+            continue
+
+    return matched
+
+
 def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
     """Sum bytes of checkpoint-pattern files under *run_cwd* for apps whose
     checkpoint logic writes to cwd-relative paths (POSIX).  Used as a fallback
@@ -403,51 +535,10 @@ def _measure_posix_checkpoint_size(run_cwd: Path) -> int | None:
     raw_metrics distinguishes "no measurement attempted" (None) from
     "measured, found nothing" (0).
     """
-    if not run_cwd.is_dir():
+    matched = _scan_checkpoint_files(run_cwd)
+    if matched is None:
         return None
-    # All patterns lowercase: filename is lowercased at the match site below,
-    # so an uppercase pattern (e.g. legacy "Blast.") would never match.
-    # Per-app native checkpoint conventions covered:
-    #   ckpt / veloc / checkpoint / _state- / restart. / .sstcpt — generic
-    #   .rst                                                    — Athena++ HDF5 restart
-    #   comd_state                                              — CoMD POSIX state files
-    #   prk_stencil_state                                       — PRK Stencil POSIX
-    #   chk                                                     — AMReX checkpoint dirs (WarpX, Nyx)
-    #   plt                                                     — AMReX plotfile dirs (also count as state)
-    #   .h5 / .hdf5                                             — generic HDF5 (Smilei dump-*, SW4lite *.cycle.*)
-    #   .cont.xml                                               — QMCPACK continuation
-    #   restart_dir / sstcpt                                    — SAMRAI / SST
-    PATTERNS = ("ckpt", "veloc", ".rst", "checkpoint", "_state-",
-                "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
-                "test.0", "test.1", "test.2", "test.3", "test.4",
-                "test.5", "test.6", "test.7", "test.8", "test.9",
-                "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
-                "restart_dir", "dump-",
-                # CLAMR Crux native: checkpoint_output/backupNNNNN.crx
-                ".crx", "backup",
-                # HyPar timestamped output (op_overwrite=no + binary format)
-                "op_0",
-                # SPPARKS dump.ising.* if treated as state proxy
-                "dump.ising")
-    # NOTE: do not put ".txt" here — CoMD reference's checkpoint format is
-    # CoMD_state-N.txt (POSIX text checkpoint, real state file).  stdout.txt /
-    # stderr.txt are still excluded via the "stdout"/"stderr" substring rules.
-    EXCLUDE = ("injection_success.flag", "stdout", "stderr", ".gitkeep",
-               "_validate", ".log", ".yaml", ".cfg", ".json",
-               "athinput", "in.", ".vtk", ".tab", ".hst")
-    total = 0
-    for f in run_cwd.rglob("*"):
-        try:
-            if not f.is_file() or f.is_symlink():
-                continue
-            n = f.name.lower()
-            if any(e in n for e in EXCLUDE):
-                continue
-            if any(p in n for p in PATTERNS):
-                total += f.stat().st_size
-        except OSError:
-            continue
-    return total
+    return sum(sz for _, sz in matched)
 
 
 _FRAME_SUFFIX_RE = re.compile(r"[._-](\d+)(?=(\.[a-z0-9]+)?$)", re.IGNORECASE)
@@ -497,6 +588,61 @@ def _frame_key(path: Path, run_cwd: Path, num_procs: int = 4) -> str:
         return f"{base_key}:{n}"
 
 
+def _measure_combined_checkpoint_metrics(
+    veloc_cfg: "Path | None",
+    run_cwd: Path,
+) -> dict | None:
+    """Sum VeloC scratch/persistent + POSIX run_cwd checkpoint scans.
+
+    This is the honest replacement for the prior OR-fallback (#57): the OR
+    pattern silently hid coordinator-style LLM solutions that wrote a small
+    VeloC marker (returns >0) AND let the application framework write the
+    real recovery state to a native chk*/ dir under run_cwd (never reached
+    because OR short-circuited on the first non-zero scan).
+
+    Returns ``None`` only when neither scan finds anything; otherwise a
+    summed dict with ``total_bytes``, ``files_count``, ``frames_on_disk``,
+    ``per_frame_bytes``.  Per-frame size uses the larger of the two scans'
+    medians (the dominant checkpoint mechanism), so a tiny VeloC marker
+    doesn't drown out a real native checkpoint.
+    """
+    veloc_m = _measure_checkpoint_metrics(veloc_cfg) if veloc_cfg is not None else None
+    posix_m = _measure_posix_checkpoint_metrics(run_cwd)
+
+    parts = [m for m in (veloc_m, posix_m)
+             if m is not None and m.get("total_bytes", 0) > 0]
+    if not parts:
+        # If both scanners ran but found nothing, return a zeroed dict
+        # rather than None so the caller distinguishes "scanned, no
+        # checkpoints" (0) from "no scan attempted" (None).
+        if veloc_m is not None or posix_m is not None:
+            return {"total_bytes": 0, "files_count": 0,
+                    "frames_on_disk": None, "per_frame_bytes": None}
+        return None
+
+    total_bytes = sum(m["total_bytes"] for m in parts)
+    files_count = sum(m.get("files_count", 0) or 0 for m in parts)
+    # Frames on disk: take the max (each scanner counts its own frames).
+    frames_on_disk = max(
+        (m.get("frames_on_disk") or 0) for m in parts
+    ) or None
+    # Per-frame: dominant scanner's per_frame, so a tiny marker doesn't
+    # mislead.  Falls back to total/frames when neither has a per_frame.
+    per_frame_candidates = [
+        m.get("per_frame_bytes") for m in parts
+        if m.get("per_frame_bytes")
+    ]
+    per_frame = max(per_frame_candidates) if per_frame_candidates else (
+        (total_bytes // frames_on_disk) if frames_on_disk else None
+    )
+    return {
+        "total_bytes": total_bytes,
+        "files_count": files_count,
+        "frames_on_disk": frames_on_disk,
+        "per_frame_bytes": per_frame,
+    }
+
+
 def _measure_posix_checkpoint_metrics(run_cwd: Path) -> dict | None:
     """Compute POSIX checkpoint metrics: total + per-frame + frame count.
 
@@ -508,30 +654,9 @@ def _measure_posix_checkpoint_metrics(run_cwd: Path) -> dict | None:
         per_frame_bytes  — total_bytes / frames_on_disk (size of ONE
                            complete checkpoint write across all ranks)
     """
-    if not run_cwd.is_dir():
+    matched = _scan_checkpoint_files(run_cwd)
+    if matched is None:
         return None
-    PATTERNS = ("ckpt", "veloc", ".rst", "checkpoint", "_state-",
-                "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
-                "test.0", "test.1", "test.2", "test.3", "test.4",
-                "test.5", "test.6", "test.7", "test.8", "test.9",
-                "blast.", "plt", "chk", ".h5", ".hdf5", ".cont.xml",
-                "restart_dir", "dump-", ".crx", "backup", "op_0",
-                "dump.ising")
-    EXCLUDE = ("injection_success.flag", "stdout", "stderr", ".gitkeep",
-               "_validate", ".log", ".yaml", ".cfg", ".json",
-               "athinput", "in.", ".vtk", ".tab", ".hst")
-    matched: list[tuple[Path, int]] = []
-    for f in run_cwd.rglob("*"):
-        try:
-            if not f.is_file() or f.is_symlink():
-                continue
-            n = f.name.lower()
-            if any(e in n for e in EXCLUDE):
-                continue
-            if any(p in n for p in PATTERNS):
-                matched.append((f, f.stat().st_size))
-        except OSError:
-            continue
     total = sum(sz for _, sz in matched)
     if not matched:
         return {"total_bytes": 0, "files_count": 0,
@@ -669,14 +794,42 @@ def _run_scenario_once(
     """
     from .runner import _symlink_input_data
 
-    # Per-codebase app_args override (for apps where vanilla and resilient
-    # take different flags or input files — ROSS, QMCPACK, LAMMPS).
+    # Per-codebase app_args override (for apps where vanilla and reference
+    # take different flags or input files — ROSS pholdio needs --io-store/--io-files,
+    # which the LLM-modified baseline (vanilla phold) does NOT accept).
+    #
+    # `resilient_app_args` is generated from `tests/apps/patches/<APP>/_extra_args.txt`
+    # and is REFERENCE-ONLY by intent (per generate_benchmark_configs.py:54-58 comment
+    # "upstream-only opt-in flags").  But the override applies to ANY resilient
+    # codebase, which broke ROSS_baseline (LLM phold rejecting --io-store=1).
+    # Restrict it to the upstream-reference resilient (source_dir under
+    # tests/apps/checkpointed/), excluding the LLM-baseline resilient (under
+    # build/tests_baseline/).
+    is_baseline_resilient = (
+        codebase == "resilient" and "tests_baseline" in str(source_dir)
+    )
     if codebase == "original" and scenario.original_app_args is not None:
         effective_args = scenario.original_app_args
-    elif codebase == "resilient" and scenario.resilient_app_args is not None:
+    elif (
+        codebase == "resilient"
+        and not is_baseline_resilient
+        and scenario.resilient_app_args is not None
+    ):
         effective_args = scenario.resilient_app_args
     else:
         effective_args = scenario.app_args
+
+    # Recovery-attempt args (attempt_2+ in checkpoint-observed runs).  Same
+    # restriction as resilient_app_args: only applied to the upstream-reference
+    # resilient (NOT the LLM baseline, which has its own checkpoint protocol).
+    # When None the runner falls back to *effective_args* on attempt_2.
+    recovery_app_args: list[str] | None = None
+    if (
+        codebase == "resilient"
+        and not is_baseline_resilient
+        and scenario.resilient_app_args_recovery is not None
+    ):
+        recovery_app_args = scenario.resilient_app_args_recovery
 
     run_output_dir = output_dir / codebase / scenario.name / f"run_{run_index}"
     run_output_dir.mkdir(parents=True, exist_ok=True)
@@ -829,6 +982,7 @@ def _run_scenario_once(
             executable_name=executable_name,
             num_procs=scenario.num_procs,
             app_args=effective_args,
+            recovery_app_args=recovery_app_args,
             max_attempts=scenario.max_attempts,
             injection_delay=scenario.injection_delay,
             target_failures=scenario.failures_per_run,
@@ -840,17 +994,19 @@ def _run_scenario_once(
             memory_samples_holder=mem_samples_holder,
             app_input_subdir=app_input_subdir,
             extra_source_dirs=extra_source_dirs,
+            priority_source_dirs=(
+                priority_source_dirs if codebase != "original" else None
+            ),
         )
-        # Checkpoint metrics.  Prefer VeloC scratch/persistent when a
-        # veloc.cfg is present; otherwise fall back to scanning the per-run
-        # cwd for POSIX-style checkpoint files.
-        ckpt_metrics = None
-        if veloc_cfg is not None:
-            ckpt_metrics = _measure_checkpoint_metrics(veloc_cfg)
-        if ckpt_metrics is None or ckpt_metrics.get("total_bytes", 0) == 0:
-            posix_metrics = _measure_posix_checkpoint_metrics(run_output_dir)
-            if posix_metrics and posix_metrics.get("total_bytes", 0) > 0:
-                ckpt_metrics = posix_metrics
+        # Checkpoint metrics: SUM both VeloC and POSIX scans (#57).  Old
+        # behavior was OR (try VeloC first, fall back to POSIX only if VeloC=0)
+        # which silently hid coordinator-pattern checkpoints — apps that use
+        # VeloC for a small marker AND let the framework write the actual
+        # state to its own dirs (e.g., LLM Nyx solution: 1944 B VeloC marker
+        # + 70 MB AMReX chk dirs in run cwd).
+        ckpt_metrics = _measure_combined_checkpoint_metrics(
+            veloc_cfg, run_output_dir
+        )
         ckpt_size = ckpt_metrics.get("total_bytes") if ckpt_metrics else None
 
     else:
@@ -869,11 +1025,13 @@ def _run_scenario_once(
             memory_monitor_fn=_monitor_memory_samples,
             memory_stop_event=mem_stop_event,
             memory_samples_holder=mem_samples_holder,
-            # 15-minute cap on a single failure-free benchmark run.  Most
-            # apps finish in 75-200s, but heavy native checkpointing
-            # (PRK_Stencil reference: ~10 GB I/O) can take 8-12 min
-            # legitimately.  15 min is absolute ceiling for runaway detection.
-            timeout_s=900.0,
+            # 30-minute cap on a single failure-free benchmark run (bumped
+            # from 15-min on 2026-05-03 — D4).  PRK_Stencil reference small-once
+            # cells can legitimately take 700-1700s due to CKPT_EVERY=200
+            # cadence, exceeding the prior 15-min cap.  30 min covers the
+            # observed 1701s outlier with margin while still catching runaway
+            # processes (real apps finish in 75-1700s).
+            timeout_s=1800.0,
         )
         if not result.succeeded:
             raise ValidationError(
@@ -885,17 +1043,73 @@ def _run_scenario_once(
                 exit_code=result.exit_code,
                 output_dir=run_output_dir,
             )
-        # Checkpoint metrics for resilient clean runs (same VeloC-or-POSIX
-        # fallback as the failure-injection branch).
-        ckpt_metrics = None
-        if codebase == "resilient":
-            if veloc_cfg is not None:
-                ckpt_metrics = _measure_checkpoint_metrics(veloc_cfg)
-            if ckpt_metrics is None or ckpt_metrics.get("total_bytes", 0) == 0:
-                posix_metrics = _measure_posix_checkpoint_metrics(run_output_dir)
-                if posix_metrics and posix_metrics.get("total_bytes", 0) > 0:
-                    ckpt_metrics = posix_metrics
+        # Checkpoint metrics for resilient clean runs: SUM VeloC + POSIX (#57)
+        # — see comment in failure-injection branch above.
+        ckpt_metrics = (
+            _measure_combined_checkpoint_metrics(veloc_cfg, run_output_dir)
+            if codebase == "resilient" else None
+        )
         ckpt_size = ckpt_metrics.get("total_bytes") if ckpt_metrics else None
+
+    # F-6: fast-pass red flag.  validate.py exiting 0 with elapsed << 1s
+    # almost always means the framework crashed during setup (build error,
+    # missing input, env-var lookup miss) BEFORE the actual measurement
+    # ran.  Recording such a sample as a "valid" 0.7s benchmark cell
+    # silently corrupts the result set.  Refuse to record.
+    #
+    # Floor is 1.0s absolute, OR 10% of injection_delay when configured
+    # (failure-injection scenarios that haven't even reached the kill
+    # point in a meaningful sense).  Override with FAST_PASS_FLOOR_S env
+    # var.
+    _ff_env = os.environ.get("FAST_PASS_FLOOR_S")
+    fast_pass_floor = (
+        float(_ff_env) if _ff_env else max(
+            1.0,
+            0.10 * (scenario.injection_delay or 0.0),
+        )
+    )
+    if result.elapsed_s < fast_pass_floor:
+        raise ValidationError(
+            f"scenario {scenario.name!r} (run {run_index}, codebase={codebase}): "
+            f"recorded elapsed_s={result.elapsed_s:.3f}s < fast-pass floor "
+            f"{fast_pass_floor:.3f}s.  This is almost always a framework "
+            "crash during setup BEFORE the real measurement ran (build error, "
+            "missing input file, exec-path lookup miss).  Recording the sample "
+            "would corrupt the result set with a fake fast measurement.  "
+            "Investigate the per-run stdout/stderr; re-run after fixing.  "
+            "Override with FAST_PASS_FLOOR_S env var if a sub-second run is "
+            "legitimate for this scenario.  (F-6 anti-fast-pass guard.)",
+            output_dir=run_output_dir,
+        )
+
+    # CRIT-2 guard (F-11): if the scenario was supposed to inject failures but
+    # NO injection actually fired during the resilient run, the recorded
+    # numbers are pure failure-free elapsed mislabeled as failure-injected.
+    # This silently happened on HPCG_reference: cached vanilla baseline was
+    # 119.66s (pre-workload-pin), generator computed injection_delay=59.8s,
+    # reference (with HPCG_FIXED_SETS=180) ran ~53s — injection point past
+    # the run's end, `injected=False`, and the cell appeared as a normal
+    # measurement.  Refuse to record; raise so the operator fixes the
+    # injection_delay (or the upstream nominal_runtime cache) before the bad
+    # data enters the result set.
+    if (
+        scenario.inject_failures
+        and codebase == "resilient"
+        and not result.injected
+    ):
+        raise ValidationError(
+            f"scenario {scenario.name!r} (run {run_index}): inject_failures=True "
+            f"but NO injection fired during the resilient run "
+            f"(elapsed={result.elapsed_s:.2f}s, "
+            f"configured injection_delay={scenario.injection_delay:.2f}s). "
+            "Recording this would mislabel a failure-free measurement as "
+            "failure-injected.  Fix: either reduce injection_delay below "
+            "the actual run elapsed, or invalidate the stale baseline cache "
+            "(build/baseline_cache/<APP>/) so the generator re-derives "
+            "nominal_runtime from a fresh measurement.  See CRIT-2 / F-11 "
+            "in build/_experiment_state/_user_review.md.",
+            output_dir=run_output_dir,
+        )
 
     # Memory samples: prefer result.memory_samples_bytes (filled by
     # run_with_failure_injection / dmtcp runners), fall back to
@@ -940,6 +1154,16 @@ def _aggregate(values: list[float]) -> dict[str, float]:
     }
 
 
+# F-2: workload-parity ceiling for bench cells.  Reference legitimately
+# adds checkpoint I/O on top of vanilla compute, so reference_elapsed
+# should be >= vanilla_elapsed but bounded.  When it exceeds this cap,
+# the two paths are running different workloads (HyPar's stale patch
+# raised n_iter 2.5M -> 4.5M, +80% work) and the comparison is invalid.
+# Cap is per-app via tests/apps/configs/<APP>.yaml: workload_overhead_cap;
+# default 1.50 (50% checkpoint overhead headroom).
+_BENCH_WORKLOAD_OVERHEAD_DEFAULT = 1.50
+
+
 def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
     """Build a nested summary dict: scenario → codebase → metric → stats."""
     summary: dict[str, Any] = {}
@@ -974,6 +1198,42 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
                 bucket[metric] = _aggregate(bucket[metric])
 
     return summary
+
+
+def _check_workload_parity(
+    summary: dict[str, Any],
+    overhead_cap: float = _BENCH_WORKLOAD_OVERHEAD_DEFAULT,
+) -> dict[str, dict[str, Any]]:
+    """F-2 — flag bench scenarios whose reference vs vanilla elapsed diverge.
+
+    Returns a per-scenario dict ``{scenario_name: {ratio, vanilla_median,
+    reference_median, ok, cap}}`` covering only scenarios that have BOTH
+    `original` and `resilient` runs.  ``ok=False`` means the workload
+    parity ceiling was violated and the cell's comparison numbers are not
+    apples-to-apples.
+
+    This is a SOFT check: the function records the verdict in raw_metrics
+    but does NOT raise.  Plotting / reporter code is expected to read the
+    field and exclude violating cells from aggregate visualisations.  The
+    forensic data is still there if someone wants to investigate.
+    """
+    parity: dict[str, dict[str, Any]] = {}
+    for scenario_name, bucket in summary.items():
+        orig = bucket.get("original", {}).get("elapsed_s", {})
+        res = bucket.get("resilient", {}).get("elapsed_s", {})
+        van_med = orig.get("median") if isinstance(orig, dict) else None
+        ref_med = res.get("median") if isinstance(res, dict) else None
+        if van_med is None or ref_med is None or van_med <= 0:
+            continue
+        ratio = ref_med / van_med
+        parity[scenario_name] = {
+            "vanilla_median_s": van_med,
+            "reference_median_s": ref_med,
+            "ratio_reference_over_vanilla": ratio,
+            "overhead_cap": overhead_cap,
+            "ok": ratio <= overhead_cap,
+        }
+    return parity
 
 
 # ---------------------------------------------------------------------------
@@ -1037,11 +1297,225 @@ def _load_bench_progress(benchmarks_dir: Path) -> tuple[list[RunMetrics], set[st
         return [], set()
 
 
+# Top-level dir-name prefixes that ARE checkpoints: deleted recursively.
+# AMReX (chk*, plt*), CLAMR (checkpoint_output), SAMRAI (restart_*), and the
+# generic "checkpoints"-named dirs an app may emit.  The forensic snapshot
+# dir written by `validate._capture_checkpoint_artifacts` is also literally
+# named "checkpoints" but lives under correctness/, NOT under per-bench-run
+# dirs — so this list is safe for the bench cleanup path.
+_BENCH_CKPT_DIR_PREFIXES = (
+    "chk", "plt", "checkpoint_output", "restart_",
+    "dmtcp_ckpt", "ckpt", "veloc",
+)
+
+# File-name patterns that are checkpoint outputs.  Mirrors
+# `_measure_posix_checkpoint_metrics` PATTERNS; kept narrow so we don't
+# accidentally delete app inputs / logs / metric JSON.
+_BENCH_CKPT_FILE_PATTERNS = (
+    "ckpt", "veloc", ".rst", "checkpoint", "_state-",
+    "restart.", "comd_state", "prk_stencil_state", ".sstcpt",
+    ".cont.xml", "dump-", ".crx", "backup", "op_0",
+    "dump.ising", "restore.", ".sw4checkpoint",
+)
+# Files that match a pattern above but must NOT be deleted (recorded
+# metrics, logs, configs, app input templates).
+_BENCH_CKPT_FILE_EXCLUDE = (
+    "stdout", "stderr", ".gitkeep",
+    ".log", ".yaml", ".cfg", ".json",
+    "checkpoint_metrics.json", "resilience_proof.json",
+    "test_results.json", "benchmark_progress.json",
+    "athinput", "in.", ".vtk", ".tab", ".hst",
+    "injection_success.flag", "_validate",
+)
+
+
+def _delete_posix_checkpoints(run_cwd: Path) -> tuple[int, int]:
+    """Delete checkpoint dirs and files under *run_cwd*. Best-effort.
+
+    Returns (file_count_deleted, bytes_deleted).
+    """
+    if not run_cwd.is_dir():
+        return (0, 0)
+    deleted_count = 0
+    deleted_bytes = 0
+
+    # 1. Top-level checkpoint dirs (entire trees).
+    try:
+        for entry in run_cwd.iterdir():
+            try:
+                if not entry.is_dir():
+                    continue
+                low = entry.name.lower()
+                if not any(low.startswith(p) for p in _BENCH_CKPT_DIR_PREFIXES):
+                    continue
+                # Sum size before removing for the log line.
+                sz = 0
+                fc = 0
+                for f in entry.rglob("*"):
+                    try:
+                        if f.is_file() and not f.is_symlink():
+                            sz += f.stat().st_size
+                            fc += 1
+                    except OSError:
+                        pass
+                shutil.rmtree(entry, ignore_errors=True)
+                deleted_count += fc
+                deleted_bytes += sz
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    # 2. Loose checkpoint files at any depth (matched by name pattern).
+    try:
+        for f in run_cwd.rglob("*"):
+            try:
+                if not f.is_file() or f.is_symlink():
+                    continue
+                name = f.name.lower()
+                if any(e in name for e in _BENCH_CKPT_FILE_EXCLUDE):
+                    continue
+                if not any(p in name for p in _BENCH_CKPT_FILE_PATTERNS):
+                    continue
+                sz = f.stat().st_size
+                f.unlink()
+                deleted_count += 1
+                deleted_bytes += sz
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    return (deleted_count, deleted_bytes)
+
+
+def _cleanup_checkpoints_post_run(
+    run_output_dir: Path,
+    veloc_cfg_name: str | None = None,
+    veloc_cfg_search_dirs: "list[Path] | None" = None,
+) -> None:
+    """Delete checkpoint state after a scenario run's metrics are persisted.
+
+    Runs unconditionally for EVERY scenario run, regardless of which
+    implementation produced the checkpoints (vanilla, LLM-baseline,
+    upstream reference, DMTCP), to:
+
+        (1) reclaim disk space — long sweeps otherwise accumulate gigabytes
+            of native checkpoint files (AMReX chk*, CLAMR .crx, SAMRAI
+            restart_*, LAMMPS restart.lj.*, …) under each run dir;
+
+        (2) guarantee the next scenario starts fresh — VeloC scratch /
+            persistent dirs (typically /tmp/<APP>_persistent) are SHARED
+            across runs.  Without cleanup the next scenario could
+            short-circuit recovery against a stale checkpoint from a
+            previous run, contaminating the resilience proof.
+
+    Cleans:
+      * VeloC scratch/persistent dirs from veloc.cfg (if found).
+      * Top-level checkpoint-pattern dirs under run_output_dir
+        (chk*, plt*, restart_*, checkpoint_output, …).
+      * Loose checkpoint-pattern files under run_output_dir.
+
+    Preserves: stdout.txt, stderr.txt, every .json (metrics & progress),
+    every .log, app input/config files.
+
+    Suppress with PRESERVE_CHECKPOINTS_AFTER_RUN=1 (debugging only).
+    """
+    if os.environ.get("PRESERVE_CHECKPOINTS_AFTER_RUN", "") in ("1", "true", "yes"):
+        return
+
+    veloc_dirs_cleared: list[Path] = []
+    if veloc_cfg_name and veloc_cfg_search_dirs:
+        cfg_path: Path | None = None
+        for d in veloc_cfg_search_dirs:
+            cand = d / veloc_cfg_name
+            if cand.exists():
+                cfg_path = cand
+                break
+        if cfg_path is not None:
+            dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_path)
+            if dirs:
+                clear_checkpoint_dirs(dirs)
+                veloc_dirs_cleared = dirs
+
+    posix_count, posix_bytes = _delete_posix_checkpoints(run_output_dir)
+
+    if veloc_dirs_cleared or posix_count:
+        msg_parts = []
+        if veloc_dirs_cleared:
+            msg_parts.append(
+                f"veloc dirs cleared: {[str(d) for d in veloc_dirs_cleared]}"
+            )
+        if posix_count:
+            msg_parts.append(
+                f"posix files deleted: {posix_count} "
+                f"({posix_bytes / (1024 * 1024):.1f} MB)"
+            )
+        print(
+            f"[metrics] checkpoint cleanup ({run_output_dir.name}): "
+            + "; ".join(msg_parts),
+            flush=True,
+        )
+
+
+def _prune_run_artifacts_if_enabled(run_output_dir: Path) -> None:
+    """Prune bulk app-emitted artifacts from a per-run dir to bound disk use.
+
+    Opt-in via env var ``PRUNE_BENCH_ARTIFACTS=1`` — used for apps with very
+    large per-run output (WarpX writes 30-50 GB of diags/chkpoint* per run;
+    keeping all 3 nofail runs concurrently exceeds typical disk budgets).
+
+    The metric values (elapsed_s, checkpoint_size_bytes via veloc_cfg /tmp
+    paths, memory samples) are already captured in-memory and persisted to
+    benchmark_progress.json by the caller BEFORE this prune runs, so removal
+    of run-output bulk does NOT affect any recorded measurement.
+
+    Kept (needed for Phase 5 trust-gate inspection):
+      - stdout.txt, stderr.txt
+      - any .json metadata file at run-dir top level
+
+    Removed:
+      - all subdirectories (diags/, plotfiles/, restart files, dmtcp_ckpt/, …)
+      - any non-stdout/stderr file > 10 MB (large app outputs)
+    """
+    import os
+    if os.environ.get("PRUNE_BENCH_ARTIFACTS", "") not in ("1", "true", "yes"):
+        return
+    if not run_output_dir.exists():
+        return
+    KEEP_FILES = {"stdout.txt", "stderr.txt"}
+    LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+    for entry in run_output_dir.iterdir():
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            elif entry.is_symlink():
+                entry.unlink()
+            elif entry.name in KEEP_FILES or entry.suffix == ".json":
+                continue
+            elif entry.stat().st_size > LARGE_FILE_THRESHOLD:
+                entry.unlink()
+        except OSError as exc:
+            print(
+                f"[metrics] WARNING: prune skipped {entry}: {exc}",
+                flush=True,
+            )
+    print(
+        f"[metrics] pruned bulk artifacts under {run_output_dir} "
+        f"(PRUNE_BENCH_ARTIFACTS=1)",
+        flush=True,
+    )
+
+
 def _save_bench_progress(benchmarks_dir: Path, runs: list[RunMetrics]) -> None:
     """Persist the list of completed runs to *benchmark_progress.json*."""
+    from . import FRAMEWORK_VERSION  # F-10: stamp partial-run artifacts too
     progress_path = benchmarks_dir / _BENCH_PROGRESS_FILE
     progress_path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"runs": [r.to_dict() for r in runs]}
+    data = {
+        "framework_version": FRAMEWORK_VERSION,
+        "runs": [r.to_dict() for r in runs],
+    }
     progress_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -1264,6 +1738,13 @@ def run_benchmark_sweep(
                 all_runs.append(orig_metrics)
                 completed_keys.add(orig_key)
                 _save_bench_progress(benchmarks_dir, all_runs)
+                _orig_run_dir = benchmarks_dir / "original" / scenario.name / f"run_{run_idx}"
+                _prune_run_artifacts_if_enabled(_orig_run_dir)
+                _cleanup_checkpoints_post_run(
+                    run_output_dir=_orig_run_dir,
+                    veloc_cfg_name=veloc_config_name,
+                    veloc_cfg_search_dirs=[original_source_dir, original_build_dir],
+                )
                 print(
                     f"[metrics] original run {run_idx}: elapsed={orig_metrics.elapsed_s:.2f}s",
                     flush=True,
@@ -1299,6 +1780,13 @@ def run_benchmark_sweep(
                 all_runs.append(res_metrics)
                 completed_keys.add(res_key)
                 _save_bench_progress(benchmarks_dir, all_runs)
+                _res_run_dir = benchmarks_dir / "resilient" / scenario.name / f"run_{run_idx}"
+                _prune_run_artifacts_if_enabled(_res_run_dir)
+                _cleanup_checkpoints_post_run(
+                    run_output_dir=_res_run_dir,
+                    veloc_cfg_name=veloc_config_name,
+                    veloc_cfg_search_dirs=[resilient_source_dir, resilient_build_dir],
+                )
                 print(
                     f"[metrics] resilient run {run_idx}: elapsed={res_metrics.elapsed_s:.2f}s, "
                     f"injected={res_metrics.injected}, attempts={res_metrics.num_attempts}",
@@ -1338,6 +1826,13 @@ def run_benchmark_sweep(
                     all_runs.append(a_metrics)
                     completed_keys.add(a_key)
                     _save_bench_progress(benchmarks_dir, all_runs)
+                    _appr_run_dir = benchmarks_dir / approach.name / scenario.name / f"run_{run_idx}"
+                    _prune_run_artifacts_if_enabled(_appr_run_dir)
+                    _cleanup_checkpoints_post_run(
+                        run_output_dir=_appr_run_dir,
+                        veloc_cfg_name=veloc_config_name,
+                        veloc_cfg_search_dirs=[approach.codebase_dir, a_build],
+                    )
                     print(
                         f"[metrics] {approach.name} run {run_idx}: "
                         f"elapsed={a_metrics.elapsed_s:.2f}s, "
@@ -1346,6 +1841,24 @@ def run_benchmark_sweep(
                     )
 
     summary = _build_summary(all_runs)
+    # F-2: workload-parity ceiling per scenario.  Result lives in summary
+    # so downstream reporter / plotter can decide whether to exclude
+    # violating cells from aggregate views.
+    parity = _check_workload_parity(summary)
+    if parity:
+        summary["_workload_parity"] = parity
+        bad = [(k, v) for k, v in parity.items() if not v.get("ok")]
+        if bad:
+            for k, v in bad:
+                print(
+                    f"[metrics] WARN F-2 workload parity VIOLATION on {k!r}: "
+                    f"reference/vanilla={v['ratio_reference_over_vanilla']:.3f}× "
+                    f"> cap {v['overhead_cap']:.2f}× "
+                    f"(vanilla={v['vanilla_median_s']:.2f}s, "
+                    f"reference={v['reference_median_s']:.2f}s).  "
+                    "Cell numbers are not apples-to-apples; exclude from aggregate plots.",
+                    flush=True,
+                )
     results = BenchmarkResults(scenarios=scenarios, runs=all_runs, summary=summary)
 
     # Save final raw metrics JSON.
