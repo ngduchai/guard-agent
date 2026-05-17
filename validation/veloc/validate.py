@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import sys
 import time
 from pathlib import Path
 
+from . import FRAMEWORK_VERSION
 from .comparator import CompareResult, make_comparator
 from .metrics_collector import (
     ApproachConfig,
@@ -50,6 +52,7 @@ from .metrics_collector import (
 from .reporter import generate_report
 from .runner import (
     ValidationError,
+    clear_checkpoint_dirs,
     configure_and_build,
     extract_checkpoint_dirs_from_veloc_cfg,
     measure_checkpoint_dirs,
@@ -66,14 +69,22 @@ def _capture_checkpoint_artifacts(
     out_dir: "Path",
     label: str,
 ) -> None:
-    """Measure and snapshot the resilient run's checkpoint artifacts so they
-    survive across batch invocations (e.g. baseline apps that write to
-    /tmp/<APP>_persistent paths get overwritten or rotated by later runs;
-    this preserves the size + a copy of the files for retrospective analysis).
+    """Measure, snapshot, then DELETE the resilient run's checkpoint
+    artifacts.
+
+    The deletion is the second half of "capture": once metrics are persisted
+    AND a forensic snapshot lives under ``out_dir/checkpoints/``, the
+    originals in shared paths (typically ``/tmp/<APP>_persistent``) are no
+    longer needed and must be cleared so the NEXT run starts from a clean
+    state — otherwise the next scenario could replay an old checkpoint
+    instead of writing its own, contaminating the resilience proof.
+
+    Set ``PRESERVE_CHECKPOINTS_AFTER_RUN=1`` in the environment to suppress
+    deletion (debugging only).
 
     Writes:
         out_dir/checkpoint_metrics.json   — total/per-dir size + file count
-        out_dir/checkpoints/<dir-name>/   — copy of each ckpt dir
+        out_dir/checkpoints/<dir-name>/   — copy of each ckpt dir (forensic)
     """
     cfg_path = None
     for d in veloc_cfg_dirs:
@@ -106,6 +117,59 @@ def _capture_checkpoint_artifacts(
         flush=True,
     )
 
+    # --- Post-capture cleanup ---
+    # Now that metrics are persisted and a forensic copy is at
+    # snapshot_dest, the originals in shared paths must be cleared so the
+    # next scenario starts fresh (no stale checkpoint to short-circuit a
+    # recovery that should have to write its own).  Best-effort.
+    if os.environ.get("PRESERVE_CHECKPOINTS_AFTER_RUN", "") in ("1", "true", "yes"):
+        return
+    if ckpt_dirs:
+        clear_checkpoint_dirs(ckpt_dirs)
+        print(
+            f"[validate] cleared shared checkpoint dirs after capture "
+            f"({label}): {[str(d) for d in ckpt_dirs]}",
+            flush=True,
+        )
+
+
+_PER_APP_CAP_CACHE: "dict[str, float]" = {}
+
+
+def _lookup_per_app_cap(app_name: "str | None") -> float:
+    """Look up production_cap_ratio for *app_name* from
+    tests/apps/configs/<APP>.yaml.  Returns 1.2 (default policy) if the
+    config is missing or doesn't override.
+
+    The per-app cap exists so that AMR-heavy or
+    checkpoint-overhead-dominated apps (SAMRAI, Nyx) don't fail the
+    production gate against a target they structurally cannot reach.
+    Cap = max(1.2x of vanilla baseline, reference-app's failure-injected
+    time / vanilla baseline).  See _decisions.log entries for the
+    per-app cap rationale.
+    """
+    if not app_name:
+        return 1.2
+    if app_name in _PER_APP_CAP_CACHE:
+        return _PER_APP_CAP_CACHE[app_name]
+    cap = 1.2
+    try:
+        import yaml
+        # validate.py is run from repo root via run_validate.sh
+        for base in (Path("tests/apps/configs"), Path(__file__).resolve().parent.parent.parent / "tests/apps/configs"):
+            cfg = base / f"{app_name}.yaml"
+            if cfg.is_file():
+                with open(cfg) as f:
+                    data = yaml.safe_load(f) or {}
+                v = data.get("production_cap_ratio")
+                if v is not None:
+                    cap = float(v)
+                break
+    except Exception:
+        pass
+    _PER_APP_CAP_CACHE[app_name] = cap
+    return cap
+
 
 def _measure_resilience_signals(
     resilient_elapsed: float,
@@ -117,6 +181,7 @@ def _measure_resilience_signals(
     checkpoint_observed: "bool | None" = None,
     kill_attempt_elapsed_s: "float | None" = None,
     recovery_attempt_elapsed_s: "float | None" = None,
+    app_name: "str | None" = None,
 ) -> dict:
     """Measure the raw resilience signals and persist them to disk.
 
@@ -146,10 +211,13 @@ def _measure_resilience_signals(
 
     ratio = (resilient_elapsed / original_elapsed) if original_elapsed > 0 else float("inf")
     has_ckpt = files_count > 0
-    # New production policy (checkpoint-observed strategy): kill+recover total
-    # must be < 1.2x failure-free.  For legacy fixed-delay strategy callers,
-    # we still publish the older 1.7x / 1.9x flags for backward-compat.
-    fast_at_production_cap = ratio < 1.2
+    # Per-app production cap (2026-05-16): for AMR-heavy / checkpoint-overhead
+    # dominated apps, 1.2x is structurally unreachable even by the upstream
+    # reference (SAMRAI reference v48d small-once = 1.98x of vanilla, with
+    # full RestartManager).  cap = max(1.2x, reference_optimum / vanilla).
+    # Configured in tests/apps/configs/<APP>.yaml as production_cap_ratio.
+    production_cap = _lookup_per_app_cap(app_name)
+    fast_at_production_cap = ratio < production_cap
     fast_at_audit_cap = ratio <= 1.7
     fast_at_legacy_production_cap = ratio < 1.9
 
@@ -157,17 +225,20 @@ def _measure_resilience_signals(
         f"[validate] resilience signals — resilient_elapsed={resilient_elapsed:.1f}s, "
         f"original_elapsed={original_elapsed:.1f}s, ratio={ratio:.2f}x; "
         f"checkpoint files = {files_count}; "
-        f"wall-time PASS at 1.2x (Validation B new) = {fast_at_production_cap}, "
+        f"wall-time PASS at {production_cap}x (per-app cap, app={app_name}) = {fast_at_production_cap}, "
         f"PASS at 1.7x (Validation A) = {fast_at_audit_cap}, "
         f"PASS at 1.9x (legacy) = {fast_at_legacy_production_cap}",
         flush=True,
     )
 
     signals = {
+        "framework_version": FRAMEWORK_VERSION,
         "resilient_elapsed_s": resilient_elapsed,
         "original_elapsed_s": original_elapsed,
         "ratio": ratio,
-        "wall_time_pass_at_1_2": fast_at_production_cap,
+        "wall_time_pass_at_1_2": fast_at_production_cap,  # backward-compat field name; actual cap is per-app
+        "production_cap_ratio": production_cap,
+        "production_cap_app_name": app_name,
         "wall_time_pass_at_1_7": fast_at_audit_cap,
         "wall_time_pass_at_1_9": fast_at_legacy_production_cap,
         "checkpoint_files": files_count,
@@ -183,21 +254,672 @@ def _measure_resilience_signals(
     return signals
 
 
+# F-4: recovery-elapsed sanity floor.  An honest checkpoint recovery has
+# to load the checkpoint, re-initialize state, then continue computing
+# from that point — that costs at LEAST a meaningful fraction of the
+# kill-attempt time.  Recoveries that complete in << kill_attempt_time
+# are typically no-op recoveries (the "recovery" path just printed a
+# banner and exited).  Threshold of 0.10 × kill_attempt is conservative:
+# even an incremental recovery that re-uses most of the in-memory state
+# still has to reload checkpoint metadata and run a few residual steps.
+_RECOVERY_ELAPSED_FLOOR_FRAC = 0.10
+
+# F-19 v2 (2026-05-17): multi-fraction kill slope gate.  Replaces the
+# single-point recovery_actually_resumed threshold of 0.9, which was
+# defeated by SAMRAI iter-21 cold-replay at ratio 0.857 (the LLM's
+# binary even predicted "F-19 expected to FAIL at ~0.93x" — it landed
+# at 0.857 instead because of incidental warm-cache speedup on the
+# recovery leg). The slope test is immune to per-run constants: cold-
+# replay produces a flat curve (slope ≈ 0) regardless of where the
+# kill landed; honest recovery produces a falling curve (slope ≈ -1).
+#
+# A slope strictly less than -0.5 indicates the recovery elapsed time
+# scales meaningfully with the kill fraction — i.e., recovery does
+# real work proportional to "what's left", which is the signature of
+# loading a mid-state checkpoint and continuing.  Lifting the threshold
+# closer to -1.0 would over-reject any app whose recovery has fixed
+# setup overhead (which flattens the slope a bit); -0.5 gives ~50%
+# margin between the honest expected slope (-1) and the cold-replay
+# slope (0).
+_RECOVERY_RESUMED_SLOPE_THRESHOLD = -0.5
+
+# F-19 v2 (2026-05-17): the standard 3 kill fractions for the multi-
+# fraction slope test.  Picked symmetrically around the middle (50%)
+# so the slope fit is balanced; 25/75 give enough kill-fraction spread
+# (>= 50 percentage points) for a meaningful slope.  Configurable per
+# bench cycle via the validator CLI if needed.
+_DEFAULT_KILL_FRACTIONS: tuple[float, ...] = (0.25, 0.50, 0.75)
+
+
+def compute_recovery_slope(
+    fractions: "list[float] | tuple[float, ...]",
+    ratios: "list[float] | tuple[float, ...]",
+) -> "tuple[float, float]":
+    """Linear regression of recovery_elapsed/nofail_elapsed vs kill_fraction.
+
+    Returns ``(slope, intercept)``.  Used by the F-19 v2 gate
+    (``recovery_resumed_slope``) to distinguish honest recovery from
+    cold-start replay:
+
+    * Honest recovery: at kill_fraction f, recovery does roughly the
+      remaining (1 - f) of the work, so ratio ≈ (1 - f).  Over the
+      sweep, ratios ≈ [0.75, 0.50, 0.25] for fractions [0.25, 0.50, 0.75],
+      slope ≈ -1.0, intercept ≈ 1.0.
+    * Cold-start replay: recovery re-runs the full integrator regardless
+      of when the kill landed, so ratio ≈ 1.0 at every fraction.
+      Slope ≈ 0, intercept ≈ 1.0.
+
+    Implemented via the standard ordinary-least-squares formula rather
+    than numpy.polyfit to keep the validator dependency-light (it is
+    invoked in production trust gates that cannot tolerate import-time
+    failures).
+
+    Raises ValueError if the inputs have mismatched length or fewer
+    than 2 points (slope undefined).
+    """
+    n = len(fractions)
+    if n != len(ratios):
+        raise ValueError(
+            f"fractions ({n}) and ratios ({len(ratios)}) must match in length"
+        )
+    if n < 2:
+        raise ValueError(
+            f"need at least 2 (fraction, ratio) points to fit a slope; got {n}"
+        )
+    xs = [float(f) for f in fractions]
+    ys = [float(r) for r in ratios]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+    den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+    if den == 0.0:
+        # All x values equal — slope undefined.  Treat as a fitting failure.
+        raise ValueError("all kill fractions are identical; cannot fit slope")
+    slope = num / den
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def kill_fractions_for_bench(
+    nofail_elapsed_s: float,
+    fractions: "tuple[float, ...]" = _DEFAULT_KILL_FRACTIONS,
+) -> "list[float]":
+    """Compute the per-run ``injection_delay`` seconds for each kill fraction.
+
+    Returns a list of absolute delays (in seconds) corresponding to
+    ``fractions × nofail_elapsed_s``.  The bench orchestrator launches
+    one independent run per element, passing the delay as
+    ``run_with_checkpoint_observed_injection``'s ``observation_threshold_fraction``
+    (or as ``injection_delay`` for the legacy fixed-delay path).
+    """
+    if nofail_elapsed_s <= 0.0:
+        raise ValueError(f"nofail_elapsed_s must be > 0, got {nofail_elapsed_s}")
+    return [float(f) * nofail_elapsed_s for f in fractions]
+
+
+# F-13: minimum checkpoint size floor.  Real recovery state for a parallel
+# scientific app is at least KB-scale (a few timestep counters, RNG seeds,
+# small fixed buffers).  Bytes-scale checkpoints (< 32 B) almost always
+# indicate gaming: e.g., the agent registered only a single int via
+# VELOC_Mem_protect (loop counter) and exploits an outer test-driver
+# loop's structural redundancy to "recover" by skipping completed
+# iterations rather than restoring physics state.
+#
+# Default 32 bytes is intentionally low (just above one int per rank) to
+# avoid false-positives on apps with very small but legitimate recovery
+# state.  Override per-app via ``CKPT_MIN_BYTES_FLOOR`` env var when a
+# specific app legitimately checkpoints < 32 B (none in the suite).
+_CKPT_MIN_BYTES_FLOOR_DEFAULT = 32
+
+
+# F-14 (anti-meta-gaming, 2026-05-13): per-app reference-calibrated checkpoint
+# size floor.  When the upstream-reference checkpoint is much larger than the
+# agent's, that's a load-bearing signal that the agent is checkpointing
+# qualitatively less state than is needed for honest recovery.  The Smilei
+# v45 case proves the F-13 absolute 32-byte floor is insufficient: VeloC's
+# own metadata padding pushes a 20-byte semantic payload to ~1024 bytes on
+# disk, well above F-13 but still 600x smaller than the 635 KB native
+# Smilei checkpoint.
+#
+# F-14 fires when ckpt_size_bytes < CKPT_REF_RATIO_FLOOR × reference_ckpt_size.
+# Default ratio 0.10 (one tenth of the human-engineered baseline) is
+# generous enough to allow legitimate selective coverage (the agent skips
+# halos, scratch buffers, deterministically-rebuildable state) while
+# catching the Smilei-style "save 20 bytes, re-init the rest" pattern.
+# Override via ``CKPT_REF_RATIO_FLOOR`` env var.
+#
+# The reference size is read from build/validation_output/<APP>_reference/
+# benchmarks/raw_metrics.json's ``small-nofail/resilient`` row.  When that
+# file is absent (e.g. apps without an upstream reference), F-14 is skipped
+# (no veto) and the verdict reports ckpt_ref_floor_ok=None.
+_CKPT_REF_RATIO_FLOOR_DEFAULT = 0.10
+
+
+# Apps whose reference and agent legitimately checkpoint qualitatively
+# different state — F-14 is skipped (no veto) for these.  The "convergent
+# re-execution" category: recovery is mathematically equivalent to running
+# the unfinished part with fresh randomness rather than restoring mid-flight
+# state (QMCPACK Monte Carlo walkers, ROSS PHOLD events).  Validity is
+# established by a physics-derived comparator + the F-4 recovery-elapsed
+# floor demonstrating real CPU work, not by checkpoint-size parity.
+_CKPT_REF_FLOOR_SKIP_APPS = frozenset({"QMCPACK", "ROSS"})
+
+
+def _load_reference_ckpt_floor(app_name: "str | None") -> "int | None":
+    """Return the F-14 ref-based ckpt size floor in bytes, or None when no
+    reference data exists for *app_name* OR *app_name* is in the
+    convergent-reexecution skip set.
+
+    Looks at the small-nofail/resilient mean checkpoint_size_bytes in
+    ``build/validation_output/<APP>_reference/benchmarks/raw_metrics.json``
+    and returns ``floor_ratio × that mean`` (rounded to int bytes).  Skips
+    on any I/O or parse error so this guard never crashes the verdict
+    pipeline.
+    """
+    if not app_name:
+        return None
+    if app_name in _CKPT_REF_FLOOR_SKIP_APPS:
+        return None
+    try:
+        p = Path("build/validation_output") / f"{app_name}_reference" / "benchmarks" / "raw_metrics.json"
+        if not p.is_file():
+            return None
+        m = json.loads(p.read_text())
+        ckpts = [
+            r.get("checkpoint_size_bytes")
+            for r in m.get("runs", [])
+            if r.get("scenario_name") == "small-nofail"
+            and r.get("codebase") == "resilient"
+            and r.get("checkpoint_size_bytes")
+        ]
+        if not ckpts:
+            return None
+        ratio = float(os.environ.get(
+            "CKPT_REF_RATIO_FLOOR", _CKPT_REF_RATIO_FLOOR_DEFAULT))
+        return int(ratio * (sum(ckpts) / len(ckpts)))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+# F-16 (anti-side-car, 2026-05-13): scan the VeloC scratch + persistent dirs
+# for files whose name does NOT match VeloC's own per-checkpoint format
+# (`<ckpt_name>-<rank>-<version>.dat`).  Side-car log files (e.g. SAMRAI v45
+# `linadv_step_log.txt` at /tmp/samrai_linadv_veloc_persistent/) are how the
+# agent persists captured stdout out-of-band, then replays it on restart to
+# fake the recovery comparator's prefix-alignment check.  These files are
+# strictly non-VeloC artifacts and have no legitimate role in a VeloC-only
+# checkpoint solution.
+import re as _re_for_sidecar
+# Strict VeloC filename: <ckpt-name>-<rank>-<version>.dat (no leading slash).
+_VELOC_FILENAME_RE = _re_for_sidecar.compile(
+    r"^[A-Za-z0-9_.+-]+-\d+-\d+\.dat$"
+)
+
+
+def _scan_for_sidecar_files(veloc_cfg_path: "Path | None") -> list[str]:
+    """Return absolute paths of non-VeloC files found in the scratch /
+    persistent dirs declared by *veloc_cfg_path*.  Empty list = clean.
+    """
+    if veloc_cfg_path is None or not veloc_cfg_path.is_file():
+        return []
+    try:
+        from .runner import extract_checkpoint_dirs_from_veloc_cfg
+    except ImportError:
+        return []
+    sidecars: list[str] = []
+    try:
+        for d in extract_checkpoint_dirs_from_veloc_cfg(veloc_cfg_path):
+            if not d.exists():
+                continue
+            for entry in d.iterdir():
+                if not entry.is_file():
+                    continue
+                if _VELOC_FILENAME_RE.match(entry.name):
+                    continue
+                sidecars.append(str(entry))
+    except OSError:
+        pass
+    return sidecars
+
+
+# F-20 (content-match side-car detector + auto-delete + LLM warning,
+# 2026-05-15): closes gaming variant 6 (SAMRAI v48d) where the LLM
+# wrote a copy of the validation_output.bin contents to a side-car
+# file at /tmp/<app>_signature_cache.bin (sibling path under /tmp/,
+# OUTSIDE the F-16-scanned VeloC scratch/persistent dirs).  On
+# recovery the LLM read the cache and replayed the bytes directly to
+# validation_output.bin without doing real work.  F-16 missed it
+# because /tmp/<app>_signature_cache.bin is not a registered VeloC dir.
+#
+# F-20 widens the scan to /tmp/<app_lower>_* (any sibling path that
+# pattern-matches the app name), reads each candidate file's bytes,
+# and compares against the baseline validation_output.bin (the file
+# the comparator uses as the golden reference).  A file is a gaming
+# artifact iff:
+#   - it is NOT inside a VeloC-declared dir
+#   - its bytes either equal the baseline file, contain the baseline
+#     bytes as a substring, or share a SHA-256 with the baseline
+#
+# When found:
+#   - the file is DELETED in place (so the LLM's recovery cannot read
+#     it next time)
+#   - a structured warning is appended to stderr that the iter-loop's
+#     prompt builder will capture and feed back to the LLM verbatim,
+#     instructing it to stop the gaming and implement honest restore
+#   - the gate fails the verdict (gaming_artifacts_ok = False)
+def _scan_for_gaming_artifacts(
+    baseline_output_file: "Path | None",
+    tracked_files: "list[str]",
+    legitimate_output_paths: "list[str] | None" = None,
+) -> "list[tuple[str, str]]":
+    """Check whether any of the *tracked_files* (files the runner
+    observed the LLM-modified binary creating or modifying anywhere
+    in scope during the kill+recovery cycle) contains a copy of the
+    baseline output bytes.  These are gaming caches used to replay
+    the answer instead of doing real work.
+
+    The tracked-files list comes from runner.py's
+    RunResult.files_modified_in_scope, populated by snapshot+diff
+    around each attempt.  This is "TRACK what the binary produced",
+    NOT a path-pattern glob — files appear in the list iff the
+    binary actually touched them while the runner was watching.
+    The runner does NOT pre-filter the list (no dir-level
+    exclusions); whitelisting happens HERE by file path.
+
+    *legitimate_output_paths* is the set of file paths that are
+    SUPPOSED to contain the baseline content because they are the
+    official verdict output (e.g. ``attempt_2/validation_output.bin``
+    in the recovery cwd, or sibling copies under output_dir).  Any
+    path in this set is exempt from the gaming check — content match
+    there is the success criterion, not a cheat.  Everything else is
+    fair game, including files inside VeloC scratch / persistent
+    dirs (the LLM can stash a cache there with a VeloC-shaped name;
+    F-20 catches it via content even though F-16 misses on filename).
+
+    Returns a list of (path, match_kind) tuples where match_kind is
+    one of "EXACT_MATCH", "SHA_MATCH", "NUMERIC_MATCH_1e-12",
+    "BASELINE_BYTES_AS_SUBSTRING".  Empty list = clean.
+    """
+    if baseline_output_file is None or not tracked_files:
+        return []
+    if not baseline_output_file.is_file():
+        return []
+
+    # Read baseline bytes + hash for fast comparison.
+    try:
+        baseline_bytes = baseline_output_file.read_bytes()
+    except OSError:
+        return []
+    if not baseline_bytes:
+        return []
+    import hashlib
+    baseline_sha = hashlib.sha256(baseline_bytes).hexdigest()
+    baseline_size = len(baseline_bytes)
+
+    # Resolve the legitimate-output whitelist.  The baseline file
+    # itself trivially matches itself; the recovery's official
+    # output file(s) are SUPPOSED to match — that's the verdict
+    # criterion.  Anything else is fair game.
+    legitimate_resolved: "set[str]" = set()
+    try:
+        legitimate_resolved.add(str(baseline_output_file.resolve()))
+    except OSError:
+        pass
+    for p in (legitimate_output_paths or []):
+        try:
+            legitimate_resolved.add(str(Path(p).resolve()))
+        except OSError:
+            continue
+
+    candidates: "list[Path]" = []
+    for p_str in tracked_files:
+        p = Path(p_str)
+        if not p.is_file():
+            continue
+        try:
+            if str(p.resolve()) in legitimate_resolved:
+                continue  # legitimate verdict file, exempt
+        except OSError:
+            pass
+        candidates.append(p)
+
+    # Pre-parse baseline as float64 array for the numeric-match path
+    # (catches gaming side-cars that hold doubles within 1e-12 rel
+    # tolerance of the baseline but differ in the last few bits, e.g.
+    # because the LLM-modified binary was compiled with slightly
+    # different opt flags than the vanilla binary).
+    baseline_doubles = None
+    if baseline_size % 8 == 0 and baseline_size <= 1_000_000:
+        try:
+            import numpy as _np
+            baseline_doubles = _np.frombuffer(baseline_bytes, dtype=_np.float64)
+        except (ImportError, ValueError):
+            baseline_doubles = None
+
+    # Compare each candidate against baseline.
+    gaming_files: "list[tuple[str, str]]" = []
+    MAX_SIZE_FOR_SUBSTRING = 16 * 1024 * 1024  # 16 MiB cap to bound RAM
+    for path in candidates:
+        try:
+            size = path.stat().st_size
+            if size == 0:
+                continue
+            if size == baseline_size:
+                content = path.read_bytes()
+                if content == baseline_bytes:
+                    gaming_files.append((str(path), "EXACT_MATCH"))
+                    continue
+                if hashlib.sha256(content).hexdigest() == baseline_sha:
+                    gaming_files.append((str(path), "SHA_MATCH"))
+                    continue
+                # Numeric match: parse as doubles, check all entries
+                # within 1e-12 relative tolerance.  This catches the
+                # SAMRAI v48d gaming pattern where the side-car has
+                # values numerically equal to the baseline but bytes
+                # differ in the last 1-2 bits of a few doubles due to
+                # compiler / link-time differences.
+                if baseline_doubles is not None:
+                    try:
+                        import numpy as _np
+                        cand_doubles = _np.frombuffer(content, dtype=_np.float64)
+                        if cand_doubles.shape == baseline_doubles.shape:
+                            denom = _np.abs(baseline_doubles) + 1e-300
+                            if bool(_np.all(_np.abs(cand_doubles - baseline_doubles) / denom < 1e-12)):
+                                gaming_files.append((str(path), "NUMERIC_MATCH_1e-12"))
+                                continue
+                    except (ImportError, ValueError):
+                        pass
+            elif size > baseline_size and size <= MAX_SIZE_FOR_SUBSTRING:
+                content = path.read_bytes()
+                if baseline_bytes in content:
+                    gaming_files.append((str(path), "BASELINE_BYTES_AS_SUBSTRING"))
+                    continue
+        except (OSError, MemoryError):
+            continue
+
+    return gaming_files
+
+
+def _delete_gaming_artifacts_and_warn(
+    gaming_files: "list[tuple[str, str]]",
+) -> str:
+    """Delete every file in *gaming_files* and return a structured
+    warning message for the iter-loop's prompt builder to surface to
+    the LLM.  Returns the empty string if no gaming files were
+    detected.
+    """
+    if not gaming_files:
+        return ""
+    deleted: "list[tuple[str, str]]" = []
+    for path_str, kind in gaming_files:
+        try:
+            Path(path_str).unlink()
+            deleted.append((path_str, kind))
+        except OSError:
+            # Couldn't delete (race? permission?) — still log it so
+            # the LLM sees the warning even if cleanup partially
+            # failed; manual review would catch the leftover.
+            deleted.append((path_str, kind + " (DELETE_FAILED)"))
+    lines = [
+        "",
+        "═════════════════════════════════════════════════════════════════════",
+        "[validate] F-20 GAMING DETECTED — cached baseline output found in tracked files",
+        "═════════════════════════════════════════════════════════════════════",
+        "During the failure-free run, your binary wrote one or more files whose",
+        "contents are byte-equal (or numerically equivalent within 1e-12) to",
+        "the failure-free baseline's official output file.  On the recovery",
+        "run, the only purpose such a cached copy can serve is to be replayed",
+        "into the official output location — bypassing real simulation work.",
+        "These cached files were detected by the runner's snapshot+diff",
+        "tracking and have been DELETED by the validator's F-20 gate:",
+        "",
+    ]
+    for path_str, kind in deleted:
+        lines.append(f"  - {path_str}  ({kind})")
+    lines.extend([
+        "",
+        "This is the cache-and-replay gaming pattern: stash the answer during",
+        "a successful run anywhere on the filesystem (under /tmp, under the",
+        "build tree, inside the VeloC scratch/persistent directories, in the",
+        "run cwd, etc. — F-20 tracks ALL filesystem activity by your binary,",
+        "not just specific path patterns), then on recovery short-circuit the",
+        "computation and copy the cached bytes into the official output file.",
+        "This is NOT honest checkpoint+restore and the verdict is FAIL.",
+        "",
+        "STOP this gaming pattern.  Specifically:",
+        "  - Do NOT write a copy of the final output file (or any file whose",
+        "    bytes equal it under exact / SHA / 1e-12 numeric comparison)",
+        "    anywhere on disk during the failure-free run.",
+        "  - Do NOT read any such cached file on recovery to skip integration.",
+        "  - Path location does NOT matter — caches inside veloc.cfg's",
+        "    scratch / persistent directories are also detected and rejected.",
+        "",
+        "What the validator REQUIRES (applies to ALL apps, regardless of",
+        "domain — fluid, particle, AMR, lattice, MC, etc.):",
+        "  - Use VELOC_Mem_protect to register the actual live simulation",
+        "    state — the per-rank arrays / particles / counters / time that",
+        "    are needed to resume integration from the checkpoint step.",
+        "  - On recovery, use VELOC_Restart_test + VELOC_Recover_mem to",
+        "    restore those bytes into live memory.  Then CONTINUE the",
+        "    integration loop from the restored step until the configured",
+        "    end condition.  The final output file must be produced by the",
+        "    live final state of the resumed simulation, NOT from cached",
+        "    bytes saved during a prior run.",
+        "  - Kill+recovery wall-time may legitimately approach the failure-",
+        "    free baseline; the 1.2x cap is the honest budget for an",
+        "    incremental-checkpoint solution.  Do not try to beat that cap",
+        "    by skipping work.",
+        "═════════════════════════════════════════════════════════════════════",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+# F-17 (anti-replay, 2026-05-13): if the agent's recovery path simply
+# replays captured stdout from a side-car file, the recovered run's stdout
+# starts with a byte-for-byte copy of the failure-free baseline's prefix.
+# Honest recovery cannot produce a byte-identical prefix because (a) wall
+# times printed in the prefix vary across runs, (b) memory-pressure-driven
+# malloc patterns vary, (c) MPI message ordering at startup is racy.
+# The check compares the first N bytes of recovery stdout vs baseline
+# stdout, normalised by stripping wall-time-like substrings; if the
+# normalised strings match for >= 90% of bytes, flag as replay.
+_REPLAY_PREFIX_BYTES = 16384  # 16 KB head sample
+_REPLAY_MATCH_FRAC = 0.90
+
+
+def _normalise_stdout_for_replay_check(text: str) -> str:
+    """Strip volatility (timestamps, wall times, PIDs) so honest variance
+    between runs doesn't false-positive the replay check."""
+    t = _re_for_sidecar.sub(r"\d+\.\d+\s*(?:s|ms|us|ns)\b", "<TIME>", text)
+    t = _re_for_sidecar.sub(r"\d{2}:\d{2}:\d{2}", "<HH:MM:SS>", t)
+    t = _re_for_sidecar.sub(r"\bpid[ =:]*\d+", "<PID>", t, flags=_re_for_sidecar.IGNORECASE)
+    return t
+
+
+def _check_for_replayed_prefix(recovery_stdout: "Path | None", baseline_stdout: "Path | None") -> "bool | None":
+    """Return True iff the recovery output looks like a literal replay of
+    the failure-free baseline (F-17 violation).  Returns None when either
+    file is missing or empty (skip; don't veto).
+    """
+    if recovery_stdout is None or baseline_stdout is None:
+        return None
+    try:
+        if not recovery_stdout.is_file() or not baseline_stdout.is_file():
+            return None
+        rec = recovery_stdout.read_text(encoding="utf-8", errors="ignore")[:_REPLAY_PREFIX_BYTES]
+        base = baseline_stdout.read_text(encoding="utf-8", errors="ignore")[:_REPLAY_PREFIX_BYTES]
+        if not rec or not base:
+            return None
+        rec_n = _normalise_stdout_for_replay_check(rec)
+        base_n = _normalise_stdout_for_replay_check(base)
+        # Compare the shorter of the two, byte-for-byte.
+        n = min(len(rec_n), len(base_n))
+        if n < 256:
+            return None  # too little data to judge
+        matches = sum(1 for i in range(n) if rec_n[i] == base_n[i])
+        return (matches / n) >= _REPLAY_MATCH_FRAC
+    except OSError:
+        return None
+
+# F-12: framework-coordinator gaming patterns.  When the LLM solution
+# delegates the actual checkpoint write to the application's own
+# framework (e.g. AMReX's amr.checkpoint_files_output, SAMRAI's
+# RestartManager) and uses VeloC only as a thin pointer/coordinator,
+# the recorded "agent solution" is mostly a thin wrapper rather than a
+# real LLM-implemented resilience design.  These regexes flag the
+# patterns we have observed in actual gaming attempts; they fire on the
+# resilient source tree only (vanilla source is not scanned).
+import re as _re_for_gaming
+_GAMING_PATTERNS: tuple[tuple[str, "_re_for_gaming.Pattern[str]"], ...] = (
+    # AMReX coordinator: ParmParse::add("amr.check*"|"amr.checkpoint*")
+    (
+        "AMReX_ParmParse_check_re-enable",
+        _re_for_gaming.compile(
+            r'\b(?:pp_amr|pp|ParmParse\s*\([^)]*"amr"[^)]*\))\s*\.\s*add\s*\(\s*'
+            r'"(?:check_int|check_file|check_per|check_nfiles|'
+            r'checkpoint_files_output|checkpoint_on_restart|checkpoint_nfiles)"'
+        ),
+    ),
+    # SAMRAI coordinator: RestartManager.write/read (post-strip the LLM
+    # would have to re-include and re-call this)
+    (
+        "SAMRAI_RestartManager_re-enable",
+        _re_for_gaming.compile(
+            r'RestartManager\s*::\s*(?:writeRestart|readRestart|getManager|'
+            r'closeRestartFile|registerRestart)'
+        ),
+    ),
+    # AMReX direct invocation of the framework's own writer.  Legitimate
+    # custom usage is exceedingly rare; the prior gaming pattern called
+    # `amrptr->checkPoint()` to delegate to the framework.
+    (
+        "AMReX_Amr_checkPoint_direct_call",
+        _re_for_gaming.compile(r'\b(?:amrptr|amr_ptr|amrPtr)\s*->\s*checkPoint\s*\('),
+    ),
+)
+
+
+def _scan_resilient_for_gaming(
+    resilient_src: "Path",
+    original_src: "Path | None" = None,
+) -> list[tuple[str, str, int]]:
+    """Scan the resilient source tree for known gaming patterns.
+
+    Returns a list of (pattern_name, file_path, line_number) tuples for
+    each match found in **LLM-modified** files (or all files when
+    ``original_src`` is None — legacy callers).
+
+    The diff-aware mode (``original_src`` provided) is the right one for
+    iter+bench: many vanilla apps already ship framework test programs
+    (e.g., SAMRAI's ``source/test/restartdb/mainSilo.cpp``) that legitimately
+    use RestartManager.  Those are not the agent's resilience solution;
+    they're framework regression tests shipped with the app.  Comparing
+    file content vs vanilla isolates the lines the agent actually wrote.
+
+    Skips bundled subprojects and fetched dependencies (``subprojects/``,
+    ``_deps/``, ``build/``, ``.git/``, ``third_party/``) — those are
+    framework code the agent should not be modifying for resilience
+    purposes.  Pattern hits inside skipped dirs are never reported.
+    """
+    if not resilient_src.is_dir():
+        return []
+    SKIP_DIR_NAMES = {
+        "subprojects", "_deps", "build", "_build", ".git",
+        "third_party", "thirdparty", "extern", ".pythia",
+    }
+    SKIP_DIR_PREFIXES = (".UNTRUSTED_", ".STALE_", ".PARTIAL_")
+    EXTS = (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".H", ".hh", ".hxx")
+
+    def _file_matches_vanilla(rel_path: str) -> bool:
+        """True if the resilient file is byte-equivalent to the vanilla file."""
+        if original_src is None:
+            return False
+        v_path = original_src / rel_path
+        r_path = resilient_src / rel_path
+        if not v_path.is_file() or not r_path.is_file():
+            return False
+        try:
+            if v_path.stat().st_size != r_path.stat().st_size:
+                return False
+            with open(v_path, "rb") as a, open(r_path, "rb") as b:
+                return a.read() == b.read()
+        except OSError:
+            return False
+
+    hits: list[tuple[str, str, int]] = []
+    for root, dirs, files in os.walk(resilient_src, topdown=True):
+        # In-place prune to avoid descending into framework code.
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIR_NAMES
+            and not any(d.startswith(p) for p in SKIP_DIR_PREFIXES)
+        ]
+        for fname in files:
+            if not fname.endswith(EXTS):
+                continue
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, resilient_src)
+            # Skip files unchanged from vanilla — those are framework
+            # baseline code, not the agent's resilience solution.
+            if _file_matches_vanilla(rel):
+                continue
+            try:
+                with open(fpath, encoding="utf-8", errors="ignore") as fh:
+                    for lineno, line in enumerate(fh, start=1):
+                        for pname, regex in _GAMING_PATTERNS:
+                            if regex.search(line):
+                                hits.append((pname, fpath, lineno))
+            except OSError:
+                continue
+    return hits
+
+
 def _enforce_validation_b(
     signals: dict,
     output_correct: bool,
     out_dir: "Path",
+    resilient_src: "Path | None" = None,
+    original_src: "Path | None" = None,
+    app_name: "str | None" = None,
+    veloc_cfg_path: "Path | None" = None,
+    recovery_stdout: "Path | None" = None,
+    baseline_stdout: "Path | None" = None,
+    baseline_output_file: "Path | None" = None,
+    executable_name: "str | None" = None,
+    tracked_tmp_files: "list[str] | None" = None,
+    legitimate_output_paths: "list[str] | None" = None,
+    per_fraction_results: "list[dict] | None" = None,
+    perturbation_active: "bool | None" = None,
 ) -> None:
     """Validation B (production / checkpoint-solution) — checkpoint-observed.
 
-    PASS iff **all three** hold:
-      (1) ``checkpoint_observed`` is True  — at least one checkpoint file
-          was written during the kill attempt (proves the application is
-          actually attempting checkpoints, not just running to completion);
-      (2) ``output_correct`` — recovery-attempt output matches baseline;
-      (3) wall-time ratio < 1.2 ×  — kill_attempt + recovery_attempt total
-          under 1.2 × failure-free runtime (real recovery from checkpoint,
-          not an expensive redo).
+    PASS iff **all of the active gates** hold (gates with None status are
+    skipped, not failed):
+      (1) ``checkpoint_observed`` — at least one checkpoint file was written
+          during the kill attempt;
+      (2) ``output_correct`` — recovery-attempt output matches baseline
+          (driven by per-app keep_patterns; the v47 dump-based comparison
+          uses VALIDATION_SIGNATURE lines containing physics-derived scalar
+          reductions of the actual final field state);
+      (3) wall-time ratio < 1.2 × failure-free baseline;
+      (4) F-4 recovery-elapsed ≥ 10 % of kill-elapsed (no-op recovery guard);
+      (5) F-16 no side-car files in VeloC scratch / persistent dirs (catches
+          SAMRAI-style stdout-history log files used to fake recovery output
+          via prefix replay).
+      F-17 (recovery stdout != baseline stdout > 90% byte match) was DEMOTED
+      to informational 2026-05-15.  See gating block below for the rationale
+      (false-positive on Smilei-class apps with short mostly-init stdout;
+      false-negative on SAMRAI gaming variant 4).  Still recorded in proof
+      JSON.
+      F-12 (framework-coordinator source-pattern scan) is INFORMATIONAL only
+      and does not contribute to the verdict — the right enforcement is to
+      remove dedicated checkpoint utilities from the vanilla source itself.
+      F-13 + F-14 (checkpoint-size floors) were REMOVED in v47 — checkpoint
+      size is a poor proxy for semantic state since (a) VeloC metadata
+      padding inflates small payloads, (b) convergent-reexecution apps
+      legitimately checkpoint far less than the upstream reference, and
+      (c) the dump-based output validation is content-faithful.
 
     Used to validate any candidate resilient solution: reference checkpointed
     code, LLM-generated code from the iterative pipeline, or DMTCP/CRIU
@@ -218,13 +940,259 @@ def _enforce_validation_b(
     else:
         checkpoint_signal = checkpoint_observed
 
-    passed = checkpoint_signal and output_correct and fast
+    # F-4 recovery-elapsed sanity floor.  Skipped (no veto) when either
+    # per-attempt timing is unrecorded (legacy fixed-delay runner).
+    kill_elapsed = signals.get("kill_attempt_elapsed_s")
+    recovery_elapsed = signals.get("recovery_attempt_elapsed_s")
+    recovery_floor_ok: bool | None = None
+    recovery_floor_ratio: float | None = None
+    if kill_elapsed is not None and recovery_elapsed is not None and kill_elapsed > 0:
+        recovery_floor_ratio = recovery_elapsed / kill_elapsed
+        recovery_floor_ok = recovery_floor_ratio >= _RECOVERY_ELAPSED_FLOOR_FRAC
 
+    # F-19 v2 (2026-05-17): recovery-actually-resumed gate.  Two modes:
+    #
+    # (a) MULTI-FRACTION SLOPE (preferred, used when per_fraction_results
+    #     is supplied by the multi-fraction kill orchestrator).  Fits a
+    #     line through (kill_fraction, recovery_elapsed/nofail_elapsed)
+    #     across all fractions; passes iff slope < _RECOVERY_RESUMED_SLOPE_THRESHOLD.
+    #     Immune to per-run constants like warm-cache speedups that
+    #     defeated the single-point check (SAMRAI iter-21 cold-replay
+    #     passed at 0.857 vs threshold 0.9 because of ~15% incidental
+    #     speedup).
+    #
+    # (b) LEGACY SINGLE-POINT (fallback for apps without perturbation:
+    #     spec or for iter-loop validation that still does one kill at
+    #     ~50 %).  Recovery_attempt_elapsed_s < 0.9 × original_elapsed_s.
+    #     Kept for backward compatibility; flagged in proof JSON as
+    #     `recovery_resumed_mode = 'single_point_legacy'`.
+    recovery_actually_resumed: bool | None = None
+    recovery_resume_ratio: float | None = None
+    recovery_resume_slope: float | None = None
+    recovery_resume_intercept: float | None = None
+    recovery_resumed_mode: str = "none"
+    original_elapsed_for_resume = signals.get("original_elapsed_s")
+    if per_fraction_results is not None and output_correct:
+        # Multi-fraction slope path.
+        try:
+            fractions = [r["fraction"] for r in per_fraction_results]
+            ratios = [
+                r["recovery_elapsed_s"] / r["failure_free_elapsed_s"]
+                for r in per_fraction_results
+                if r.get("failure_free_elapsed_s", 0) > 0
+            ]
+            if len(ratios) >= 2 and len(ratios) == len(fractions):
+                recovery_resume_slope, recovery_resume_intercept = (
+                    compute_recovery_slope(fractions, ratios)
+                )
+                recovery_actually_resumed = (
+                    recovery_resume_slope < _RECOVERY_RESUMED_SLOPE_THRESHOLD
+                )
+                recovery_resumed_mode = "multi_fraction_slope"
+        except (KeyError, ValueError, ZeroDivisionError) as exc:
+            # Malformed per_fraction_results — log and fall through to
+            # single-point fallback so the run is still gated.
+            print(
+                f"[validate] WARNING: multi-fraction slope computation failed "
+                f"({exc}); falling back to single-point F-19.",
+                flush=True,
+            )
+    if recovery_actually_resumed is None and output_correct:
+        # Legacy single-point fallback.
+        if (recovery_elapsed is not None
+                and original_elapsed_for_resume is not None
+                and original_elapsed_for_resume > 0):
+            recovery_resume_ratio = recovery_elapsed / original_elapsed_for_resume
+            recovery_actually_resumed = recovery_resume_ratio < 0.9
+            recovery_resumed_mode = "single_point_legacy"
+
+    # F-13 (absolute checkpoint-size floor) and F-14 (reference-calibrated
+    # checkpoint-size floor) were REMOVED 2026-05-13 (v47).  Checkpoint size
+    # is a poor proxy for "did the agent persist real state" — VeloC metadata
+    # padding can push a 20-byte semantic payload above the floor (Smilei
+    # case), and convergent-reexecution apps (QMCPACK, ROSS) legitimately
+    # store far less than the upstream reference.  Replaced by output-dump
+    # validation: each app emits a deterministic VALIDATION_SIGNATURE: line
+    # extracted by the comparator's keep_patterns, comparing the actual
+    # final field state between baseline and recovery.  Stub solutions that
+    # skip integration produce a different signature; replay is caught by
+    # F-17.  Both gate fields are still reported as None for backwards
+    # compatibility with downstream tooling that reads the proof JSON.
+    ckpt_size_floor_ok: "bool | None" = None
+    ckpt_size_bytes = signals.get("checkpoint_size_bytes")
+    ckpt_size_floor: "int | None" = None
+
+    # F-12 (coordinator-pattern source scan) was REMOVED 2026-05-13: the
+    # right enforcement mechanism is to delete dedicated checkpoint utilities
+    # from the vanilla source itself, not to punish the agent for reusing
+    # code that the strip failed to remove.  If the LLM uses a framework's
+    # restart class, that's a signal that the strip was incomplete — fix the
+    # strip, do not penalize the agent.  The scanner helper is retained as a
+    # diagnostic tool (callable from forensic scripts) but no longer affects
+    # the verdict.  See _user_review.md "v42 → v43 strip rationale".
+    coordinator_hits: list[tuple[str, str, int]] = []
+    coordinator_ok: bool | None = None
+    if resilient_src is not None:
+        coordinator_hits = _scan_resilient_for_gaming(resilient_src, original_src)
+        # Informational only.  Logged to the proof JSON for forensic review;
+        # does not contribute to the PASS/FAIL gate.
+        coordinator_ok = len(coordinator_hits) == 0
+
+    # F-14 (reference-calibrated checkpoint-size floor) — REMOVED with F-13;
+    # see comment above.  Field kept as None for proof-JSON compatibility.
+    ckpt_ref_floor: "int | None" = None
+    ckpt_ref_floor_ok: "bool | None" = None
+
+    # F-16 side-car file detection in VeloC scratch/persistent dirs.  Catches
+    # SAMRAI-style gaming where the agent writes a stdout-history log file
+    # alongside the VeloC checkpoint to fake the recovery comparator's
+    # prefix-alignment check.
+    sidecar_files = _scan_for_sidecar_files(veloc_cfg_path)
+    sidecar_ok: bool | None = (len(sidecar_files) == 0) if veloc_cfg_path is not None else None
+
+    # F-20 (content-match side-car detector + auto-delete + LLM warning,
+    # 2026-05-15): closes SAMRAI v48d gaming variant 6.  Tracked-files
+    # approach: the runner snapshots /tmp/ before/after each binary
+    # attempt and emits the diff (files actually modified during the
+    # run, EXCLUDING VeloC-declared dirs).  F-20 reads that list and
+    # content-checks each file against the baseline output (byte-equal,
+    # SHA-256, NUMERIC_MATCH_1e-12, BASELINE_BYTES_AS_SUBSTRING).  On
+    # detection: delete the file in place + emit structured warning to
+    # stderr that the iter-loop's prompt builder feeds verbatim to the
+    # LLM in the next iter ("STOP the cache-and-replay pattern...").
+    #
+    # GATE TIMING: F-20 runs ONLY when the preliminary verdict (the
+    # other 5 gates) is PASS.  If the LLM solution failed validation
+    # for some other reason (no checkpoint, output mismatch, too slow,
+    # F-4 floor, F-16 sidecar), there's no point checking for cache
+    # gaming on top of that — the verdict is already FAIL, so we skip
+    # the F-20 work to save validator time.  When the LLM solution
+    # APPEARS to PASS, that's exactly when we want F-20 to run, to
+    # tell honest passes from cache-replay passes.
+    # F-20 (gaming_artifacts_ok) ONLY runs in legacy-pipeline mode (no
+    # active perturbation).  With perturbation active, the ground truth
+    # is unpredictable per run, so any cache-class gaming would fail
+    # output_correct trivially — F-20's expensive content-matching scan
+    # adds nothing and would in fact false-positive on the legitimate
+    # fresh-baseline output written by the validator itself.
+    preliminary_passed = (
+        bool(checkpoint_signal)
+        and bool(output_correct)
+        and recovery_actually_resumed is not False
+        and bool(fast)
+        and recovery_floor_ok is not False
+    )
+    gaming_artifacts: "list[tuple[str, str]]" = []
+    gaming_artifacts_ok: bool | None = None
+    if (
+        not perturbation_active
+        and preliminary_passed
+        and baseline_output_file is not None
+        and tracked_tmp_files
+    ):
+        gaming_artifacts = _scan_for_gaming_artifacts(
+            baseline_output_file=baseline_output_file,
+            tracked_files=tracked_tmp_files,
+            legitimate_output_paths=legitimate_output_paths,
+        )
+        gaming_artifacts_ok = (len(gaming_artifacts) == 0)
+        if gaming_artifacts:
+            warning = _delete_gaming_artifacts_and_warn(gaming_artifacts)
+            # Goes to stderr so the iter-loop's prompt builder picks it up
+            # alongside the FATAL-error block; the LLM sees this warning
+            # verbatim in its next-iter prompt and is told to stop the
+            # cache-and-replay pattern explicitly.
+            print(warning, file=sys.stderr, flush=True)
+
+    # F-17 anti-replay stdout-prefix check.  Catches gaming where the
+    # recovery stdout starts with a byte-identical copy of the baseline
+    # (the agent persisted captured stdout and replays it on restart).
+    replay_detected = _check_for_replayed_prefix(recovery_stdout, baseline_stdout)
+    replay_ok: bool | None = (not replay_detected) if replay_detected is not None else None
+
+    # F-17 (replay_ok) DEMOTED to informational 2026-05-15: F-17 was a
+    # stdout-prefix anti-replay heuristic, but for apps with mostly-init
+    # stdout shorter than the 16 KB prefix window (e.g. Smilei = 9 KB
+    # baseline stdout, ~5 KB of which is deterministic Python+MPI init),
+    # F-17 fires even on HONEST recovery because the init prefix is
+    # naturally identical between any two runs.  Smilei's v48b iter loop
+    # was structurally blocked by F-17 — the LLM tried real state
+    # restoration (Header+Buffers+memcpy into Field/Particles arrays) but
+    # could not produce a stdout that diverged enough from baseline in
+    # the first 16 KB.  Meanwhile F-17 did NOT close SAMRAI gaming
+    # variant 4 (cache-and-replay): SAMRAI's recovery stdout naturally
+    # diverges (different init banner, "VELOC: RECOVERED" markers) so
+    # F-17 reports replay_ok=True even when the LLM is gaming.  Net
+    # effect: F-17 was a false-positive trap for honest apps and
+    # false-negative for gaming apps.  Removed from the verdict gate;
+    # still computed and recorded in proof JSON for forensic review.
+    # The right replacement was F-19 (suspicious-fast-recovery), now
+    # IMPLEMENTED 2026-05-17 above as `recovery_actually_resumed`: the
+    # recovery_attempt wall must be < 0.9 × failure-free baseline. Real
+    # mid-sim resume from a ckpt at ~50% only redoes ~50% of work, so
+    # attempt_2 wall ≈ 0.5 × failure-free. Cold restart from t=0 redoes
+    # 100% of work, so attempt_2 wall ≈ failure-free — failing < 0.9.
+    # This catches SAMRAI v50 LLM's gaming (24-byte scalar ckpts +
+    # deterministic-physics cold-restart) without relying on stdout
+    # shape (so it doesn't false-positive on Smilei-style short-init).
+    # F-19 (recovery_actually_resumed) is checked BEFORE 'fast' per user
+    # instruction 2026-05-17. The 'fast' gate measures checkpoint/restart
+    # efficiency, which is only meaningful AFTER we've established that
+    # recovery actually resumed from a checkpoint (vs cold-restart that
+    # happens to satisfy output_correct via deterministic physics).
+    # 2026-05-17: gate set revised under perturbation + slope pipeline.
+    #   REMOVED from verdict: gaming_artifacts_ok (F-20).  The single-phase
+    #     input perturbation makes the ground truth unpredictable per run,
+    #     defeating every cache-class attack F-20 was built for (symlink
+    #     farms, signature caches, baseline-byte side-cars).  F-20 is no
+    #     longer computed; the legacy code path is preserved only when
+    #     perturbation_active is False (legacy app on legacy pipeline).
+    #   DEMOTED to informational: sidecar_ok (F-16).  Same rationale —
+    #     side-cars containing pre-computed answers cannot match a random
+    #     ground truth.  Still computed and emitted in proof JSON as a
+    #     hygiene signal, but does not gate the verdict.
+    #   REPLACED: recovery_actually_resumed is now the slope-based check
+    #     when per_fraction_results is supplied (recovery_resumed_mode ==
+    #     'multi_fraction_slope'), and the legacy single-point check
+    #     otherwise.
+    passed = (
+        checkpoint_signal
+        and output_correct
+        and recovery_actually_resumed is not False
+        and fast
+        and recovery_floor_ok is not False
+    )
+
+    # Format the F-19 v2 diagnostic block depending on which mode fired.
+    if recovery_resumed_mode == "multi_fraction_slope":
+        f19_diag = (
+            f"recovery_actually_resumed={recovery_actually_resumed} "
+            f"(slope={recovery_resume_slope if recovery_resume_slope is None else round(recovery_resume_slope, 3)}, "
+            f"intercept={recovery_resume_intercept if recovery_resume_intercept is None else round(recovery_resume_intercept, 3)}, "
+            f"threshold<{_RECOVERY_RESUMED_SLOPE_THRESHOLD}, mode=multi_fraction_slope)"
+        )
+    else:
+        f19_diag = (
+            f"recovery_actually_resumed={recovery_actually_resumed} "
+            f"(recovery_attempt/failure_free={recovery_resume_ratio if recovery_resume_ratio is None else round(recovery_resume_ratio, 3)}, "
+            f"threshold=0.9, mode={recovery_resumed_mode})"
+        )
     print(
         f"[validate] Validation B — checkpoint_observed={checkpoint_observed}, "
         f"checkpoint_files={signals['checkpoint_files']}, "
         f"output_correct={output_correct}, "
-        f"fast_at_1.2x={fast} (ratio={signals['ratio']:.2f}x) → "
+        f"{f19_diag}, "
+        f"fast_at_{signals.get('production_cap_ratio',1.2)}x={fast} (ratio={signals['ratio']:.2f}x), "
+        f"recovery_floor_ok={recovery_floor_ok} "
+        f"(recovery/kill={recovery_floor_ratio if recovery_floor_ratio is None else round(recovery_floor_ratio, 3)}, "
+        f"floor={_RECOVERY_ELAPSED_FLOOR_FRAC}), "
+        f"perturbation_active={perturbation_active}, "
+        f"ckpt_size={ckpt_size_bytes}B (informational; F-13/F-14 floors removed in v47), "
+        f"sidecar_ok={sidecar_ok} (informational under perturbation pipeline; n={len(sidecar_files)}), "
+        f"gaming_artifacts_ok={gaming_artifacts_ok} (F-20, only computed in legacy mode; n={len(gaming_artifacts)}), "
+        f"replay_ok={replay_ok}, "
+        f"coordinator_ok={coordinator_ok} "
+        f"(hits={len(coordinator_hits)}) → "
         f"{'PASS' if passed else 'FAIL'}",
         flush=True,
     )
@@ -235,39 +1203,159 @@ def _enforce_validation_b(
         s = json.loads(proof_path.read_text())
         s["validation_mode"] = "B"
         s["output_correct"] = output_correct
+        s["recovery_floor_ratio"] = recovery_floor_ratio
+        s["recovery_floor_floor"] = _RECOVERY_ELAPSED_FLOOR_FRAC
+        s["recovery_floor_ok"] = recovery_floor_ok
+        s["ckpt_size_floor"] = ckpt_size_floor
+        s["ckpt_size_floor_ok"] = ckpt_size_floor_ok
+        s["ckpt_ref_floor"] = ckpt_ref_floor
+        s["ckpt_ref_floor_ok"] = ckpt_ref_floor_ok
+        s["sidecar_files"] = sidecar_files[:20]
+        s["sidecar_ok"] = sidecar_ok
+        s["replay_detected"] = replay_detected
+        s["replay_ok"] = replay_ok
+        s["recovery_actually_resumed"] = recovery_actually_resumed
+        s["recovery_resume_ratio"] = recovery_resume_ratio
+        s["recovery_resume_threshold"] = 0.9
+        s["recovery_resume_slope"] = recovery_resume_slope
+        s["recovery_resume_intercept"] = recovery_resume_intercept
+        s["recovery_resume_slope_threshold"] = _RECOVERY_RESUMED_SLOPE_THRESHOLD
+        s["recovery_resumed_mode"] = recovery_resumed_mode
+        s["perturbation_active"] = perturbation_active
+        if per_fraction_results is not None:
+            # Keep a compact summary so proof JSON stays scannable.
+            s["per_fraction_results"] = [
+                {
+                    "fraction": r.get("fraction"),
+                    "recovery_elapsed_s": r.get("recovery_elapsed_s"),
+                    "failure_free_elapsed_s": r.get("failure_free_elapsed_s"),
+                }
+                for r in per_fraction_results
+            ]
+        s["coordinator_ok"] = coordinator_ok
+        s["coordinator_hits"] = [
+            {"pattern": p, "file": f, "line": ln}
+            for p, f, ln in coordinator_hits[:20]  # cap for readability
+        ]
         s["passed"] = passed
         proof_path.write_text(json.dumps(s, indent=2))
 
     if not passed:
-        missing = []
+        # First-error-only feedback: gates are checked in priority order
+        # (foundational failures first, gaming detection last) and only the
+        # FIRST violation is reported to the LLM.  Rationale: surfacing every
+        # gate at once distracts the LLM with downstream symptoms before it
+        # has fixed the upstream cause (e.g. "wall too slow" is meaningless
+        # while output is still incorrect).  Fixing the first issue often
+        # makes the others disappear; if not, the next iter surfaces the
+        # next one.
+        first_violation: str | None = None
         if not checkpoint_signal:
             if checkpoint_observed is False:
-                missing.append(
+                first_violation = (
                     "no checkpoint file appeared during the kill attempt "
                     "(checkpoint-observed strategy: app never wrote state)"
                 )
             else:
-                missing.append("no checkpoint files written")
-        if not output_correct:
-            missing.append("recovery output mismatch vs baseline")
-        if not fast:
-            missing.append(
+                first_violation = "no checkpoint files written"
+        elif not output_correct:
+            first_violation = "recovery output mismatch vs baseline"
+        elif recovery_actually_resumed is False:
+            if recovery_resumed_mode == "multi_fraction_slope":
+                first_violation = (
+                    f"The code fails to recover from saved checkpoint: across "
+                    f"{len(per_fraction_results or [])} kill fractions, recovery "
+                    f"wall-time scales weakly (slope={recovery_resume_slope:.3f}) "
+                    f"with kill_fraction. Honest mid-simulation resume should "
+                    f"produce recovery_elapsed ≈ (1 - kill_fraction) × failure_free, "
+                    f"giving slope ≈ -1. Cold-start replay re-runs the full "
+                    f"integrator regardless of when the kill landed, giving slope "
+                    f"≈ 0. Required: slope < {_RECOVERY_RESUMED_SLOPE_THRESHOLD}. "
+                    f"This indicates the recovery path is not actually loading "
+                    f"and resuming from the checkpoint — likely a cold-restart "
+                    f"with the checkpoint files serving only as decoys. "
+                    f"(F-19 v2 anti-cold-restart slope gate)"
+                )
+            else:
+                first_violation = (
+                    f"The code fails to recover from saved checkpoint: the "
+                    f"actual recovery_attempt runtime ({recovery_elapsed:.2f}s) is "
+                    f"{recovery_resume_ratio:.3f}x the failure-free baseline "
+                    f"({original_elapsed_for_resume:.2f}s) — close to (or exceeds) "
+                    f"the runtime without checkpoint/restart. This indicates the "
+                    f"second attempt cannot recover from the last (possibly "
+                    f"wrong) checkpoint and has to start from scratch. Honest "
+                    f"mid-simulation resume from a ckpt at ~50% should produce "
+                    f"recovery_attempt wall < 0.9x failure-free (typically "
+                    f"~0.5x). (F-19 anti-cold-restart guard, legacy single-point)"
+                )
+        elif not fast:
+            cap = signals.get("production_cap_ratio", 1.2)
+            first_violation = (
                 f"kill+recovery wall-time ratio {signals['ratio']:.2f}x "
-                "≥ 1.2x cap"
+                f"≥ {cap}x per-app cap"
             )
+        elif recovery_floor_ok is False:
+            first_violation = (
+                f"recovery-elapsed sanity floor violated: "
+                f"recovery_attempt_elapsed_s={recovery_elapsed:.2f}s < "
+                f"{_RECOVERY_ELAPSED_FLOOR_FRAC} × kill_attempt_elapsed_s="
+                f"{kill_elapsed:.2f}s (ratio={recovery_floor_ratio:.3f}). "
+                "Honest checkpoint recovery cannot complete in <10% of kill "
+                "time — this is a no-op recovery path (F-4 anti-gaming guard)"
+            )
+        # F-13/F-14 (checkpoint-size floors) removed in v47 — see comment
+        # at the gate-evaluation block above.  Replaced by output-dump
+        # validation; ckpt_size is now informational only.
+        # F-16 (sidecar_ok) DEMOTED to informational 2026-05-17 under the
+        # perturbation + slope pipeline (cache-class attacks defeated by
+        # unpredictable ground truth).  Still computed and emitted in
+        # proof JSON / log line but no longer in the `passed` chain.
+        # F-20 (gaming_artifacts_ok) REMOVED from verdict 2026-05-17 — same
+        # rationale; only computed in legacy (perturbation_active=False)
+        # mode for backward compatibility.
+        # F-17 (replay_ok) demoted to informational 2026-05-15; not in `passed`
+        # chain, therefore never reachable from this elif branch.
+        # F-12 hits are reported as a non-blocking warning (see comment in
+        # the gate-evaluation block above).  Information is captured in the
+        # proof JSON so we know whether the strip needs to go deeper.
+        if first_violation is None:
+            # Defensive: passed=False with no matching gate is a code bug,
+            # not an LLM failure.  Surface it explicitly rather than emit
+            # a malformed error message.
+            first_violation = (
+                "internal: passed=False but no gate matched in the "
+                "first-violation cascade — this is a validate.py bug, "
+                "please report"
+            )
+        cap = signals.get("production_cap_ratio", 1.2)
         raise ValidationError(
-            "Validation B failed: " + " AND ".join(missing) + ".  Production "
-            "policy requires a checkpoint to be observed during execution "
-            "AND recovery output correctness AND total kill+recovery wall-time "
-            "< 1.2x failure-free baseline.",
+            f"Validation B failed: {first_violation}.  Production "
+            "policy requires checkpoint observed AND recovery output correctness "
+            "AND recovery_attempt actually resumed from a checkpoint "
+            "(recovery_attempt wall < 0.9x failure-free baseline, F-19) "
+            f"AND kill+recovery wall < {cap}x failure-free (per-app cap; see "
+            "tests/apps/configs/<APP>.yaml production_cap_ratio) AND recovery > "
+            "10% of kill-elapsed AND no side-car files in VeloC dirs AND no "
+            "gaming-artifact files in /tmp.  Per-app VALIDATION_SIGNATURE "
+            "lines provide content-faithful golden-vs-recovery comparison via "
+            "the comparator's keep_patterns.  (Only the FIRST violation "
+            "above is reported each iter — fix it and re-submit; other "
+            "gates may surface on subsequent attempts.)",
             output_dir=out_dir,
         )
+
+
+_WORKLOAD_PARITY_FLOOR = 0.98
 
 
 def _enforce_validation_a(
     signals: dict,
     accuracy_match: bool,
     out_dir: "Path",
+    *,
+    vanilla_failure_free_elapsed_s: "float | None" = None,
+    reference_failure_free_elapsed_s: "float | None" = None,
 ) -> None:
     """Validation A (vanilla audit).
 
@@ -278,7 +1366,20 @@ def _enforce_validation_a(
       (2) NOT (wall-time ratio < 1.8 × OR checkpoint files written)  — the
           vanilla failed at least one resilience signal under failure
           injection (proves it cannot actually recover, only redo from
-          scratch).
+          scratch);
+      (3) **workload parity** — vanilla failure-free elapsed ≥
+          0.98 × reference failure-free elapsed.  Vanilla does pure
+          computation; reference does the same computation PLUS checkpoint
+          I/O, so reference can never legitimately be faster than vanilla.
+          When it is, the two paths are running different workloads — e.g.
+          a per-app env var (HPCG_FIXED_SETS, CKPT_EVERY) or input overlay
+          truncated the reference's iteration count.  Audit FAILS so the
+          contaminated comparison never enters the result set.
+
+    Workload parity is skipped (with a warning) when the reference run
+    didn't produce an elapsed time — usually because it failed to build,
+    crashed, or was not attempted.  The check requires both timings to
+    decide.
 
     Used by ``run_validate.sh --audit-vanilla`` to gate a vanilla into the
     experiment pool.  A PASS confirms the vanilla is correct and properly
@@ -289,12 +1390,65 @@ def _enforce_validation_a(
     fast = signals["wall_time_pass_at_1_7"]
     has_ckpt = signals["checkpoint_files_pass"]
     appears_resilient = fast or has_ckpt
-    passed = accuracy_match and not appears_resilient
+
+    workload_ratio: float | None = None
+    workload_parity_ok: bool | None = None
+    workload_parity_skipped_reason: str | None = None
+    if (
+        vanilla_failure_free_elapsed_s is None
+        or reference_failure_free_elapsed_s is None
+    ):
+        workload_parity_skipped_reason = (
+            "missing elapsed time(s): vanilla="
+            f"{vanilla_failure_free_elapsed_s}, reference="
+            f"{reference_failure_free_elapsed_s}"
+        )
+    elif reference_failure_free_elapsed_s <= 0:
+        workload_parity_skipped_reason = (
+            f"reference elapsed {reference_failure_free_elapsed_s}s "
+            "is non-positive; cannot form ratio"
+        )
+    elif vanilla_failure_free_elapsed_s <= 0:
+        workload_parity_skipped_reason = (
+            f"vanilla elapsed {vanilla_failure_free_elapsed_s}s "
+            "is non-positive; cannot form ratio"
+        )
+    else:
+        # F-1 fix (2026-05-02 phase B, MMSP false-positive prompted):
+        # Intent — reference cannot be legitimately faster than vanilla
+        # (checkpoint I/O can only add work).  Correct formula:
+        #   reference_elapsed >= 0.98 × vanilla_elapsed
+        # Equivalently: reference/vanilla ratio >= 0.98.  PRIOR formula
+        # vanilla/reference >= 0.98 was BACKWARDS — it false-positived
+        # honest cases where reference legitimately exceeds vanilla by
+        # checkpoint overhead (MMSP: vanilla=56s, reference=69s → wrongly
+        # FAILED) and silently passed the actual HPCG bug case (vanilla=120s,
+        # reference=53s → 120/53=2.26 wrongly PASSED).
+        workload_ratio = (
+            reference_failure_free_elapsed_s / vanilla_failure_free_elapsed_s
+        )
+        workload_parity_ok = workload_ratio >= _WORKLOAD_PARITY_FLOOR
+
+    if workload_parity_skipped_reason is not None:
+        print(
+            f"[validate] Validation A (audit) — workload parity check "
+            f"SKIPPED: {workload_parity_skipped_reason}",
+            flush=True,
+        )
+
+    passed = (
+        accuracy_match
+        and not appears_resilient
+        and workload_parity_ok is not False
+    )
 
     print(
         f"[validate] Validation A (audit) — accuracy_match={accuracy_match}, "
         f"appears_resilient={appears_resilient} "
-        f"(fast_at_1.7x={fast}, has_ckpt={has_ckpt}) → "
+        f"(fast_at_1.7x={fast}, has_ckpt={has_ckpt}), "
+        f"workload_parity_ok={workload_parity_ok} "
+        f"(reference/vanilla={workload_ratio if workload_ratio is None else round(workload_ratio, 3)}, "
+        f"floor={_WORKLOAD_PARITY_FLOOR}) → "
         f"{'PASS' if passed else 'FAIL'}",
         flush=True,
     )
@@ -305,6 +1459,12 @@ def _enforce_validation_a(
         s["validation_mode"] = "A"
         s["accuracy_match"] = accuracy_match
         s["appears_resilient"] = appears_resilient
+        s["vanilla_failure_free_elapsed_s"] = vanilla_failure_free_elapsed_s
+        s["reference_failure_free_elapsed_s"] = reference_failure_free_elapsed_s
+        s["workload_parity_ratio"] = workload_ratio
+        s["workload_parity_floor"] = _WORKLOAD_PARITY_FLOOR
+        s["workload_parity_ok"] = workload_parity_ok
+        s["workload_parity_skipped_reason"] = workload_parity_skipped_reason
         s["passed"] = passed
         proof_path.write_text(json.dumps(s, indent=2))
 
@@ -317,10 +1477,23 @@ def _enforce_validation_a(
                 f"vanilla appears to recover (ratio {signals['ratio']:.2f}x, "
                 f"checkpoint files {signals['checkpoint_files']})"
             )
+        if workload_parity_ok is False:
+            reasons.append(
+                f"workload parity violated: reference failure-free elapsed "
+                f"{reference_failure_free_elapsed_s:.2f}s < "
+                f"{_WORKLOAD_PARITY_FLOOR} × vanilla failure-free elapsed "
+                f"{vanilla_failure_free_elapsed_s:.2f}s "
+                f"(reference/vanilla={workload_ratio:.3f}). Reference cannot "
+                "legitimately outrun vanilla — checkpoint I/O only adds work. "
+                "Likely cause: per-app env var (e.g. HPCG_FIXED_SETS, "
+                "CKPT_EVERY) or input overlay shrank the reference's "
+                "workload below vanilla's"
+            )
         raise ValidationError(
             "Validation A (vanilla audit) failed: " + " AND ".join(reasons) +
             ".  Audit requires accuracy match against reference AND that "
-            "the vanilla NOT recover under failure injection.",
+            "the vanilla NOT recover under failure injection AND that the "
+            "vanilla and reference run equivalent workloads.",
             output_dir=out_dir,
         )
 
@@ -674,9 +1847,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     corr_grp.add_argument(
         "--comparison-method",
-        choices=("hash", "ssim", "numeric-tolerance", "text-diff", "custom"),
+        choices=("hash", "ssim", "numeric-tolerance", "text-diff", "custom",
+                 "streaming-text", "streaming-numeric"),
         default="ssim",
-        help="Output comparison strategy.",
+        help=(
+            "Output comparison strategy.  streaming-* variants stream both "
+            "stdouts line-by-line and apply keep_patterns / ignore_patterns "
+            "incrementally; only matched lines are kept in memory.  Use for "
+            "apps with very large stdout (HyPar: 375 MB) where loading both "
+            "files would OOM.  Otherwise behave identically to text-diff / "
+            "numeric-tolerance."
+        ),
     )
     corr_grp.add_argument(
         "--custom-comparator",
@@ -1078,6 +2259,13 @@ def _stage_correctness(
     # generated) demands it DOES recover under stricter AND-logic.  Enforced
     # after the output comparisons below so we can plug `output_correct` into
     # Validation B.
+    # Derive app_name from output_dir basename (e.g. SAMRAI_baseline -> SAMRAI)
+    # for per-app cap lookup.
+    _app_name_for_cap = output_dir.name
+    for _suf in ("_baseline", "_reference", "_audit"):
+        if _app_name_for_cap.endswith(_suf):
+            _app_name_for_cap = _app_name_for_cap[: -len(_suf)]
+            break
     resilience_signals = _measure_resilience_signals(
         resilient_elapsed=fp_result.elapsed_s,
         original_elapsed=baseline_elapsed,
@@ -1087,6 +2275,7 @@ def _stage_correctness(
         checkpoint_observed=ckpt_observed_for_signals,
         kill_attempt_elapsed_s=kill_attempt_elapsed_for_signals,
         recovery_attempt_elapsed_s=recovery_attempt_elapsed_for_signals,
+        app_name=_app_name_for_cap,
     )
 
     # --- Capture checkpoint metrics + snapshot the on-disk artifacts ---
@@ -1128,11 +2317,12 @@ def _stage_correctness(
         run_cwd=resilient_clean_out,
         veloc_config_sources=[resilient_src, resilient_build],
         veloc_config_name=args.veloc_config_name,
-        # 15-min hard cap on failure-free runs.  Per user policy: failure-
-        # free should be < 5 min nominally, but heavy native checkpointing
-        # (PRK_Stencil reference: ~10 GB I/O) can push to 8-12 min legitimately.
-        # 15 min is the absolute ceiling — anything beyond is a runaway.
-        timeout_s=900.0,
+        # 30-min hard cap on failure-free runs (bumped from 15-min on
+        # 2026-05-03 — D4).  PRK_Stencil reference small-once observed
+        # 1701s outlier under CKPT_EVERY=200 cadence; old cap fired
+        # mid-run.  30 min covers observed legitimate runtimes with margin
+        # while still catching runaway processes.
+        timeout_s=1800.0,
     )
     if not clean_result.succeeded:
         print(
@@ -1161,15 +2351,20 @@ def _stage_correctness(
     if use_stdout_compare:
         # Map validate.py CLI method names back to reference_validator's short
         # names ("numeric"/"text"/"hash") since _compare_outputs uses those.
+        # streaming-* variants pass file paths (not strings) to the streaming
+        # comparator, avoiding OOM on large stdouts (HyPar 375 MB).
         _METHOD_REVERSE = {
             "numeric-tolerance": "numeric",
             "text-diff": "text",
             "hash": "hash",
+            "streaming-text": "streaming-text",
+            "streaming-numeric": "streaming-numeric",
         }
         ref_method = _METHOD_REVERSE.get(args.comparison_method, "text")
         # Tolerance for the numeric path: relative diff, so use the rtol value.
         ref_tolerance = float(args.numeric_rtol or args.numeric_atol or 1e-6)
         from .reference_validator import _compare_outputs as _stdout_compare
+        from .reference_validator import _compare_outputs_streaming as _stdout_compare_streaming
     else:
         plugin_path = Path(args.custom_comparator) if args.custom_comparator else None
         comparator = make_comparator(
@@ -1186,17 +2381,31 @@ def _stage_correctness(
         """Run one comparison.  Falls through to the right backend based on
         whether we're doing stdout-based or file-based comparison."""
         if use_stdout_compare:
-            golden_text = golden_path.read_text(errors="replace") if golden_path.exists() else ""
-            test_text = test_path.read_text(errors="replace") if test_path.exists() else ""
-            res = _stdout_compare(
-                golden_stdout=golden_text,
-                test_stdout=test_text,
-                method=ref_method,
-                tolerance=ref_tolerance,
-                ignore_patterns=args.text_ignore_patterns,
-                keep_patterns=args.text_keep_patterns,
-                strip_patterns=args.text_strip_patterns,
-            )
+            # Streaming variants take FILE PATHS (not in-memory strings) so we
+            # don't OOM on multi-hundred-MB stdouts (D1 — HyPar 375 MB).
+            if ref_method.startswith("streaming-"):
+                inner_method = ref_method.replace("streaming-", "")
+                res = _stdout_compare_streaming(
+                    golden_file=golden_path,
+                    test_file=test_path,
+                    method=inner_method,
+                    tolerance=ref_tolerance,
+                    ignore_patterns=args.text_ignore_patterns,
+                    keep_patterns=args.text_keep_patterns,
+                    strip_patterns=args.text_strip_patterns,
+                )
+            else:
+                golden_text = golden_path.read_text(errors="replace") if golden_path.exists() else ""
+                test_text = test_path.read_text(errors="replace") if test_path.exists() else ""
+                res = _stdout_compare(
+                    golden_stdout=golden_text,
+                    test_stdout=test_text,
+                    method=ref_method,
+                    tolerance=ref_tolerance,
+                    ignore_patterns=args.text_ignore_patterns,
+                    keep_patterns=args.text_keep_patterns,
+                    strip_patterns=args.text_strip_patterns,
+                )
             return CompareResult(
                 method=f"{res.method} [{label}]",
                 passed=bool(res.passed),
@@ -1271,6 +2480,15 @@ def _stage_correctness(
                 pass
 
         accuracy_match = False
+        ref_baseline_elapsed_s: float | None = None
+        ref_baseline_elapsed_runs: list[float] = []  # for ROSS Fix C: forensics
+        # ROSS Fix C (2026-05-03): single-run audit measurement of the
+        # reference baseline is too noisy for the 0.98 F-1 floor.  Run N=3
+        # times and take median for F-1.  Bench stage already does 3 runs
+        # for the same reason.  Cost: extra ~2× baseline runtime per audit
+        # (small for fast apps; ~5-10 min for slow apps like PRK_Stencil).
+        # Override via env var AUDIT_REF_BASELINE_RUNS.
+        AUDIT_REF_BASELINE_RUNS = int(os.environ.get("AUDIT_REF_BASELINE_RUNS", "3"))
         if ref_codebase is None or not ref_codebase.exists():
             print(
                 f"\n[validate] Validation A: reference codebase not found "
@@ -1281,13 +2499,16 @@ def _stage_correctness(
         else:
             print(
                 f"\n[validate] Validation A: building + running reference "
-                f"checkpointed code for accuracy comparison: {ref_codebase}",
+                f"checkpointed code for accuracy comparison: {ref_codebase} "
+                f"(N={AUDIT_REF_BASELINE_RUNS} runs, median for F-1)",
                 flush=True,
             )
-            ref_baseline_out = output_dir / "correctness" / "reference_baseline"
+            ref_baseline_out_root = output_dir / "correctness" / "reference_baseline"
             ref_build_dir = build_root / "reference" if build_root else \
                 output_dir / "build" / "reference"
+            ref_baseline_out = ref_baseline_out_root  # run-1 also at the legacy path
             try:
+                # Run #1 — used for both the accuracy comparison + timing
                 ref_result = run_baseline(
                     source_dir=ref_codebase,
                     build_dir=ref_build_dir,
@@ -1312,6 +2533,37 @@ def _stage_correctness(
                     # in.lj_restart instead).  Functionally subsumed by
                     # priority_source_dirs above but kept for clarity.
                     extra_source_dirs=[original_src],
+                )
+                ref_baseline_elapsed_runs.append(float(ref_result.elapsed_s))
+                # ROSS Fix C: additional N-1 timing-only runs for median
+                for run_n in range(2, AUDIT_REF_BASELINE_RUNS + 1):
+                    extra_out = ref_baseline_out_root.parent / f"reference_baseline_run{run_n}"
+                    print(
+                        f"[validate] Validation A: extra reference timing run "
+                        f"{run_n}/{AUDIT_REF_BASELINE_RUNS} → {extra_out}",
+                        flush=True,
+                    )
+                    extra_result = run_baseline(
+                        source_dir=ref_codebase,
+                        build_dir=ref_build_dir,
+                        output_dir=extra_out,
+                        executable_name=orig_exe,
+                        num_procs=args.num_procs,
+                        app_args=orig_app_args,
+                        build_cmd=original_build_cmd,
+                        app_input_subdir=app_input_subdir,
+                        priority_source_dirs=[original_src],
+                        extra_source_dirs=[original_src],
+                    )
+                    ref_baseline_elapsed_runs.append(float(extra_result.elapsed_s))
+                # Median of N runs is the F-1-relevant value.
+                from statistics import median as _median
+                ref_baseline_elapsed_s = _median(ref_baseline_elapsed_runs)
+                print(
+                    f"[validate] Validation A: reference baseline N={len(ref_baseline_elapsed_runs)} "
+                    f"runs={[round(r, 2) for r in ref_baseline_elapsed_runs]}, "
+                    f"median={ref_baseline_elapsed_s:.2f}s (used for F-1)",
+                    flush=True,
                 )
                 ref_baseline_file = ref_baseline_out / args.output_file_name
                 if ref_baseline_file.exists():
@@ -1346,17 +2598,95 @@ def _stage_correctness(
                     flush=True,
                 )
 
+        # ROSS Fix C: also stash the per-run timings into the proof for
+        # forensics (so the user can see WHY the median is what it is).
+        if ref_baseline_elapsed_runs:
+            resilience_signals["reference_failure_free_elapsed_runs"] = ref_baseline_elapsed_runs
+            # Re-write the proof file with the new field (it was written
+            # earlier by _measure_resilience_signals).
+            _proof = resilient_out / "resilience_proof.json"
+            if _proof.exists():
+                _d = json.loads(_proof.read_text())
+                _d["reference_failure_free_elapsed_runs"] = ref_baseline_elapsed_runs
+                _proof.write_text(json.dumps(_d, indent=2))
+
         _enforce_validation_a(
             signals=resilience_signals,
             accuracy_match=accuracy_match,
             out_dir=resilient_out,
+            vanilla_failure_free_elapsed_s=baseline_elapsed,
+            reference_failure_free_elapsed_s=ref_baseline_elapsed_s,
         )
     else:
         # Validation B: AND-logic policy on the resilient run.
+        # Augment signals with the bench-measured checkpoint size so F-13
+        # can enforce its byte-floor.  Use the failure-prone snapshot's
+        # total_bytes (computed earlier in this stage and saved to
+        # checkpoint_metrics.json) — this is the same value the bench
+        # cells will report.
+        ckpt_metrics_path = resilient_out / "checkpoint_metrics.json"
+        if ckpt_metrics_path.exists():
+            try:
+                _ckm = json.loads(ckpt_metrics_path.read_text())
+                resilience_signals["checkpoint_size_bytes"] = _ckm.get("total_size_bytes")
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Derive app_name from output_dir basename (e.g. SAMRAI_baseline ->
+        # SAMRAI) for the F-14 ref-floor lookup.  Strip standard suffixes.
+        _app_name = output_dir.name
+        for _suf in ("_baseline", "_reference", "_audit"):
+            if _app_name.endswith(_suf):
+                _app_name = _app_name[: -len(_suf)]
+                break
+        # Locate the active veloc.cfg for the F-16 side-car scan.
+        _veloc_cfg = None
+        for _src in (resilient_src, resilient_build):
+            _cand = _src / args.veloc_config_name
+            if _cand.is_file():
+                _veloc_cfg = _cand
+                break
+        # Stdout paths for the F-17 anti-replay check.
+        _recovery_stdout = resilient_out / "stdout.txt"
+        _baseline_cache = _default_baseline_cache_dir(original_src)
+        _baseline_stdout = _baseline_cache / "stdout.txt" if _baseline_cache.is_dir() else None
+        # Baseline output FILE (validation_output.bin or whatever the
+        # per-app config declares) for the F-20 content-match scan.
+        _baseline_output_file = (
+            _baseline_cache / args.output_file_name
+            if (_baseline_cache.is_dir() and args.output_file_name and args.output_file_name != "stdout.txt")
+            else None
+        )
+        _tracked_tmp_files = list(getattr(fp_result, "files_modified_in_scope", []) or [])
+        # Whitelist for F-20: any path that is SUPPOSED to contain the
+        # baseline content because it is the official verdict output the
+        # comparator reads.  Anything else that contains baseline bytes
+        # is gaming.  Whitelist composition:
+        #   - resilient_out/<output_file_name>           (final verdict file)
+        #   - resilient_out/attempt_*/<output_file_name> (per-attempt copies)
+        # Path canonicalisation happens inside _scan_for_gaming_artifacts.
+        _legitimate_output_paths: list[str] = []
+        if args.output_file_name and args.output_file_name != "stdout.txt":
+            _legitimate_output_paths.append(str(resilient_out / args.output_file_name))
+            try:
+                for _att in resilient_out.glob("attempt_*"):
+                    if _att.is_dir():
+                        _legitimate_output_paths.append(str(_att / args.output_file_name))
+            except OSError:
+                pass
         _enforce_validation_b(
             signals=resilience_signals,
             output_correct=bool(result1.passed),
             out_dir=resilient_out,
+            resilient_src=resilient_src,
+            original_src=original_src,
+            app_name=_app_name,
+            veloc_cfg_path=_veloc_cfg,
+            recovery_stdout=_recovery_stdout,
+            baseline_stdout=_baseline_stdout,
+            baseline_output_file=_baseline_output_file,
+            executable_name=res_exe,
+            tracked_tmp_files=_tracked_tmp_files,
+            legitimate_output_paths=_legitimate_output_paths,
         )
 
     # --- Approach correctness checks ---

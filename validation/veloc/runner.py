@@ -26,6 +26,73 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# HyPar Fix B (2026-05-03) — bounded stdout/stderr capture for memory safety.
+#
+# Some apps (HyPar with n_iter=2.5M) produce 375 MB of stdout per run.  After
+# the run, we read the full stdout file into a Python string for the
+# `RunResult.stdout` field.  That string × multiple runs in a bench loop has
+# OOM-killed the runner / validate.py process.
+#
+# Fix: a tail-bounded reader that returns only the LAST N lines (or full
+# file when N is 0/unset).  On-disk file is left intact — the streaming
+# comparator reads from disk, not from RunResult.stdout.
+#
+# Activation: opt-in via env var BENCH_STDOUT_TRUNCATE_LINES=N.  Default
+# behavior unchanged (full read) when the var is unset or 0.  Per-app
+# enablement happens in run_validate.sh's case statement (export the var
+# only for HyPar, similar to how PRUNE_BENCH_ARTIFACTS=1 is HyPar/WarpX
+# only).
+
+def _read_text_tailed(
+    path: "Path",
+    encoding: str = "utf-8",
+    errors: str = "replace",
+) -> str:
+    """Read text from *path*.  When BENCH_STDOUT_TRUNCATE_LINES env var is
+    set to a positive integer N, return only the LAST N lines (memory-
+    bounded).  Otherwise read the full file (legacy behavior)."""
+    n_str = os.environ.get("BENCH_STDOUT_TRUNCATE_LINES", "").strip()
+    try:
+        n = int(n_str) if n_str else 0
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return path.read_text(encoding=encoding, errors=errors)
+    # Tail-N read: walk file from end in 64 KB chunks, accumulate until
+    # we have N+1 newlines (the +1 to discard the partial-leading-line).
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size == 0:
+        return ""
+    chunk = 65536
+    needed = n + 1  # extra to discard partial first line
+    buf = bytearray()
+    nl_count = 0
+    with path.open("rb") as f:
+        pos = size
+        while pos > 0 and nl_count < needed:
+            read_size = min(chunk, pos)
+            pos -= read_size
+            f.seek(pos)
+            data = f.read(read_size)
+            buf[0:0] = data  # prepend
+            nl_count = buf.count(b"\n")
+    text = buf.decode(encoding, errors=errors)
+    # Slice to last N lines (drop the partial leading line if file > N lines).
+    lines = text.splitlines()
+    if len(lines) > n:
+        lines = lines[-n:]
+        return (
+            f"[BENCH_STDOUT_TRUNCATE_LINES={n}: showing last {n} of "
+            f"~{nl_count} lines, {size} bytes total on disk]\n"
+            + "\n".join(lines)
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 
@@ -85,6 +152,42 @@ class ValidationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_and_apply_perturbation(
+    perturbation_spec,
+    perturbation_seed,
+    source_dir,
+    output_dir,
+    app_args,
+    env,
+):
+    """Resolve a perturbation value from seed and apply all three slots
+    (input file, app_args, env) consistently.
+
+    Returns ``(new_app_args, new_env, resolved_value_or_None)``. When
+    ``perturbation_spec`` is ``None`` or marked ``disabled``, this is a
+    no-op that returns the inputs unchanged with ``value=None``.
+
+    Callers should invoke this after :func:`_symlink_input_data` since
+    regex_replace perturbations need to overwrite the freshly-created
+    symlink in ``output_dir``.
+    """
+    from .app_config import resolve_perturbation_value, apply_perturbation
+    if perturbation_spec is None or getattr(perturbation_spec, "method", None) == "disabled":
+        return list(app_args), dict(env), None
+    if perturbation_seed is None:
+        raise ValueError(
+            "perturbation_spec provided but perturbation_seed is None — "
+            "caller must supply a seed for deterministic perturbation"
+        )
+    value = resolve_perturbation_value(perturbation_spec, perturbation_seed)
+    new_args, new_env, _ = apply_perturbation(
+        perturbation_spec, value,
+        cwd=output_dir, source_dir=source_dir,
+        app_args=app_args, env=env,
+    )
+    return new_args, new_env, value
+
+
 @dataclass
 class RunResult:
     """Structured result of a single MPI application run."""
@@ -118,6 +221,23 @@ class RunResult:
     # None when the legacy strategy is used.
     kill_attempt_elapsed_s: float | None = None
     recovery_attempt_elapsed_s: float | None = None
+    # F-20 (2026-05-15): files in /tmp/ that were created or modified
+    # during ANY attempt of this run (kill attempt + recovery attempt).
+    # Empty list = nothing touched.  Used by validate.py F-20 gate to
+    # content-check binary outputs against the baseline (gaming-6
+    # detection: side-car cache outside VeloC dirs).  Does NOT include
+    # files inside the VeloC scratch / persistent dirs declared in
+    # veloc.cfg (those are legitimate ckpts, not side-cars).  Path
+    # strings, NOT Paths, for cheap JSON serialization.
+    files_modified_in_scope: list[str] = field(default_factory=list)
+    # Perturbation tracking (2026-05-17 cold-replay detector): when the
+    # validator applied a random input perturbation before the run, these
+    # fields record what was applied for forensic reproducibility. Both
+    # None when perturbation is inactive (legacy path / app has no
+    # perturbation: spec). The seed alone is enough to reproduce the value
+    # via app_config.resolve_perturbation_value.
+    perturbation_seed: int | None = None
+    perturbation_value: float | int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -261,6 +381,23 @@ def configure_and_build(
         # Copy source to build directory (same as reference_validator._build_app)
         if source_dir != build_dir:
             if build_dir.exists():
+                # Restore u+w on every entry before rmtree.  Source trees
+                # under iter+bench may carry F-15 read-only locks on
+                # vendored subprojects (set by run_iterative.sh's
+                # _lock_vendored helper) which propagate to the build_dir
+                # on first --install-resilient copy.  Without this, the
+                # second iter cycle's rmtree fails with PermissionError on
+                # files inside the locked dir (e.g. amrex/Tools/C_scripts/
+                # describe_sources.py — directory perms 555 prevent
+                # unlink even though the file itself is readable).  Note:
+                # F-15 is reapplied to the LLM source tree after each iter
+                # by run_iterative.sh, so this only relaxes the build_dir
+                # copy, not the LLM-facing source.
+                _sp_chmod = __import__("subprocess")
+                _sp_chmod.run(
+                    ["chmod", "-R", "u+w", str(build_dir)],
+                    check=False, capture_output=True,
+                )
                 shutil.rmtree(build_dir)
             shutil.copytree(source_dir, build_dir, symlinks=True,
                             ignore_dangling_symlinks=True)
@@ -494,8 +631,8 @@ def run_once(
         memory_stop_event.set()
         mem_thread.join(timeout=5.0)
 
-    stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
-    stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    stdout_text = _read_text_tailed(stdout_path)
+    stderr_text = _read_text_tailed(stderr_path)
 
     return RunResult(
         exit_code=exit_code,
@@ -668,6 +805,67 @@ def snapshot_checkpoint_dirs(dirs: list[Path], dest: Path) -> dict:
         except (OSError, shutil.Error) as e:
             summary["errors"].append(f"{d}: {e}")
     return summary
+
+
+def _resolve_dynamic_recovery_args(args: "list[str]", search_dirs: "list[Path]") -> "list[str]":
+    """Replace dynamic tokens in recovery args with values computed from
+    on-disk state at recovery time.  Used so per-app bench configs don't
+    hardcode restore-numbers that only happen to work for one
+    `restart_interval` value.
+
+    Supported tokens (must be the ENTIRE argument string, not embedded):
+      {LATEST_RESTORE:<subdir>}
+        Search each `search_dir` for `<subdir>/restore.NNNNNN` directories
+        (SAMRAI convention) or `<subdir>/chk*` (AMReX convention) and
+        replace with the highest NNNNNN found.  If none exist, returns "0".
+
+    Example (SAMRAI LinAdv):
+      _extra_args_recovery.txt:
+          validation_inputs/linadv.2d.input
+          restart_linadv
+          {LATEST_RESTORE:restart_linadv}
+      At recovery time, the runner inspects search_dirs (mpirun cwd =
+      output_dir) for `restart_linadv/restore.NNNNNN`, picks the highest
+      NNNNNN, and substitutes that string.  Recovery then reads from
+      restart_linadv/restore.NNNNNN/nodes.M/proc.K/ and resumes
+      integration.  Works for ANY restart_interval value.
+    """
+    import re
+    pat = re.compile(r"^\{LATEST_RESTORE:([^}]+)\}$")
+    resolved: list[str] = []
+    for arg in args:
+        m = pat.match(str(arg))
+        if not m:
+            resolved.append(arg)
+            continue
+        subdir_name = m.group(1)
+        best = -1
+        for root in search_dirs:
+            sub = Path(root) / subdir_name
+            if not sub.is_dir():
+                continue
+            try:
+                for child in sub.iterdir():
+                    if not child.is_dir():
+                        continue
+                    name = child.name
+                    # SAMRAI convention: restore.NNNNNN
+                    if name.startswith("restore."):
+                        try:
+                            n = int(name.split(".", 1)[1])
+                            if n > best:
+                                best = n
+                        except ValueError:
+                            pass
+            except OSError:
+                continue
+        replacement = str(best) if best >= 0 else "0"
+        resolved.append(replacement)
+        print(
+            f"[runner] dynamic recovery arg: {{LATEST_RESTORE:{subdir_name}}} -> {replacement}",
+            flush=True,
+        )
+    return resolved
 
 
 def _copy_veloc_cfg(
@@ -998,6 +1196,10 @@ def run_with_failure_injection(
     app_input_subdir: str | None = None,
     extra_source_dirs: list[Path] | None = None,
     attempt_timeout_s: float | None = None,
+    recovery_app_args: list[str] | None = None,
+    priority_source_dirs: list[Path] | None = None,
+    perturbation_spec: "object | None" = None,
+    perturbation_seed: int | None = None,
 ) -> RunResult:
     """Inject *target_failures* failures into a single resilient run.
 
@@ -1093,6 +1295,11 @@ def run_with_failure_injection(
     last_stdout = ""
     last_stderr = ""
     last_exit_code = -1
+    # Holds the resolved perturbation value (None when perturbation_spec is
+    # absent). Updated per attempt by _resolve_and_apply_perturbation; same
+    # seed across attempts means the value is stable.
+    perturbation_value = None
+    _perturbed_env_override: dict = {}
 
     while True:
         attempt += 1
@@ -1114,15 +1321,92 @@ def run_with_failure_injection(
             shutil.rmtree(attempt_dir)
         attempt_dir.mkdir(parents=True, exist_ok=True)
 
+        # Per-attempt args.  attempt_1 always uses the original *app_args*
+        # (writes checkpoints).  attempt_2+ uses *recovery_app_args* when set
+        # (so upstream binaries that need different flags / a different input
+        # file to read a checkpoint — LAMMPS, SPARTA, SW4lite, Athena++,
+        # QMCPACK, Smilei — actually restore instead of starting fresh).
+        # Falling back to *app_args* preserves previous behaviour for apps
+        # whose binary auto-detects checkpoints (HPCG, MMSP, OpenLB, CoMD).
+        if attempt > 1 and recovery_app_args is not None:
+            # Resolve dynamic tokens like {LATEST_RESTORE:<subdir>} against
+            # the on-disk state.  Search the shared run cwd (output_dir)
+            # where checkpoints from attempt_1 were written.
+            attempt_args = _resolve_dynamic_recovery_args(
+                list(recovery_app_args),
+                [output_dir],
+            )
+            args_source = "recovery"
+        else:
+            attempt_args = list(app_args)
+            args_source = "primary"
+
         # veloc.cfg + input-data symlinks live in output_dir (the shared cwd
         # for all attempts), not in the per-attempt artifact dir.  Apps look
         # for these via cwd-relative paths.
         _copy_veloc_cfg(source_dir, build_dir, output_dir, veloc_config_name)
         _symlink_input_data(
-            source_dir, build_dir, output_dir, app_args,
+            source_dir, build_dir, output_dir, attempt_args,
             extra_source_dirs=extra_source_dirs,
             input_subdir=app_input_subdir,
+            priority_source_dirs=priority_source_dirs,
         )
+        # 2026-05-17 cold-replay detector: apply random input perturbation
+        # AFTER the symlink step (regex_replace needs to overwrite the
+        # freshly-created symlink). app_arg_override and env_var_set
+        # mutate the local attempt_args / run_env captures below.
+        # Same perturbation_seed across all attempts of one run, so both
+        # the kill leg and the recovery leg see the same perturbed input.
+        attempt_args, _perturbed_env_override, _pv = _resolve_and_apply_perturbation(
+            perturbation_spec, perturbation_seed,
+            source_dir=source_dir, output_dir=output_dir,
+            app_args=attempt_args, env={},
+        )
+        if _pv is not None:
+            perturbation_value = _pv
+
+        # Pre-attempt-2 hook: if a `_recovery_hook.sh` exists in the overlay
+        # or source tree, run it from the cwd before launching attempt_2.
+        # This is the extension point for apps whose binary needs cwd-side
+        # setup before it can restore from a checkpoint — e.g. HyPar, where
+        # restart_iter only adjusts iteration counters but the binary still
+        # reads `initial.bin` for state, so the hook must copy the latest
+        # `op_NNNNN.bin` over `initial.bin` before launch.
+        if attempt > 1:
+            hook_path = None
+            search_roots = []
+            if priority_source_dirs:
+                search_roots.extend(priority_source_dirs)
+            search_roots.extend([source_dir, build_dir])
+            for root in search_roots:
+                # Hook may live at the top of the overlay, or under
+                # input_subdir if the app uses one (HyPar runs from
+                # Examples/1D/FPDoubleWell, the hook lives there).
+                candidates = [Path(root) / "_recovery_hook.sh"]
+                if app_input_subdir:
+                    candidates.append(Path(root) / app_input_subdir / "_recovery_hook.sh")
+                for c in candidates:
+                    if c.exists():
+                        hook_path = c
+                        break
+                if hook_path:
+                    break
+            if hook_path:
+                print(
+                    f"[runner] attempt {attempt}: running recovery hook {hook_path}",
+                    flush=True,
+                )
+                try:
+                    hook_rc = subprocess.call(
+                        ["bash", str(hook_path)],
+                        cwd=str(output_dir),
+                    )
+                    print(
+                        f"[runner] recovery hook exited with rc={hook_rc}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[runner] recovery hook failed to launch: {e}", flush=True)
 
         stdout_path = attempt_dir / "stdout.txt"
         stderr_path = attempt_dir / "stderr.txt"
@@ -1130,16 +1414,19 @@ def run_with_failure_injection(
 
         exe_path = _find_executable(build_dir, executable_name)
         mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
-        cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
+        cmd = [mpirun, "-np", str(num_procs), str(exe_path), *attempt_args]
         print(
-            f"[runner] attempt {attempt}: starting MPI run (cwd={attempt_dir}): "
-            f"{' '.join(cmd)}",
+            f"[runner] attempt {attempt} ({args_source}): starting MPI run "
+            f"(cwd={attempt_dir}): {' '.join(cmd)}",
             flush=True,
         )
 
         # Ensure LD_LIBRARY_PATH includes checkpoint library directories
         # (VeloC, FTI, SCR, jemalloc) — same logic as in run_once.
         run_env = dict(os.environ)
+        # Apply env_var_set perturbation overrides on top of inherited env.
+        if _perturbed_env_override:
+            run_env.update(_perturbed_env_override)
         _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
         _extra_libs: list[str] = []
         _veloc_prefix = _detect_veloc_dir()
@@ -1265,8 +1552,8 @@ def run_with_failure_injection(
         if injected:
             total_injections += 1
 
-        last_stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
-        last_stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        last_stdout = _read_text_tailed(stdout_path)
+        last_stderr = _read_text_tailed(stderr_path)
         last_exit_code = mpi_return
 
         print(
@@ -1322,6 +1609,8 @@ def run_with_failure_injection(
                 output_dir=output_dir,
                 last_attempt_elapsed_s=elapsed,
                 memory_samples_bytes=all_mem_samples,
+                perturbation_seed=perturbation_seed,
+                perturbation_value=perturbation_value,
             )
 
         # App finished cleanly BUT we are still short of target_failures.
@@ -1356,6 +1645,8 @@ def run_with_failure_injection(
                     output_dir=output_dir,
                     last_attempt_elapsed_s=elapsed,
                     memory_samples_bytes=all_mem_samples,
+                    perturbation_seed=perturbation_seed,
+                    perturbation_value=perturbation_value,
                 )
             # Correctness mode: must have at least target_failures injections.
             # Clear checkpoint dirs so the next attempt actually runs the app
@@ -1422,6 +1713,133 @@ def _count_checkpoint_files(dirs: "list[Path]") -> int:
     return total
 
 
+# F-20 helpers (2026-05-15): track files the LLM-modified binary
+# creates or modifies under /tmp/ AND build/ during a kill+recovery
+# cycle, so validate.py can content-check them against the baseline
+# output (gaming-6 detection — side-car cache outside VeloC dirs OR
+# tampering with the cached baseline file inside build/).
+#
+# Tracking both roots is required because the LLM has filesystem
+# write access via the binary it controls.  Likely targets:
+#   - /tmp/<exe>_signature_cache.bin       (sibling sidecar; v48d)
+#   - build/baseline_cache/<APP>/...       (tampering with cached baseline)
+#   - build/validation_output/.../...      (sibling files outside attempt dirs)
+#   - build/tests_baseline/<APP>/...       (writes to the LLM's source tree)
+_F20_SKIP_TMP_PREFIXES = (
+    "/tmp/.X11-unix",
+    "/tmp/.font-unix",
+    "/tmp/.ICE-unix",
+    "/tmp/.Test-unix",
+    "/tmp/.XIM-unix",
+    "/tmp/systemd-",
+    "/tmp/snap-private-tmp",
+    "/tmp/pmix-",
+    "/tmp/openmpi-",
+    "/tmp/ompi.",
+    "/tmp/ssh-",
+    "/tmp/dbus-",
+    "/tmp/claude-",
+    "/tmp/cargo-",
+)
+# Inside build/ we skip compiler intermediate dirs and vendored
+# sources — the LLM doesn't typically tamper with these from inside
+# the running binary, and snapshotting them is expensive.  These
+# names are matched as ANY path component (so "build/foo/_build/bar"
+# is skipped via "_build").
+_F20_SKIP_BUILD_DIR_NAMES = frozenset({
+    "_build",          # CMake build dir (compiler intermediates)
+    "CMakeFiles",      # CMake intermediate
+    "subprojects",     # vendored sources (e.g. AMReX inside Nyx)
+    "_deps",           # CMake fetched deps
+    "third_party",
+    "vendor",
+    "thirdparty",
+    "node_modules",
+    ".git",
+    "__pycache__",
+})
+
+
+def _snapshot_paths_for_gaming_check(
+    roots: "list[Path]",
+) -> "dict[str, tuple[int, float]]":
+    """Snapshot every regular file under each *roots* dir.  Returns
+    {path: (size, mtime)}.  Used to diff before / after each binary
+    attempt and identify what the binary touched.
+
+    Skips noisy system entries under /tmp/ (sockets, dbus, etc.) and
+    huge compiler intermediates under build/ (subprojects/, _build/,
+    CMakeFiles/, _deps/, third_party/).
+    """
+    snap: "dict[str, tuple[int, float]]" = {}
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            root_str = str(root)
+            # /tmp/ has its own skip-prefix list.
+            is_tmp_root = root_str == "/tmp" or root_str.startswith("/tmp/")
+            for entry in root.iterdir():
+                entry_str = str(entry)
+                if is_tmp_root and any(entry_str.startswith(p) for p in _F20_SKIP_TMP_PREFIXES):
+                    continue
+                try:
+                    if entry.is_file():
+                        st = entry.stat()
+                        snap[entry_str] = (st.st_size, st.st_mtime)
+                    elif entry.is_dir():
+                        # Walk recursively, skipping known compiler /
+                        # vendored dir names anywhere in the path.
+                        for f in entry.rglob("*"):
+                            try:
+                                if not f.is_file():
+                                    continue
+                                # Skip if any path component is a
+                                # known noisy/vendored dir name.
+                                if any(part in _F20_SKIP_BUILD_DIR_NAMES for part in f.parts):
+                                    continue
+                                st = f.stat()
+                                snap[str(f)] = (st.st_size, st.st_mtime)
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return snap
+
+
+def _diff_path_snapshots(
+    before: "dict[str, tuple[int, float]]",
+    after: "dict[str, tuple[int, float]]",
+    excluded_dir_strs: "list[str]",
+) -> "list[str]":
+    """Files newly created or modified between snapshots, excluding
+    paths inside any directory in *excluded_dir_strs*.  Excluded
+    dirs typically include the VeloC scratch / persistent dirs
+    (legitimate ckpt locations) and the current attempt's output_dir
+    (legitimate run cwd where stdout.txt etc. land).
+    """
+    out: "list[str]" = []
+    excl_prefixes = tuple(d.rstrip("/") + "/" for d in excluded_dir_strs)
+    excl_exact = set(excluded_dir_strs)
+    for path, (size, mtime) in after.items():
+        prev = before.get(path)
+        if prev is not None and prev == (size, mtime):
+            continue  # unchanged
+        if path in excl_exact:
+            continue
+        if any(path.startswith(p) for p in excl_prefixes):
+            continue
+        out.append(path)
+    return out
+
+
+# Backwards-compatible aliases (in case anything else imports them).
+_snapshot_tmp_file_states = _snapshot_paths_for_gaming_check
+_diff_tmp_snapshots = _diff_path_snapshots
+
+
 def run_with_checkpoint_observed_injection(
     source_dir: "Path",
     build_dir: "Path",
@@ -1447,6 +1865,8 @@ def run_with_checkpoint_observed_injection(
     memory_samples_holder: "list | None" = None,
     injection_nodes: "str | None" = None,
     injection_hostfile: "str | None" = None,
+    perturbation_spec: "object | None" = None,
+    perturbation_seed: "int | None" = None,
 ) -> RunResult:
     """Checkpoint-observed failure injection (single kill + single recovery).
 
@@ -1545,9 +1965,15 @@ def run_with_checkpoint_observed_injection(
         print(f"  - {d}", flush=True)
     clear_checkpoint_dirs(ckpt_dirs)
 
+    # Outer-scope perturbation tracking so _launch_attempt can write back to it.
+    # The same value is computed on every call (deterministic from seed), so any
+    # call sets the same final value. None when perturbation is inactive.
+    observed_perturbation_value: "int | float | None" = None
+
     # Helper to launch one mpirun attempt; returns (proc, attempt_dir,
     # stdout_path, stderr_path, t0_monotonic).
     def _launch_attempt(attempt_idx: int):
+        nonlocal observed_perturbation_value
         attempt_dir = output_dir / f"attempt_{attempt_idx}"
         if attempt_dir.exists():
             shutil.rmtree(attempt_dir)
@@ -1559,13 +1985,25 @@ def run_with_checkpoint_observed_injection(
             extra_source_dirs=extra_source_dirs,
             input_subdir=app_input_subdir,
         )
+        # 2026-05-17 cold-replay detector: apply random input perturbation
+        # after the symlink step. Same seed across kill + recovery attempts
+        # of one run, so both legs see the same perturbed input.
+        effective_app_args, perturbed_env_override, _pv = (
+            _resolve_and_apply_perturbation(
+                perturbation_spec, perturbation_seed,
+                source_dir=source_dir, output_dir=output_dir,
+                app_args=list(app_args), env={},
+            )
+        )
+        if _pv is not None:
+            observed_perturbation_value = _pv
 
         stdout_path = attempt_dir / "stdout.txt"
         stderr_path = attempt_dir / "stderr.txt"
 
         exe_path = _find_executable(build_dir, executable_name)
         mpirun = os.environ.get("MPIRUN_PATH") or _resolve_tool("mpirun")
-        cmd = [mpirun, "-np", str(num_procs), str(exe_path), *app_args]
+        cmd = [mpirun, "-np", str(num_procs), str(exe_path), *effective_app_args]
         print(
             f"[runner] checkpoint-observed attempt {attempt_idx}: launching "
             f"(cwd={attempt_dir}): {' '.join(cmd)}",
@@ -1573,6 +2011,8 @@ def run_with_checkpoint_observed_injection(
         )
 
         run_env = dict(os.environ)
+        if perturbed_env_override:
+            run_env.update(perturbed_env_override)
         _existing_ld = run_env.get("LD_LIBRARY_PATH", "")
         _extra_libs: list[str] = []
         _veloc_prefix = _detect_veloc_dir()
@@ -1601,6 +2041,43 @@ def run_with_checkpoint_observed_injection(
                 env=run_env,
             )
         return proc, attempt_dir, stdout_path, stderr_path, t0
+
+    # F-20: snapshot /tmp/ AND build/ state BEFORE the kill attempt
+    # so we can diff after each attempt and emit the FULL list of
+    # files the LLM-modified binary touches.  Tracking both roots is
+    # required because the LLM has filesystem write access via the
+    # binary it controls.
+    #
+    # NOTE on exclusions: the diff DELIBERATELY does NOT exclude any
+    # directories.  In particular, VeloC scratch/persistent dirs and
+    # the current attempt's output_dir are NOT excluded — the LLM can
+    # stash a cache file inside those dirs too (e.g. give it a name
+    # that looks like a VeloC ckpt, or drop it next to stdout.txt in
+    # the attempt cwd).  F-20's content-check in validate.py is the
+    # actual discriminator: legit ckpt files don't match the baseline
+    # output bytes (a 40-byte signature won't match 4 MB of field
+    # data); gaming caches do.  Whitelisting happens at the F-20
+    # stage by file PATH, not directory: the official
+    # output_dir/<output_file_name> and its attempt_*/ copies are
+    # exempt because they're SUPPOSED to match the baseline (that's
+    # the verdict criterion).  Everything else is fair game.
+    _f20_excluded_dirs: "list[str]" = []
+    # Find the project's build/ dir (for baseline_cache, validation_output,
+    # tests_baseline tampering detection).  Walk up from output_dir to
+    # find the first ancestor named "build".
+    _f20_build_root: "Path | None" = None
+    try:
+        for parent in output_dir.resolve().parents:
+            if parent.name == "build":
+                _f20_build_root = parent
+                break
+    except OSError:
+        pass
+    _f20_snapshot_roots = [Path("/tmp")]
+    if _f20_build_root is not None:
+        _f20_snapshot_roots.append(_f20_build_root)
+    _f20_snapshot_before_a1 = _snapshot_paths_for_gaming_check(_f20_snapshot_roots)
+    _f20_files_modified: "list[str]" = []
 
     # ---- Attempt 1: kill attempt ----
     mpi_proc, attempt1_dir, a1_stdout_path, a1_stderr_path, t0_a1 = (
@@ -1699,8 +2176,8 @@ def run_with_checkpoint_observed_injection(
             mem_thread.join(timeout=5.0)
             if memory_samples_holder is not None:
                 all_mem_samples.extend(memory_samples_holder[0])
-        a1_stdout = a1_stdout_path.read_text(encoding="utf-8", errors="replace")
-        a1_stderr = a1_stderr_path.read_text(encoding="utf-8", errors="replace")
+        a1_stdout = _read_text_tailed(a1_stdout_path)
+        a1_stderr = _read_text_tailed(a1_stderr_path)
         a1_exit = mpi_proc.returncode if mpi_proc.returncode is not None else -1
         # Refresh top-level stdout.txt / stderr.txt from this run so the
         # validate.py comparator reads CURRENT data, not a stale file from
@@ -1724,6 +2201,14 @@ def run_with_checkpoint_observed_injection(
             f"exit={a1_exit}). Reporting checkpoint_observed=False.",
             flush=True,
         )
+        # F-20: diff /tmp/ snapshots before vs after attempt 1.
+        try:
+            _f20_snap_after_a1 = _snapshot_paths_for_gaming_check(_f20_snapshot_roots)
+            _f20_files_modified = _diff_path_snapshots(
+                _f20_snapshot_before_a1, _f20_snap_after_a1, _f20_excluded_dirs
+            )
+        except Exception:
+            _f20_files_modified = []
         return RunResult(
             exit_code=a1_exit if a1_exit != 0 else -1,
             stdout=a1_stdout,
@@ -1738,6 +2223,9 @@ def run_with_checkpoint_observed_injection(
             checkpoint_observed=False,
             kill_attempt_elapsed_s=kill_attempt_elapsed,
             recovery_attempt_elapsed_s=None,
+            files_modified_in_scope=_f20_files_modified,
+            perturbation_seed=perturbation_seed,
+            perturbation_value=observed_perturbation_value,
         )
 
     # ---- Phase C: post-checkpoint wait, then inject failure ----
@@ -1758,8 +2246,8 @@ def run_with_checkpoint_observed_injection(
                 mem_thread.join(timeout=5.0)
                 if memory_samples_holder is not None:
                     all_mem_samples.extend(memory_samples_holder[0])
-            a1_stdout = a1_stdout_path.read_text(encoding="utf-8", errors="replace")
-            a1_stderr = a1_stderr_path.read_text(encoding="utf-8", errors="replace")
+            a1_stdout = _read_text_tailed(a1_stdout_path)
+            a1_stderr = _read_text_tailed(a1_stderr_path)
             # Same stdout/stderr refresh as the no-checkpoint path; without
             # it, the comparator reads a stale file from a previous iter.
             try:
@@ -1778,6 +2266,13 @@ def run_with_checkpoint_observed_injection(
                 "Cannot validate recovery — reporting failure.",
                 flush=True,
             )
+            try:
+                _f20_snap_after_a1 = _snapshot_paths_for_gaming_check(_f20_snapshot_roots)
+                _f20_files_modified = _diff_path_snapshots(
+                    _f20_snapshot_before_a1, _f20_snap_after_a1, _f20_excluded_dirs
+                )
+            except Exception:
+                _f20_files_modified = []
             return RunResult(
                 exit_code=mpi_proc.returncode if mpi_proc.returncode == 0 else -1,
                 stdout=a1_stdout,
@@ -1792,6 +2287,9 @@ def run_with_checkpoint_observed_injection(
                 checkpoint_observed=True,
                 kill_attempt_elapsed_s=kill_attempt_elapsed,
                 recovery_attempt_elapsed_s=None,
+                files_modified_in_scope=_f20_files_modified,
+                perturbation_seed=perturbation_seed,
+                perturbation_value=observed_perturbation_value,
             )
         time.sleep(min(0.5, sleep_deadline - time.monotonic()))
 
@@ -1901,8 +2399,8 @@ def run_with_checkpoint_observed_injection(
         if memory_samples_holder is not None:
             all_mem_samples.extend(memory_samples_holder[0])
 
-    a2_stdout = a2_stdout_path.read_text(encoding="utf-8", errors="replace")
-    a2_stderr = a2_stderr_path.read_text(encoding="utf-8", errors="replace")
+    a2_stdout = _read_text_tailed(a2_stdout_path)
+    a2_stderr = _read_text_tailed(a2_stderr_path)
 
     # Surface success_output_filename from the recovery attempt for the
     # caller's downstream comparison logic (mirrors run_with_failure_injection).
@@ -1928,6 +2426,18 @@ def run_with_checkpoint_observed_injection(
         flush=True,
     )
 
+    # F-20: diff /tmp/ snapshots before kill vs after recovery
+    # (covers both attempts as one window — the LLM may have written
+    # the side-car during attempt 1 OR during recovery; either way
+    # we see it in the post-recovery snapshot).
+    try:
+        _f20_snap_after_a2 = _snapshot_paths_for_gaming_check(_f20_snapshot_roots)
+        _f20_files_modified = _diff_path_snapshots(
+            _f20_snapshot_before_a1, _f20_snap_after_a2, _f20_excluded_dirs
+        )
+    except Exception:
+        _f20_files_modified = []
+
     return RunResult(
         exit_code=rec_return,
         stdout=a2_stdout,
@@ -1942,4 +2452,7 @@ def run_with_checkpoint_observed_injection(
         checkpoint_observed=True,
         kill_attempt_elapsed_s=kill_attempt_elapsed,
         recovery_attempt_elapsed_s=recovery_elapsed,
+        files_modified_in_scope=_f20_files_modified,
+        perturbation_seed=perturbation_seed,
+        perturbation_value=observed_perturbation_value,
     )
