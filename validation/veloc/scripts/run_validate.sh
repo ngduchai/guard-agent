@@ -34,6 +34,14 @@ if [ -f "$BUILD_DIR/venv/bin/activate" ]; then
 fi
 export PYTHONPATH="${REPO_ROOT}"
 
+# MODEL_TAG env var (set by run_iterative_for_model.sh wrapper for 3-D model
+# exploration cells) shards every output path with the LLM tag so cells run
+# concurrently without clobbering each other.  When unset (default), behavior
+# is exactly as before — the Opus 4.7 baseline lives at un-suffixed paths.
+MODEL_TAG="${MODEL_TAG:-}"
+_TAG_PATH_SUFFIX=""
+[ -n "$MODEL_TAG" ] && _TAG_PATH_SUFFIX="_${MODEL_TAG}"
+
 # --- Parse approach flag ---
 USE_BASELINE=false
 USE_REFERENCE=false
@@ -60,8 +68,13 @@ shift
 APP_CONFIG="$REPO_ROOT/validation/veloc/app_configs/${APP_NAME}.json"
 APP_YAML=""
 
-# Check for app.yaml in the 20-app set
+# Check for app.yaml in the 20-app set.  When sharded (MODEL_TAG set), also
+# look in the sharded build subtrees so the YAML is found inside the per-cell
+# copy if it exists (falls back to the un-suffixed vanilla, which is the
+# authoritative source of the app.yaml schema anyway).
 for _yaml_dir in "$REPO_ROOT/tests/apps/vanillas/$APP_NAME" \
+                 "$BUILD_DIR/tests${_TAG_PATH_SUFFIX}/$APP_NAME" \
+                 "$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME" \
                  "$BUILD_DIR/tests/$APP_NAME" \
                  "$BUILD_DIR/tests_baseline/$APP_NAME"; do
   if [ -f "$_yaml_dir/app.yaml" ]; then
@@ -158,8 +171,8 @@ fi
 
 # Fallback: try to extract from CMakeLists.txt
 if [ -z "$EXE_NAME" ]; then
-  RESILIENT_SRC_TMP="$BUILD_DIR/tests/$APP_NAME"
-  [ "$USE_BASELINE" = true ] && RESILIENT_SRC_TMP="$BUILD_DIR/tests_baseline/$APP_NAME"
+  RESILIENT_SRC_TMP="$BUILD_DIR/tests${_TAG_PATH_SUFFIX}/$APP_NAME"
+  [ "$USE_BASELINE" = true ] && RESILIENT_SRC_TMP="$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME"
   CMAKE_FILE="$RESILIENT_SRC_TMP/CMakeLists.txt"
   if [ -f "$CMAKE_FILE" ]; then
     EXE_NAME=$(grep -oP 'add_executable\s*\(\s*\K\S+' "$CMAKE_FILE" 2>/dev/null | head -1)
@@ -189,8 +202,12 @@ if [ "$USE_REFERENCE" = true ]; then
   RESILIENT_SRC="$REPO_ROOT/tests/apps/checkpointed/$APP_NAME"
   LABEL="reference (human-written)"
 elif [ "$USE_BASELINE" = true ]; then
-  RESILIENT_SRC="$BUILD_DIR/tests_baseline/$APP_NAME"
-  LABEL="baseline (no guard-agent)"
+  RESILIENT_SRC="$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME"
+  if [ -n "$MODEL_TAG" ]; then
+    LABEL="baseline (no guard-agent; MODEL_TAG=$MODEL_TAG)"
+  else
+    LABEL="baseline (no guard-agent)"
+  fi
 elif [ "$USE_AUDIT_VANILLA" = true ]; then
   # Point "resilient" at the same vanilla source so the failure-injected run
   # exercises the unmodified code; if it actually recovers we know the vanilla
@@ -198,8 +215,12 @@ elif [ "$USE_AUDIT_VANILLA" = true ]; then
   RESILIENT_SRC="$ORIGINAL_SRC"
   LABEL="audit (vanilla vs vanilla)"
 else
-  RESILIENT_SRC="$BUILD_DIR/tests/$APP_NAME"
-  LABEL="with guard-agent"
+  RESILIENT_SRC="$BUILD_DIR/tests${_TAG_PATH_SUFFIX}/$APP_NAME"
+  if [ -n "$MODEL_TAG" ]; then
+    LABEL="with guard-agent (MODEL_TAG=$MODEL_TAG)"
+  else
+    LABEL="with guard-agent"
+  fi
 fi
 if [ ! -d "$RESILIENT_SRC" ]; then
   echo "ERROR: Resilient source not found at $RESILIENT_SRC" >&2
@@ -215,13 +236,16 @@ fi
 
 # --- Output directory ---
 if [ "$USE_REFERENCE" = true ]; then
+  # Reference (upstream human-written) outputs are not sharded — the upstream
+  # source is a single ground truth shared across all model cells.
   OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_reference"
 elif [ "$USE_BASELINE" = true ]; then
-  OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline"
+  OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline${_TAG_PATH_SUFFIX}"
 elif [ "$USE_AUDIT_VANILLA" = true ]; then
+  # Audit (vanilla vs vanilla) is invariant across model cells.
   OUTPUT_DIR="$BUILD_DIR/audit_output/$APP_NAME"
 else
-  OUTPUT_DIR="$BUILD_DIR/validation_output/$APP_NAME"
+  OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}${_TAG_PATH_SUFFIX}"
 fi
 
 echo "════════════════════════════════════════════════════════════════════"

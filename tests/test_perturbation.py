@@ -708,6 +708,28 @@ class TestStripOutputDirSuffix:
     def test_empty_string(self):
         assert _strip_output_dir_suffix("") == ""
 
+    def test_baseline_tagged_suffix(self):
+        # 3-D model exploration: sharded cells encode the LLM tag after the
+        # canonical mode suffix.  SAMRAI_baseline_sonnet46 must still
+        # resolve to "SAMRAI" so the per-app perturbation spec and per-app
+        # cap lookups continue to work for the sharded cell.
+        assert _strip_output_dir_suffix("SAMRAI_baseline_sonnet46") == "SAMRAI"
+
+    def test_reference_tagged_suffix(self):
+        assert _strip_output_dir_suffix("Nyx_reference_haiku45") == "Nyx"
+
+    def test_audit_tagged_suffix(self):
+        assert _strip_output_dir_suffix("CoMD_audit_gpt55") == "CoMD"
+
+    def test_baseline_tagged_with_internal_underscore_app(self):
+        # PRK_Stencil_baseline_opus47_128k → PRK_Stencil.  Both the intra-
+        # name underscores and the tag (which itself contains underscores)
+        # must be handled correctly.
+        assert (
+            _strip_output_dir_suffix("PRK_Stencil_baseline_opus47_128k")
+            == "PRK_Stencil"
+        )
+
 
 class TestLoadPerturbationSpecForApp:
     """``_load_perturbation_spec_for_app`` reads the per-app YAML and

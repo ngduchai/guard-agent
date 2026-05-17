@@ -2503,13 +2503,10 @@ def _stage_correctness(
     # generated) demands it DOES recover under stricter AND-logic.  Enforced
     # after the output comparisons below so we can plug `output_correct` into
     # Validation B.
-    # Derive app_name from output_dir basename (e.g. SAMRAI_baseline -> SAMRAI)
-    # for per-app cap lookup.
-    _app_name_for_cap = output_dir.name
-    for _suf in ("_baseline", "_reference", "_audit"):
-        if _app_name_for_cap.endswith(_suf):
-            _app_name_for_cap = _app_name_for_cap[: -len(_suf)]
-            break
+    # Derive app_name from output_dir basename (e.g. SAMRAI_baseline -> SAMRAI,
+    # SAMRAI_baseline_sonnet46 -> SAMRAI) for per-app cap lookup.  Uses the
+    # centralized helper so model-sharded outputs resolve to the bare app key.
+    _app_name_for_cap = _strip_output_dir_suffix(output_dir.name)
     resilience_signals = _measure_resilience_signals(
         resilient_elapsed=fp_result.elapsed_s,
         original_elapsed=baseline_elapsed,
@@ -2911,12 +2908,10 @@ def _stage_correctness(
             except (json.JSONDecodeError, OSError):
                 pass
         # Derive app_name from output_dir basename (e.g. SAMRAI_baseline ->
-        # SAMRAI) for the F-14 ref-floor lookup.  Strip standard suffixes.
-        _app_name = output_dir.name
-        for _suf in ("_baseline", "_reference", "_audit"):
-            if _app_name.endswith(_suf):
-                _app_name = _app_name[: -len(_suf)]
-                break
+        # SAMRAI, SAMRAI_baseline_sonnet46 -> SAMRAI) for the F-14 ref-floor
+        # lookup.  Uses the centralized helper so model-sharded outputs
+        # resolve to the bare app key.
+        _app_name = _strip_output_dir_suffix(output_dir.name)
         # Locate the active veloc.cfg for the F-16 side-car scan.
         _veloc_cfg = None
         for _src in (resilient_src, resilient_build):
@@ -3355,10 +3350,27 @@ def _default_baseline_cache_dir(original_src: Path) -> Path:
 
 def _strip_output_dir_suffix(name: str) -> str:
     """Map an output_dir basename like ``SAMRAI_baseline`` to the app name
-    ``SAMRAI`` used as the key in ``tests/apps/configs/<APP>.yaml``."""
+    ``SAMRAI`` used as the key in ``tests/apps/configs/<APP>.yaml``.
+
+    Also handles model-sharded variants produced by
+    ``run_iterative_for_model.sh`` (3-D model exploration cells): a
+    basename like ``SAMRAI_baseline_sonnet46`` strips both the
+    ``_<TAG>`` and the canonical mode suffix and returns ``SAMRAI``.
+    The per-app YAML key is the bare app name regardless of which LLM
+    produced the resilient source, so all sharded cells resolve the same
+    perturbation spec and per-app cap.
+    """
     for suf in ("_baseline", "_reference", "_audit"):
         if name.endswith(suf):
             return name[: -len(suf)]
+        # Tagged variant: <APP><suf>_<TAG>.  Match against ``<suf>_`` so we
+        # don't accidentally truncate an app whose name legitimately
+        # contains a substring like ``baseline`` (none today, but be
+        # defensive).
+        marker = suf + "_"
+        idx = name.find(marker)
+        if idx > 0:
+            return name[:idx]
     return name
 
 

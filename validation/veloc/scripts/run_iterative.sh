@@ -121,13 +121,22 @@ if [ -z "$APP_NAME" ]; then
 fi
 
 # --- Resolve paths ---
+# MODEL_TAG env var (set by run_iterative_for_model.sh wrapper for 3-D model
+# exploration cells) shards every output path with the LLM tag so multiple
+# cells can run concurrently without clobbering each other's data.  When unset
+# (default), behavior is exactly as before — the Opus 4.7 baseline lives at
+# un-suffixed paths.
+MODEL_TAG="${MODEL_TAG:-}"
+_TAG_PATH_SUFFIX=""
+[ -n "$MODEL_TAG" ] && _TAG_PATH_SUFFIX="_${MODEL_TAG}"
+
 if [ "$USE_BASELINE" = true ]; then
-  APP_DIR="$BUILD_DIR/tests_baseline/$APP_NAME"
-  LABEL="baseline"
+  APP_DIR="$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME"
+  LABEL="baseline${_TAG_PATH_SUFFIX}"
   VALIDATE_FLAG="--baseline"
 else
-  APP_DIR="$BUILD_DIR/tests/$APP_NAME"
-  LABEL="guard-agent"
+  APP_DIR="$BUILD_DIR/tests${_TAG_PATH_SUFFIX}/$APP_NAME"
+  LABEL="guard-agent${_TAG_PATH_SUFFIX}"
   VALIDATE_FLAG=""
 fi
 
@@ -421,10 +430,13 @@ Then make the change."
   # Available models from opencode.json (Argo dev gateway):
   #   argo/claudeopus47    Claude Opus 4.7 (default — highest-quality Anthropic)
   #   argo/claudeopus46    Claude Opus 4.6
-  #   argo/claudesonnet46  Claude Sonnet 4.6
-  #   argo/claudehaiku45   Claude Haiku 4.5
-  #   argo/gpt54           GPT-5.4 (highest-quality OpenAI)
-  #   argo/gemini25pro     Gemini 2.5 Pro (highest-quality Google)
+  #   argo/claudesonnet46  Claude Sonnet 4.6   (3-D cell A1)
+  #   argo/claudehaiku45   Claude Haiku 4.5    (3-D cell A2)
+  #   argo/gpt55           GPT-5.5             (3-D cell C1)
+  #   argo/gpt54           GPT-5.4
+  #   argo/gemini25pro     Gemini 2.5 Pro      (3-D cell C2)
+  # The wrapper run_iterative_for_model.sh sets OPENCODE_MODEL + MODEL_TAG
+  # together to drive sharded multi-cell runs.
   OPENCODE_MODEL="${OPENCODE_MODEL:-argo/claudeopus47}"
   echo "[iter $ITER] OpenCode model: $OPENCODE_MODEL"
   echo "[iter $ITER] Hard cap: ${OPENCODE_TIMEOUT}s.  Stall watch: check every ${OPENCODE_STALL_CHECK}s, kill if stalled ≥${OPENCODE_STALL_KILL}s after flag."
