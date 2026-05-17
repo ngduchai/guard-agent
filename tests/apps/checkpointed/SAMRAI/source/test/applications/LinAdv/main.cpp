@@ -172,7 +172,14 @@ int main(
 {
 
    int num_failures = 0;
-   const int number_of_runs = 2;
+   // 2026-05-16: upstream sets number_of_runs=2 as a self-soak (run the
+   // simulation twice in one invocation, regardless of restart args). Both
+   // iterations are fresh starts in our usage (argc==2) — see
+   // build/_experiment_state/samrai_phase_analysis.md. The outer loop
+   // doubles wall time without exercising the checkpoint/restart path. Set
+   // to 1 so our reference measurement is a single simulation comparable
+   // to vanilla and to the LLM-modified codebase.
+   const int number_of_runs = 1;
 
    /*
     * Initialize tbox::MPI.
@@ -614,6 +621,14 @@ int main(
 #endif
 
          }
+
+         /*
+          * Dump physics-derived signature of the final solution field for
+          * the validation framework's golden-vs-recovery comparison.
+          * Must run BEFORE deallocating linear_advection_model (which owns
+          * the patch-data accessor) and patch_hierarchy.
+          */
+         linear_advection_model->dumpValidationSignature(patch_hierarchy);
 
          /*
           * At conclusion of simulation, deallocate objects.

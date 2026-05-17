@@ -86,6 +86,20 @@ public:
     */
    ~LinAdv();
 
+   /**
+    * Compute four physics-derived scalar reductions over the final solution
+    * field u (sum, sum-of-squares, max, min, cell-count) across the entire
+    * patch hierarchy and across all MPI ranks, and print them on rank 0 as
+    * a single line: ``VALIDATION_SIGNATURE: sum=...e+0X sum2=... max=...
+    * min=... count=N``.  The numbers depend on the actual final state of
+    * the simulation; they cannot be reproduced by re-initialising from the
+    * input file alone, nor by replaying captured stdout, so they form a
+    * deterministic golden signature suitable for the validation framework's
+    * baseline-vs-recovery numeric-tolerance comparison.
+    */
+   void dumpValidationSignature(
+      const std::shared_ptr<hier::PatchHierarchy>& hierarchy);
+
    ///
    ///  The following routines:
    ///

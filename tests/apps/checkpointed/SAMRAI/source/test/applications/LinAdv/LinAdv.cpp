@@ -11,7 +11,10 @@
 
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <fstream>
+
+#include "SAMRAI/hier/VariableDatabase.h"
 
 #ifndef LACKS_SSTREAM
 #ifndef included_sstream
@@ -328,6 +331,96 @@ LinAdv::LinAdv(
  */
 
 LinAdv::~LinAdv() {
+}
+
+
+void
+LinAdv::dumpValidationSignature(
+    const std::shared_ptr<hier::PatchHierarchy>& hierarchy)
+{
+    const tbox::SAMRAI_MPI& mpi(tbox::SAMRAI_MPI::getSAMRAIWorld());
+
+    // Look up the variable id for d_uval against the CURRENT data context
+    // managed by the variable database (HyperbolicLevelIntegrator
+    // registers d_uval under "CURRENT").  The LinAdv-side getDataContext()
+    // is reset to null once the time loop completes, so we cannot rely on
+    // it here.
+    hier::VariableDatabase* var_db = hier::VariableDatabase::getDatabase();
+    std::shared_ptr<hier::VariableContext> ctx = var_db->getContext("CURRENT");
+    int uval_id = var_db->mapVariableAndContextToIndex(d_uval, ctx);
+    if (uval_id < 0) {
+        std::shared_ptr<hier::VariableContext> own = getDataContext();
+        if (own) {
+            uval_id = var_db->mapVariableAndContextToIndex(d_uval, own);
+        }
+    }
+
+    double local_sum = 0.0;
+    double local_sum2 = 0.0;
+    double local_max = -std::numeric_limits<double>::infinity();
+    double local_min = std::numeric_limits<double>::infinity();
+    long local_count = 0;
+
+    if (uval_id >= 0) {
+        const int num_levels = hierarchy->getNumberOfLevels();
+        for (int ln = 0; ln < num_levels; ++ln) {
+            std::shared_ptr<hier::PatchLevel> level = hierarchy->getPatchLevel(ln);
+            for (hier::PatchLevel::iterator pi(level->begin()); pi != level->end(); ++pi) {
+                std::shared_ptr<hier::Patch> patch = *pi;
+                std::shared_ptr<hier::PatchData> raw = patch->getPatchData(uval_id);
+                if (!raw) continue;
+                std::shared_ptr<pdat::CellData<double> > uval(
+                    SAMRAI_SHARED_PTR_CAST<pdat::CellData<double>, hier::PatchData>(raw));
+                if (!uval) continue;
+                const hier::Box& pbox = patch->getBox();
+                pdat::CellIterator icend(pdat::CellGeometry::end(pbox));
+                for (pdat::CellIterator ic(pdat::CellGeometry::begin(pbox));
+                     ic != icend; ++ic) {
+                    const pdat::CellIndex& ci(*ic);
+                    const double v = (*uval)(ci);
+                    local_sum  += v;
+                    local_sum2 += v * v;
+                    if (v > local_max) local_max = v;
+                    if (v < local_min) local_min = v;
+                    ++local_count;
+                }
+            }
+        }
+    }
+
+    double agg[2] = { local_sum, local_sum2 };
+    mpi.AllReduce(agg, 2, MPI_SUM);
+    mpi.AllReduce(&local_max, 1, MPI_MAX);
+    mpi.AllReduce(&local_min, 1, MPI_MIN);
+    int local_count_int = static_cast<int>(local_count);
+    mpi.AllReduce(&local_count_int, 1, MPI_SUM);
+
+    if (mpi.getRank() == 0) {
+        // Stdout copy (informational only — file is the verdict source).
+        std::cout << "VALIDATION_SIGNATURE:"
+                  << " sum="   << std::scientific << std::setprecision(10) << agg[0]
+                  << " sum2="  << agg[1]
+                  << " max="   << local_max
+                  << " min="   << local_min
+                  << " count=" << local_count_int << std::endl;
+
+        // Authoritative golden artifact: raw binary doubles, in process
+        // memory layout, written to validation_output.bin in the run cwd.
+        // Mirrors vanilla; consumed by NumericToleranceComparator at
+        // tolerance 1e-12.
+        std::FILE* fp = std::fopen("validation_output.bin", "wb");
+        if (fp != nullptr) {
+            const double values[5] = {
+                agg[0],
+                agg[1],
+                local_max,
+                local_min,
+                static_cast<double>(local_count_int),
+            };
+            std::fwrite(values, sizeof(double), 5, fp);
+            std::fclose(fp);
+        }
+    }
 }
 
 /*
