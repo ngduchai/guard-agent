@@ -39,6 +39,29 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #79 — Perturbation calibrator: pre-flight check for per-app YAML specs `Solved`
+
+**Reported:** 2026-05-17
+
+**Explanation:** The cold-replay detector (issue #78) requires every protected app to have a `perturbation:` block in `tests/apps/configs/<APP>.yaml`.  Without verification, those specs are author guesses — the chosen knob may produce output diffs too small for the slope-test gate to work, or shift execution time enough to contaminate the slope's timing denominators, or crash vanilla at the value-range extremes.  Manual three-run verification per app is tedious and error-prone.
+
+**Resolution:** `validation/veloc/perturbation_calibrator.py` automates the check:
+
+1. Runs vanilla 3 times: unperturbed (value=None), min (value_range[0]), max (value_range[1]).
+2. Verifies three invariants in order, safety first (failure short-circuits):
+   - safety: all 3 exit cleanly, no NaN, output file produced
+   - output sensitivity: `|Z_P(min) - Z_X| > threshold` AND `|Z_P(max) - Z_X| > threshold` (default = `1000 × app tolerance`)
+   - timing stability: `|t(min) - t(X)|/t(X) <= threshold` AND same for max (default = 15%, loosened from the plan's 5% because shared-host noise is real)
+3. On `--update-yaml` + PASS: regex-rewrites the YAML to flip `safe_value_range_verified: true` (preserves comments — full yaml round-trip would re-flow the multi-line rationale blocks).
+
+CLI exit codes: 0 = PASS, 1 = FAIL, 2 = setup error.  `--json` for machine-readable output.
+
+**Commit:** `05fada88f` (1362 lines: implementation + 26 unit tests covering all invariant pass/fail cases, threshold configurability, safety short-circuit, YAML rewrite, CLI exit codes).
+
+NOT yet exercised against any real app — the background 3-D Phase 0 agent is doing serial HPCG smoke tests via `mpirun`, so running the calibrator concurrently would violate OP-8.  First real invocation queued for SAMRAI after Phase 0 completes.  See `docs/cold_replay_detector.md` §7 for operator-facing usage docs.
+
+---
+
 ### #78 — Cold-replay-detector validator pipeline: input perturbation + multi-fraction kill slope gate `Solved`
 
 **Reported:** 2026-05-17
@@ -54,9 +77,12 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 - `20e7fb27a` — infra: `PerturbationSpec`, `compute_recovery_slope`, refactored `_enforce_validation_b` (multi-fraction-aware), anti-gaming directive in iter prompt
 - `a6d96fcc5` — SAMRAI + Nyx per-app perturbation specs
 - `c6be00065` — `_compute_perturbed_baseline()` helper for fresh Z_P (Piece A)
-- This commit — multi-fraction orchestrator in `_stage_correctness` (Piece B): replaces the single `run_with_checkpoint_observed_injection` call with a 3-fraction loop, plumbs `per_fraction_results` + `perturbation_active` to `_enforce_validation_b`, switches comparison ground truth to Z_P when perturbation is active, applies the same perturbation to the clean leg.
+- `da1c87e20` — multi-fraction orchestrator in `_stage_correctness` (Piece B): replaces the single `run_with_checkpoint_observed_injection` call with a 3-fraction loop, plumbs `per_fraction_results` + `perturbation_active` to `_enforce_validation_b`, switches comparison ground truth to Z_P when perturbation is active, applies the same perturbation to the clean leg.
+- `d04c4fdff` — `--perturbation-fractions` + `--no-perturbation` CLI flags (Piece C); 18 new tests for argparse + run_validate.sh wrapper.
+- `05fada88f` — `perturbation_calibrator.py` pre-flight script (see issue #79 for details).
+- See `docs/cold_replay_detector.md` for the canonical operator-facing reference (design rationale, gate set, YAML spec format, calibrator usage, forensic flow on failure).
 
-Pipeline is READY for the SAMRAI/Nyx pilot.  User's experimentor will run the actual validation cycles.
+Pipeline is READY for the SAMRAI/Nyx pilot.  User's experimentor will run the actual validation cycles.  Test count: 102 (76 in `test_perturbation.py` + 26 in `test_perturbation_calibrator.py`).
 
 ---
 
