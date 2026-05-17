@@ -386,6 +386,23 @@ failure-analysis discipline you were given originally:
 Then make the change."
   fi
 
+  # --- Optional context-cap (Deliverable 2, cell B1 enabler) ---
+  # OPENCODE_INPUT_TRUNC_TOKENS env var: cap the prompt at roughly N
+  # tokens (chars/4 approx) by dropping oldest stdout/stderr lines first
+  # and then whole least-informative sections.  Anti-gaming directive +
+  # failure-analysis preamble are NEVER trimmed.  Used by cell B1 to
+  # simulate a 128K-context Opus 4.7 run against the existing 1M
+  # baseline.  When unset, behavior is unchanged.
+  if [ -n "${OPENCODE_INPUT_TRUNC_TOKENS:-}" ]; then
+    _TRUNC_META="$ITER_LOG/prompt_truncation.json"
+    PROMPT_CAPPED=$(printf '%s\n' "$PROMPT" | \
+        OPENCODE_INPUT_TRUNC_TOKENS="$OPENCODE_INPUT_TRUNC_TOKENS" \
+        python3 -m validation.veloc.prompt_truncator 2>"$_TRUNC_META")
+    PROMPT="$PROMPT_CAPPED"
+    # Surface a one-line summary so the iter log shows what the cap did.
+    echo "[iter $ITER] context cap: $(cat "$_TRUNC_META" 2>/dev/null)"
+  fi
+
   # Save the prompt for debugging
   printf '%s\n' "$PROMPT" > "$ITER_LOG/prompt.txt"
 
