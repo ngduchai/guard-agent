@@ -106,67 +106,113 @@ if [ -n "${OPENCODE_INPUT_TRUNC_TOKENS:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Inter-tag read isolation (defense-in-depth against cross-cell leakage)
+# Cross-cell read isolation (defense in depth)
 #
 # When cell N runs after cells 1..N-1, those earlier cells' tagged source
-# dirs (build/tests_baseline_<OTHER_TAG>/) sit on disk. OpenCode's read/
-# grep/glob tools have full FS visibility, so cell N's LLM could read
-# those earlier solutions and crib from them, contaminating the experiment.
+# dirs (build/tests_baseline_<OTHER_TAG>/) sit on disk.  Also the upstream
+# reference checkpointed source (tests/apps/checkpointed/<APP>/).  OpenCode's
+# read/grep/glob tools have full FS visibility, so cell N's LLM could read
+# any of those and crib from them, contaminating the experiment.
 #
-# Mitigation: temporarily mv every OTHER cell's tagged dir to a .hidden_*
-# sibling before run_iterative.sh launches, restore on any exit (normal,
-# error, signal). Mirrors the existing reference-hiding pattern at
-# run_iterative.sh:474-493 for tests/apps/checkpointed/.
+# Mitigation: move every OTHER cell's tagged dir and the per-app reference
+# into a SINGLE isolation folder under /tmp/ (outside the project tree, so
+# not discoverable by globbing build/) and chmod 000 the folder so the OS
+# itself denies traversal regardless of what OpenCode tries.  Restore on
+# any exit (normal, error, signal).  Same effect as the existing per-iter
+# reference-hiding in run_iterative.sh, just scaled to cover other-cell
+# sources and centralised in one place so the OS perm bit lifts both kinds
+# of isolation atomically.
 #
 # NOT hidden:
 #   - This cell's own tests_baseline_${MODEL_TAG}/ (obviously)
 #   - The un-suffixed tests_baseline/ (Opus 4.7 1M baseline) — covered by
 #     OpenCode permission.read deny at ~/.config/opencode/opencode.json
-#     so defense-in-depth is via the config, not by hiding
 # ---------------------------------------------------------------------------
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
-HIDDEN_DIRS=()  # entries: "<hidden_path>|<original_path>"
+ISOLATION_DIR="${ISOLATION_DIR:-/tmp/.cell_iso_${MODEL_TAG}_$$}"
+HIDDEN_ENTRIES=()  # entries: "<isolation_path>|<original_path>"
 
+# Pull --baseline <APP> out of the forwarded args so we know which app's
+# reference dir to hide.  --baseline may appear as one or two tokens.
+APP_FROM_ARGS=""
+for ((i=0; i<${#FORWARD_ARGS[@]}; i++)); do
+  case "${FORWARD_ARGS[$i]}" in
+    --baseline)
+      APP_FROM_ARGS="${FORWARD_ARGS[$((i+1))]:-}"
+      break
+      ;;
+    --baseline=*)
+      APP_FROM_ARGS="${FORWARD_ARGS[$i]#*=}"
+      break
+      ;;
+  esac
+done
+
+mkdir -p "$ISOLATION_DIR"
+
+# Move other cells' tagged source dirs into the isolation folder.
 if [ -d "$BUILD_DIR" ]; then
   for d in "$BUILD_DIR"/tests_baseline_*/; do
     [ -d "$d" ] || continue
     base=$(basename "${d%/}")
     tag="${base#tests_baseline_}"
-    # Skip this cell's own dir and any pre-existing .hidden_* (left over
-    # from a crashed prior run that didn't restore — we ignore those, the
-    # operator can clean up manually).
-    if [ "$tag" = "$MODEL_TAG" ] || [[ "$tag" == .hidden_* ]]; then
+    if [ "$tag" = "$MODEL_TAG" ]; then
       continue
     fi
-    hidden="${BUILD_DIR}/.hidden_tests_baseline_${tag}_$$"
-    if mv "$d" "$hidden" 2>/dev/null; then
-      HIDDEN_DIRS+=("$hidden|$d")
-      echo "[run_iterative_for_model] hid other-cell dir (${d%/} → $hidden)"
-    else
-      echo "[run_iterative_for_model] WARN: failed to hide ${d%/} — cell may read it"
+    target="$ISOLATION_DIR/$base"
+    if mv "$d" "$target" 2>/dev/null; then
+      HIDDEN_ENTRIES+=("$target|${d%/}")
+      echo "[run_iterative_for_model] hid $d → isolation"
     fi
   done
 fi
 
-_restore_hidden_dirs() {
-  local entry hidden orig
-  for entry in "${HIDDEN_DIRS[@]}"; do
-    hidden="${entry%%|*}"
+# Move the per-app upstream reference source into the same isolation folder.
+# Skip if we couldn't determine the app from --baseline (no harm, run_iterative.sh
+# has its own per-iter fallback hiding for the reference dir).
+if [ -n "$APP_FROM_ARGS" ]; then
+  REF_DIR="$REPO_ROOT/tests/apps/checkpointed/$APP_FROM_ARGS"
+  if [ -d "$REF_DIR" ]; then
+    target="$ISOLATION_DIR/checkpointed_$APP_FROM_ARGS"
+    if mv "$REF_DIR" "$target" 2>/dev/null; then
+      HIDDEN_ENTRIES+=("$target|$REF_DIR")
+      echo "[run_iterative_for_model] hid reference $REF_DIR → isolation"
+    fi
+  fi
+fi
+
+# OS-level denial: chmod 000 prevents traversal of the isolation folder by
+# anyone (including the user the wrapper runs as).  An LLM that somehow
+# guesses the isolation path still gets EACCES from the kernel before any
+# tool-layer permission check fires.  Wrapper temporarily lifts the mode
+# in the restore trap.
+chmod 000 "$ISOLATION_DIR" 2>/dev/null
+
+_restore_isolation() {
+  # Lift the OS-level deny so we can mv contents back.
+  chmod 755 "$ISOLATION_DIR" 2>/dev/null
+  local entry iso orig
+  for entry in "${HIDDEN_ENTRIES[@]}"; do
+    iso="${entry%%|*}"
     orig="${entry##*|}"
-    if [ -d "$hidden" ]; then
-      if mv "$hidden" "$orig" 2>/dev/null; then
-        echo "[run_iterative_for_model] restored other-cell dir ($hidden → $orig)"
+    if [ -e "$iso" ]; then
+      if mv "$iso" "$orig" 2>/dev/null; then
+        echo "[run_iterative_for_model] restored $iso → $orig"
       else
-        echo "[run_iterative_for_model] WARN: failed to restore $hidden — manual: mv $hidden $orig"
+        echo "[run_iterative_for_model] WARN: failed to restore $iso — manual: chmod 755 $ISOLATION_DIR && mv $iso $orig"
       fi
     fi
   done
+  # Remove the isolation folder if empty; leave it (warn) if not (something
+  # went wrong with restore).
+  rmdir "$ISOLATION_DIR" 2>/dev/null || \
+    echo "[run_iterative_for_model] WARN: $ISOLATION_DIR not empty after restore — operator cleanup required"
 }
-trap _restore_hidden_dirs EXIT INT TERM
+trap _restore_isolation EXIT INT TERM
 
-# Forward everything else to the base script.  Run (not exec) so the
-# trap above fires after run_iterative.sh exits and the hidden dirs get
-# restored before the wrapper returns.
+# Forward to the base script.  Run (not exec) so the trap above fires
+# after run_iterative.sh exits and the isolation gets lifted before the
+# wrapper returns.
 "$SCRIPT_DIR/run_iterative.sh" "${FORWARD_ARGS[@]}"
