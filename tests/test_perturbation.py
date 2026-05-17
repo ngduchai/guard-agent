@@ -28,6 +28,7 @@ from validation.veloc.validate import (
     _DEFAULT_KILL_FRACTIONS,
     _RECOVERY_RESUMED_SLOPE_THRESHOLD,
     ValidationError,
+    _compute_perturbed_baseline,
     _enforce_validation_b,
     compute_recovery_slope,
     kill_fractions_for_bench,
@@ -427,3 +428,246 @@ class TestEnforceValidationB:
         assert proof["recovery_resumed_mode"] == "single_point_legacy"
         assert proof["recovery_resume_slope"] is None
         assert proof["perturbation_active"] is False
+
+
+# ---------------------------------------------------------------------------
+# _compute_perturbed_baseline (Piece A)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRunResult:
+    """Minimal stand-in for runner.RunResult used by the mock below."""
+    def __init__(self, *, exit_code: int, elapsed_s: float,
+                 stdout: str = "", stderr: str = ""):
+        self.exit_code = exit_code
+        self.elapsed_s = elapsed_s
+        self.stdout = stdout
+        self.stderr = stderr
+
+    @property
+    def succeeded(self) -> bool:
+        return self.exit_code == 0
+
+
+class TestComputePerturbedBaseline:
+    """Unit tests for the perturbed-baseline helper.
+
+    Mocks runner.run_once so we do not need MPI or a built binary.  The
+    mock writes a synthetic output file into the cwd so the helper's
+    "did the run produce the expected file?" check succeeds, and the
+    perturbation_seed is recorded so we can also assert that the input
+    file in cwd was actually modified by apply_perturbation.
+    """
+
+    def _common(self, tmp_path):
+        src = tmp_path / "src"
+        build = tmp_path / "build"
+        scratch = tmp_path / "scratch"
+        src.mkdir()
+        build.mkdir()
+        # Source input file the perturbation will modify in cwd (NOT here).
+        (src / "input.txt").write_text("dt = 0.001\n")
+        spec = _parse_perturbation({
+            "method": "regex_replace", "file": "input.txt",
+            "pattern": r"dt\s*=\s*[0-9.]+",
+            "replacement_template": "dt = {value:.4f}",
+            "value_range": [0.005, 0.015],
+        })
+        return src, build, scratch, spec
+
+    def _install_mock_run_once(self, monkeypatch, *,
+                               elapsed: float = 12.34,
+                               output_name: str = "out.bin",
+                               output_content: bytes = b"FAKE",
+                               exit_code: int = 0,
+                               call_log: "list | None" = None):
+        """Patch runner.run_once + the validate-side import.
+
+        Writes ``output_content`` into ``output_dir/output_name`` so the
+        helper's post-run output-file check passes.  Records each call
+        in ``call_log`` for assertion (kwargs only — args is unused).
+        """
+        def fake_run_once(*, build_dir, executable_name, num_procs, app_args,
+                          output_dir, run_cwd=None, env=None,
+                          veloc_config_sources=None, veloc_config_name="veloc.cfg",
+                          memory_monitor_fn=None, memory_stop_event=None,
+                          memory_samples_holder=None, timeout_s=None):
+            if call_log is not None:
+                call_log.append({
+                    "build_dir": str(build_dir),
+                    "executable_name": executable_name,
+                    "num_procs": num_procs,
+                    "app_args": list(app_args),
+                    "output_dir": str(output_dir),
+                    "run_cwd": str(run_cwd) if run_cwd else None,
+                })
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / output_name).write_bytes(output_content)
+            return _FakeRunResult(exit_code=exit_code, elapsed_s=elapsed)
+
+        # validate.py imports run_once at call time via
+        # `from .runner import run_once, ...` inside the helper, so we patch
+        # the runner module itself (the canonical source).
+        import validation.veloc.runner as _runner
+        monkeypatch.setattr(_runner, "run_once", fake_run_once)
+        # _copy_veloc_cfg + _symlink_input_data are also imported inside the
+        # helper; patch with no-ops so we don't need real veloc.cfg files
+        # or input directories laid out under src/build.
+        monkeypatch.setattr(_runner, "_copy_veloc_cfg",
+                            lambda *a, **k: None)
+        monkeypatch.setattr(_runner, "_symlink_input_data",
+                            lambda *a, **k: None)
+        return fake_run_once
+
+    def test_writes_output_and_returns_value(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        calls: list = []
+        self._install_mock_run_once(monkeypatch, call_log=calls, elapsed=9.5)
+        elapsed, out_path, value = _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=42,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        assert elapsed == 9.5
+        assert out_path == scratch / "seed_42" / "out.bin"
+        assert out_path.exists()
+        assert 0.005 <= float(value) <= 0.015
+        # Input file in cwd was overwritten with the perturbed value.
+        cwd_input = (scratch / "seed_42" / "input.txt").read_text()
+        assert "dt = " in cwd_input
+        assert "dt = 0.001" not in cwd_input  # source value replaced
+        # Source file untouched.
+        assert (src / "input.txt").read_text() == "dt = 0.001\n"
+        assert len(calls) == 1
+
+    def test_same_seed_returns_cached_without_rerun(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        calls: list = []
+        self._install_mock_run_once(monkeypatch, call_log=calls, elapsed=7.7)
+        # First call populates cache.
+        e1, p1, v1 = _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=99,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        # Second call same seed → cached path: run_once NOT invoked again.
+        e2, p2, v2 = _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=99,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        assert len(calls) == 1, "cached seed must not re-invoke run_once"
+        assert e1 == e2 == 7.7
+        assert p1 == p2
+        assert v1 == v2
+
+    def test_different_seed_reruns(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        calls: list = []
+        self._install_mock_run_once(monkeypatch, call_log=calls)
+        _, _, v_a = _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=1,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        _, _, v_b = _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=2,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        assert len(calls) == 2
+        assert v_a != v_b  # different seeds → different values
+
+    def test_disabled_spec_raises(self, tmp_path, monkeypatch):
+        src, build, scratch, _ = self._common(tmp_path)
+        disabled = _parse_perturbation({"method": "disabled", "reason": "x"})
+        with pytest.raises(ValueError, match="active PerturbationSpec"):
+            _compute_perturbed_baseline(
+                original_src=src, build_dir=build, executable_name="app",
+                num_procs=4, app_args=[],
+                perturbation_spec=disabled, perturbation_seed=1,
+                scratch_root=scratch, veloc_config_name="veloc.cfg",
+                app_input_subdir=None, extra_source_dirs=None,
+                output_file_name="out.bin",
+            )
+
+    def test_none_spec_raises(self, tmp_path, monkeypatch):
+        src, build, scratch, _ = self._common(tmp_path)
+        with pytest.raises(ValueError, match="active PerturbationSpec"):
+            _compute_perturbed_baseline(
+                original_src=src, build_dir=build, executable_name="app",
+                num_procs=4, app_args=[],
+                perturbation_spec=None, perturbation_seed=1,
+                scratch_root=scratch, veloc_config_name="veloc.cfg",
+                app_input_subdir=None, extra_source_dirs=None,
+                output_file_name="out.bin",
+            )
+
+    def test_nonzero_exit_raises_validation_error(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        self._install_mock_run_once(monkeypatch, exit_code=42)
+        with pytest.raises(ValidationError, match="exit code 42"):
+            _compute_perturbed_baseline(
+                original_src=src, build_dir=build, executable_name="app",
+                num_procs=4, app_args=[],
+                perturbation_spec=spec, perturbation_seed=1,
+                scratch_root=scratch, veloc_config_name="veloc.cfg",
+                app_input_subdir=None, extra_source_dirs=None,
+                output_file_name="out.bin",
+            )
+
+    def test_missing_output_file_raises(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        # output_name='out.bin' is what the helper expects, but mock writes
+        # 'wrong_name.bin' so the post-run check fails.
+        self._install_mock_run_once(monkeypatch, output_name="wrong_name.bin")
+        with pytest.raises(ValidationError, match="produced no output"):
+            _compute_perturbed_baseline(
+                original_src=src, build_dir=build, executable_name="app",
+                num_procs=4, app_args=[],
+                perturbation_spec=spec, perturbation_seed=1,
+                scratch_root=scratch, veloc_config_name="veloc.cfg",
+                app_input_subdir=None, extra_source_dirs=None,
+                output_file_name="out.bin",
+            )
+
+    def test_corrupt_cache_meta_reruns(self, tmp_path, monkeypatch):
+        src, build, scratch, spec = self._common(tmp_path)
+        calls: list = []
+        self._install_mock_run_once(monkeypatch, call_log=calls, elapsed=5.0)
+        # Populate cache.
+        _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=7,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        # Corrupt the meta.
+        (scratch / "seed_7" / "_perturbed_baseline_meta.json").write_text("{not json")
+        # Second call must rerun (NOT trust the corrupt meta).
+        _compute_perturbed_baseline(
+            original_src=src, build_dir=build, executable_name="app",
+            num_procs=4, app_args=[],
+            perturbation_spec=spec, perturbation_seed=7,
+            scratch_root=scratch, veloc_config_name="veloc.cfg",
+            app_input_subdir=None, extra_source_dirs=None,
+            output_file_name="out.bin",
+        )
+        assert len(calls) == 2

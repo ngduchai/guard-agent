@@ -3103,6 +3103,177 @@ def _autodetect_or_collect_baseline_cache(
     return cache_dir
 
 
+def _compute_perturbed_baseline(
+    *,
+    original_src: "Path",
+    build_dir: "Path",
+    executable_name: str,
+    num_procs: int,
+    app_args: "list[str]",
+    perturbation_spec: "object",
+    perturbation_seed: int,
+    scratch_root: "Path",
+    veloc_config_name: str,
+    app_input_subdir: "str | None",
+    extra_source_dirs: "list[Path] | None",
+    output_file_name: str,
+    timeout_s: "float | None" = None,
+) -> "tuple[float, Path, float | int]":
+    """Run vanilla ONCE with a random input perturbation applied and return
+    the resulting ground truth (``Z_P``) for the cold-replay detector.
+
+    The vanilla binary at ``build_dir / executable_name`` is reused as-is
+    (no rebuild).  A scratch cwd is set up by symlinking input data the
+    same way :func:`runner.run_with_checkpoint_observed_injection` does,
+    then :func:`app_config.apply_perturbation` overwrites the relevant
+    input file inside the scratch cwd (the source tree is never touched).
+    Finally :func:`runner.run_once` executes mpirun and captures the
+    output file at ``scratch_root / "seed_<seed>" / output_file_name``.
+
+    Caching: the scratch cwd is keyed by ``perturbation_seed``.  When the
+    same seed is requested again (e.g. for the 3 fractions of one
+    validation cycle), the cached output file is returned and ``run_once``
+    is not invoked again — but the elapsed time from the original cached
+    run is returned so the slope-test denominators stay consistent.
+
+    Returns
+    -------
+    elapsed_s : float
+        Wall-clock elapsed of the perturbed vanilla run (cached after
+        first invocation per seed).
+    output_file_path : Path
+        Absolute path to the freshly-produced ``output_file_name`` inside
+        the scratch cwd — the new ground truth for ``output_correct``.
+    resolved_value : float | int
+        The actual perturbed value applied (deterministic from
+        ``perturbation_seed``).
+
+    Raises
+    ------
+    ValueError
+        If ``perturbation_spec`` is None or marked ``disabled`` — callers
+        must check ``app_cell.perturbation`` before invoking.
+    ValidationError
+        If the perturbed vanilla run exited non-zero (likely the
+        perturbation value crashes the binary — calibration issue) or
+        the expected output file is not produced.
+    """
+    from .app_config import resolve_perturbation_value, apply_perturbation
+    from .runner import run_once, _copy_veloc_cfg, _symlink_input_data
+
+    if perturbation_spec is None or getattr(perturbation_spec, "method", None) == "disabled":
+        raise ValueError(
+            "_compute_perturbed_baseline requires an active PerturbationSpec; "
+            "got None or 'disabled'"
+        )
+
+    # Cache key: one scratch cwd per seed so the 3 fractions of one cycle
+    # share a single vanilla run.
+    cwd = scratch_root / f"seed_{perturbation_seed}"
+    cached_output = cwd / output_file_name
+    cached_meta = cwd / "_perturbed_baseline_meta.json"
+
+    # Cache hit: a prior call for this seed completed and persisted the
+    # output file + meta.  Reuse without re-running.
+    if cached_meta.exists() and cached_output.exists():
+        try:
+            meta = json.loads(cached_meta.read_text())
+            return (
+                float(meta["elapsed_s"]),
+                cached_output,
+                meta["perturbation_value"],
+            )
+        except (json.JSONDecodeError, KeyError, ValueError, OSError):
+            # Corrupt meta → fall through to re-run; the actual files
+            # in cwd will be cleared below.
+            pass
+
+    # Clear any stale partial state from an interrupted prior call.
+    if cwd.exists():
+        shutil.rmtree(cwd)
+    cwd.mkdir(parents=True, exist_ok=True)
+
+    # Mirror the runner's setup so the perturbed run sees the same input
+    # layout as a normal vanilla run.
+    _copy_veloc_cfg(original_src, build_dir, cwd, veloc_config_name)
+    _symlink_input_data(
+        original_src, build_dir, cwd, list(app_args),
+        extra_source_dirs=extra_source_dirs,
+        input_subdir=app_input_subdir,
+    )
+
+    # Resolve the deterministic value from seed, then overwrite the input
+    # in cwd (source files are NEVER modified — apply_perturbation writes
+    # to cwd/<spec.file> only).
+    value = resolve_perturbation_value(perturbation_spec, perturbation_seed)
+    new_args, new_env, _modf = apply_perturbation(
+        perturbation_spec, value,
+        cwd=cwd, source_dir=original_src,
+        app_args=list(app_args), env={},
+    )
+
+    # Compose the run env: start from os.environ (so LD_LIBRARY_PATH etc.
+    # are present), then overlay any env vars the perturbation set.
+    run_env = dict(os.environ)
+    if new_env:
+        run_env.update(new_env)
+
+    print(
+        f"[validate] perturbed-baseline: seed={perturbation_seed} "
+        f"value={value} cwd={cwd}",
+        flush=True,
+    )
+    result = run_once(
+        build_dir=build_dir,
+        executable_name=executable_name,
+        num_procs=num_procs,
+        app_args=new_args,
+        output_dir=cwd,
+        run_cwd=cwd,
+        env=run_env,
+        veloc_config_sources=[original_src, build_dir],
+        veloc_config_name=veloc_config_name,
+        timeout_s=timeout_s,
+    )
+
+    if not result.succeeded:
+        raise ValidationError(
+            f"Perturbed vanilla baseline run failed with exit code "
+            f"{result.exit_code} for perturbation seed={perturbation_seed} "
+            f"value={value}.  Likely calibration issue: the perturbation "
+            f"range in tests/apps/configs/<APP>.yaml drove the value "
+            f"outside the binary's stable region.  Re-check the YAML "
+            f"perturbation.value_range or surface to user.",
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+            output_dir=cwd,
+        )
+
+    if not cached_output.exists():
+        raise ValidationError(
+            f"Perturbed vanilla run completed (exit=0) but produced no "
+            f"output file at {cached_output} (expected name "
+            f"'{output_file_name}').  Likely an app config mismatch — "
+            f"check tests/apps/configs/<APP>.yaml comparison.output_file.",
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=0,
+            output_dir=cwd,
+        )
+
+    # Persist meta so a subsequent call with the same seed (e.g. the 2nd
+    # and 3rd fractions of the same validation cycle) returns immediately
+    # without re-running vanilla.
+    cached_meta.write_text(json.dumps({
+        "elapsed_s": float(result.elapsed_s),
+        "perturbation_seed": int(perturbation_seed),
+        "perturbation_value": value,
+        "output_file_name": output_file_name,
+    }, indent=2))
+    return float(result.elapsed_s), cached_output, value
+
+
 def _stage_benchmarks(
     args: argparse.Namespace,
     original_src: Path,
