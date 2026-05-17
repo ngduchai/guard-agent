@@ -130,13 +130,7 @@ public:
     */
     void PushX (amrex::Real dt);
 
-    /**
-    * This pushes the particle momenta by dt for all the species in the
-    * MultiParticleContainer. It is used to desynchronize the particles after initialization
-    * or when restarting from a checkpoint.  It is also used to synchronize particles at the
-    * the end of the run.  This is the electromagnetic version.
-    */
-    void PushP (int lev, amrex::Real dt,
+        void PushP (int lev, amrex::Real dt,
                 const amrex::MultiFab& Ex, const amrex::MultiFab& Ey, const amrex::MultiFab& Ez,
                 const amrex::MultiFab& Bx, const amrex::MultiFab& By, const amrex::MultiFab& Bz,
                 MomentumPushType momentum_push_type);

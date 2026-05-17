@@ -520,32 +520,5 @@ void StochasticForcing::read_params()
 }
 
 //
-// Read the spectrum from checkpoint file
 //
-void
-Nyx::forcing_post_restart (const std::string& restart_file)
-{
-    BL_PROFILE("StochasticForcing::forcing_post_restart()");
-    if (level > 0)
-        return;
-
-    if (ParallelDescriptor::IOProcessor())
-    {
-        std::string FileName = restart_file + "/forcing";
-        std::ifstream File;
-        File.open(FileName.c_str(), std::ios::in);
-        if (!File.good())
-            amrex::FileOpenFailed(FileName);
-        forcing->read_Spectrum(File);
-        File.close();
-
-        FileName = restart_file + "/mt";
-        File.open(FileName.c_str(), std::ios::in);
-        if (!File.good())
-            amrex::FileOpenFailed(FileName);
-        mt_read(File);
-    }
-
-    forcing->distribute();
-}
 

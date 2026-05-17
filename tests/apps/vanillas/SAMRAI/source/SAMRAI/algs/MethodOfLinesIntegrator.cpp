@@ -11,10 +11,8 @@
 
 #include "SAMRAI/hier/Patch.h"
 #include "SAMRAI/hier/PatchData.h"
-#include "SAMRAI/hier/PatchDataRestartManager.h"
 #include "SAMRAI/hier/VariableDatabase.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 #include "SAMRAI/tbox/MathUtilities.h"
 
@@ -47,9 +45,6 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(patch_strategy != 0);
 
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name,
-      this);
-
    /*
     * hier::Variable contexts used in algorithm.
     */
@@ -75,7 +70,7 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
    /*
     * Initialize object with data read from input and restart databases.
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -95,8 +90,7 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
 
 MethodOfLinesIntegrator::~MethodOfLinesIntegrator()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 /*
  *************************************************************************
@@ -399,12 +393,6 @@ MethodOfLinesIntegrator::registerVariable(
          d_scratch_data.setFlag(scratch);
 
          /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(current);
-
-         /*
           * Ask the geometry for the appropriate refinement operator and
           * register that operator and the variables with the communication
           * algorithms.  Two different communication algorithms are required by
@@ -676,14 +664,7 @@ void
 MethodOfLinesIntegrator::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_METHOD_OF_LINES_INTEGRATOR_VERSION",
-      ALGS_METHOD_OF_LINES_INTEGRATOR_VERSION);
-
-   restart_db->putDoubleVector("alpha_1", d_alpha_1);
-   restart_db->putDoubleVector("alpha_2", d_alpha_2);
-   restart_db->putDoubleVector("beta", d_beta);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -761,40 +742,7 @@ MethodOfLinesIntegrator::getFromInput(
 void
 MethodOfLinesIntegrator::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file." << std::endl);
-   }
-   std::shared_ptr<tbox::Database> restart_db(
-      root_db->getDatabase(d_object_name));
-
-   int ver = restart_db->getInteger("ALGS_METHOD_OF_LINES_INTEGRATOR_VERSION");
-   if (ver != ALGS_METHOD_OF_LINES_INTEGRATOR_VERSION) {
-      TBOX_ERROR(
-         d_object_name << ":  "
-                       << "Restart file version different than class version."
-                       << std::endl);
-   }
-
-   d_alpha_1 = restart_db->getDoubleVector("alpha_1");
-   d_alpha_2 = restart_db->getDoubleVector("alpha_2");
-   d_beta = restart_db->getDoubleVector("beta");
-
-   if (d_alpha_1.size() != d_alpha_2.size() ||
-       d_alpha_2.size() != d_beta.size()) {
-      TBOX_ERROR(
-         d_object_name << ":  "
-                       << "The number of alpha_1, alpha_2, and beta values "
-                       << "specified in restart is not consistent"
-                       << std::endl);
-   }
-
-   d_order = static_cast<int>(d_alpha_1.size());
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

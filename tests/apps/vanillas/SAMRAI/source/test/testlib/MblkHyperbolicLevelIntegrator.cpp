@@ -15,8 +15,6 @@
 #include <fstream>
 #include <string>
 
-#include "SAMRAI/tbox/RestartManager.h"
-#include "SAMRAI/hier/PatchDataRestartManager.h"
 #include "SAMRAI/hier/VariableDatabase.h"
 #include "SAMRAI/pdat/FaceVariable.h"
 #include "SAMRAI/pdat/OuterfaceVariable.h"
@@ -213,14 +211,11 @@ MblkHyperbolicLevelIntegrator::MblkHyperbolicLevelIntegrator(
    TBOX_ASSERT(input_db);
    TBOX_ASSERT(patch_strategy != 0);
 
-   tbox::RestartManager::getManager()->
-   registerRestartItem(d_object_name, this);
-
    /*
     * Initialize object with data read from the input and restart databases.
     */
 
-   bool from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool from_restart = false;
    if (from_restart) {
       getFromRestart();
    }
@@ -237,8 +232,7 @@ MblkHyperbolicLevelIntegrator::MblkHyperbolicLevelIntegrator(
  */
 MblkHyperbolicLevelIntegrator::~MblkHyperbolicLevelIntegrator()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 /*
  *************************************************************************
@@ -1711,12 +1705,6 @@ void MblkHyperbolicLevelIntegrator::registerVariable(
          d_new_time_dep_data.setFlag(new_id);
 
          /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
-
-         /*
           * Set boundary fill schedules for time-dependent variable.
           * If time interpolation operator is non-NULL, regular advance
           * bdry fill algorithm will time interpolate between current and
@@ -1800,12 +1788,6 @@ void MblkHyperbolicLevelIntegrator::registerVariable(
          d_new_patch_init_data.setFlag(cur_id);
 
          /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
-
-         /*
           * Bdry algorithms for input variables will fill from current only.
           */
 
@@ -1847,12 +1829,6 @@ void MblkHyperbolicLevelIntegrator::registerVariable(
                ghosts);
 
          d_new_patch_init_data.setFlag(cur_id);
-
-         /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
 
          d_mblk_fill_new_level->registerRefine(
             cur_id, cur_id, scr_id, refine_op);
@@ -2354,16 +2330,7 @@ void MblkHyperbolicLevelIntegrator::printClassData(
 void MblkHyperbolicLevelIntegrator::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION",
-      ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION);
-
-   restart_db->putDouble("d_cfl", d_cfl);
-   restart_db->putDouble("d_cfl_init", d_cfl_init);
-   restart_db->putBool("d_lag_dt_computation", d_lag_dt_computation);
-   restart_db->putBool("d_use_ghosts_for_dt", d_use_ghosts_for_dt);
-   restart_db->putBool("d_do_coarsening", d_do_coarsening);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -2448,28 +2415,7 @@ void MblkHyperbolicLevelIntegrator::getFromInput(
  */
 void MblkHyperbolicLevelIntegrator::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION");
-   if (ver != ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION) {
-      TBOX_ERROR(d_object_name << ":  "
-                               << "Restart file version different "
-                               << "than class version." << std::endl);
-   }
-
-   d_cfl = db->getDouble("d_cfl");
-   d_cfl_init = db->getDouble("d_cfl_init");
-   d_lag_dt_computation = db->getBool("d_lag_dt_computation");
-   d_use_ghosts_for_dt = db->getBool("d_use_ghosts_for_dt");
-   d_do_coarsening = db->getBool("d_do_coarsening");
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

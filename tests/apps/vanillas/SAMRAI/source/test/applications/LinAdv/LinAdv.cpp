@@ -11,6 +11,9 @@
 
 #include <iostream>
 #include <iomanip>
+#include <limits>
+
+#include "SAMRAI/hier/VariableDatabase.h"
 #include <fstream>
 
 #ifndef LACKS_SSTREAM
@@ -44,12 +47,10 @@
 #include "SAMRAI/pdat/NodeData.h"
 #include "SAMRAI/mesh/CascadePartitioner.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 #include "SAMRAI/tbox/MathUtilities.h"
 #include "SAMRAI/tbox/Collectives.h"
 #include "SAMRAI/tbox/NVTXUtilities.h"
-#include "SAMRAI/hier/PatchDataRestartManager.h"
 #include "SAMRAI/hier/VariableDatabase.h"
 
 
@@ -96,23 +97,6 @@
 #define FALSE (0)
 #endif
 
-// Version of LinAdv restart file data
-#define LINADV_VERSION (3)
-
-/*
- *************************************************************************
- *
- * The constructor for LinAdv class sets data members to defualt values,
- * creates variables that define the solution state for the linear
- * advection equation.
- *
- * After default values are set, this routine calls getFromRestart()
- * if execution from a restart file is specified.  Finally,
- * getFromInput() is called to read values from the given input
- * database (potentially overriding those found in the restart file).
- *
- *************************************************************************
- */
 
 LinAdv::LinAdv(
    const std::string& object_name,
@@ -147,9 +131,6 @@ LinAdv::LinAdv(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(input_db);
    TBOX_ASSERT(grid_geom);
-
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name, this);
-
    TBOX_ASSERT(CELLG == FACEG);
 
    // SPHERE problem...
@@ -205,15 +186,10 @@ LinAdv::LinAdv(
       tbox::MathUtilities<double>::setVectorToSignalingNaN(d_bdry_face_uval);
    }
 
-   /*
-    * Native restart support has been removed from this vanilla, so we always
-    * initialize from input data only and never call getFromRestart().
-    */
-   const bool is_from_restart = false;
-   getFromInput(input_db, is_from_restart);
+      getFromInput(input_db);
 
    /*
-    * Set problem data to values read from input/restart.
+    * Set problem data to values read from input.
     */
 
    if (d_data_problem == "PIECEWISE_CONSTANT_X") {
@@ -239,7 +215,7 @@ LinAdv::LinAdv(
    }
 
    /*
-    * Postprocess boundary data from input/restart values.  Note: scalar
+    * Postprocess boundary data from input values.  Note: scalar
     * quantity in this problem cannot have reflective boundary conditions
     * so we reset them to FLOW.
     */
@@ -328,6 +304,102 @@ LinAdv::LinAdv(
 LinAdv::~LinAdv() {
 }
 
+
+void
+LinAdv::dumpValidationSignature(
+    const std::shared_ptr<hier::PatchHierarchy>& hierarchy)
+{
+    const tbox::SAMRAI_MPI& mpi(tbox::SAMRAI_MPI::getSAMRAIWorld());
+
+    // Look up the variable id for d_uval against the CURRENT data context
+    // managed by the variable database (HyperbolicLevelIntegrator
+    // registers d_uval under "CURRENT").  The LinAdv-side getDataContext()
+    // is reset to null once the time loop completes, so we cannot rely on
+    // it here.
+    hier::VariableDatabase* var_db = hier::VariableDatabase::getDatabase();
+    std::shared_ptr<hier::VariableContext> ctx = var_db->getContext("CURRENT");
+    int uval_id = var_db->mapVariableAndContextToIndex(d_uval, ctx);
+    if (uval_id < 0) {
+        // Fallback: try the LinAdv-owned context if it is still set.
+        std::shared_ptr<hier::VariableContext> own = getDataContext();
+        if (own) {
+            uval_id = var_db->mapVariableAndContextToIndex(d_uval, own);
+        }
+    }
+
+    double local_sum = 0.0;
+    double local_sum2 = 0.0;
+    double local_max = -std::numeric_limits<double>::infinity();
+    double local_min = std::numeric_limits<double>::infinity();
+    long local_count = 0;
+
+    if (uval_id >= 0) {
+        const int num_levels = hierarchy->getNumberOfLevels();
+        for (int ln = 0; ln < num_levels; ++ln) {
+            std::shared_ptr<hier::PatchLevel> level = hierarchy->getPatchLevel(ln);
+            for (hier::PatchLevel::iterator pi(level->begin()); pi != level->end(); ++pi) {
+                std::shared_ptr<hier::Patch> patch = *pi;
+                std::shared_ptr<hier::PatchData> raw = patch->getPatchData(uval_id);
+                if (!raw) continue;
+                std::shared_ptr<pdat::CellData<double> > uval(
+                    SAMRAI_SHARED_PTR_CAST<pdat::CellData<double>, hier::PatchData>(raw));
+                if (!uval) continue;
+                const hier::Box& pbox = patch->getBox();
+                pdat::CellIterator icend(pdat::CellGeometry::end(pbox));
+                for (pdat::CellIterator ic(pdat::CellGeometry::begin(pbox));
+                     ic != icend; ++ic) {
+                    const pdat::CellIndex& ci(*ic);
+                    const double v = (*uval)(ci);
+                    local_sum  += v;
+                    local_sum2 += v * v;
+                    if (v > local_max) local_max = v;
+                    if (v < local_min) local_min = v;
+                    ++local_count;
+                }
+            }
+        }
+    }
+
+    double agg[2] = { local_sum, local_sum2 };
+    mpi.AllReduce(agg, 2, MPI_SUM);
+    mpi.AllReduce(&local_max, 1, MPI_MAX);
+    mpi.AllReduce(&local_min, 1, MPI_MIN);
+    int local_count_int = static_cast<int>(local_count);
+    mpi.AllReduce(&local_count_int, 1, MPI_SUM);
+
+    if (mpi.getRank() == 0) {
+        // Stdout copy (informational only — no longer drives the verdict).
+        std::cout << "VALIDATION_SIGNATURE:"
+                  << " sum="   << std::scientific << std::setprecision(10) << agg[0]
+                  << " sum2="  << agg[1]
+                  << " max="   << local_max
+                  << " min="   << local_min
+                  << " count=" << local_count_int << std::endl;
+
+        // Authoritative golden artifact: raw binary doubles, in process
+        // memory layout, written to validation_output.bin in the run cwd.
+        // The validation framework's NumericToleranceComparator reads
+        // this via np.fromfile(dtype=np.float64), enforces length parity
+        // (shape check), and compares element-wise with relative
+        // tolerance 1e-12.  No precision loss, no parsing, no
+        // length-mismatch ambiguity, no per-line suppression vector for
+        // the LLM to exploit.  Five doubles (sum, sum², max, min,
+        // count-as-double) = 40 bytes.
+        std::FILE* fp = std::fopen("validation_output.bin", "wb");
+        if (fp != nullptr) {
+            const double values[5] = {
+                agg[0],
+                agg[1],
+                local_max,
+                local_min,
+                static_cast<double>(local_count_int),
+            };
+            std::fwrite(values, sizeof(double), 5, fp);
+            std::fclose(fp);
+        }
+    }
+}
+
 /*
  *************************************************************************
  *
@@ -397,11 +469,7 @@ void LinAdv::setupLoadBalancer(
 
    const hier::IntVector& zero_vec = hier::IntVector::getZero(d_dim);
 
-   hier::VariableDatabase* vardb = hier::VariableDatabase::getDatabase();
-   hier::PatchDataRestartManager* pdrm =
-      hier::PatchDataRestartManager::getManager();
-
-   if (d_use_nonuniform_workload && gridding_algorithm) {
+   hier::VariableDatabase* vardb = hier::VariableDatabase::getDatabase();   if (d_use_nonuniform_workload && gridding_algorithm) {
       std::shared_ptr<mesh::CascadePartitioner> load_balancer(
          std::dynamic_pointer_cast<mesh::CascadePartitioner, mesh::LoadBalanceStrategy>(
             gridding_algorithm->getLoadBalanceStrategy()));
@@ -417,7 +485,6 @@ void LinAdv::setupLoadBalancer(
                vardb->getContext("WORKLOAD"),
                zero_vec);
          load_balancer->setWorkloadPatchDataIndex(d_workload_data_id);
-         pdrm->registerPatchDataForRestart(d_workload_data_id);
       } else {
          TBOX_WARNING(
             d_object_name << ": "
@@ -2313,31 +2380,18 @@ void LinAdv::printClassData(
 /*
  *************************************************************************
  *
- * Read data members from input.  All values set from restart can be
- * overridden by values in the input database.
+ * Read data members from input.
  *
  *************************************************************************
  */
 void LinAdv::getFromInput(
-   std::shared_ptr<tbox::Database> input_db,
-   bool is_from_restart)
+   std::shared_ptr<tbox::Database> input_db)
 {
    TBOX_ASSERT(input_db);
 
-   /*
-    * Note: if we are restarting, then we only allow nonuniform
-    * workload to be used if nonuniform workload was used originally.
-    */
-   if (!is_from_restart) {
-      d_use_nonuniform_workload =
-         input_db->getBoolWithDefault("use_nonuniform_workload",
-            d_use_nonuniform_workload);
-   } else {
-      if (d_use_nonuniform_workload) {
-         d_use_nonuniform_workload =
-            input_db->getBool("use_nonuniform_workload");
-      }
-   }
+   d_use_nonuniform_workload =
+      input_db->getBoolWithDefault("use_nonuniform_workload",
+         d_use_nonuniform_workload);
 
    if (input_db->keyExists("advection_velocity")) {
       input_db->getDoubleArray("advection_velocity",
@@ -2584,172 +2638,169 @@ void LinAdv::getFromInput(
       input_db->getBoolWithDefault("write_coord_values", false);
 #endif
 
-   if (!is_from_restart) {
+   if (input_db->keyExists("data_problem")) {
+      d_data_problem = input_db->getString("data_problem");
+   } else {
+      TBOX_ERROR(
+         d_object_name << ": "
+                       << "`data_problem' value not found in input."
+                       << std::endl);
+   }
 
-      if (input_db->keyExists("data_problem")) {
-         d_data_problem = input_db->getString("data_problem");
+   if (!input_db->keyExists("Initial_data")) {
+      TBOX_ERROR(
+         d_object_name << ": "
+                       << "No `Initial_data' database found in input." << std::endl);
+   }
+   std::shared_ptr<tbox::Database> init_data_db(
+      input_db->getDatabase("Initial_data"));
+
+   bool found_problem_data = false;
+
+   if (d_data_problem == "SPHERE") {
+
+      if (init_data_db->keyExists("radius")) {
+         d_radius = init_data_db->getDouble("radius");
       } else {
          TBOX_ERROR(
             d_object_name << ": "
-                          << "`data_problem' value not found in input."
+                          << "`radius' input required for SPHERE problem." << std::endl);
+      }
+      if (init_data_db->keyExists("center")) {
+         d_center = init_data_db->getDoubleVector("center");
+      } else {
+         TBOX_ERROR(
+            d_object_name << ": "
+                          << "`center' input required for SPHERE problem." << std::endl);
+      }
+      if (init_data_db->keyExists("uval_inside")) {
+         d_uval_inside = init_data_db->getDouble("uval_inside");
+      } else {
+         TBOX_ERROR(d_object_name << ": "
+                                  << "`uval_inside' input required for "
+                                  << "SPHERE problem." << std::endl);
+      }
+      if (init_data_db->keyExists("uval_outside")) {
+         d_uval_outside = init_data_db->getDouble("uval_outside");
+      } else {
+         TBOX_ERROR(d_object_name << ": "
+                                  << "`uval_outside' input required for "
+                                  << "SPHERE problem." << std::endl);
+      }
+
+      found_problem_data = true;
+
+   }
+
+   if (!found_problem_data &&
+       ((d_data_problem == "PIECEWISE_CONSTANT_X") ||
+        (d_data_problem == "PIECEWISE_CONSTANT_Y") ||
+        (d_data_problem == "PIECEWISE_CONSTANT_Z") ||
+        (d_data_problem == "SINE_CONSTANT_X") ||
+        (d_data_problem == "SINE_CONSTANT_Y") ||
+        (d_data_problem == "SINE_CONSTANT_Z"))) {
+
+      int idir = 0;
+      if (d_data_problem == "PIECEWISE_CONSTANT_Y") {
+         if (d_dim < tbox::Dimension(2)) {
+            TBOX_ERROR(
+               d_object_name << ": `PIECEWISE_CONSTANT_Y' "
+                             << "problem invalid in 1 dimension."
+                             << std::endl);
+         }
+         idir = 1;
+      }
+
+      if (d_data_problem == "PIECEWISE_CONSTANT_Z") {
+         if (d_dim < tbox::Dimension(3)) {
+            TBOX_ERROR(
+               d_object_name << ": `PIECEWISE_CONSTANT_Z' "
+                             << "problem invalid in 1 or 2 dimensions." << std::endl);
+         }
+         idir = 2;
+      }
+
+      std::vector<std::string> init_data_keys = init_data_db->getAllKeys();
+
+      if (init_data_db->keyExists("front_position")) {
+         d_front_position = init_data_db->getDoubleVector("front_position");
+      } else {
+         TBOX_ERROR(d_object_name << ": "
+                                  << "`front_position' input required for "
+                                  << d_data_problem << " problem." << std::endl);
+      }
+      d_number_of_intervals =
+         tbox::MathUtilities<int>::Min(static_cast<int>(d_front_position.size()) + 1,
+            static_cast<int>(init_data_keys.size()) - 1);
+
+      d_front_position.resize(static_cast<int>(d_front_position.size()) + 1);
+      d_front_position[static_cast<int>(d_front_position.size()) - 1] =
+         d_grid_geometry->getXUpper()[idir];
+
+      d_interval_uval.resize(d_number_of_intervals);
+
+      int i = 0;
+      int nkey = 0;
+      bool found_interval_data = false;
+
+      while (!found_interval_data
+             && (i < d_number_of_intervals)
+             && (nkey < static_cast<int>(init_data_keys.size()))) {
+
+         if (!(init_data_keys[nkey] == "front_position")) {
+
+            std::shared_ptr<tbox::Database> interval_db(
+               init_data_db->getDatabase(init_data_keys[nkey]));
+
+            if (interval_db->keyExists("uval")) {
+               d_interval_uval[i] = interval_db->getDouble("uval");
+            } else {
+               TBOX_ERROR(d_object_name << ": "
+                                        << "`uval' data missing in input for key = "
+                                        << init_data_keys[nkey] << std::endl);
+            }
+            ++i;
+
+            found_interval_data = (i == d_number_of_intervals);
+
+         }
+
+         ++nkey;
+
+      }
+
+      if ((d_data_problem == "SINE_CONSTANT_X") ||
+          (d_data_problem == "SINE_CONSTANT_Y") ||
+          (d_data_problem == "SINE_CONSTANT_Z")) {
+         if (init_data_db->keyExists("amplitude")) {
+            d_amplitude = init_data_db->getDouble("amplitude");
+         }
+         if (init_data_db->keyExists("frequency")) {
+            init_data_db->getDoubleArray("frequency", &d_frequency[0], d_dim.getValue());
+         } else {
+            TBOX_ERROR(
+               d_object_name << ": "
+                             << "`frequency' input required for SINE problem." << std::endl);
+         }
+      }
+
+      if (!found_interval_data) {
+         TBOX_ERROR(
+            d_object_name << ": "
+                          << "Insufficient interval data given in input"
+                          << " for PIECEWISE_CONSTANT_*problem."
                           << std::endl);
       }
 
-      if (!input_db->keyExists("Initial_data")) {
-         TBOX_ERROR(
-            d_object_name << ": "
-                          << "No `Initial_data' database found in input." << std::endl);
-      }
-      std::shared_ptr<tbox::Database> init_data_db(
-         input_db->getDatabase("Initial_data"));
+      found_problem_data = true;
+   }
 
-      bool found_problem_data = false;
+   if (!found_problem_data) {
+      TBOX_ERROR(d_object_name << ": "
+                               << "`Initial_data' database found in input."
+                               << " But bad data supplied." << std::endl);
+   }
 
-      if (d_data_problem == "SPHERE") {
-
-         if (init_data_db->keyExists("radius")) {
-            d_radius = init_data_db->getDouble("radius");
-         } else {
-            TBOX_ERROR(
-               d_object_name << ": "
-                             << "`radius' input required for SPHERE problem." << std::endl);
-         }
-         if (init_data_db->keyExists("center")) {
-            d_center = init_data_db->getDoubleVector("center");
-         } else {
-            TBOX_ERROR(
-               d_object_name << ": "
-                             << "`center' input required for SPHERE problem." << std::endl);
-         }
-         if (init_data_db->keyExists("uval_inside")) {
-            d_uval_inside = init_data_db->getDouble("uval_inside");
-         } else {
-            TBOX_ERROR(d_object_name << ": "
-                                     << "`uval_inside' input required for "
-                                     << "SPHERE problem." << std::endl);
-         }
-         if (init_data_db->keyExists("uval_outside")) {
-            d_uval_outside = init_data_db->getDouble("uval_outside");
-         } else {
-            TBOX_ERROR(d_object_name << ": "
-                                     << "`uval_outside' input required for "
-                                     << "SPHERE problem." << std::endl);
-         }
-
-         found_problem_data = true;
-
-      }
-
-      if (!found_problem_data &&
-          ((d_data_problem == "PIECEWISE_CONSTANT_X") ||
-           (d_data_problem == "PIECEWISE_CONSTANT_Y") ||
-           (d_data_problem == "PIECEWISE_CONSTANT_Z") ||
-           (d_data_problem == "SINE_CONSTANT_X") ||
-           (d_data_problem == "SINE_CONSTANT_Y") ||
-           (d_data_problem == "SINE_CONSTANT_Z"))) {
-
-         int idir = 0;
-         if (d_data_problem == "PIECEWISE_CONSTANT_Y") {
-            if (d_dim < tbox::Dimension(2)) {
-               TBOX_ERROR(
-                  d_object_name << ": `PIECEWISE_CONSTANT_Y' "
-                                << "problem invalid in 1 dimension."
-                                << std::endl);
-            }
-            idir = 1;
-         }
-
-         if (d_data_problem == "PIECEWISE_CONSTANT_Z") {
-            if (d_dim < tbox::Dimension(3)) {
-               TBOX_ERROR(
-                  d_object_name << ": `PIECEWISE_CONSTANT_Z' "
-                                << "problem invalid in 1 or 2 dimensions." << std::endl);
-            }
-            idir = 2;
-         }
-
-         std::vector<std::string> init_data_keys = init_data_db->getAllKeys();
-
-         if (init_data_db->keyExists("front_position")) {
-            d_front_position = init_data_db->getDoubleVector("front_position");
-         } else {
-            TBOX_ERROR(d_object_name << ": "
-                                     << "`front_position' input required for "
-                                     << d_data_problem << " problem." << std::endl);
-         }
-         d_number_of_intervals =
-            tbox::MathUtilities<int>::Min(static_cast<int>(d_front_position.size()) + 1,
-               static_cast<int>(init_data_keys.size()) - 1);
-
-         d_front_position.resize(static_cast<int>(d_front_position.size()) + 1);
-         d_front_position[static_cast<int>(d_front_position.size()) - 1] =
-            d_grid_geometry->getXUpper()[idir];
-
-         d_interval_uval.resize(d_number_of_intervals);
-
-         int i = 0;
-         int nkey = 0;
-         bool found_interval_data = false;
-
-         while (!found_interval_data
-                && (i < d_number_of_intervals)
-                && (nkey < static_cast<int>(init_data_keys.size()))) {
-
-            if (!(init_data_keys[nkey] == "front_position")) {
-
-               std::shared_ptr<tbox::Database> interval_db(
-                  init_data_db->getDatabase(init_data_keys[nkey]));
-
-               if (interval_db->keyExists("uval")) {
-                  d_interval_uval[i] = interval_db->getDouble("uval");
-               } else {
-                  TBOX_ERROR(d_object_name << ": "
-                                           << "`uval' data missing in input for key = "
-                                           << init_data_keys[nkey] << std::endl);
-               }
-               ++i;
-
-               found_interval_data = (i == d_number_of_intervals);
-
-            }
-
-            ++nkey;
-
-         }
-
-         if ((d_data_problem == "SINE_CONSTANT_X") ||
-             (d_data_problem == "SINE_CONSTANT_Y") ||
-             (d_data_problem == "SINE_CONSTANT_Z")) {
-            if (init_data_db->keyExists("amplitude")) {
-               d_amplitude = init_data_db->getDouble("amplitude");
-            }
-            if (init_data_db->keyExists("frequency")) {
-               init_data_db->getDoubleArray("frequency", &d_frequency[0], d_dim.getValue());
-            } else {
-               TBOX_ERROR(
-                  d_object_name << ": "
-                                << "`frequency' input required for SINE problem." << std::endl);
-            }
-         }
-
-         if (!found_interval_data) {
-            TBOX_ERROR(
-               d_object_name << ": "
-                             << "Insufficient interval data given in input"
-                             << " for PIECEWISE_CONSTANT_*problem."
-                             << std::endl);
-         }
-
-         found_problem_data = true;
-      }
-
-      if (!found_problem_data) {
-         TBOX_ERROR(d_object_name << ": "
-                                  << "`Initial_data' database found in input."
-                                  << " But bad data supplied." << std::endl);
-      }
-
-   } // if !is_from_restart read in problem data
 
    const hier::IntVector& one_vec = hier::IntVector::getOne(d_dim);
    hier::IntVector periodic(d_grid_geometry->getPeriodicShift(one_vec));
@@ -2787,208 +2838,9 @@ void LinAdv::getFromInput(
 
 }
 
-/*
- *************************************************************************
- *
- * Routines to put/get data members to/from restart database.
- *
- *************************************************************************
- */
 
-void LinAdv::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   TBOX_ASSERT(restart_db);
 
-   restart_db->putInteger("LINADV_VERSION", LINADV_VERSION);
 
-   restart_db->putDoubleVector("d_advection_velocity", d_advection_velocity);
-   restart_db->putDouble("d_source", d_source);
-   restart_db->putBool("d_check_fluxes", d_check_fluxes);
-
-   restart_db->putInteger("d_godunov_order", d_godunov_order);
-   restart_db->putString("d_corner_transport", d_corner_transport);
-   restart_db->putIntegerArray("d_nghosts", &d_nghosts[0], d_dim.getValue());
-   restart_db->putIntegerArray("d_fluxghosts",
-      &d_fluxghosts[0],
-      d_dim.getValue());
-
-   restart_db->putString("d_data_problem", d_data_problem);
-
-   if (d_data_problem == "SPHERE") {
-      restart_db->putDouble("d_radius", d_radius);
-      restart_db->putDoubleVector("d_center", d_center);
-      restart_db->putDouble("d_uval_inside", d_uval_inside);
-      restart_db->putDouble("d_uval_outside", d_uval_outside);
-   }
-
-   if ((d_data_problem == "PIECEWISE_CONSTANT_X") ||
-       (d_data_problem == "PIECEWISE_CONSTANT_Y") ||
-       (d_data_problem == "PIECEWISE_CONSTANT_Z") ||
-       (d_data_problem == "SINE_CONSTANT_X") ||
-       (d_data_problem == "SINE_CONSTANT_Y") ||
-       (d_data_problem == "SINE_CONSTANT_Z")) {
-      restart_db->putInteger("d_number_of_intervals", d_number_of_intervals);
-      if (d_number_of_intervals > 0) {
-         restart_db->putDoubleVector("d_front_position", d_front_position);
-         restart_db->putDoubleVector("d_interval_uval", d_interval_uval);
-      }
-   }
-
-   restart_db->putIntegerVector("d_scalar_bdry_edge_conds",
-      d_scalar_bdry_edge_conds);
-   restart_db->putIntegerVector("d_scalar_bdry_node_conds",
-      d_scalar_bdry_node_conds);
-
-   if (d_dim == tbox::Dimension(2)) {
-      restart_db->putDoubleVector("d_bdry_edge_uval", d_bdry_edge_uval);
-   }
-   if (d_dim == tbox::Dimension(3)) {
-      restart_db->putIntegerVector("d_scalar_bdry_face_conds",
-         d_scalar_bdry_face_conds);
-      restart_db->putDoubleVector("d_bdry_face_uval", d_bdry_face_uval);
-   }
-
-   if (d_refinement_criteria.size() > 0) {
-      restart_db->putStringVector("d_refinement_criteria",
-         d_refinement_criteria);
-   }
-   for (int i = 0; i < static_cast<int>(d_refinement_criteria.size()); ++i) {
-
-      if (d_refinement_criteria[i] == "UVAL_DEVIATION") {
-         restart_db->putDoubleVector("d_dev_tol", d_dev_tol);
-         restart_db->putDoubleVector("d_dev", d_dev);
-         restart_db->putDoubleVector("d_dev_time_max", d_dev_time_max);
-         restart_db->putDoubleVector("d_dev_time_min", d_dev_time_min);
-      } else if (d_refinement_criteria[i] == "UVAL_GRADIENT") {
-         restart_db->putDoubleVector("d_grad_tol", d_grad_tol);
-         restart_db->putDoubleVector("d_grad_time_max", d_grad_time_max);
-         restart_db->putDoubleVector("d_grad_time_min", d_grad_time_min);
-      } else if (d_refinement_criteria[i] == "UVAL_SHOCK") {
-         restart_db->putDoubleVector("d_shock_onset", d_shock_onset);
-         restart_db->putDoubleVector("d_shock_tol", d_shock_tol);
-         restart_db->putDoubleVector("d_shock_time_max", d_shock_time_max);
-         restart_db->putDoubleVector("d_shock_time_min", d_shock_time_min);
-      } else if (d_refinement_criteria[i] == "UVAL_RICHARDSON") {
-         restart_db->putDoubleVector("d_rich_tol", d_rich_tol);
-         restart_db->putDoubleVector("d_rich_time_max", d_rich_time_max);
-         restart_db->putDoubleVector("d_rich_time_min", d_rich_time_min);
-      }
-
-   }
-
-}
-
-/*
- *************************************************************************
- *
- *    Access class information from restart database.
- *
- *************************************************************************
- */
-void LinAdv::getFromRestart()
-{
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file.");
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("LINADV_VERSION");
-   if (ver != LINADV_VERSION) {
-      TBOX_ERROR(
-         d_object_name << ":  "
-                       << "Restart file version different than class version.");
-   }
-
-   d_advection_velocity = db->getDoubleVector("d_advection_velocity");
-   d_source = db->getDouble("d_source");
-   d_check_fluxes = db->getBool("d_check_fluxes");
-
-   d_godunov_order = db->getInteger("d_godunov_order");
-   d_corner_transport = db->getString("d_corner_transport");
-
-   int* tmp_nghosts = &d_nghosts[0];
-   db->getIntegerArray("d_nghosts", tmp_nghosts, d_dim.getValue());
-   if (!(d_nghosts == CELLG)) {
-      TBOX_ERROR(
-         d_object_name << ": "
-                       << "Key data `d_nghosts' in restart file != CELLG." << std::endl);
-   }
-   int* tmp_fluxghosts = &d_fluxghosts[0];
-   db->getIntegerArray("d_fluxghosts", tmp_fluxghosts, d_dim.getValue());
-   if (!(d_fluxghosts == FLUXG)) {
-      TBOX_ERROR(
-         d_object_name << ": "
-                       << "Key data `d_fluxghosts' in restart file != FLUXG." << std::endl);
-   }
-
-   d_data_problem = db->getString("d_data_problem");
-
-   if (d_data_problem == "SPHERE") {
-      d_data_problem_int = SPHERE;
-      d_radius = db->getDouble("d_radius");
-      d_center = db->getDoubleVector("d_center");
-      d_uval_inside = db->getDouble("d_uval_inside");
-      d_uval_outside = db->getDouble("d_uval_outside");
-   }
-
-   if ((d_data_problem == "PIECEWISE_CONSTANT_X") ||
-       (d_data_problem == "PIECEWISE_CONSTANT_Y") ||
-       (d_data_problem == "PIECEWISE_CONSTANT_Z") ||
-       (d_data_problem == "SINE_CONSTANT_X") ||
-       (d_data_problem == "SINE_CONSTANT_Y") ||
-       (d_data_problem == "SINE_CONSTANT_Z")) {
-      d_number_of_intervals = db->getInteger("d_number_of_intervals");
-      if (d_number_of_intervals > 0) {
-         d_front_position = db->getDoubleVector("d_front_position");
-         d_interval_uval = db->getDoubleVector("d_interval_uval");
-      }
-   }
-
-   d_scalar_bdry_edge_conds = db->getIntegerVector("d_scalar_bdry_edge_conds");
-   d_scalar_bdry_node_conds = db->getIntegerVector("d_scalar_bdry_node_conds");
-
-   if (d_dim == tbox::Dimension(2)) {
-      d_bdry_edge_uval = db->getDoubleVector("d_bdry_edge_uval");
-   }
-   if (d_dim == tbox::Dimension(3)) {
-      d_scalar_bdry_face_conds =
-         db->getIntegerVector("d_scalar_bdry_face_conds");
-
-      d_bdry_face_uval = db->getDoubleVector("d_bdry_face_uval");
-   }
-
-   if (db->keyExists("d_refinement_criteria")) {
-      d_refinement_criteria = db->getStringVector("d_refinement_criteria");
-   }
-   for (int i = 0; i < static_cast<int>(d_refinement_criteria.size()); ++i) {
-
-      if (d_refinement_criteria[i] == "UVAL_DEVIATION") {
-         d_dev_tol = db->getDoubleVector("d_dev_tol");
-         d_dev_time_max = db->getDoubleVector("d_dev_time_max");
-         d_dev_time_min = db->getDoubleVector("d_dev_time_min");
-      } else if (d_refinement_criteria[i] == "UVAL_GRADIENT") {
-         d_grad_tol = db->getDoubleVector("d_grad_tol");
-         d_grad_time_max = db->getDoubleVector("d_grad_time_max");
-         d_grad_time_min = db->getDoubleVector("d_grad_time_min");
-      } else if (d_refinement_criteria[i] == "UVAL_SHOCK") {
-         d_shock_onset = db->getDoubleVector("d_shock_onset");
-         d_shock_tol = db->getDoubleVector("d_shock_tol");
-         d_shock_time_max = db->getDoubleVector("d_shock_time_max");
-         d_shock_time_min = db->getDoubleVector("d_shock_time_min");
-      } else if (d_refinement_criteria[i] == "UVAL_RICHARDSON") {
-         d_rich_tol = db->getDoubleVector("d_rich_tol");
-         d_rich_time_max = db->getDoubleVector("d_rich_time_max");
-         d_rich_time_min = db->getDoubleVector("d_rich_time_min");
-      }
-
-   }
-
-}
 
 /*
  *************************************************************************

@@ -202,41 +202,39 @@ Nyx::hydro_setup()
     Interpolater* interp = &cell_cons_interp;
 
     // Note that the default is state_data_extrap = false,
-    // store_in_checkpoint = true.  We only need to put these in
     // explicitly if we want to do something different,
-    // like not store the state data in a checkpoint directory
     bool state_data_extrap = false;
-    bool store_in_checkpoint;
+    bool persist_state;
 
-    store_in_checkpoint = true;
+    persist_state = true;
     desc_lst.addDescriptor(State_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, nghost_state, NUM_STATE, interp,
-                           state_data_extrap, store_in_checkpoint);
+                           state_data_extrap, persist_state);
 
     // This has two components: Temperature and Ne
     desc_lst.addDescriptor(DiagEOS_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, nghost_state, NDIAG_C, interp,
-                           state_data_extrap, store_in_checkpoint);
+                           state_data_extrap, persist_state);
 
 #ifdef SDC
     // This only has one component -- the update to rho_e from reactions
-    store_in_checkpoint = true;
+    persist_state = true;
     desc_lst.addDescriptor(SDC_IR_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, 1, interp,
-                           state_data_extrap, store_in_checkpoint);
+                           state_data_extrap, persist_state);
 #endif
 
-    store_in_checkpoint = true;
+    persist_state = true;
     desc_lst.addDescriptor(PhiGrav_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, 1,
                            &cell_cons_interp, state_data_extrap,
-                           store_in_checkpoint);
+                           persist_state);
 
-    store_in_checkpoint = false;
+    persist_state = false;
     desc_lst.addDescriptor(Gravity_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, AMREX_SPACEDIM,
                            &cell_cons_interp, state_data_extrap,
-                           store_in_checkpoint);
+                           persist_state);
 
     Vector<BCRec> bcs(NUM_STATE);
     Vector<std::string> name(NUM_STATE);
@@ -608,11 +606,9 @@ Nyx::no_hydro_setup()
 #endif
 
     // Note that the default is state_data_extrap = false,
-    // store_in_checkpoint = true.  We only need to put these in
     // explicitly if we want to do something different,
-    // like not store the state data in a checkpoint directory
     bool state_data_extrap = false;
-    bool store_in_checkpoint;
+    bool persist_state;
 
     BCRec bc;
 
@@ -622,38 +618,38 @@ Nyx::no_hydro_setup()
 #ifndef NO_HYDRO
     // We have to create these anyway because the StateTypes are defined at compile time.
     // However, we define them with only one component each because we don't actually use them.
-    store_in_checkpoint = false;
+    persist_state = false;
     // This has only one dummy components
     desc_lst.addDescriptor(State_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, 1, &cell_cons_interp,
-                           state_data_extrap, store_in_checkpoint);
+                           state_data_extrap, persist_state);
 
     set_scalar_bc(bc, phys_bc);
     desc_lst.setComponent(State_Type, 0, "density", bc,
                           bndryfunc);
 
     // This has only one dummy components
-    store_in_checkpoint = false;
+    persist_state = false;
     desc_lst.addDescriptor(DiagEOS_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, 1, &cell_cons_interp,
-                           state_data_extrap, store_in_checkpoint);
+                           state_data_extrap, persist_state);
 
     set_scalar_bc(bc, phys_bc);
     desc_lst.setComponent(DiagEOS_Type, 0, "Temp", bc,
                           bndryfunc);
 #endif
 
-    store_in_checkpoint = true;
+    persist_state = true;
     desc_lst.addDescriptor(PhiGrav_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, 1,
                            &cell_cons_interp, state_data_extrap,
-                           store_in_checkpoint);
+                           persist_state);
 
-    store_in_checkpoint = false;
+    persist_state = false;
     desc_lst.addDescriptor(Gravity_Type, IndexType::TheCellType(),
                            StateDescriptor::Point, 1, AMREX_SPACEDIM,
                            &cell_cons_interp, state_data_extrap,
-                           store_in_checkpoint);
+                           persist_state);
 
     if (do_grav)
     {

@@ -41,7 +41,6 @@ public:
     enum signal_action_requested_labels {
         //! Cleanly stop execution, as if the simulation reached its configured end
         SIGNAL_REQUESTS_BREAK = 0,
-        //! Produce a checkpoint
         SIGNAL_REQUESTS_CHECKPOINT = 1,
         SIGNAL_REQUESTS_SIZE = 2 // This should always be 1 greater than the last valid value
     };

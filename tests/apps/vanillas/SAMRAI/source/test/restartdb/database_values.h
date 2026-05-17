@@ -17,7 +17,6 @@
 #include "SAMRAI/tbox/Complex.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 
 #include <string>
 

@@ -430,7 +430,7 @@ Nyx::init_from_plotfile ()
     // Make sure to read in "a" before we call ReadPlotFile since we will use a 
     //      when we construct e from T.
 
-    bool is_checkpoint = false;
+    
 
     // Now read in the time as well as the grid and particle data
     bool first = true;
@@ -440,8 +440,6 @@ Nyx::init_from_plotfile ()
     // This is just a dummy value so that we can set the current time of the StateData
     Real dummy_dt = 1.e100;
     setTimeLevel(parent->cumTime(), dummy_dt, dummy_dt);
-
-    comoving_a_post_restart(parent->theRestartPlotFile());
 
 #ifndef NO_HYDRO
     for (int lev = 0; lev <= parent->finestLevel(); ++lev)
@@ -465,8 +463,6 @@ Nyx::init_from_plotfile ()
 #endif
 
     // Now read the particles from the plotfile
-    particle_post_restart(parent->theRestartPlotFile(),is_checkpoint);
-
     if (verbose && ParallelDescriptor::IOProcessor())
     {
         std::cout << "Done initializing the particles from the plotfile " << std::endl;

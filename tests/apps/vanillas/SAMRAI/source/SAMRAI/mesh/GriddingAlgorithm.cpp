@@ -10,7 +10,6 @@
 #include "SAMRAI/mesh/GriddingAlgorithm.h"
 
 #include "SAMRAI/tbox/IEEE.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/hier/BoxContainer.h"
 #include "SAMRAI/hier/BoxUtilities.h"
 #include "SAMRAI/hier/PeriodicShiftCatalog.h"
@@ -108,9 +107,6 @@ GriddingAlgorithm::GriddingAlgorithm(
    TBOX_ASSERT(tag_init_strategy);
    TBOX_ASSERT(generator);
    TBOX_ASSERT(balancer);
-
-   tbox::RestartManager::getManager()->
-   registerRestartItem(d_object_name, this);
 
    d_hierarchy->registerConnectorWidthRequestor(
       d_connector_width_requestor);
@@ -227,7 +223,7 @@ GriddingAlgorithm::GriddingAlgorithm(
    /*
     * Initialize object with data read from input and restart databases.
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -305,8 +301,7 @@ GriddingAlgorithm::GriddingAlgorithm(
  */
 GriddingAlgorithm::~GriddingAlgorithm()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-   delete d_mb_tagger_strategy;
+      delete d_mb_tagger_strategy;
    d_mb_tagger_strategy = 0;
 }
 
@@ -4873,36 +4868,7 @@ void
 GriddingAlgorithm::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_GRIDDING_ALGORITHM_VERSION",
-      ALGS_GRIDDING_ALGORITHM_VERSION);
-
-   restart_db->putBool("check_overflow_nesting", d_check_overflow_nesting);
-   restart_db->putBool("check_proper_nesting", d_check_proper_nesting);
-   restart_db->putBool("DEV_check_connectors", d_check_connectors);
-   restart_db->putBool("DEV_print_steps", d_print_steps);
-   restart_db->putBool("DEV_log_metadata_statistics", d_log_metadata_statistics);
-
-   restart_db->putChar("check_nonrefined_tags", d_check_nonrefined_tags);
-   restart_db->putChar("check_overlapping_patches",
-      d_check_overlapping_patches);
-   restart_db->putChar("check_nonnesting_user_boxes",
-      d_check_nonnesting_user_boxes);
-   restart_db->putChar("DEV_check_boundary_proximity_violation",
-      d_check_boundary_proximity_violation);
-
-   restart_db->putBool("sequentialize_patch_indices",
-      d_sequentialize_patch_indices);
-
-   restart_db->putBool("enforce_proper_nesting", d_enforce_proper_nesting);
-   restart_db->putBool("DEV_extend_to_domain_boundary",
-      d_extend_to_domain_boundary);
-   restart_db->putBool("DEV_load_balance", d_load_balance);
-
-   restart_db->putBool("DEV_barrier_and_time", d_barrier_and_time);
-
-   restart_db->putBool("save_tag_data", d_save_tag_data);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -5097,44 +5063,7 @@ GriddingAlgorithm::getFromInput(
 void
 GriddingAlgorithm::getFromRestart()
 {
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file." << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("ALGS_GRIDDING_ALGORITHM_VERSION");
-   if (ver != ALGS_GRIDDING_ALGORITHM_VERSION) {
-      TBOX_ERROR(
-         d_object_name << ":  "
-                       << "Restart file version different than class version."
-                       << std::endl);
-   }
-
-   d_check_overflow_nesting = db->getBool("check_overflow_nesting");
-   d_check_proper_nesting = db->getBool("check_proper_nesting");
-   d_check_connectors = db->getBool("DEV_check_connectors");
-   d_print_steps = db->getBool("DEV_print_steps");
-   d_log_metadata_statistics = db->getBool("DEV_log_metadata_statistics");
-
-   d_check_nonrefined_tags = db->getChar("check_nonrefined_tags");
-   d_check_overlapping_patches = db->getChar("check_overlapping_patches");
-   d_check_nonnesting_user_boxes = db->getChar("check_nonnesting_user_boxes");
-   d_check_boundary_proximity_violation =
-      db->getChar("DEV_check_boundary_proximity_violation");
-
-   d_sequentialize_patch_indices = db->getBool("sequentialize_patch_indices");
-
-   d_enforce_proper_nesting = db->getBool("enforce_proper_nesting");
-   d_extend_to_domain_boundary = db->getBool("DEV_extend_to_domain_boundary");
-   d_load_balance = db->getBool("DEV_load_balance");
-
-   d_barrier_and_time = db->getBool("DEV_barrier_and_time");
-
-   d_save_tag_data = db->getBool("save_tag_data");
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

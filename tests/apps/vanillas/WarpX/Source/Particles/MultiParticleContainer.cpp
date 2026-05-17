@@ -1029,7 +1029,6 @@ MultiParticleContainer::SetDoBackTransformedParticles (const std::string& specie
 
            if ((!old_do_btd) && do_back_transformed_particles) {
                // Set comm to false so that the attributes are not communicated
-               // nor written to the checkpoint files
                int const comm = 0;
 #if (AMREX_SPACEDIM >= 2)
                pc->AddRealComp("x_n_btd", comm);

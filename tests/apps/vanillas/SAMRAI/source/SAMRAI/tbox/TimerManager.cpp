@@ -12,7 +12,6 @@
 #include "SAMRAI/tbox/TimerManager.h"
 #include "SAMRAI/tbox/InputDatabase.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/SAMRAIManager.h"
 #include "SAMRAI/tbox/StartupShutdownManager.h"
 #include "SAMRAI/tbox/IOStream.h"

@@ -332,7 +332,6 @@ Diagnostics::BaseReadParameters ()
     }
 
     const bool checkpoint_compatibility = (
-        m_format == "checkpoint" &&
         !varnames_specified &&
         !pfield_varnames_specified &&
         !pfield_species_specified &&

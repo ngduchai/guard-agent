@@ -12,7 +12,6 @@
 #ifdef HAVE_SUNDIALS
 
 #include "SAMRAI/solv/Sundials_SAMRAIVector.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 
 namespace SAMRAI {
@@ -66,12 +65,10 @@ KINSOL_SAMRAIContext::KINSOL_SAMRAIContext(
    d_eisenstat_walker_params[0] = 2.0;
    d_eisenstat_walker_params[1] = 0.9;
 
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name, this);
-
    /*
     * Initialize object with data read from the input and restart databases.
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -80,8 +77,6 @@ KINSOL_SAMRAIContext::KINSOL_SAMRAIContext(
 
 KINSOL_SAMRAIContext::~KINSOL_SAMRAIContext()
 {
-
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
 
    if (d_solution_vector) {
       Sundials_SAMRAIVector::destroySundialsVector(d_solution_vector);
@@ -361,94 +356,7 @@ KINSOL_SAMRAIContext::getFromInput(
 void
 KINSOL_SAMRAIContext::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file");
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("SOLV_KINSOL_SAMRAI_CONTEXT_VERSION");
-   if (ver != SOLV_KINSOL_SAMRAI_CONTEXT_VERSION) {
-      TBOX_ERROR(d_object_name << ":  "
-                               << "Restart file version different "
-                               << "than class version.");
-   }
-
-   d_residual_stop_tolerance = db->getDouble("residual_stop_tolerance");
-   d_KINSOL_solver->setResidualStoppingTolerance(d_residual_stop_tolerance);
-
-   d_max_nonlinear_iterations = db->getInteger("max_nonlinear_iterations");
-   d_KINSOL_solver->setMaxIterations(d_max_nonlinear_iterations);
-
-   d_max_krylov_dimension = db->getInteger("max_krylov_dimension");
-   d_KINSOL_solver->setMaxKrylovDimension(d_max_krylov_dimension);
-
-   d_global_newton_strategy = db->getInteger("global_newton_strategy");
-   d_KINSOL_solver->setGlobalStrategy(d_global_newton_strategy);
-
-   d_max_newton_step = db->getDouble("max_newton_step");
-   d_KINSOL_solver->setMaxNewtonStep(d_max_newton_step);
-
-   d_nonlinear_step_tolerance = db->getDouble("nonlinear_step_tolerance");
-   d_KINSOL_solver->setNonlinearStepTolerance(d_nonlinear_step_tolerance);
-
-   d_relative_function_error = db->getDouble("relative_function_error");
-   d_KINSOL_solver->setRelativeFunctionError(d_relative_function_error);
-
-   d_linear_convergence_test = db->getInteger("linear_convergence_test");
-   d_KINSOL_solver->setLinearSolverConvergenceTest(d_linear_convergence_test);
-
-   d_max_subsetup_calls = db->getInteger("max_subsetup_calls");
-   d_KINSOL_solver->setMaxSubSetupCalls(d_max_subsetup_calls);
-
-   db->getDoubleArray("residual_monitoring_params",
-      d_residual_monitoring_params, 2);
-   d_KINSOL_solver->setResidualMonitoringParams(
-      d_residual_monitoring_params[0],
-      d_residual_monitoring_params[1]);
-
-   d_residual_monitoring_constant =
-      db->getDouble("residual_monitoring_constant");
-   d_KINSOL_solver->setResidualMonitoringConstant(
-      d_residual_monitoring_constant);
-
-   d_no_min_eps = db->getBool("no_min_eps");
-   d_KINSOL_solver->setNoMinEps(d_no_min_eps);
-
-   db->getDoubleArray("eisenstat_walker_params",
-      d_eisenstat_walker_params, 2);
-   d_KINSOL_solver->setEisenstatWalkerParameters(d_eisenstat_walker_params[0],
-      d_eisenstat_walker_params[1]);
-
-   d_linear_solver_constant_tolerance =
-      db->getDouble("linear_solver_constant_tolerance");
-   d_KINSOL_solver->setLinearSolverConstantTolerance(
-      d_linear_solver_constant_tolerance);
-
-   d_max_solves_no_precond_setup =
-      db->getInteger("max_solves_no_precond_setup");
-   d_KINSOL_solver->setMaxStepsWithNoPrecondSetup(
-      d_max_solves_no_precond_setup);
-
-   d_max_linear_solve_restarts = db->getInteger("max_linear_solve_restarts");
-   d_KINSOL_solver->setMaxLinearSolveRestarts(d_max_linear_solve_restarts);
-
-   d_KINSOL_log_filename = db->getString("KINSOL_log_filename");
-   d_KINSOL_print_flag = db->getInteger("KINSOL_print_flag");
-   d_KINSOL_solver->setLogFileData(d_KINSOL_log_filename, d_KINSOL_print_flag);
-
-   d_uses_preconditioner = db->getBool("uses_preconditioner");
-   d_KINSOL_solver->setPreconditioner(
-      (d_uses_preconditioner == false) ? 0 : 1);
-
-   d_uses_jac_times_vector = db->getBool("uses_jac_times_vector");
-   d_KINSOL_solver->setJacobianTimesVector(
-      (d_uses_jac_times_vector == false) ? 0 : 1);
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -463,43 +371,7 @@ void
 KINSOL_SAMRAIContext::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("SOLV_KINSOL_SAMRAI_CONTEXT_VERSION",
-      SOLV_KINSOL_SAMRAI_CONTEXT_VERSION);
-
-   restart_db->putDouble("residual_stop_tolerance",
-      d_residual_stop_tolerance);
-   restart_db->putInteger("max_nonlinear_iterations",
-      d_max_nonlinear_iterations);
-   restart_db->putInteger("max_krylov_dimension", d_max_krylov_dimension);
-   restart_db->putInteger("global_newton_strategy",
-      d_global_newton_strategy);
-   restart_db->putDouble("max_newton_step", d_max_newton_step);
-   restart_db->putDouble("nonlinear_step_tolerance",
-      d_nonlinear_step_tolerance);
-   restart_db->putDouble("relative_function_error",
-      d_relative_function_error);
-   restart_db->putInteger("linear_convergence_test",
-      d_linear_convergence_test);
-   restart_db->putInteger("max_subsetup_calls", d_max_subsetup_calls);
-   restart_db->putDoubleArray("residual_monitoring_params",
-      d_residual_monitoring_params, 2);
-   restart_db->putDouble("residual_monitoring_constant",
-      d_residual_monitoring_constant);
-   restart_db->putBool("no_min_eps", d_no_min_eps);
-   restart_db->putDoubleArray("eisenstat_walker_params",
-      d_eisenstat_walker_params, 2);
-   restart_db->putDouble("linear_solver_constant_tolerance",
-      d_linear_solver_constant_tolerance);
-   restart_db->putInteger("max_solves_no_precond_setup",
-      d_max_solves_no_precond_setup);
-   restart_db->putInteger("max_linear_solve_restarts",
-      d_max_linear_solve_restarts);
-   restart_db->putString("KINSOL_log_filename", d_KINSOL_log_filename);
-   restart_db->putInteger("KINSOL_print_flag", d_KINSOL_print_flag);
-   restart_db->putBool("uses_preconditioner", d_uses_preconditioner);
-   restart_db->putBool("uses_jac_times_vector", d_uses_jac_times_vector);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

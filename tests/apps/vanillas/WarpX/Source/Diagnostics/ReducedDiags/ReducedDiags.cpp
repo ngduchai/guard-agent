@@ -39,11 +39,7 @@ m_rd_name{rd_name}
     pp_rd.query("extension", m_extension);
     pp_rd_name.query("extension", m_extension);
 
-    // check if it is a restart run
-    std::string restart_chkfile;
-    const ParmParse pp_amr("amr");
-    pp_amr.query("restart", restart_chkfile);
-    const bool IsNotRestart = restart_chkfile.empty();
+    const bool IsNotRestart = true;
 
     if (ParallelDescriptor::IOProcessor())
     {
@@ -101,15 +97,11 @@ void ReducedDiags::ComputeDiagsMidStep (int /*step*/)
 
 void ReducedDiags::WriteCheckpointData (std::string const & /*dir*/)
 {
-    // Defines an empty function WriteCheckpointData() to be overwritten if needed.
     // Function used to write out and data needed by the diagnostic in
-    // the checkpoint.
 }
 
 void ReducedDiags::ReadCheckpointData (std::string const & /*dir*/)
 {
-    // Defines an empty function ReadCheckpointData() to be overwritten if needed.
-    // Function used to read in any data that was written out in the checkpoint
     // when doing a restart.
 }
 

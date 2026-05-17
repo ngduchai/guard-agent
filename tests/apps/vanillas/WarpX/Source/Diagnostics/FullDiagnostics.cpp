@@ -215,13 +215,6 @@ FullDiagnostics::ReadParameters ()
     amrex::ignore_unused(m_dump_rz_modes);
 #endif
 
-    if (m_format == "checkpoint"){
-        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-            raw_specified == false &&
-            checkpoint_compatibility == true,
-            "For a checkpoint output, cannot specify these parameters as all data must be dumped "
-            "to file for a restart");
-    }
     // Number of buffers = 1 for FullDiagnostics.
     // It is used to allocate the number of output multi-level MultiFab, m_mf_output
     m_num_buffers = 1;

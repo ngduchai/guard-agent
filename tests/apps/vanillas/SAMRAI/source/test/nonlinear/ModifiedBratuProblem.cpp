@@ -48,7 +48,6 @@ using namespace SAMRAI;
 #include "SAMRAI/hier/Index.h"
 #include "SAMRAI/pdat/OutersideData.h"
 #include "SAMRAI/math/PatchCellDataOpsReal.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/pdat/SideData.h"
 #include "SAMRAI/pdat/SideIndex.h"
 #include "SAMRAI/tbox/Timer.h"
@@ -168,8 +167,6 @@ ModifiedBratuProblem::ModifiedBratuProblem(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(input_db);
    TBOX_ASSERT(grid_geometry);
-
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name, this);
 
    getFromInput(input_db, false);
 
@@ -2719,15 +2716,7 @@ void ModifiedBratuProblem::getFromInput(
 void ModifiedBratuProblem::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("MODIFIED_BRATU_PROBLEM", MODIFIED_BRATU_PROBLEM);
-
-   restart_db->putDouble("d_lambda", d_lambda);
-   restart_db->putDouble("d_input_dt", d_input_dt);
-   restart_db->putInteger("d_max_precond_its", d_max_precond_its);
-   restart_db->putDouble("d_precond_tol", d_precond_tol);
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

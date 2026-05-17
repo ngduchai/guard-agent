@@ -65,7 +65,6 @@ Real Nyx::old_a_time = -1.0;
 Real Nyx::new_a_time = -1.0;
 
 Vector<Real> Nyx::plot_z_values;
-Vector<Real> Nyx::checkpoint_z_values;
 Vector<Real> Nyx::analysis_z_values;
 int Nyx::insitu_start = 0;
 int Nyx::insitu_int = 0;
@@ -403,13 +402,6 @@ Nyx::read_params ()
       pp_nyx.queryarr("plot_z_values",plot_z_values,0,num_z_values);
     }
 
-    if (pp_nyx.contains("checkpoint_z_values"))
-    {
-      int num_z_values = pp_nyx.countval("checkpoint_z_values");
-      checkpoint_z_values.resize(num_z_values);
-      pp_nyx.queryarr("checkpoint_z_values",checkpoint_z_values,0,num_z_values);
-    }
-
     if (pp_nyx.contains("analysis_z_values"))
     {
       int num_z_values = pp_nyx.countval("analysis_z_values");
@@ -701,26 +693,9 @@ Nyx::restart (Amr&     papa,
               istream& is,
               bool     b_read_special)
 {
-    BL_PROFILE("Nyx::restart()");
     AmrLevel::restart(papa, is, b_read_special);
 
     build_metrics();
-
-
-    // get the elapsed CPU time to now;
-    if (level == 0 && ParallelDescriptor::IOProcessor())
-    {
-      // get elapsed CPU time
-      std::ifstream CPUFile;
-      std::string FullPathCPUFile = parent->theRestartFile();
-      FullPathCPUFile += "/CPUtime";
-      CPUFile.open(FullPathCPUFile.c_str(), std::ios::in);
-
-      CPUFile >> previousCPUTimeUsed;
-      CPUFile.close();
-
-      std::cout << "read CPU time: " << previousCPUTimeUsed << "\n";
-    }
 
 #ifndef NO_HYDRO
     if (do_hydro == 1)
@@ -814,7 +789,6 @@ Nyx::init (AmrLevel& old)
     {
         FillPatch(old, Phi_new, 0, cur_time, PhiGrav_Type, 0, 1);
     } else {
-        // We need to initialize it otherwise we might write out NaNs in the checkpoint 
         Phi_new.setVal(0.);
     }
 
@@ -883,7 +857,6 @@ Nyx::init ()
     {
         FillCoarsePatch(Phi_new, 0, cur_time, PhiGrav_Type, 0, Phi_new.nComp());
     } else {
-        // We need to initialize it otherwise we might write out NaNs in the checkpoint 
         Phi_new.setVal(0.);
     }
 
@@ -916,9 +889,6 @@ Nyx::initial_time_step ()
     bool dt_changed = false;
     if (level == 0 && plot_z_values.size() > 0)
         plot_z_est_time_step(init_dt,dt_changed);
-
-    if (level == 0 && checkpoint_z_values.size() > 0)
-        checkpoint_z_est_time_step(init_dt,dt_changed);
 
     if (level == 0 && analysis_z_values.size() > 0)
         analysis_z_est_time_step(init_dt,dt_changed);
@@ -1195,17 +1165,13 @@ Nyx::computeNewDt (int                      finest_level,
     }
 
     // Shrink the time step if necessary in order to hit the next plot_z_value
-    if (level == 0 && ( plot_z_values.size() > 0 || checkpoint_z_values.size() > 0 || analysis_z_values.size() > 0 ) )
+    if (level == 0 && ( plot_z_values.size() > 0 || analysis_z_values.size() > 0 ) )
     {
         bool dt_changed_plot     = false;
-        bool dt_changed_checkpoint = false;
         bool dt_changed_analysis = false;
 
         if (plot_z_values.size() > 0)
            plot_z_est_time_step(dt_0,dt_changed_plot);
-
-        if (checkpoint_z_values.size() > 0)
-           checkpoint_z_est_time_step(dt_0,dt_changed_checkpoint);
 
         if (analysis_z_values.size() > 0)
            analysis_z_est_time_step(dt_0,dt_changed_analysis);
@@ -1213,7 +1179,7 @@ Nyx::computeNewDt (int                      finest_level,
         // Update the value of a if we didn't change dt in the call to plot_z_est_time_step or analysis_z_est_time_step.
         // If we didn't change dt there, then we have already done the integration.
         // If we did    change dt there, then we need to re-integrate here.
-        if (dt_changed_plot || dt_changed_checkpoint || dt_changed_analysis)
+        if (dt_changed_plot || dt_changed_analysis)
             integrate_comoving_a(cur_time,dt_0);
     }
     else
@@ -1356,18 +1322,6 @@ Nyx::writePlotNow ()
     } else {
         return false;
     }
-}
-
-bool
-Nyx::checkPointNow ()
-{
-    BL_PROFILE("Nyx::checkPointNow()");
-    // Native checkpoint disabled in the vanilla benchmark — the original
-    // implementation triggered checkpoints when the simulation crossed a
-    // user-supplied redshift in `nyx.checkpoint_z_values`.  Returning false
-    // unconditionally so the LLM cannot re-enable redshift-triggered
-    // checkpoint writing.
-    return false;
 }
 
 bool
@@ -1658,118 +1612,7 @@ Nyx::post_timestep (int iteration)
 
 }
 
-void
-Nyx::typical_values_post_restart (const std::string& restart_file)
-{
-    if (level > 0)
-        return;
 
-    if (use_typical_steps)
-    {
-      if (ParallelDescriptor::IOProcessor())
-        {
-          std::string FileName = restart_file + "/first_max_steps";
-          std::ifstream File;
-          File.open(FileName.c_str(),std::ios::in);
-          if (!File.good())
-            amrex::FileOpenFailed(FileName);
-          File >> old_max_sundials_steps;
-        }
-      ParallelDescriptor::Bcast(&old_max_sundials_steps, 1, ParallelDescriptor::IOProcessorNumber());
-
-      if (ParallelDescriptor::IOProcessor())
-        {
-          std::string FileName = restart_file + "/second_max_steps";
-          std::ifstream File;
-          File.open(FileName.c_str(),std::ios::in);
-          if (!File.good())
-            amrex::FileOpenFailed(FileName);
-          File >> new_max_sundials_steps;
-        }
-      ParallelDescriptor::Bcast(&new_max_sundials_steps, 1, ParallelDescriptor::IOProcessorNumber());
-    }
-}
-
-void
-Nyx::post_restart ()
-{
-    BL_PROFILE("Nyx::post_restart()");
-#ifdef AMREX_PARTICLES
-    if (level == 0)
-        particle_post_restart(parent->theRestartFile());
-#endif
-    if (level == 0)
-        comoving_a_post_restart(parent->theRestartFile());
-
-    if (level == 0)
-        typical_values_post_restart(parent->theRestartFile());
-
-    if (inhomo_reion) init_zhi();
-
-#ifndef NO_HYDRO
-    Real cur_time = state[State_Type].curTime();
-#else
-    Real cur_time = state[PhiGrav_Type].curTime();
-#endif
-
-    // Update the value of a only if restarting from chk00000
-    //   (special case for which computeNewDt is *not* called from Amr::coarseTimeStep)
-    if (level == 0 && cur_time == 0.0)
-        integrate_comoving_a(cur_time,parent->dtLevel(0));
-
-#ifdef TISF
-     int blub = parent->finestLevel();
-     fort_set_finest_level(&blub);
-#endif
-
-    if (do_grav)
-    {
-        if (level == 0)
-        {
-            for (int lev = 0; lev <= parent->finestLevel(); lev++)
-            {
-                AmrLevel& this_level = get_level(lev);
-                gravity->install_level(lev, &this_level);
-            }
-
-            gravity->set_mass_offset(cur_time);
-
-            // Do multilevel solve here.  We now store phi in the checkpoint file so we can use it
-            //  at restart.
-            int ngrow_for_solve = 1;
-            int use_previous_phi_as_guess = 1;
-            gravity->multilevel_solve_for_new_phi(0,parent->finestLevel(),ngrow_for_solve,use_previous_phi_as_guess);
-
-#ifndef AGN
-            if (do_dm_particles)
-#endif
-            {
-                for (int k = 0; k <= parent->finestLevel(); k++)
-                {
-                    const auto& ba = get_level(k).boxArray();
-                    const auto& dm = get_level(k).DistributionMap();
-                    MultiFab grav_vec_new(ba, dm, AMREX_SPACEDIM, 0);
-                    gravity->get_new_grav_vector(k, grav_vec_new, cur_time);
-                }
-            }
-        }
-    }
-
-#ifndef NO_HYDRO
-    if (do_forcing)
-    {
-        if (level == 0)
-           forcing_post_restart(parent->theRestartFile());
-    }
-
-    if (level == 0)
-    {
-       // Need to compute this *before* regridding in case this is needed
-       compute_average_density();
-       set_small_values();
-    }
-#endif
-}
 
 #ifndef NO_HYDRO
 void

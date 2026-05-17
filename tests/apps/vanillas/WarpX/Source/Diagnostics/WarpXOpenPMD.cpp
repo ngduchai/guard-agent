@@ -678,7 +678,6 @@ WarpXOpenPMDPlot::FlushBTDToDisk()
     if (flattenSteps)
     {
         ABLASTR_PROFILE("WarpXOpenPMDPlot::ForceFlush()");
-        // Here for checkpointing purpose, we ask ADIOS to create to a new step, which
         // triggers writting both data and metadata.
         openPMD::Iteration currIteration = GetIteration(m_CurrentStep, isBTD);
         currIteration.seriesFlush(R"(adios2.engine.preferred_flush_target = "new_step")");

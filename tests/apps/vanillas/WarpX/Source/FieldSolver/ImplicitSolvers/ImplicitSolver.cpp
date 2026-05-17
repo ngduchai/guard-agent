@@ -10,7 +10,6 @@ using namespace amrex::literals;
 void ImplicitSolver::CreateParticleAttributes () const
 {
     // Set comm to false to that the attributes are not communicated
-    // nor written to the checkpoint files
     int const comm = 0;
 
     // Add space to save the positions and velocities at the start of the time steps
@@ -532,7 +531,6 @@ void ImplicitSolver::parseNonlinearSolverParams ( const amrex::ParmParse&  pp )
 void ImplicitSolver::SaveEoldMultifab ()
 {
     using warpx::fields::FieldType;
-    // E_old multifab is needed for diagnostics and saving at checkpoints
     for (int lev = 0; lev < m_num_amr_levels; ++lev) {
         const ablastr::fields::VectorField Efp = m_WarpX->m_fields.get_alldirs(FieldType::Efield_fp, lev);
         ablastr::fields::VectorField E_old = m_WarpX->m_fields.get_alldirs(FieldType::E_old, lev);

@@ -25,7 +25,6 @@
 #include "SAMRAI/algs/HyperbolicPatchStrategy.h"
 #include "SAMRAI/hier/IntVector.h"
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/hier/VariableContext.h"
 #include "SAMRAI/appu/VisItDataWriter.h"
 
@@ -59,7 +58,6 @@ class LinAdv:
 #ifdef SAMRAI_HAVE_CONDUIT
    public hier::BlueprintUtilsStrategy,
 #endif
-   public tbox::Serializable,
    public algs::HyperbolicPatchStrategy,
    public appu::BoundaryUtilityStrategy
 {
@@ -67,13 +65,10 @@ public:
    /**
     * The constructor for LinAdv sets default parameters for the linear
     * advection model.  Specifically, it creates variables that represent
-    * the state of the solution.  The constructor also registers this
-    * object for restart with the restart manager using the object name.
+    * the state of the solution.
     *
-    * After default values are set, this routine calls getFromRestart()
-    * if execution from a restart file is specified.  Finally,
-    * getFromInput() is called to read values from the given input
-    * database (potentially overriding those found in the restart file).
+    * After default values are set, getFromInput() is called to read
+    * values from the given input database.
     */
    LinAdv(
       const std::string& object_name,
@@ -85,6 +80,20 @@ public:
     * The destructor for LinAdv does nothing.
     */
    ~LinAdv();
+
+   /**
+    * Compute four physics-derived scalar reductions over the final solution
+    * field u (sum, sum-of-squares, max, min, cell-count) across the entire
+    * patch hierarchy and across all MPI ranks, and print them on rank 0 as
+    * a single line: ``VALIDATION_SIGNATURE: sum=...e+0X sum2=... max=...
+    * min=... count=N``.  The numbers depend on the actual final state of
+    * the simulation; they cannot be reproduced by re-initialising from the
+    * input file alone, nor by replaying captured stdout, so they form a
+    * deterministic golden signature suitable for the validation framework's
+    * baseline-vs-recovery numeric-tolerance comparison.
+    */
+   void dumpValidationSignature(
+      const std::shared_ptr<hier::PatchHierarchy>& hierarchy);
 
    ///
    ///  The following routines:
@@ -305,16 +314,6 @@ public:
    //@}
 
    /**
-    * Write state of LinAdv object to the given database for restart.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * This routine is a concrete implementation of the virtual function
     * in the base class BoundaryUtilityStrategy.  It reads DIRICHLET
     * boundary state values from the given database with the
@@ -392,21 +391,13 @@ public:
 
 private:
    /*
-    * These private member functions read data from input and restart.
-    * When beginning a run from a restart file, all data members are read
-    * from the restart file.  If the boolean flag is true when reading
-    * from input, some restart values may be overridden by those in the
-    * input file.
+    * Private member function to read data from input.
     *
     * An assertion results if the database pointer is null.
     */
    void
    getFromInput(
-      std::shared_ptr<tbox::Database> input_db,
-      bool is_from_restart);
-
-   void
-   getFromRestart();
+      std::shared_ptr<tbox::Database> input_db);
 
    void
    readStateDataEntry(
@@ -440,8 +431,7 @@ private:
       const double dt);
 
    /*
-    * The object name is used for error/warning reporting and also as a
-    * string label for restart database entries.
+    * The object name is used for error/warning reporting.
     */
    std::string d_object_name;
 

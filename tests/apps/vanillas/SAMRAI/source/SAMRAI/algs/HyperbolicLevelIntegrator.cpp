@@ -24,12 +24,10 @@
 #include "SAMRAI/xfer/CoarsenSchedule.h"
 #include "SAMRAI/hier/PatchData.h"
 #include "SAMRAI/hier/PatchDataFactory.h"
-#include "SAMRAI/hier/PatchDataRestartManager.h"
 #include "SAMRAI/hier/OverlapConnectorAlgorithm.h"
 #include "SAMRAI/hier/VariableDatabase.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/TimerManager.h"
 #include "SAMRAI/tbox/Timer.h"
 #include "SAMRAI/tbox/Utilities.h"
@@ -225,13 +223,10 @@ HyperbolicLevelIntegrator::HyperbolicLevelIntegrator(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(patch_strategy != 0);
 
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name,
-      this);
-
    /*
     * Initialize object with data read from the input and restart databases.
     */
-   bool from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool from_restart = false;
    if (from_restart) {
       getFromRestart();
    }
@@ -248,8 +243,7 @@ HyperbolicLevelIntegrator::HyperbolicLevelIntegrator(
  */
 HyperbolicLevelIntegrator::~HyperbolicLevelIntegrator()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 /*
  *************************************************************************
@@ -1814,12 +1808,6 @@ HyperbolicLevelIntegrator::registerVariable(
          d_new_time_dep_data.setFlag(new_id);
 
          /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
-
-         /*
           * Set boundary fill schedules for time-dependent variable.
           * If time interpolation operator is non-NULL, regular advance
           * bdry fill algorithm will time interpolate between current and
@@ -1909,12 +1897,6 @@ HyperbolicLevelIntegrator::registerVariable(
          d_new_patch_init_data.setFlag(cur_id);
 
          /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
-
-         /*
           * Bdry algorithms for input variables will fill from current only.
           */
          std::shared_ptr<hier::RefineOperator> refine_op(
@@ -1959,12 +1941,6 @@ HyperbolicLevelIntegrator::registerVariable(
                ghosts);
 
          d_new_patch_init_data.setFlag(cur_id);
-
-         /*
-          * Register variable and context needed for restart.
-          */
-         hier::PatchDataRestartManager::getManager()->
-         registerPatchDataForRestart(cur_id);
 
          std::shared_ptr<hier::RefineOperator> refine_op(
             transfer_geom->lookupRefineOperator(var, refine_name));
@@ -2719,18 +2695,7 @@ void
 HyperbolicLevelIntegrator::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION",
-      ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION);
-
-   restart_db->putDouble("cfl", d_cfl);
-   restart_db->putDouble("cfl_init", d_cfl_init);
-   restart_db->putBool("lag_dt_computation", d_lag_dt_computation);
-   restart_db->putBool("use_ghosts_to_compute_dt", d_use_ghosts_for_dt);
-   restart_db->putBool("use_flux_correction", d_use_flux_correction);
-   restart_db->putBool("DEV_distinguish_mpi_reduction_costs",
-      d_distinguish_mpi_reduction_costs);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -2824,30 +2789,7 @@ HyperbolicLevelIntegrator::getFromInput(
 void
 HyperbolicLevelIntegrator::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION");
-   if (ver != ALGS_HYPERBOLIC_LEVEL_INTEGRATOR_VERSION) {
-      TBOX_ERROR(d_object_name << ":  "
-                               << "Restart file version different "
-                               << "than class version." << std::endl);
-   }
-
-   d_cfl = db->getDouble("cfl");
-   d_cfl_init = db->getDouble("cfl_init");
-   d_lag_dt_computation = db->getBool("lag_dt_computation");
-   d_use_ghosts_for_dt = db->getBool("use_ghosts_to_compute_dt");
-   d_use_flux_correction = db->getBool("use_flux_correction");
-   d_distinguish_mpi_reduction_costs =
-      db->getBool("DEV_distinguish_mpi_reduction_costs");
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

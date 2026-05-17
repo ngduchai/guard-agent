@@ -81,7 +81,6 @@
 #include "SAMRAI/hier/Patch.h"
 #include "SAMRAI/hier/PatchLevel.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 #include "SAMRAI/tbox/MathUtilities.h"
 
@@ -116,7 +115,7 @@ CartesianGridGeometry::CartesianGridGeometry(
 
    buildOperators();
 
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -554,18 +553,7 @@ void
 CartesianGridGeometry::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   hier::BaseGridGeometry::putToRestart(restart_db);
-
-   const tbox::Dimension& dim(getDim());
-
-   restart_db->putInteger("GEOM_CARTESIAN_GRID_GEOMETRY_VERSION",
-      GEOM_CARTESIAN_GRID_GEOMETRY_VERSION);
-
-   restart_db->putDoubleArray("x_lo", d_x_lo, dim.getValue());
-   restart_db->putDoubleArray("x_up", d_x_up, dim.getValue());
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -634,34 +622,7 @@ CartesianGridGeometry::getFromInput(
 void
 CartesianGridGeometry::getFromRestart()
 {
-   std::shared_ptr<tbox::Database> restart_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!restart_db->isDatabase(getObjectName())) {
-      TBOX_ERROR("CartesianGridGeometry::getFromRestart() error...\n"
-         << "    database with name " << getObjectName()
-         << " not found in the restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(
-      restart_db->getDatabase(getObjectName()));
-
-   const tbox::Dimension& dim(getDim());
-
-   int ver = db->getInteger("GEOM_CARTESIAN_GRID_GEOMETRY_VERSION");
-   if (ver != GEOM_CARTESIAN_GRID_GEOMETRY_VERSION) {
-      TBOX_ERROR("CartesianGridGeometry::getFromRestart() error...\n"
-         << "    geometry object with name = " << getObjectName()
-         << "Restart file version is different than class version"
-         << std::endl);
-   }
-
-   double x_lo[SAMRAI::MAX_DIM_VAL],
-          x_up[SAMRAI::MAX_DIM_VAL];
-   db->getDoubleArray("x_lo", x_lo, dim.getValue());
-   db->getDoubleArray("x_up", x_up, dim.getValue());
-
-   setGeometryData(x_lo, x_up, getPhysicalDomain());
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 }

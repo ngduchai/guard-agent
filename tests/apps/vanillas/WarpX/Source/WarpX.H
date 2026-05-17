@@ -319,7 +319,6 @@ public:
     static amrex::Vector<int> boost_direction;
 
     //! store initial value of zmin_domain_boost because WarpX::computeMaxStepBoostAccelerator
-    //! needs the initial value of zmin_domain_boost, even if restarting from a checkpoint file
     static amrex::Real zmin_domain_boost_step_0;
 
     //! If true, the code will compute max_step from the back transformed diagnostics
@@ -1017,7 +1016,6 @@ private:
     // Singleton is used when the code is run from python
     static WarpX* m_instance;
 
-    //! Complete the asynchronous broadcast of signal flags, and initiate a checkpoint if requested
     void HandleSignals ();
 
     void FillBoundaryB (int lev, PatchType patch_type, amrex::IntVect ng, std::optional<bool> nodal_sync = std::nullopt);
@@ -1098,12 +1096,6 @@ private:
 
     void AllocLevelData (int lev, const amrex::BoxArray& ba,
                          const amrex::DistributionMapping& dm);
-
-    [[nodiscard]] amrex::DistributionMapping
-    GetRestartDMap (const std::string& chkfile, const amrex::BoxArray& ba, int lev) const;
-
-    void InitFromCheckpoint ();
-    void PostRestart ();
 
     void InitPML ();
     void ComputePMLFactors ();
@@ -1353,11 +1345,6 @@ private:
     int regrid_int = -1;
 
     amrex::Real cfl = amrex::Real(0.999);
-
-    std::string restart_chkfile;
-
-    /** When `true`, write the diagnostics after restart at the time of the restart. */
-    bool write_diagnostics_on_restart = false;
 
     bool synchronize_velocity_for_diagnostics = true;
 

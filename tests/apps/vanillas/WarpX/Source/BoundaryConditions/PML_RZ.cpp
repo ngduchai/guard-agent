@@ -164,31 +164,9 @@ PML_RZ::FillBoundaryB (ablastr::fields::MultiFabRegister& fields, PatchType patc
     }
 }
 
-void
-PML_RZ::CheckPoint (ablastr::fields::MultiFabRegister& fields, std::string const& dir) const
-{
-    using ablastr::fields::Direction;
 
-    if (fields.has(FieldType::pml_E_fp, Direction{0}, 0)) {
-        amrex::VisMF::AsyncWrite(*fields.get(FieldType::pml_E_fp, Direction{0}, 0), dir+"_Er_fp");
-        amrex::VisMF::AsyncWrite(*fields.get(FieldType::pml_E_fp, Direction{1}, 0), dir+"_Et_fp");
-        amrex::VisMF::AsyncWrite(*fields.get(FieldType::pml_B_fp, Direction{0}, 0), dir+"_Br_fp");
-        amrex::VisMF::AsyncWrite(*fields.get(FieldType::pml_B_fp, Direction{1}, 0), dir+"_Bt_fp");
-    }
-}
 
-void
-PML_RZ::Restart (ablastr::fields::MultiFabRegister& fields, std::string const& dir)
-{
-    using ablastr::fields::Direction;
 
-    if (fields.has(FieldType::pml_E_fp, Direction{0}, 0)) {
-        amrex::VisMF::Read(*fields.get(FieldType::pml_E_fp, Direction{0}, 0), dir+"_Er_fp");
-        amrex::VisMF::Read(*fields.get(FieldType::pml_E_fp, Direction{1}, 0), dir+"_Et_fp");
-        amrex::VisMF::Read(*fields.get(FieldType::pml_B_fp, Direction{0}, 0), dir+"_Br_fp");
-        amrex::VisMF::Read(*fields.get(FieldType::pml_B_fp, Direction{1}, 0), dir+"_Bt_fp");
-    }
-}
 
 #ifdef WARPX_USE_FFT
 void

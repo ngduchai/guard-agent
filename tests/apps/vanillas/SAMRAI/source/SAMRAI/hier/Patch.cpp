@@ -8,7 +8,6 @@
  *
  ************************************************************************/
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/hier/PatchDataRestartManager.h"
 
 #include <typeinfo>
 #include <string>
@@ -192,66 +191,7 @@ void
 Patch::getFromRestart(
    const std::shared_ptr<tbox::Database>& restart_db)
 {
-   TBOX_ASSERT(restart_db);
-
-   int ver = restart_db->getInteger("HIER_PATCH_VERSION");
-   if (ver != HIER_PATCH_VERSION) {
-      TBOX_ERROR("Patch::getFromRestart() error...\n"
-         << "   Restart file version different than class version" << std::endl);
-   }
-
-   Box box(restart_db->getDatabaseBox("d_box"));
-   const LocalId patch_local_id(restart_db->getInteger("d_patch_local_id"));
-   int patch_owner = restart_db->getInteger("d_patch_owner");
-   int block_id = restart_db->getInteger("d_block_id");
-   box.setBlockId(BlockId(block_id));
-   d_box.initialize(box,
-      patch_local_id,
-      patch_owner);
-
-   d_patch_level_number = restart_db->getInteger("d_patch_level_number");
-   d_patch_in_hierarchy = restart_db->getBool("d_patch_in_hierarchy");
-
-   d_patch_data.resize(d_descriptor->getMaxNumberRegisteredComponents());
-
-   int namelist_count = restart_db->getInteger("patch_data_namelist_count");
-   std::vector<std::string> patch_data_namelist;
-   if (namelist_count) {
-      patch_data_namelist = restart_db->getStringVector("patch_data_namelist");
-   }
-
-   PatchDataRestartManager* pdrm = PatchDataRestartManager::getManager();
-   ComponentSelector patch_data_read;
-
-   for (int i = 0; i < static_cast<int>(patch_data_namelist.size()); ++i) {
-      std::string& patch_data_name = patch_data_namelist[i];
-      int patch_data_index;
-
-      if (!restart_db->isDatabase(patch_data_name)) {
-         TBOX_ERROR("Patch::getFromRestart() error...\n"
-            << "   patch data" << patch_data_name
-            << " not found in restart database" << std::endl);
-      }
-      std::shared_ptr<tbox::Database> patch_data_database(
-         restart_db->getDatabase(patch_data_name));
-
-      patch_data_index = d_descriptor->mapNameToIndex(patch_data_name);
-
-      if ((patch_data_index >= 0) &&
-          (pdrm->isPatchDataRegisteredForRestart(patch_data_index))) {
-         std::shared_ptr<PatchDataFactory> patch_data_factory(
-            d_descriptor->getPatchDataFactory(patch_data_index));
-         d_patch_data[patch_data_index] = patch_data_factory->allocate(*this);
-         d_patch_data[patch_data_index]->getFromRestart(patch_data_database);
-         patch_data_read.setFlag(patch_data_index);
-      }
-   }
-
-   if (!pdrm->registeredPatchDataMatches(patch_data_read)) {
-      TBOX_WARNING("Patch::getFromRestart() warning...\n"
-         << "   Some requested patch data components not "
-         << "found in restart database" << std::endl);
-   }
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -278,44 +218,7 @@ void
 Patch::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   int i;
-
-   restart_db->putInteger("HIER_PATCH_VERSION", HIER_PATCH_VERSION);
-   restart_db->putDatabaseBox("d_box", d_box);
-   restart_db->putInteger("d_patch_local_id", d_box.getLocalId().getValue());
-   restart_db->putInteger("d_patch_owner", d_box.getOwnerRank());
-   restart_db->putInteger("d_block_id",
-                          static_cast<int>(d_box.getBlockId().getBlockValue()));
-   restart_db->putInteger("d_patch_level_number", d_patch_level_number);
-   restart_db->putBool("d_patch_in_hierarchy", d_patch_in_hierarchy);
-
-   int namelist_count = 0;
-   const PatchDataRestartManager* pdrm = PatchDataRestartManager::getManager();
-   for (i = 0; i < static_cast<int>(d_patch_data.size()); ++i) {
-      if (pdrm->isPatchDataRegisteredForRestart(i) && checkAllocated(i)) {
-         ++namelist_count;
-      }
-   }
-
-   std::string patch_data_name;
-   std::vector<std::string> patch_data_namelist(namelist_count);
-   namelist_count = 0;
-   for (i = 0; i < static_cast<int>(d_patch_data.size()); ++i) {
-      if (pdrm->isPatchDataRegisteredForRestart(i) && checkAllocated(i)) {
-         patch_data_namelist[namelist_count++] =
-            patch_data_name = d_descriptor->mapIndexToName(i);
-         std::shared_ptr<tbox::Database> patch_data_database(
-            restart_db->putDatabase(patch_data_name));
-         (d_patch_data[i])->putToRestart(patch_data_database);
-      }
-   }
-
-   restart_db->putInteger("patch_data_namelist_count", namelist_count);
-   if (namelist_count > 0) {
-      restart_db->putStringVector("patch_data_namelist", patch_data_namelist);
-   }
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

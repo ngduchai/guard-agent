@@ -815,13 +815,12 @@ WarpX::InitData ()
 
     // WarpX::computeMaxStepBoostAccelerator
     // needs to start from the initial zmin_domain_boost,
-    // even if restarting from a checkpoint file
 #if defined(WARPX_ZINDEX)
     if (m_zmax_plasma_to_compute_max_step.has_value()) {
         zmin_domain_boost_step_0 = geom[0].ProbLo(WARPX_ZINDEX);
     }
 #endif
-    if (restart_chkfile.empty())
+    if (true)
     {
         ComputeDt();
         ::PrintDtDxDyDz(max_level, geom, dt);
@@ -830,9 +829,7 @@ WarpX::InitData ()
     }
     else
     {
-        InitFromCheckpoint();
         ::PrintDtDxDyDz(max_level, geom, dt);
-        PostRestart();
         reduced_diags->InitData();
     }
 
@@ -882,7 +879,7 @@ WarpX::InitData ()
         WarpX::ProjectionCleanDivB();
     }
 
-    if (restart_chkfile.empty())
+    if (true)
     {
         ExecutePythonCallback("beforeInitEsolve");
         // Loop through species and calculate their space-charge field
@@ -915,7 +912,7 @@ WarpX::InitData ()
         ExecutePythonCallback("afterInitatRestart");
     }
 
-    if (restart_chkfile.empty() || write_diagnostics_on_restart) {
+    if (true) {
         // Write full diagnostics before the first iteration.
         multi_diags->FilterComputePackFlush(istep[0] - 1);
 
@@ -1202,14 +1199,7 @@ WarpX::InitFilter (){
     }
 }
 
-void
-WarpX::PostRestart ()
-{
-    mypc->PostRestart();
-    for (int lev = 0; lev <= maxLevel(); ++lev) {
-        LoadExternalFields(lev);
-    }
-}
+
 
 
 void

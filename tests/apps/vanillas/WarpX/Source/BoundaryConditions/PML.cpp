@@ -1239,71 +1239,9 @@ PML::FillBoundary (amrex::MultiFab & mf_pml, PatchType patch_type, std::optional
     ablastr::utils::communication::FillBoundary(mf_pml, WarpX::do_single_precision_comms, period, nodal_sync);
 }
 
-void
-PML::CheckPoint (
-    ablastr::fields::MultiFabRegister& fields,
-    const std::string& dir
-) const
-{
-    using ablastr::fields::Direction;
 
-    if (fields.has_vector(FieldType::pml_E_fp, 0))
-    {
-        ablastr::fields::VectorField pml_E_fp = fields.get_alldirs(FieldType::pml_E_fp, 0);
-        ablastr::fields::VectorField pml_B_fp = fields.get_alldirs(FieldType::pml_B_fp, 0);
-        VisMF::AsyncWrite(*pml_E_fp[0], dir+"_Ex_fp");
-        VisMF::AsyncWrite(*pml_E_fp[1], dir+"_Ey_fp");
-        VisMF::AsyncWrite(*pml_E_fp[2], dir+"_Ez_fp");
-        VisMF::AsyncWrite(*pml_B_fp[0], dir+"_Bx_fp");
-        VisMF::AsyncWrite(*pml_B_fp[1], dir+"_By_fp");
-        VisMF::AsyncWrite(*pml_B_fp[2], dir+"_Bz_fp");
-    }
 
-    if (fields.has_vector(FieldType::pml_E_cp, 0))
-    {
-        ablastr::fields::VectorField pml_E_cp = fields.get_alldirs(FieldType::pml_E_cp, 0);
-        ablastr::fields::VectorField pml_B_cp = fields.get_alldirs(FieldType::pml_B_cp, 0);
-        VisMF::AsyncWrite(*pml_E_cp[0], dir+"_Ex_cp");
-        VisMF::AsyncWrite(*pml_E_cp[1], dir+"_Ey_cp");
-        VisMF::AsyncWrite(*pml_E_cp[2], dir+"_Ez_cp");
-        VisMF::AsyncWrite(*pml_B_cp[0], dir+"_Bx_cp");
-        VisMF::AsyncWrite(*pml_B_cp[1], dir+"_By_cp");
-        VisMF::AsyncWrite(*pml_B_cp[2], dir+"_Bz_cp");
-    }
-}
 
-void
-PML::Restart (
-    ablastr::fields::MultiFabRegister& fields,
-    const std::string& dir
-)
-{
-    using ablastr::fields::Direction;
-
-    if (fields.has_vector(FieldType::pml_E_fp, 0))
-    {
-        ablastr::fields::VectorField pml_E_fp = fields.get_alldirs(FieldType::pml_E_fp, 0);
-        ablastr::fields::VectorField pml_B_fp = fields.get_alldirs(FieldType::pml_B_fp, 0);
-        VisMF::Read(*pml_E_fp[0], dir+"_Ex_fp");
-        VisMF::Read(*pml_E_fp[1], dir+"_Ey_fp");
-        VisMF::Read(*pml_E_fp[2], dir+"_Ez_fp");
-        VisMF::Read(*pml_B_fp[0], dir+"_Bx_fp");
-        VisMF::Read(*pml_B_fp[1], dir+"_By_fp");
-        VisMF::Read(*pml_B_fp[2], dir+"_Bz_fp");
-    }
-
-    if (fields.has_vector(FieldType::pml_E_cp, 0))
-    {
-        ablastr::fields::VectorField pml_E_cp = fields.get_alldirs(FieldType::pml_E_cp, 0);
-        ablastr::fields::VectorField pml_B_cp = fields.get_alldirs(FieldType::pml_B_cp, 0);
-        VisMF::Read(*pml_E_cp[0], dir+"_Ex_cp");
-        VisMF::Read(*pml_E_cp[1], dir+"_Ey_cp");
-        VisMF::Read(*pml_E_cp[2], dir+"_Ez_cp");
-        VisMF::Read(*pml_B_cp[0], dir+"_Bx_cp");
-        VisMF::Read(*pml_B_cp[1], dir+"_By_cp");
-        VisMF::Read(*pml_B_cp[2], dir+"_Bz_cp");
-    }
-}
 
 #ifdef WARPX_USE_FFT
 void

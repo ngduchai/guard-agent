@@ -12,7 +12,6 @@
 
 #include "SAMRAI/tbox/IOStream.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/SAMRAIManager.h"
 #include "SAMRAI/tbox/StartupShutdownManager.h"
 #include "SAMRAI/tbox/Schedule.h"
@@ -2562,9 +2561,7 @@ StatisticRestartDatabase::StatisticRestartDatabase(
 {
    TBOX_ASSERT(!object_name.empty());
 
-   RestartManager::getManager()->registerRestartItem(d_object_name, this);
-
-   bool is_from_restart = RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart && read_from_restart) {
       getFromRestart();
    }
@@ -2572,129 +2569,17 @@ StatisticRestartDatabase::StatisticRestartDatabase(
 
 StatisticRestartDatabase::~StatisticRestartDatabase()
 {
-   RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 void StatisticRestartDatabase::putToRestart(
    const std::shared_ptr<Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("TBOX_STATISTICRESTARTDATABASE_VERSION",
-      TBOX_STATISTICRESTARTDATABASE_VERSION);
-
-   /*
-    * Get pointer to Statistician object.
-    */
-   Statistician* statistician = Statistician::getStatistician();
-
-   /*
-    * Write the number of statistics
-    */
-   int number_of_procstats = statistician->getNumberProcessorStats();
-   restart_db->putInteger("number_of_procstats", number_of_procstats);
-
-   int number_of_patchstats = statistician->getNumberPatchStats();
-   restart_db->putInteger("number_of_patchstats", number_of_patchstats);
-
-   /*
-    * Iterate through the list of statistics and write out a
-    * sub-database for each stat, containing the data values
-    * Store the name of each stat in the string arrays
-    * "proc_stat_names" and "patch_stat_names".
-    */
-   std::vector<std::string> proc_stat_names(number_of_procstats);
-   std::vector<std::string> patch_stat_names(number_of_patchstats);
-
-   /*
-    * Write procstat and patchstats to database.
-    */
-   std::shared_ptr<Statistic> stat;
-   std::shared_ptr<Database> stat_database;
-   int n;
-   for (n = 0; n < number_of_procstats; ++n) {
-      stat = statistician->d_proc_statistics[n];
-      proc_stat_names[n] = stat->getName();
-      stat_database = restart_db->putDatabase(proc_stat_names[n]);
-      stat->putToRestart(stat_database);
-   }
-
-   for (n = 0; n < number_of_patchstats; ++n) {
-      stat = statistician->d_patch_statistics[n];
-      patch_stat_names[n] = stat->getName();
-      stat_database = restart_db->putDatabase(patch_stat_names[n]);
-      stat->putToRestart(stat_database);
-   }
-
-   /*
-    * Write out string array containing names of stats.  This will be
-    * used upon restart to specify the name of the sub-database from
-    * which to read the stat info.
-    */
-   if (number_of_procstats > 0) {
-      restart_db->putStringVector("proc_stat_names", proc_stat_names);
-   }
-
-   if (number_of_patchstats > 0) {
-      restart_db->putStringVector("patch_stat_names", patch_stat_names);
-   }
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 void StatisticRestartDatabase::getFromRestart()
 {
-   std::shared_ptr<Database> root_db(
-      RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("TBOX_STATISTICRESTARTDATABASE_VERSION");
-   if (ver != TBOX_STATISTICRESTARTDATABASE_VERSION) {
-      TBOX_WARNING(
-         d_object_name << ":  "
-         "Restart file version different than class version. \n"
-                       << "Cannot read statistic information from restart file so"
-                       << "all statistics will be reset." << std::endl);
-   }
-
-   int number_of_procstats = db->getInteger("number_of_procstats");
-   int number_of_patchstats = db->getInteger("number_of_patchstats");
-
-   /*
-    * Read in the list of sub-database names.
-    */
-   std::vector<std::string> proc_stat_names;
-   if (number_of_procstats > 0) {
-      proc_stat_names = db->getStringVector("proc_stat_names");
-   }
-   std::vector<std::string> patch_stat_names;
-   if (number_of_patchstats > 0) {
-      patch_stat_names = db->getStringVector("patch_stat_names");
-   }
-
-   /*
-    * Read in each stat from restart database.
-    */
-   Statistician* statistician = Statistician::getStatistician();
-   std::shared_ptr<Database> sub_database;
-   std::string sub_database_name;
-   std::shared_ptr<Statistic> stat;
-   int i;
-   for (i = 0; i < number_of_procstats; ++i) {
-      sub_database = db->getDatabase(proc_stat_names[i]);
-      stat = statistician->getStatistic(proc_stat_names[i], "PROC_STAT");
-      stat->getFromRestart(sub_database);
-   }
-
-   for (i = 0; i < number_of_patchstats; ++i) {
-      sub_database = db->getDatabase(patch_stat_names[i]);
-      stat = statistician->getStatistic(patch_stat_names[i], "PATCH_STAT");
-      stat->getFromRestart(sub_database);
-   }
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 }

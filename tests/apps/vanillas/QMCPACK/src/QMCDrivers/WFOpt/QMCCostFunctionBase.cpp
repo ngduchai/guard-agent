@@ -192,15 +192,6 @@ void QMCCostFunctionBase::Report()
   if (!myComm->rank())
   {
     updateXmlNodes();
-    std::array<char, 128> newxml;
-    int length{0};
-    if (Write2OneXml)
-      length = std::snprintf(newxml.data(), newxml.size(), "%s.opt.xml", RootName.c_str());
-    else
-      length = std::snprintf(newxml.data(), newxml.size(), "%s.opt.%d.xml", RootName.c_str(), ReportCounter);
-    if (length < 0)
-      throw std::runtime_error("Error generating fileroot");
-    xmlSaveFormatFile(newxml.data(), m_doc_out, 1);
     if (msg_stream)
     {
       msg_stream->precision(8);
@@ -234,20 +225,6 @@ void QMCCostFunctionBase::reportParameters()
     *msg_stream << "  Updated wave function parameters:\n";
     opt_vars.print(*msg_stream, 4 /* left padding spaces */, true);
     *msg_stream << std::endl;
-
-    std::string vp_fname(RootName + ".vp.h5");
-    *msg_stream << "  Updated wavefunction vp file " << vp_fname << std::endl;
-    hdf_archive hout;
-    opt_vars.writeToHDF(vp_fname, hout);
-
-    UniqueOptObjRefs opt_obj_refs = Psi.extractOptimizableObjectRefs();
-    for (auto opt_obj : opt_obj_refs)
-      opt_obj.get().writeVariationalParameters(hout);
-
-    std::string newxml = RootName + ".opt.xml";
-    *msg_stream << "  Updated wavefunction xml file " << newxml << std::endl;
-    updateXmlNodes();
-    xmlSaveFormatFile(newxml.c_str(), m_doc_out, 1);
   }
 }
 /** This function stores optimized CI coefficients in HDF5 

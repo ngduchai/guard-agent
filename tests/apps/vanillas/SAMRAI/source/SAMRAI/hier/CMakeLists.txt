@@ -44,7 +44,6 @@ set (hier_headers
   PatchBoundaries.h
   PatchData.h
   PatchDataFactory.h
-  PatchDataRestartManager.h
   PatchDescriptor.h
   PatchFactory.h
   PatchGeometry.h
@@ -112,7 +111,6 @@ set (hier_sources
   PatchBoundaries.cpp
   PatchData.cpp
   PatchDataFactory.cpp
-  PatchDataRestartManager.cpp
   PatchDescriptor.cpp
   PatchFactory.cpp
   PatchGeometry.cpp

@@ -152,21 +152,7 @@ public:
   /** Return OpenPMD File type ("bp5", "bp4", "h5" or "json")*/
   std::string OpenPMDFileType () { return m_OpenPMDFileType; }
 
-  /** Ensure BTD buffers are written to disk
-   *
-   * This function can be called to intermediately ensure ADIOS buffered "steps"
-   * are written to disk, and the valid metadata if checkpointing is required.
-   *
-   * This is needed to read partial data while a simulation is running or
-   * to support restarting (the BTD diagnostics) in WarpX, so it
-   * can continue to append to a partially written labframe station
-   * after restart.
-   *
-   * The frequency is controlled by
-   * FlushFormatOpenPMD::m_NumAggBTDBufferToFlush (default to 5).
-   * It can be adjusted in the input file: diag_name.buffer_flush_limit_btd
-   */
-  void FlushBTDToDisk ();
+    void FlushBTDToDisk ();
 private:
   void Init (openPMD::Access access, bool isBTD);
 

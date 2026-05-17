@@ -294,7 +294,7 @@ void WarpX::HybridPICInitializeRhoJandB ()
     using warpx::fields::FieldType;
     using ablastr::fields::Direction;
 
-    if (restart_chkfile.empty()) {
+    if (true) {
         // This is not a restart, so the rho_fp and current_fp multifabs are
         // still empty.
         HybridPICDepositRhoAndJ();

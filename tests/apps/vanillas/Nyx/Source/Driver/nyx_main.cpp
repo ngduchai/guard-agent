@@ -2,6 +2,8 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <limits>
+#include <algorithm>
 
 #include <AMReX_CArena.H>
 #include <AMReX_REAL.H>
@@ -49,6 +51,67 @@ const int GimletSignal(55);
 const int quitSignal(-44);
 
 amrex::LevelBld* getLevelBld ();
+
+// Compute physics-derived scalar reductions over the FINAL hydrodynamic
+// state (State_Type MultiFab on every level) and emit one
+// VALIDATION_SIGNATURE line per conserved component on rank 0.  This is the
+// content-faithful golden-vs-recovery comparison anchor used by the
+// validation framework: an LLM stub that initializes but skips integration
+// produces a different signature because the shock has not propagated; an
+// LLM stub that replays captured baseline stdout is caught by the
+// framework's anti-replay check.  Dumps OUTPUT only (the conserved
+// hydrodynamic variables that are the user-facing scientific result), not
+// internal scratch / ghost / integrator state.
+static void dumpValidationSignature (amrex::Amr* amrptr)
+{
+    using namespace amrex;
+
+    constexpr int N_OUT = 6;
+    const int comps[N_OUT]    = { 0, 1, 2, 3, 4, 5 };
+    const char* names[N_OUT]  = { "den", "xmom", "ymom", "zmom", "eden", "eint" };
+
+    Real total_sum [N_OUT] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    Real total_sum2[N_OUT] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    Real total_max [N_OUT];
+    Real total_min [N_OUT];
+    for (int c = 0; c < N_OUT; ++c) {
+        total_max[c] = -std::numeric_limits<Real>::infinity();
+        total_min[c] =  std::numeric_limits<Real>::infinity();
+    }
+    long total_count = 0;
+
+    const int n_levels = amrptr->finestLevel() + 1;
+    for (int lev = 0; lev < n_levels; ++lev) {
+        AmrLevel& al = amrptr->getLevel(lev);
+        // State_Type == 0 in Nyx (see Nyx.H StateType enum).
+        const MultiFab& mf = al.get_new_data(0);
+
+        const long ncells_this_level =
+            static_cast<long>(al.Geom().Domain().numPts());
+        total_count += ncells_this_level;
+
+        for (int c = 0; c < N_OUT; ++c) {
+            total_sum [c] += mf.sum(comps[c]);
+            const Real n2 = mf.norm2(comps[c]);
+            total_sum2[c] += n2 * n2;
+            total_max [c]  = std::max(total_max[c], mf.max(comps[c]));
+            total_min [c]  = std::min(total_min[c], mf.min(comps[c]));
+        }
+    }
+
+    if (ParallelDescriptor::IOProcessor()) {
+        std::cout << std::scientific << std::setprecision(10);
+        for (int c = 0; c < N_OUT; ++c) {
+            std::cout << "VALIDATION_SIGNATURE:"
+                      << " field=" << names[c]
+                      << " sum="   << total_sum [c]
+                      << " sum2="  << total_sum2[c]
+                      << " max="   << total_max [c]
+                      << " min="   << total_min [c]
+                      << " count=" << total_count << std::endl;
+        }
+    }
+}
 
 void
 nyx_main (int argc, char* argv[])
@@ -110,28 +173,6 @@ nyx_main (int argc, char* argv[])
     // We hard-wire the initial time to 0
     Real strt_time =  0.0;
 
-    // Native checkpoint disabled in the vanilla benchmark.  Force-disable
-    // AMReX's checkpoint-writing inputs BEFORE constructing Amr so the
-    // framework cannot create chk* directories regardless of what the user
-    // (or LLM) put in the inputs file.  AMReX's defaults (check_int = -1,
-    // check_per = -1, checkpoint_files_output = 1) become inert because
-    // Nyx::checkPoint and Nyx::checkPointNow are stubbed to no-ops, but we
-    // also strip the upstream-facing knobs so even Amr::checkPoint() never
-    // fires from the coarseTimeStep loop.
-    {
-        ParmParse pp_amr_strip("amr");
-        pp_amr_strip.remove("check_int");
-        pp_amr_strip.remove("check_per");
-        pp_amr_strip.remove("check_file");
-        pp_amr_strip.remove("check_nfiles");
-        pp_amr_strip.remove("checkpoint_files_output");
-        pp_amr_strip.remove("checkpoint_on_restart");
-        pp_amr_strip.remove("checkpoint_nfiles");
-        pp_amr_strip.add("check_int", -1);
-        pp_amr_strip.add("check_per", Real(-1.0));
-        pp_amr_strip.add("checkpoint_files_output", 0);
-    }
-
     Amr *amrptr = new Amr(getLevelBld());
     amrptr->init(strt_time,stop_time);
 
@@ -185,14 +226,16 @@ nyx_main (int argc, char* argv[])
     const Real time_without_init = ParallelDescriptor::second() - time_before_main_loop;
     if (ParallelDescriptor::IOProcessor()) std::cout << "Time w/o init: " << time_without_init << std::endl;
 
-    // Native checkpoint disabled in the vanilla benchmark — the original
-    // driver wrote a final checkpoint here via `amrptr->checkPoint()`.  That
     // call is removed so the LLM cannot rely on a guaranteed end-of-run
-    // checkpoint.  Final plotfile is preserved (it is diagnostic output, not
     // restart state).
     if (amrptr->stepOfLastPlotFile() < amrptr->levelSteps(0)) {
         amrptr->writePlotFile();
     }
+
+    // Validation framework golden-vs-recovery comparison anchor.  Must run
+    // BEFORE delete amrptr (which tears down the AmrLevel and its state
+    // MultiFabs).
+    dumpValidationSignature(amrptr);
 
     delete amrptr;
 

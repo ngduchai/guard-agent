@@ -40,7 +40,6 @@
 #include "SAMRAI/tbox/InputManager.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 
 
@@ -151,17 +150,9 @@ using namespace SAMRAI;
 /*
  *******************************************************************
  *
- * For each run, the input filename and restart information
- * (if needed) must be given on the command line.
- *
- *      For non-restarted case, command line is:
+ * The input filename must be given on the command line:
  *
  *          executable <input file name>
- *
- *      For restarted run, command line is:
- *
- *          executable <input file name> <restart directory> \
- *                     <restart number>
  *
  *******************************************************************
  */
@@ -172,7 +163,6 @@ int main(
 {
 
    int num_failures = 0;
-   const int number_of_runs = 2;
 
    /*
     * Initialize tbox::MPI.
@@ -181,7 +171,7 @@ int main(
    tbox::SAMRAI_MPI::init(&argc, &argv);
    tbox::SAMRAIManager::initialize();
 
-   for (int run = 0; run < number_of_runs; ++run) {
+   {
       /*
        * Initialize SAMRAI, enable logging, and process command line.
        */
@@ -190,32 +180,16 @@ int main(
 
       {
          std::string input_filename;
-         std::string restart_read_dirname;
-         int restore_num = 0;
 
-         bool is_from_restart = false;
-
-         if ((argc != 2) && (argc != 4)) {
-            tbox::pout << "USAGE:  " << argv[0] << " <input filename> "
-                       << "<restart dir> <restore number> [options]\n"
-                       << "  options:\n"
-                       << "  none at this time"
+         if (argc != 2) {
+            tbox::pout << "USAGE:  " << argv[0] << " <input filename>"
                        << std::endl;
             tbox::SAMRAI_MPI::abort();
             return -1;
-         } else {
-            input_filename = argv[1];
-            if (argc == 4) {
-               restart_read_dirname = argv[2];
-               restore_num = atoi(argv[3]);
-
-               is_from_restart = true;
-            }
          }
+         input_filename = argv[1];
 
          tbox::plog << "input_filename = " << input_filename << std::endl;
-         tbox::plog << "restart_read_dirname = " << restart_read_dirname << std::endl;
-         tbox::plog << "restore_num = " << restore_num << std::endl;
 
          /*
           * Create input database and parse all data in input file.
@@ -250,9 +224,6 @@ int main(
          /*
           * Retrieve "Main" section of the input database.  First, read
           * dump information, which is used for writing plot files.
-          * Second, if proper restart information was given on command
-          * line, and the restart interval is non-zero, create a restart
-          * database.
           */
 
          std::shared_ptr<tbox::Database> main_db(
@@ -293,13 +264,6 @@ int main(
             main_db->getBoolWithDefault("write_blueprint", false);
 #endif
 
-         // Native restart support has been removed in this vanilla.
-         // Any `restart_interval` / `restart_write_dirname` value coming from
-         // the input file is ignored so checkpoint files cannot be written.
-         (void) main_db->keyExists("restart_interval");
-         const int restart_interval = 0;
-         const std::string restart_write_dirname;
-
          bool use_refined_timestepping = true;
          if (main_db->keyExists("timestepping")) {
             std::string timestepping_method = main_db->getString("timestepping");
@@ -313,25 +277,12 @@ int main(
             rebalance_coarsest = main_db->getBool("rebalance_coarsest");
          }
 
-         // Native restart support has been removed in this vanilla.
-         // The CLI-positional `<restart dir> <restore number>` form still
-         // parses (so existing wrappers don't break) but the restart-from-disk
-         // path is unconditionally disabled, and no restart file will be
-         // opened or written.
-         is_from_restart = false;
-         (void) restore_num;
-         (void) restart_read_dirname;
-         const bool write_restart = false;
-
-         tbox::RestartManager* restart_manager = tbox::RestartManager::getManager();
-         (void) restart_manager;
-
          /*
           * Create major algorithm and data objects which comprise application.
-          * Each object will be initialized either from input data or restart
-          * files, or a combination of both.  Refer to each class constructor
-          * for details.  For more information on the composition of objects
-          * for this application, see comments at top of file.
+          * Each object will be initialized from input data.  Refer to each
+          * class constructor for details.  For more information on the
+          * composition of objects for this application, see comments at top
+          * of file.
           */
 
          std::shared_ptr<geom::CartesianGridGeometry> grid_geometry(
@@ -412,12 +363,9 @@ int main(
 
          /*
           * Initialize hierarchy configuration and data on all patches.
-          * Then, close restart file and write initial state for visualization.
           */
 
          double dt_now = time_integrator->initializeHierarchy();
-
-         tbox::RestartManager::getManager()->closeRestartFile();
 
 #if (TESTING == 1)
          /*
@@ -495,11 +443,6 @@ int main(
             tbox::pout << "At end of timestep # " << iteration_num - 1 << std::endl;
             tbox::pout << "Simulation time is " << loop_time << std::endl;
             tbox::pout << "++++++++++++++++++++++++++++++++++++++++++++" << std::endl;
-
-            /*
-             * Restart-file writing is disabled in this vanilla; only visit
-             * dumps remain.
-             */
 
             /*
              * At specified intervals, write out data files for plotting.
@@ -591,6 +534,14 @@ int main(
 #endif
 
          }
+
+         /*
+          * Dump physics-derived signature of the final solution field for
+          * the validation framework's golden-vs-recovery comparison.
+          * Must run BEFORE deallocating linear_advection_model (which owns
+          * the patch-data accessor) and patch_hierarchy.
+          */
+         linear_advection_model->dumpValidationSignature(patch_hierarchy);
 
          /*
           * At conclusion of simulation, deallocate objects.

@@ -732,18 +732,15 @@ Nyx::particle_check_point (const std::string& dir)
 #ifdef AMREX_PARTICLES
                 if (Nyx::theDMPC())
         {
-          Nyx::theDMPC()->NyxCheckpoint(dir, dm_chk_particle_file);
         }
 #ifdef AGN
       if (Nyx::theAPC())
         {
-          Nyx::theAPC()->NyxCheckpoint(dir, agn_chk_particle_file);
         }
 #endif
 #ifdef NEUTRINO_DARK_PARTICLES
       if (Nyx::theNPC())
         {
-          Nyx::theNPC()->NyxCheckpoint(dir, npc_chk_particle_file);
         }
 #endif
 #endif
@@ -873,36 +870,6 @@ Nyx::writeMultiFabAsPlotFile(const std::string& pltfile,
     TheFullPath += BaseName;
     VisMF::Write(mf, TheFullPath);
     ParallelDescriptor::Barrier();
-}
-
-void
-Nyx::checkPoint (const std::string& /*dir*/,
-                 std::ostream&      /*os*/,
-                 VisMF::How         /*how*/,
-                 bool               /*dump_old_default*/)
-{
-  // Native checkpoint disabled in the vanilla benchmark — this override no
-  // longer calls AmrLevel::checkPoint, write_*JobInfo, particle_check_point,
-  // forcing_check_point, or CPUtime.  Amr::checkPoint() may still be invoked
-  // by the framework when amr.check_int / amr.check_per > 0, but those input
-  // parameters are stripped in nyx_main() before the Amr ctor runs (see
-  // Source/Driver/nyx_main.cpp).  No file is written from this method.
-}
-
-void
-Nyx::checkPointPre (const std::string& /*dir*/,
-                    std::ostream&      /*os*/)
-{
-  // Native checkpoint disabled in the vanilla benchmark.
-}
-
-
-void
-Nyx::checkPointPost (const std::string& /*dir*/,
-                     std::ostream&      /*os*/)
-{
-  // Native checkpoint disabled in the vanilla benchmark — no comoving_a,
-  // first_max_steps, or second_max_steps sentinels are written.
 }
 
 #ifndef NO_HYDRO

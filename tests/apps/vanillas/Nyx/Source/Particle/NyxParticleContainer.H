@@ -179,9 +179,6 @@ public:
     virtual void WriteNyxPlotFile (const std::string& dir,
                                    const std::string& name) const;
 
-    virtual void NyxCheckpoint (const std::string& dir,
-                                const std::string& name) const;
-
     typedef amrex::Particle<NSR,NSI> ParticleType;
     using AoS = typename amrex::ParticleContainer<NSR,NSI,NAR,NAI>::AoS;
     using ParticleLevel = typename amrex::ParticleContainer<NSR,NSI,NAR,NAI>::ParticleLevel;
@@ -503,17 +500,6 @@ NyxParticleContainer<NSR,NSI,NAR,NAI>::WriteNyxPlotFile (const std::string& dir,
 
   amrex::NeighborParticleContainer<NSR,NSI>::WritePlotFile(dir, name, real_comp_names);
 
-}
-
-template <int NSR,int NSI,int NAR,int NAI>
-void
-NyxParticleContainer<NSR,NSI,NAR,NAI>::NyxCheckpoint (const std::string& dir,
-                                                      const std::string& name) const
-{
-  BL_PROFILE("NyxParticleContainer<NSR,NSI,NAR,NAI>::NyxCheckpoint()");
-
-  bool is_checkpoint = true;
-  amrex::NeighborParticleContainer<NSR,NSI>::Checkpoint(dir, name, is_checkpoint, real_comp_names);
 }
 
 #endif /*_NyxParticleContainer_H_*/

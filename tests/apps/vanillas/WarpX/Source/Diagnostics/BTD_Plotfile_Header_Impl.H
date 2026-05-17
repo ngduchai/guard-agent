@@ -295,8 +295,7 @@ public:
     amrex::Vector<std::string> m_real_comp_names;
     /** The real integer names*/
     amrex::Vector<std::string> m_int_comp_names;
-    /** if the output is a checkpoint */
-    bool m_is_checkpoint;
+        bool m_is_checkpoint;
 };
 
 /**

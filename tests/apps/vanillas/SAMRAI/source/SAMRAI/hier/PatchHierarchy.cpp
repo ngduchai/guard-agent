@@ -14,7 +14,6 @@
 #include "SAMRAI/hier/OverlapConnectorAlgorithm.h"
 #include "SAMRAI/hier/PeriodicShiftCatalog.h"
 #include "SAMRAI/hier/VariableDatabase.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/MathUtilities.h"
 
 
@@ -91,15 +90,13 @@ PatchHierarchy::PatchHierarchy(
     * Without input database, the default is single-level with no
     * patch size constraints.
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
    getFromInput(input_db, is_from_restart);
 
    d_grid_geometry->setUpRatios(d_ratio_to_coarser);
-
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name, this);
 }
 
 /*
@@ -114,8 +111,7 @@ PatchHierarchy::PatchHierarchy(
 
 PatchHierarchy::~PatchHierarchy()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 /*
  *************************************************************************
@@ -1061,116 +1057,7 @@ void
 PatchHierarchy::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("HIER_PATCH_HIERARCHY_VERSION",
-      HIER_PATCH_HIERARCHY_VERSION);
-
-   restart_db->putInteger("d_number_levels", d_number_levels);
-
-   std::vector<std::string> level_names(d_max_levels);
-   const std::string prefix("level_");
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      level_names[ln] = prefix + tbox::Utilities::levelToString(ln);
-   }
-
-   /*
-    * Write hierarchy parameters.
-    */
-   restart_db->putInteger("max_levels", d_max_levels);
-
-   std::shared_ptr<tbox::Database> ratio_to_coarser_db(
-      restart_db->putDatabase("ratio_to_coarser"));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         std::vector<int> ratio_vec(d_dim.getValue());
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            ratio_vec[d] = (d_ratio_to_coarser[ln](b,d));
-         }
-         std::string level_block_name(level_names[ln]);
-         level_block_name += "_";
-         level_block_name += tbox::Utilities::intToString(static_cast<int>(b));
-         ratio_to_coarser_db->putIntegerArray(level_block_name,
-            &ratio_vec[0],
-            d_dim.getValue());
-      }
-   }
-
-   std::shared_ptr<tbox::Database> smallest_patch_db(
-      restart_db->putDatabase("smallest_patch_size"));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      smallest_patch_db->putIntegerArray(level_names[ln],
-         &d_smallest_patch_size[ln][0],
-         d_dim.getValue());
-   }
-
-   std::shared_ptr<tbox::Database> minimum_cells_db(
-      restart_db->putDatabase("minimum_cell_request"));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      minimum_cells_db->putInteger(level_names[ln],
-         d_minimum_cells[ln]);
-   }
-
-   std::shared_ptr<tbox::Database> largest_patch_db(
-      restart_db->putDatabase("largest_patch_size"));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      largest_patch_db->putIntegerArray(level_names[ln],
-         &d_largest_patch_size[ln][0],
-         d_dim.getValue());
-   }
-
-   if (d_max_levels > 1) {
-      restart_db->putIntegerVector("proper_nesting_buffer",
-         d_proper_nesting_buffer);
-   }
-
-   restart_db->putBool("allow_patches_smaller_than_ghostwidth",
-      d_allow_patches_smaller_than_ghostwidth);
-
-   restart_db->putBool("allow_patches_smaller_than_minimum_size_to_prevent_overlaps",
-      d_allow_patches_smaller_than_minimum_size_to_prevent_overlaps);
-
-   std::shared_ptr<tbox::Database> self_connector_widths_db(
-      restart_db->putDatabase("d_self_connector_widths"));
-   d_self_connector_widths.resize(d_max_levels, IntVector(d_dim, 1, d_number_blocks));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-
-      std::vector<int> put_self_widths(d_number_blocks * d_dim.getValue());
-      int ic = 0;
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            put_self_widths[ic] = d_self_connector_widths[ln](b,d);
-            ++ic;
-         }
-      }
-      self_connector_widths_db->putIntegerVector(level_names[ln],
-         put_self_widths);
-   }
-
-   std::shared_ptr<tbox::Database> fine_connector_widths_db(
-      restart_db->putDatabase("d_fine_connector_widths"));
-   d_fine_connector_widths.resize(d_max_levels-1, IntVector(d_dim, 1, d_number_blocks));
-   for (int ln = 0; ln < d_max_levels - 1; ++ln) {
-
-      std::vector<int> put_fine_widths(d_number_blocks * d_dim.getValue());
-      int ic = 0;
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            put_fine_widths[ic] = d_self_connector_widths[ln](b,d);
-            ++ic;
-         }
-      }
-      fine_connector_widths_db->putIntegerVector(level_names[ln],
-         put_fine_widths);
-   }
-
-   for (int i = 0; i < d_number_levels; ++i) {
-
-      std::shared_ptr<tbox::Database> level_database(
-         restart_db->putDatabase(level_names[i]));
-
-      d_patch_levels[i]->putToRestart(level_database);
-   }
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 #ifdef SAMRAI_HAVE_CONDUIT
@@ -2313,188 +2200,13 @@ PatchHierarchy::makeAdjacencySets(
 void
 PatchHierarchy::getFromRestart()
 {
-   std::shared_ptr<tbox::Database> restart_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!restart_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("PatchHierarchy::getFromRestart() error...\n"
-         << "   Restart database with name "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> database(
-      restart_db->getDatabase(d_object_name));
-
-   /*
-    * Read hierarchy paremeters.
-    */
-
-   int ver = database->getInteger("HIER_PATCH_HIERARCHY_VERSION");
-   if (ver != HIER_PATCH_HIERARCHY_VERSION) {
-      TBOX_ERROR("PatchHierarchy::getFromRestart error...\n"
-         << "  object name = " << d_object_name
-         << " : Restart file version different than class version" << std::endl);
-   }
-
-   d_number_levels = database->getInteger("d_number_levels");
-   if (d_number_levels <= 0) {
-      TBOX_ERROR("PatchHierarchy::getFromRestart error ...\n"
-         << "  object name = " << d_object_name
-         << " : `d_number_levels' is <= zero in restart file" << std::endl);
-   }
-
-   d_max_levels = database->getInteger("max_levels");
-
-   std::vector<std::string> level_names(d_max_levels);
-   const std::string prefix("level_");
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      level_names[ln] = prefix + tbox::Utilities::levelToString(ln);
-   }
-
-   std::shared_ptr<tbox::Database> ratio_to_coarser_db(
-      database->getDatabase("ratio_to_coarser"));
-   d_ratio_to_coarser.resize(d_max_levels, d_ratio_to_coarser.back());
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         std::string level_block_name(level_names[ln]);
-         level_block_name += "_";
-         level_block_name += tbox::Utilities::intToString(static_cast<int>(b));
-         std::vector<int> ratio_vec(d_dim.getValue());
-         ratio_to_coarser_db->getIntegerArray(level_block_name,
-            &ratio_vec[0],
-            d_dim.getValue());
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            d_ratio_to_coarser[ln](b,d) = ratio_vec[d];
-         }
-      }
-   }
-
-   std::shared_ptr<tbox::Database> smallest_patch_db(
-      database->getDatabase("smallest_patch_size"));
-   d_smallest_patch_size.resize(d_max_levels, d_smallest_patch_size.back());
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      smallest_patch_db->getIntegerArray(level_names[ln],
-         &d_smallest_patch_size[ln][0],
-         d_dim.getValue());
-   }
-
-   std::shared_ptr<tbox::Database> minimum_cells_db(
-      database->getDatabase("minimum_cell_request"));
-   d_minimum_cells.resize(d_max_levels, d_minimum_cells.back());
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      d_minimum_cells[ln] =
-         minimum_cells_db->getInteger(level_names[ln]);
-   }
-
-   std::shared_ptr<tbox::Database> largest_patch_db(
-      database->getDatabase("largest_patch_size"));
-   d_largest_patch_size.resize(d_max_levels, d_largest_patch_size.back());
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      largest_patch_db->getIntegerArray(level_names[ln],
-         &d_largest_patch_size[ln][0],
-         d_dim.getValue());
-   }
-
-   d_proper_nesting_buffer.resize(d_max_levels - 1, 0);
-   if (d_max_levels > 1) {
-      d_proper_nesting_buffer =
-         database->getIntegerVector("proper_nesting_buffer");
-   }
-
-   d_allow_patches_smaller_than_ghostwidth = database->getBool(
-         "allow_patches_smaller_than_ghostwidth");
-
-   d_allow_patches_smaller_than_minimum_size_to_prevent_overlaps =
-      database->getBool(
-         "allow_patches_smaller_than_minimum_size_to_prevent_overlaps");
-   if (d_allow_patches_smaller_than_minimum_size_to_prevent_overlaps) {
-      TBOX_WARNING(
-         d_object_name << ":  "
-                       << "Allowing patches smaller than the given "
-                       << "smallest patch size.  Note:  If periodic "
-                       << "boundary conditions are used, this flag is "
-                       << "ignored in the periodic directions." << std::endl);
-   }
-
-   std::shared_ptr<tbox::Database> self_connector_widths_db(
-      database->getDatabase("d_self_connector_widths"));
-   d_self_connector_widths.resize(d_max_levels, IntVector(d_dim, 1, d_number_blocks));
-   for (int ln = 0; ln < d_max_levels; ++ln) {
-      std::vector<int> get_self_widths =
-         self_connector_widths_db->getIntegerVector(level_names[ln]);
-
-      d_self_connector_widths[ln] = IntVector(d_dim, 0, d_number_blocks);
-      int ic = 0;
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            d_self_connector_widths[ln](b,d) = get_self_widths[ic];
-            ++ic;
-         }
-      }
-   }
-
-   std::shared_ptr<tbox::Database> fine_connector_widths_db(
-      database->getDatabase("d_fine_connector_widths"));
-   d_fine_connector_widths.resize(d_max_levels - 1, IntVector(d_dim, 1, d_number_blocks));
-   for (int ln = 0; ln < d_max_levels - 1; ++ln) {
-      std::vector<int> get_fine_widths =
-         fine_connector_widths_db->getIntegerVector(level_names[ln]);
-
-      d_fine_connector_widths[ln] = IntVector(d_dim, 0, d_number_blocks);
-      int ic = 0;
-      for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-         for (int d = 0; d < d_dim.getValue(); ++d) {
-            d_fine_connector_widths[ln](b,d) = get_fine_widths[ic];
-            ++ic;
-         }
-      }
-   }
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 void
 PatchHierarchy::initializeHierarchy()
 {
-   std::shared_ptr<tbox::Database> restart_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!restart_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("PatchHierarchy::initializeHierarchy() error...\n"
-         << "   Restart database with name "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> database(
-      restart_db->getDatabase(d_object_name));
-
-   d_patch_levels.resize(d_number_levels);
-   for (int i = 0; i < d_number_levels; ++i) {
-      std::string level_name = "level_" + tbox::Utilities::levelToString(i);
-
-      std::shared_ptr<tbox::Database> level_database(
-         database->getDatabase(level_name));
-
-      d_patch_levels[i] = d_patch_level_factory->allocate(
-            level_database,
-            d_grid_geometry,
-            d_patch_descriptor,
-            d_patch_factory,
-            false);
-   }
-   /*
-    * Compute Connectors.
-    * BTNG TODO: This should be replaced by writing edges to
-    * restart and reading them back.
-    */
-   for (int i = 0; i < d_number_levels; ++i) {
-      d_patch_levels[i]->findConnector(*d_patch_levels[i],
-         getRequiredConnectorWidth(i, i),
-         CONNECTOR_CREATE);
-      if (i < d_number_levels - 1) {
-         d_patch_levels[i]->findConnectorWithTranspose(*d_patch_levels[i + 1],
-            getRequiredConnectorWidth(i, i + 1),
-            getRequiredConnectorWidth(i + 1, i),
-            CONNECTOR_CREATE);
-      }
-   }
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 int

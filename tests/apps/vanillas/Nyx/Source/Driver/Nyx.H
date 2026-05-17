@@ -97,18 +97,11 @@ public:
     virtual ~Nyx() override;
 
     //
-    //Restart from a checkpoint file.
     //
     virtual void restart(amrex::Amr& papa, istream& is, bool b_read_special=false) override;
 
     //
-    //Call amrex::AmrLevel::checkPoint and then add radiation info
     //
-    virtual void checkPoint(const std::string& dir, std::ostream& os,
-                            amrex::VisMF::How how, bool dump_old) override;
-    virtual void checkPointPre(const std::string& dir, std::ostream& os) override;
-    virtual void checkPointPost(const std::string& dir, std::ostream& os) override;
-
     // A string written as the first item in `write_plot_file()` at level zero.
     // It is so we can distinguish between different types of plot files. For
     // Nyx it has the form: Nyx-Vnnn.
@@ -272,26 +265,16 @@ public:
     void plot_z_est_time_step(amrex::Real& est_dt, bool& dt_changed);
 
     //
-    // Time step control based on "z" not passing one of the specified checkpoint_z_values
     //
-    void checkpoint_z_est_time_step(amrex::Real& est_dt, bool& dt_changed);
-
-
     //
     // Time step control based on "z" not passing one of the specified analysis_z_values
     //
     void analysis_z_est_time_step(amrex::Real& est_dt, bool& dt_changed);
 
     //
-    // How to initialize "a" at restart (from checkpoint or plotfile)
     //
-    void comoving_a_post_restart(const std::string& restart_file);
-
     //
-    // How to initialize typical values at restart (from checkpoint or plotfile)
     //
-    void typical_values_post_restart(const std::string& restart_file);
-
     //
     // Initialize the zhi component of the EOS from a binary input file
     //
@@ -312,15 +295,12 @@ public:
     void icReadAndPrepareFab(std::string mfDirName, int nghost, amrex::MultiFab &mf);
 
     //
-    // Write forcing spectrum in checkpoint directories
     //
     void forcing_check_point (const std::string& dir);
 
     //
     // Restore spectrum at restart
     //
-    void forcing_post_restart(const std::string& restart_file);
-
     void integrate_state_force(
             amrex::Box const& bx,
             amrex::Array4<amrex::Real> const& state,
@@ -361,7 +341,6 @@ public:
 #endif
 
     //
-    // Write particles in checkpoint directories
     //
     void particle_check_point(const std::string& dir);
 
@@ -374,8 +353,6 @@ public:
     //
     // How to initialize at restart
     //
-    void particle_post_restart(const std::string& restart_file, bool is_checkpoint = true);
-
     //
     // Redistribute
     //
@@ -463,10 +440,7 @@ public:
     bool writePlotNow() override;
 
     //
-    // Tell amrex::Amr to write a checkpoint file now
     //
-    bool checkPointNow() override;
-
     //
     // Tell Nyx to do analysis now
     //
@@ -669,8 +643,6 @@ int integrate_state_struct
     //
     // Do work after a `restart()`.
     //
-    virtual void post_restart() override;
-
     //
     // Do work after `init()`.
     //
@@ -811,7 +783,6 @@ int integrate_state_struct
                               const std::string &secondDir,  // ---- probably DM or AGN
                               std::string &LevelDir,
                               std::string &FullPath);
-    //! Create the Level_ and other directories in checkpoint and plot files
     virtual void CreateLevelDirectory (const std::string &dir) override;
 
 protected:
@@ -916,7 +887,6 @@ protected:
     static int particle_launch_ics;
 
     static amrex::Vector<amrex::Real> plot_z_values;       // These are the value of "z" at which to dump plotfiles.
-    static amrex::Vector<amrex::Real> checkpoint_z_values; // These are the value of "z" at which to dump checkpoint files.
     static amrex::Vector<amrex::Real> analysis_z_values;   // These are the value of "z" at which to perform analysis
     static int insitu_int;
     static int insitu_start;

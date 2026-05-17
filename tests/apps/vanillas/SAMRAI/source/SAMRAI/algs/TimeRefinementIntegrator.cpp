@@ -12,7 +12,6 @@
 #include "SAMRAI/tbox/MathUtilities.h"
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/TimerManager.h"
 #include "SAMRAI/tbox/Timer.h"
 #include "SAMRAI/tbox/MathUtilities.h"
@@ -82,9 +81,6 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
    TBOX_ASSERT(hierarchy);
    TBOX_ASSERT(level_integrator);
    TBOX_ASSERT(gridding_algorithm);
-
-   tbox::RestartManager::getManager()->registerRestartItem(d_object_name,
-      this);
 
    d_use_refined_timestepping = level_integrator->usingRefinedTimestepping();
 
@@ -161,7 +157,7 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
     * Initialize this time refinement integration object with data read
     * from input and restart databases.
     */
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -199,8 +195,7 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
 
 TimeRefinementIntegrator::~TimeRefinementIntegrator()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(d_object_name);
-}
+   }
 
 /*
  *************************************************************************
@@ -225,7 +220,7 @@ TimeRefinementIntegrator::initializeHierarchy()
 
    d_refine_level_integrator->initializeLevelIntegrator(d_gridding_algorithm);
 
-   if (tbox::RestartManager::getManager()->isFromRestart()) {
+   if (false) {
 
       d_patch_hierarchy->initializeHierarchy();
 
@@ -1578,23 +1573,7 @@ void
 TimeRefinementIntegrator::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_TIME_REFINEMENT_INTEGRATOR_VERSION",
-      ALGS_TIME_REFINEMENT_INTEGRATOR_VERSION);
-
-   restart_db->putDouble("start_time", d_start_time);
-   restart_db->putDouble("end_time", d_end_time);
-   restart_db->putDouble("grow_dt", d_grow_dt);
-   restart_db->putInteger("max_integrator_steps", d_max_steps_level[0]);
-   restart_db->putIntegerVector("regrid_interval", d_regrid_interval);
-   restart_db->putIntegerVector("tag_buffer", d_tag_buffer);
-   restart_db->putBool("DEV_barrier_and_time", d_barrier_and_time);
-   restart_db->putDouble("d_integrator_time", d_integrator_time);
-   restart_db->putInteger("d_integrator_step", d_step_level[0]);
-   restart_db->putInteger("d_last_finest_level", d_last_finest_level);
-   restart_db->putDoubleVector("d_dt_max_level", d_dt_max_level);
-   restart_db->putDoubleVector("d_dt_actual_level", d_dt_actual_level);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -1770,37 +1749,7 @@ TimeRefinementIntegrator::getFromInput(
 void
 TimeRefinementIntegrator::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> restart_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!restart_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file." << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(
-      restart_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("ALGS_TIME_REFINEMENT_INTEGRATOR_VERSION");
-   if (ver != ALGS_TIME_REFINEMENT_INTEGRATOR_VERSION) {
-      TBOX_ERROR(
-         d_object_name << ":  "
-                       << "Restart file version different than class version."
-                       << std::endl);
-   }
-
-   d_start_time = db->getDouble("start_time");
-   d_end_time = db->getDouble("end_time");
-   d_grow_dt = db->getDouble("grow_dt");
-   d_max_steps_level[0] = db->getInteger("max_integrator_steps");
-   d_regrid_interval = db->getIntegerVector("regrid_interval");
-   d_tag_buffer = db->getIntegerVector("tag_buffer");
-   d_barrier_and_time = db->getBool("DEV_barrier_and_time");
-   d_integrator_time = db->getDouble("d_integrator_time");
-   d_step_level[0] = db->getInteger("d_integrator_step");
-   d_last_finest_level = db->getInteger("d_last_finest_level");
-   d_dt_max_level = db->getDoubleVector("d_dt_max_level");
-   d_dt_actual_level = db->getDoubleVector("d_dt_actual_level");
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

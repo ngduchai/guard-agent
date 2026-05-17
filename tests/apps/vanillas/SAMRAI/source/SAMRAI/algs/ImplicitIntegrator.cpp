@@ -13,7 +13,6 @@
 #include <stdlib.h>
 #include <fstream>
 #include "SAMRAI/tbox/SAMRAI_MPI.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 #include "SAMRAI/tbox/MathUtilities.h"
 
@@ -61,7 +60,7 @@ ImplicitIntegrator::ImplicitIntegrator(
     * Initialize object with data read from input and restart databases.
     */
 
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -335,17 +334,7 @@ void
 ImplicitIntegrator::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("ALGS_IMPLICIT_INTEGRATOR_VERSION",
-      ALGS_IMPLICIT_INTEGRATOR_VERSION);
-
-   restart_db->putDouble("initial_time", d_initial_time);
-   restart_db->putDouble("final_time", d_final_time);
-
-   restart_db->putInteger("d_integrator_step", d_integrator_step);
-   restart_db->putInteger("max_integrator_steps", d_max_integrator_steps);
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -361,29 +350,7 @@ ImplicitIntegrator::putToRestart(
 void
 ImplicitIntegrator::getFromRestart()
 {
-
-   std::shared_ptr<tbox::Database> root_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!root_db->isDatabase(d_object_name)) {
-      TBOX_ERROR("Restart database corresponding to "
-         << d_object_name << " not found in restart file" << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(root_db->getDatabase(d_object_name));
-
-   int ver = db->getInteger("ALGS_IMPLICIT_INTEGRATOR_VERSION");
-   if (ver != ALGS_IMPLICIT_INTEGRATOR_VERSION) {
-      TBOX_ERROR(d_object_name << ":  "
-                               << "Restart file version different "
-                               << "than class version." << std::endl);
-   }
-
-   d_initial_time = db->getDouble("initial_time");
-   d_final_time = db->getDouble("final_time");
-
-   d_integrator_step = db->getInteger("d_integrator_step");
-   d_max_integrator_steps = db->getInteger("max_integrator_steps");
-
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

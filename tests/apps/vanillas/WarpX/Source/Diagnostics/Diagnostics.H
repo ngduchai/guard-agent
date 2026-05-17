@@ -265,10 +265,7 @@ protected:
 
     /** If true, a dump is performed at the last timestep regardless of the required dump timesteps */
     bool m_dump_last_timestep = true;
-    /** format for output files, "plotfile" or "openpmd" or "sensei" or "ascent"
-     * The checkpoint format is applicable for FullDiagnostics only.
-     */
-    std::string m_format = "plotfile";
+        std::string m_format = "plotfile";
     /** Whether this iteration has already been dumped, to avoid writing data twice */
     int m_already_done = false;
     /** This class is responsible for flushing the data to file */

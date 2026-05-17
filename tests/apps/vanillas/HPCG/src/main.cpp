@@ -317,6 +317,22 @@ int main(int argc, char * argv[]) {
   double total_runtime = params.runningTime;
   int numberOfCgSets = int(total_runtime / opt_worst_time) + 1; // Run at least once, account for rounding
 
+  /* === Workload-pin: read HPCG_FIXED_SETS, mirror of the reference's
+     tests/apps/checkpointed/HPCG/src/main.cpp:325-330 read.  Required so
+     the validation framework can run vanilla and reference under the SAME
+     numberOfCgSets — without this, opt_worst_time variance between
+     binaries (vanilla auto-computes ~more sets) breaks workload parity
+     and the bench comparison is invalid.  Compute-only knob, no I/O,
+     does not re-introduce checkpoint capability. === */
+  {
+    const char *fs = getenv("HPCG_FIXED_SETS");
+    if (fs && *fs) {
+      int n = atoi(fs);
+      if (n > 0) numberOfCgSets = n;
+    }
+  }
+  /* === end === */
+
 #ifdef HPCG_DEBUG
   if (rank==0) {
     HPCG_fout << "Projected running time: " << total_runtime << " seconds" << endl;

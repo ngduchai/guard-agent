@@ -14,7 +14,6 @@
 #include "SAMRAI/hier/PatchLevel.h"
 #include "SAMRAI/hier/PeriodicShiftCatalog.h"
 #include "SAMRAI/hier/SingularityFinder.h"
-#include "SAMRAI/tbox/RestartManager.h"
 #include "SAMRAI/tbox/StartupShutdownManager.h"
 #include "SAMRAI/tbox/Utilities.h"
 
@@ -82,10 +81,7 @@ BaseGridGeometry::BaseGridGeometry(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(input_db);
 
-   tbox::RestartManager::getManager()->registerRestartItem(getObjectName(),
-      this);
-
-   bool is_from_restart = tbox::RestartManager::getManager()->isFromRestart();
+   bool is_from_restart = false;
    if (is_from_restart) {
       getFromRestart();
    }
@@ -122,9 +118,6 @@ BaseGridGeometry::BaseGridGeometry(
 {
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(!domain.empty());
-
-   tbox::RestartManager::getManager()->
-   registerRestartItem(getObjectName(), this);
 
    LocalId local_id(0);
    std::set<BlockId::block_t> block_numbers;
@@ -165,9 +158,6 @@ BaseGridGeometry::BaseGridGeometry(
    TBOX_ASSERT(!object_name.empty());
    TBOX_ASSERT(!domain.empty());
 
-   tbox::RestartManager::getManager()->
-   registerRestartItem(getObjectName(), this);
-
    LocalId local_id(0);
    std::set<BlockId::block_t> block_numbers;
    for (BoxContainer::iterator itr = domain.begin(); itr != domain.end();
@@ -196,8 +186,7 @@ BaseGridGeometry::BaseGridGeometry(
 
 BaseGridGeometry::~BaseGridGeometry()
 {
-   tbox::RestartManager::getManager()->unregisterRestartItem(getObjectName());
-}
+   }
 
 /*
  *************************************************************************
@@ -608,110 +597,7 @@ BaseGridGeometry::setGeometryDataOnPatch(
 void
 BaseGridGeometry::getFromRestart()
 {
-   std::shared_ptr<tbox::Database> restart_db(
-      tbox::RestartManager::getManager()->getRootDatabase());
-
-   if (!restart_db->isDatabase(getObjectName())) {
-      TBOX_ERROR("Restart database corresponding to "
-         << getObjectName() << " not found in the restart file." << std::endl);
-   }
-   std::shared_ptr<tbox::Database> db(
-      restart_db->getDatabase(getObjectName()));
-
-   const tbox::Dimension dim(getDim());
-
-   int ver = db->getInteger("HIER_GRID_GEOMETRY_VERSION");
-   if (ver != HIER_GRID_GEOMETRY_VERSION) {
-      TBOX_ERROR(
-         getObjectName() << ":  "
-                         << "Restart file version is different than class version."
-                         << std::endl);
-   }
-
-   d_number_blocks = static_cast<size_t>(db->getInteger("num_blocks"));
-   if (d_ratio_to_level_zero[0].getNumBlocks() != d_number_blocks) {
-      d_ratio_to_level_zero[0] = 
-         IntVector(IntVector::getOne(d_dim), d_number_blocks);
-   }
-
-   d_singularity.resize(d_number_blocks);
-   d_block_neighbors.resize(d_number_blocks);
-
-   std::string domain_name;
-   BoxContainer domain;
-   LocalId local_id(0);
-
-   for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-      std::string blk_string =
-         tbox::Utilities::intToString(static_cast<int>(b));
-
-      domain_name = "domain_boxes_" + blk_string;
-      std::vector<tbox::DatabaseBox> db_box_vector =
-         db->getDatabaseBoxVector(domain_name);
-      BoxContainer block_domain_boxes(db_box_vector);
-
-      for (BoxContainer::iterator itr = block_domain_boxes.begin();
-           itr != block_domain_boxes.end(); ++itr) {
-         Box box(*itr, local_id++, 0);
-         box.setBlockId(BlockId(b));
-         domain.pushBack(box);
-      }
-
-      if (d_number_blocks > 1) {
-
-         std::string singularity_db_name =
-            "Singularity_" + blk_string;
-         std::shared_ptr<tbox::Database> singularity_db =
-            db->getDatabase(singularity_db_name);
-         d_singularity[b].getFromRestart(*singularity_db);
-
-         std::string neighbors_db_name =
-            "Neighbors_" + blk_string;
-         std::shared_ptr<tbox::Database> neighbors_db =
-            db->getDatabase(neighbors_db_name);
-         int num_neighbors = neighbors_db->getInteger("num_neighbors");
-         for (int count = 0; count < num_neighbors; ++count) {
-            std::string neighbor_db_name =
-               "neighbor_" + tbox::Utilities::intToString(count);
-            std::shared_ptr<tbox::Database> neighbor_db =
-               neighbors_db->getDatabase(neighbor_db_name);
-            BlockId nbr_block_id(neighbor_db->getInteger("nbr_block_id"));
-            BoxContainer nbr_transformed_domain;
-            nbr_transformed_domain.getFromRestart(*neighbor_db);
-            Transformation::RotationIdentifier nbr_rotation_ident =
-               static_cast<Transformation::RotationIdentifier>(
-                  neighbor_db->getInteger("rotation_identifier"));
-            IntVector nbr_offset(dim);
-            nbr_offset.getFromRestart(*neighbor_db, "offset");
-            BlockId nbr_begin_block(neighbor_db->getInteger("begin_block"));
-            BlockId nbr_end_block(neighbor_db->getInteger("end_block"));
-            bool nbr_is_singularity = neighbor_db->getBool("d_is_singularity");
-            Transformation nbr_transformation(nbr_rotation_ident,
-               nbr_offset,
-               nbr_begin_block,
-               nbr_end_block);
-            std::vector<Transformation> restart_transformation(
-               1, nbr_transformation);
-            Neighbor block_nbr(nbr_block_id,
-               nbr_transformed_domain,
-               restart_transformation);
-            block_nbr.setSingularity(nbr_is_singularity);
-            std::pair<BlockId, Neighbor> nbr_pair(nbr_block_id, block_nbr);
-            d_block_neighbors[b].insert(nbr_pair);
-         }
-      }
-   }
-   setPhysicalDomain(domain, d_number_blocks);
-
-   d_has_enhanced_connectivity = db->getInteger("d_has_enhanced_connectivity");
-
-   d_number_of_block_singularities =
-      db->getInteger("d_number_of_block_singularities");
-
-   IntVector periodic_shift(dim);
-   int* temp_shift = &periodic_shift[0];
-   db->getIntegerArray("periodic_dimension", temp_shift, dim.getValue());
-   initializePeriodicShift(periodic_shift);
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*
@@ -850,80 +736,7 @@ void
 BaseGridGeometry::putToRestart(
    const std::shared_ptr<tbox::Database>& restart_db) const
 {
-   TBOX_ASSERT(restart_db);
-
-   const tbox::Dimension dim(getDim());
-
-   restart_db->putInteger("HIER_GRID_GEOMETRY_VERSION",
-      HIER_GRID_GEOMETRY_VERSION);
-
-   restart_db->putInteger("num_blocks", static_cast<int>(d_number_blocks));
-
-   for (BlockId::block_t b = 0; b < d_number_blocks; ++b) {
-
-      std::string blk_string =
-         tbox::Utilities::intToString(static_cast<int>(b));
-      std::string domain_name =
-         "domain_boxes_" + blk_string;
-
-      BoxContainer block_phys_domain(getPhysicalDomain(), BlockId(b));
-      std::vector<tbox::DatabaseBox> temp_box_vector = block_phys_domain;
-
-      restart_db->putDatabaseBoxVector(domain_name, temp_box_vector);
-
-      if (d_number_blocks > 1) {
-
-         std::string singularity_db_name =
-            "Singularity_" + blk_string;
-         std::shared_ptr<tbox::Database> singularity_db =
-            restart_db->putDatabase(singularity_db_name);
-         d_singularity[b].putToRestart(singularity_db);
-
-         std::string neighbors_db_name =
-            "Neighbors_" + blk_string;
-         std::shared_ptr<tbox::Database> neighbors_db =
-            restart_db->putDatabase(neighbors_db_name);
-         neighbors_db->putInteger("num_neighbors",
-            static_cast<int>(d_block_neighbors[b].size()));
-         int count = 0;
-         for (std::map<BlockId, Neighbor>::const_iterator ni = d_block_neighbors[b].begin();
-              ni != d_block_neighbors[b].end(); ++ni) {
-            const Neighbor& neighbor = ni->second;
-            std::string neighbor_db_name =
-               "neighbor_" +
-               tbox::Utilities::intToString(static_cast<int>(count));
-            std::shared_ptr<tbox::Database> neighbor_db =
-               neighbors_db->putDatabase(neighbor_db_name);
-            neighbor_db->putInteger("nbr_block_id",
-               static_cast<int>(neighbor.getBlockId().getBlockValue()));
-            neighbor.getTransformedDomain().putToRestart(neighbor_db);
-            neighbor_db->putInteger("rotation_identifier",
-               neighbor.getTransformation(0).getRotation());
-            neighbor.getTransformation(0).getOffset().putToRestart(*neighbor_db,
-               "offset");
-            neighbor_db->putInteger("begin_block",
-               static_cast<int>(
-                  neighbor.getTransformation(0).getBeginBlock().getBlockValue()));
-            neighbor_db->putInteger("end_block",
-               static_cast<int>(
-                  neighbor.getTransformation(0).getEndBlock().getBlockValue()));
-            neighbor_db->putBool("d_is_singularity", neighbor.isSingularity());
-            ++count;
-         }
-      }
-   }
-
-   restart_db->putInteger("d_has_enhanced_connectivity",
-      d_has_enhanced_connectivity);
-
-   restart_db->putInteger("d_number_of_block_singularities",
-      d_number_of_block_singularities);
-
-   IntVector level0_shift(getPeriodicShift(IntVector::getOne(dim)));
-   int* temp_shift = &level0_shift[0];
-   restart_db->putIntegerArray("periodic_dimension",
-      temp_shift,
-      dim.getValue());
+   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

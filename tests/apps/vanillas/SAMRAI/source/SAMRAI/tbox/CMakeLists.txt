@@ -45,7 +45,6 @@ set ( tbox_headers
   RankTreeStrategy.h
   ReferenceCounter.h
   ResourceAllocator.h
-  RestartManager.h
   SAMRAI_MPI.h
   SAMRAIManager.h
   Schedule.h
@@ -106,7 +105,6 @@ set (tbox_sources
   RankGroup.cpp
   RankTreeStrategy.cpp
   ReferenceCounter.cpp
-  RestartManager.cpp
   SAMRAIManager.cpp
   SAMRAI_MPI.cpp
   Scanner.cpp

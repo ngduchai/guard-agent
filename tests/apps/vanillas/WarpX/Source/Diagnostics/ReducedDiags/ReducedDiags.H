@@ -100,19 +100,9 @@ public:
     /** Check if diag should be done */
     [[nodiscard]] bool DoDiags(int step) const { return m_intervals.contains(step+1); }
 
-    /**
-     * \brief Write out checkpoint related data
-     *
-     * \param[in] dir Directory where checkpoint data is written
-     */
-    virtual void WriteCheckpointData (std::string const & dir);
+        virtual void WriteCheckpointData (std::string const & dir);
 
-    /**
-     * \brief Read in checkpoint related data
-     *
-     * \param[in] dir Directory where checkpoint data was written
-     */
-    virtual void ReadCheckpointData (std::string const & dir);
+        virtual void ReadCheckpointData (std::string const & dir);
 
     /**
      * This function queries deprecated input parameters and aborts
