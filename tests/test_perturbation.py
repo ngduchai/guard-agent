@@ -12,6 +12,7 @@ See plan: /home/ndhai/.claude/plans/tranquil-napping-meerkat.md
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -28,9 +29,11 @@ from validation.veloc.validate import (
     _DEFAULT_KILL_FRACTIONS,
     _RECOVERY_RESUMED_SLOPE_THRESHOLD,
     ValidationError,
+    _build_parser,
     _compute_perturbed_baseline,
     _enforce_validation_b,
     _load_perturbation_spec_for_app,
+    _parse_perturbation_fractions,
     _strip_output_dir_suffix,
     compute_recovery_slope,
     kill_fractions_for_bench,
@@ -739,5 +742,129 @@ class TestLoadPerturbationSpecForApp:
         monkeypatch.setattr(_ac, "load_frequencies",
                             lambda: {"once": {"inject_failures": False}})
         assert _load_perturbation_spec_for_app("X") is None
+
+
+# ---------------------------------------------------------------------------
+# --perturbation-fractions + --no-perturbation CLI plumbing (Piece C)
+# ---------------------------------------------------------------------------
+
+
+class TestParsePerturbationFractionsType:
+    """The argparse type converter for --perturbation-fractions."""
+
+    def test_percent_form(self):
+        assert _parse_perturbation_fractions("25,50,75") == (0.25, 0.50, 0.75)
+
+    def test_decimal_form(self):
+        assert _parse_perturbation_fractions("0.25,0.5,0.75") == (0.25, 0.50, 0.75)
+
+    def test_two_fractions_minimum(self):
+        # 2 points is the lower bound for fitting a slope.
+        assert _parse_perturbation_fractions("30,70") == (0.30, 0.70)
+
+    def test_one_fraction_rejected(self):
+        # 1 point → slope undefined.
+        with pytest.raises(argparse.ArgumentTypeError, match="at least 2"):
+            _parse_perturbation_fractions("50")
+
+    def test_empty_rejected(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="at least 2"):
+            _parse_perturbation_fractions("")
+
+    def test_mixed_scales_rejected(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="mixed"):
+            _parse_perturbation_fractions("0.25,50,0.75")
+
+    def test_zero_rejected(self):
+        # 0 is the open-interval lower bound.
+        with pytest.raises(argparse.ArgumentTypeError, match=r"\(0, 1\)"):
+            _parse_perturbation_fractions("0,50,75")
+
+    def test_one_hundred_rejected(self):
+        # 100% (= 1.0 in decimal scale) is the open-interval upper bound.
+        with pytest.raises(argparse.ArgumentTypeError, match=r"\(0, 1\)"):
+            _parse_perturbation_fractions("25,50,100")
+
+    def test_nonnumeric_rejected(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="parse"):
+            _parse_perturbation_fractions("not,a,number")
+
+    def test_whitespace_tolerated(self):
+        assert _parse_perturbation_fractions(" 25 , 50 , 75 ") == (0.25, 0.50, 0.75)
+
+
+class TestPerturbationFractionsFlag:
+    """End-to-end: ``--perturbation-fractions`` plumbs through _build_parser
+    into args.perturbation_fractions as a tuple of floats in (0, 1).
+    """
+
+    def _required_positionals(self):
+        return ["orig", "res", "--executable-name", "app"]
+
+    def test_default_is_none(self):
+        # Default = None so the orchestrator falls back to
+        # _DEFAULT_KILL_FRACTIONS without the CLI having to specify them.
+        p = _build_parser()
+        ns = p.parse_args(self._required_positionals())
+        assert ns.perturbation_fractions is None
+
+    def test_three_fraction_string_parses(self):
+        p = _build_parser()
+        ns = p.parse_args(
+            self._required_positionals() + ["--perturbation-fractions", "25,50,75"]
+        )
+        assert ns.perturbation_fractions == (0.25, 0.50, 0.75)
+
+    def test_equals_form_parses(self):
+        # `--perturbation-fractions=25,50,75` (the form documented in the
+        # brief's pilot command) must work alongside the space-separated
+        # form above.
+        p = _build_parser()
+        ns = p.parse_args(
+            self._required_positionals() + ["--perturbation-fractions=25,50,75"]
+        )
+        assert ns.perturbation_fractions == (0.25, 0.50, 0.75)
+
+    def test_decimal_form_parses(self):
+        p = _build_parser()
+        ns = p.parse_args(
+            self._required_positionals() + ["--perturbation-fractions", "0.2,0.5,0.8"]
+        )
+        assert ns.perturbation_fractions == (0.20, 0.50, 0.80)
+
+    def test_invalid_value_exits(self):
+        # argparse raises SystemExit on ArgumentTypeError.
+        p = _build_parser()
+        with pytest.raises(SystemExit):
+            p.parse_args(
+                self._required_positionals() + ["--perturbation-fractions", "0,50,100"]
+            )
+
+
+class TestNoPerturbationFlag:
+    """``--no-perturbation`` is the escape hatch that forces
+    perturbation_spec=None even when the YAML has a perturbation: block.
+    """
+
+    def _required_positionals(self):
+        return ["orig", "res", "--executable-name", "app"]
+
+    def test_default_false(self):
+        p = _build_parser()
+        ns = p.parse_args(self._required_positionals())
+        assert ns.no_perturbation is False
+
+    def test_flag_sets_true(self):
+        p = _build_parser()
+        ns = p.parse_args(self._required_positionals() + ["--no-perturbation"])
+        assert ns.no_perturbation is True
+
+    def test_flag_does_not_take_value(self):
+        # --no-perturbation is a flag, not an option.  Passing a value
+        # after it should make argparse treat the value as a positional
+        # (and fail since positionals are exhausted).
+        p = _build_parser()
+        with pytest.raises(SystemExit):
+            p.parse_args(self._required_positionals() + ["--no-perturbation", "extra-positional"])
 
 

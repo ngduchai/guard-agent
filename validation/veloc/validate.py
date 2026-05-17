@@ -1685,6 +1685,50 @@ def _load_benchmark_results(output_dir: Path) -> BenchmarkResults | None:
 # ---------------------------------------------------------------------------
 
 
+def _parse_perturbation_fractions(raw: str) -> "tuple[float, ...]":
+    """Parse a ``--perturbation-fractions`` CLI value into a tuple of floats
+    in the open interval (0, 1).
+
+    Accepts either percentages (``"25,50,75"``) or decimals
+    (``"0.25,0.5,0.75"``).  Mixed scales (one >1, one <1) are rejected as
+    ambiguous.  Endpoints 0 and 1 are also rejected — a kill at 0% lands
+    before the binary can checkpoint and a kill at 100% lands after the
+    failure-free wallclock has elapsed, so neither carries slope-test
+    information.
+
+    At least 2 points are required to fit a line (the slope is undefined
+    with 1 point).  Caller (``_stage_correctness``) enforces a stricter
+    "at least 2" check at use-site too.
+    """
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) < 2:
+        raise argparse.ArgumentTypeError(
+            f"--perturbation-fractions needs at least 2 comma-separated "
+            f"values; got {raw!r}"
+        )
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--perturbation-fractions: cannot parse {raw!r} as floats: {exc}"
+        ) from exc
+    has_percent = any(n > 1.0 for n in nums)
+    has_decimal = any(0.0 < n < 1.0 for n in nums)
+    if has_percent and has_decimal:
+        raise argparse.ArgumentTypeError(
+            f"--perturbation-fractions: mixed percent and decimal scales "
+            f"in {raw!r} (e.g. '0.25,50,0.75'); use one consistent scale"
+        )
+    if has_percent:
+        nums = [n / 100.0 for n in nums]
+    if any(n <= 0.0 or n >= 1.0 for n in nums):
+        raise argparse.ArgumentTypeError(
+            f"--perturbation-fractions: all values must be in the open "
+            f"interval (0, 1); got {raw!r}"
+        )
+    return tuple(nums)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m validation.veloc.validate",
@@ -1922,6 +1966,37 @@ def _build_parser() -> argparse.ArgumentParser:
             "in deterministic output lines (e.g. miniVite's `Time (in s): "
             "[0-9.]+` next to its Modularity result).  Sourced from "
             "comparison.strip_patterns in app.yaml."
+        ),
+    )
+
+    # Cold-replay detector (perturbation + multi-fraction kill).  Auto-enabled
+    # per-app when tests/apps/configs/<APP>.yaml has a perturbation: block.
+    # --no-perturbation forces it off for debugging the slope test alone.
+    corr_grp.add_argument(
+        "--perturbation-fractions",
+        type=_parse_perturbation_fractions,
+        default=None,
+        metavar="F1,F2,F3",
+        help=(
+            "Comma-separated kill fractions for the F-19 v2 multi-fraction "
+            "slope test (e.g. '25,50,75' or '0.25,0.5,0.75').  Each fraction "
+            "is a separate run; the recovery_elapsed/failure_free_elapsed "
+            "ratios are regressed against kill_fraction and the verdict gate "
+            f"is slope < {_RECOVERY_RESUMED_SLOPE_THRESHOLD}.  Default uses "
+            "the canonical {0.25, 0.50, 0.75} from _DEFAULT_KILL_FRACTIONS.  "
+            "Minimum 2 fractions; values in the open interval (0, 1)."
+        ),
+    )
+    corr_grp.add_argument(
+        "--no-perturbation",
+        action="store_true",
+        default=False,
+        help=(
+            "Force-disable input perturbation even when the per-app YAML has "
+            "a perturbation: block.  Use for isolated slope-test debugging "
+            "(slope still runs against the cached vanilla baseline) or when "
+            "the perturbation calibration is suspect.  Auto-enable is the "
+            "default; this is the escape hatch."
         ),
     )
 
@@ -2225,7 +2300,20 @@ def _stage_correctness(
         # cached baseline; `perturbation_active=False` is recorded so
         # _enforce_validation_b knows to keep the legacy F-20 path live.
         _app_name_for_pert = _strip_output_dir_suffix(output_dir.name)
-        perturbation_spec = _load_perturbation_spec_for_app(_app_name_for_pert)
+        # --no-perturbation is the escape hatch: skip the YAML lookup
+        # entirely so the spec is None even for SAMRAI/Nyx.  The slope
+        # test still runs (against the cached vanilla baseline) so the
+        # mechanism can be isolated for debugging.
+        if getattr(args, "no_perturbation", False):
+            perturbation_spec = None
+            print(
+                f"[validate] --no-perturbation: skipping YAML perturbation "
+                f"lookup for {_app_name_for_pert}; slope test runs against "
+                f"cached vanilla baseline.",
+                flush=True,
+            )
+        else:
+            perturbation_spec = _load_perturbation_spec_for_app(_app_name_for_pert)
         perturbation_active = perturbation_spec is not None
         # One seed per validation cycle, shared across the 3 fractions so
         # both the perturbed-vanilla Z_P and every resilient leg see the

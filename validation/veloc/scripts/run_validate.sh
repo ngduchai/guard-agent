@@ -14,9 +14,15 @@ set -e
 # The injection delay defaults to 'auto' (computed from baseline runtime).
 # Override with: --injection-delay 10.0
 #
+# Cold-replay detector (auto-enabled when tests/apps/configs/<APP>.yaml
+# declares a perturbation: block — currently SAMRAI + Nyx).  Tune via:
+#   --perturbation-fractions=25,50,75   override the slope-test kill fractions
+#   --no-perturbation                   force-disable per-app perturbation
+#
 # Examples:
 #   ./validation/veloc/scripts/run_validate.sh art_simple
 #   ./validation/veloc/scripts/run_validate.sh --baseline art_simple --skip-benchmarks
+#   ./validation/veloc/scripts/run_validate.sh --baseline SAMRAI --perturbation-fractions=25,50,75
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
