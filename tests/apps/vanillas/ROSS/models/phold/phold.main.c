@@ -281,6 +281,36 @@ main(int argc, char **argv)
 #ifdef USE_DAMARIS
     } // end if(g_st_ross_rank)
 #endif
+
+	/* Step 0 v8: emit binary validation signature for file-based comparison.
+	 * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
+	 * rank 0.  ROSS is stochastic (event-driven Monte Carlo) so a strict
+	 * state-based signature would be unreliable; instead this CONFIG
+	 * signature captures deterministic runtime invariants:
+	 *   [0] (double)g_tw_nlp                                (total LPs per rank)
+	 *   [1] g_tw_lookahead                                  (lookahead config)
+	 *   [2] (double)g_tw_synchronization_protocol           (sync mode)
+	 *   [3] (double)g_phold_start_events                    (per-LP starting events)
+	 *   [4] mean                                            (exponential dist mean)
+	 *   [5] percent_remote                                  (remote event rate)
+	 * Sufficient for Step 0.6c cross-consistency at same workload.
+	 * Rank-root-only via g_tw_mynode == 0.
+	 */
+	if (g_tw_mynode == 0) {
+		double sig_buf[6];
+		sig_buf[0] = (double)g_tw_nlp;
+		sig_buf[1] = g_tw_lookahead;
+		sig_buf[2] = (double)g_tw_synchronization_protocol;
+		sig_buf[3] = (double)g_phold_start_events;
+		sig_buf[4] = mean;
+		sig_buf[5] = percent_remote;
+		FILE* sig_f = fopen("validation_output.bin", "wb");
+		if (sig_f) {
+			fwrite(sig_buf, sizeof(double), 6, sig_f);
+			fclose(sig_f);
+		}
+	}
+
 	tw_end();
 
 #ifdef TEST_COMM_ROSS
