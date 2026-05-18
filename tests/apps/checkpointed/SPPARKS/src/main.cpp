@@ -27,40 +27,69 @@ using namespace SPPARKS_NS;
  *
  * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
  * Byte layout MUST be identical between vanilla and reference at the same
- * workload so Step 0.6c cross-consistency passes:
- *   [0] global nsites (MPI_SUM of app->nlocal across ranks)
- *   [1] app->time                                   (final simulation time)
- *   [2] (double)rank0_nlocal                        (rank 0's local site count)
- *   [3] (double)world_size                          (number of MPI ranks)
- *   [4] (double)(global_nsites)                     (duplicate for invariance)
- *   [5] (double)world_size * app->time              (combined invariant)
+ * workload so Step 0.6c cross-consistency passes.
  *
- * app->time is identical on every rank (advanced collectively); app->nlocal is
- * per-rank, reduced via MPI_Reduce(MPI_SUM).  Uses only base-class App fields
- * to remain agnostic of which SPPARKS app subclass is in use (AppLattice,
- * AppPotts, AppDiffusion, etc.).
+ * SCHEMA REDESIGN (2026-05-18 v2, was v1 = commit aae27dc64): v1 captured
+ * temperature-INVARIANT counts (nsites, world_size) and app->time which is
+ * FIXED by the `run UNTIL time=18800` command in the validation input.  All
+ * 6 v1 fields would be perturbation-invariant -> Step B calibration FAIL.
+ *
+ * v2 captures per-site state aggregates via MPI_Reduce so the signature
+ * reacts to temperature changes (KMC accept/reject rates depend on T,
+ * producing different final lattice configurations):
+ *   [0] global sum of iarray[0][i]    (integer state, e.g. Ising spins)
+ *   [1] global sum of iarray[0][i]^2  (state variance amplitude)
+ *   [2] global sum of darray[0][i]    (double state, if ndouble>0; else 0)
+ *   [3] app->time                     (kept as final-time marker; fixed for
+ *                                      `run until time=N` inputs but informative)
+ *   [4] (double)global_nsites         (sanity check)
+ *   [5] (double)world_size            (decomposition sanity)
+ *
+ * Defensive: ninteger >= 1 expected (lattice apps have at least one int
+ * per site); ndouble may be 0 (skipped if so).  Local sums over
+ * iarray[0][0..nlocal-1] and darray[0][0..nlocal-1].  Global sums via
+ * MPI_Reduce(MPI_SUM).  Rank-root-only file write.
  */
 static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
   int rank, size;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  long long local_n = (long long)spk->app->nlocal;
-  long long global_n = 0;
-  MPI_Reduce(&local_n, &global_n, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+  int nlocal = spk->app->nlocal;
+  double local_sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
-  long long rank0_n = 0;
-  if (rank == 0) rank0_n = local_n;
+  // Per-site integer state sums (most lattice apps use iarray[0])
+  if (spk->app->ninteger >= 1 && spk->app->iarray != nullptr
+      && spk->app->iarray[0] != nullptr) {
+    int *iarr = spk->app->iarray[0];
+    for (int i = 0; i < nlocal; i++) {
+      double v = (double)iarr[i];
+      local_sums[0] += v;
+      local_sums[1] += v * v;
+    }
+  }
+  // Per-site double state sum (if app has continuous per-site values)
+  if (spk->app->ndouble >= 1 && spk->app->darray != nullptr
+      && spk->app->darray[0] != nullptr) {
+    double *darr = spk->app->darray[0];
+    for (int i = 0; i < nlocal; i++) {
+      local_sums[2] += darr[i];
+    }
+  }
+  local_sums[3] = (double)nlocal;  // for global nsites computation
+
+  double global_sums[5];
+  MPI_Reduce(local_sums, global_sums, 5, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
   if (rank != 0) return;
 
   double buf[6];
-  buf[0] = (double)global_n;
-  buf[1] = spk->app->time;
-  buf[2] = (double)rank0_n;
-  buf[3] = (double)size;
-  buf[4] = (double)global_n;
-  buf[5] = (double)size * spk->app->time;
+  buf[0] = global_sums[0];
+  buf[1] = global_sums[1];
+  buf[2] = global_sums[2];
+  buf[3] = spk->app->time;
+  buf[4] = global_sums[3];  // = global nsites
+  buf[5] = (double)size;
 
   FILE* f = std::fopen("validation_output.bin", "wb");
   if (f) {
