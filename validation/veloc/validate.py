@@ -3907,9 +3907,15 @@ def _stage_benchmarks(
         app_input_subdir=getattr(args, 'app_input_subdir', None),
         resilient_priority_source_dirs=resilient_priority_param,
         skip_original_codebase=is_baseline_mode,
-        # always skip original.<inject> — vanilla can't recover, value is
-        # synthetic = vanilla.nofail × (1 + delay_fraction).
-        skip_original_inject_scenarios=True,
+        # 2026-05-18: collect MEASURED vanilla.once instead of synthesizing
+        # it.  Paper figure fast_tier_compare_walltime_failure_injected.pdf
+        # needs vanilla-once as a real measurement (kill at f×T_nofail, then
+        # vanilla restarts from scratch since it has no checkpoint -- total
+        # wall ≈ (1+f)×T_nofail).  Previous synthetic value matched this
+        # formula exactly but was a model assumption, not a measurement.
+        # Cost: 3 extra mpirun cycles per app (~5 min per app at typical
+        # T_nofail≈60s, f=0.5); ~85 min over the 17-app sweep.
+        skip_original_inject_scenarios=False,
     )
 
 
