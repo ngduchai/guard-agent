@@ -650,6 +650,32 @@ int main(int argc, char *argv[]) {
     std::cout << std::endl << "omp wtime used = " << omp_time << std::endl;
     std::cout << "zone-cycles/omp_wsecond = " << zc_omps << std::endl;
 #endif
+
+    /* Step 0 v8: emit binary validation signature for file-based comparison.
+     * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
+     * rank 0.  Schema (byte-identical between vanilla and reference at
+     * same workload):
+     *   [0] pmesh->time                            (final simulated time)
+     *   [1] (double)pmesh->ncycle                  (final cycle count)
+     *   [2] pmesh->dt                              (final timestep size)
+     *   [3] (double)pmesh->nbtotal                 (total mesh blocks)
+     *   [4] pmesh->tlim                            (time limit; constant)
+     *   [5] (double)pmesh->nlim                    (cycle limit; constant or -1)
+     * All values are globally consistent mesh-wide scalars; rank-root-only
+     * (we are inside the `if (Globals::my_rank == 0)` block).
+     */
+    double sig_buf[6];
+    sig_buf[0] = pmesh->time;
+    sig_buf[1] = static_cast<double>(pmesh->ncycle);
+    sig_buf[2] = pmesh->dt;
+    sig_buf[3] = static_cast<double>(pmesh->nbtotal);
+    sig_buf[4] = pmesh->tlim;
+    sig_buf[5] = static_cast<double>(pmesh->nlim);
+    FILE* sig_f = std::fopen("validation_output.bin", "wb");
+    if (sig_f) {
+      std::fwrite(sig_buf, sizeof(double), 6, sig_f);
+      std::fclose(sig_f);
+    }
   }
 
   delete pinput;
