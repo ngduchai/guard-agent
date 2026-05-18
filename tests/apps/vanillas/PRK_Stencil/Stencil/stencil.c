@@ -95,6 +95,43 @@ HISTORY: - Written by Rob Van der Wijngaart, November 2006.
 #define OUT(i,j)      out[INDEXOUT(i-istart,j-jstart)]
 #define WEIGHT(ii,jj) weight[ii+RADIUS][jj+RADIUS]
 
+/* PRK_Stencil validation signature dumper (Step 0 v8: file-based comparison).
+ *
+ * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank
+ * `root`.  Byte layout MUST be identical between vanilla and reference at the
+ * same workload so Step 0.6c cross-consistency passes:
+ *   [0] norm                          (per-active-point L1 norm; rank-root local)
+ *   [1] reference_norm                (target value, deterministic)
+ *   [2] norm - reference_norm         (validation residual; should be near 0)
+ *   [3] (double)iterations            (timestep count from CLI)
+ *   [4] (double)f_active_points       (active grid-point count)
+ *   [5] (double)(COEFX + COEFY)       (sum of stencil coefficients)
+ *
+ * Caller must invoke ONLY on rank `root` (typically my_ID == 0), AFTER the
+ * validation block where `norm /= f_active_points` is applied and
+ * `reference_norm` is computed, BEFORE MPI_Finalize.  On other ranks the
+ * `norm` variable is uninitialised garbage (only rank root received the
+ * MPI_Reduce result).  norm and reference_norm are DTYPE which is `double`
+ * by default (or `float` under -DSINGLE_PRECISION); cast to double for the
+ * binary payload.
+ */
+static void dumpValidationSignatureBin(DTYPE norm, DTYPE reference_norm,
+                                       int iterations, DTYPE f_active_points)
+{
+   double buf[6];
+   buf[0] = (double)norm;
+   buf[1] = (double)reference_norm;
+   buf[2] = (double)(norm - reference_norm);
+   buf[3] = (double)iterations;
+   buf[4] = (double)f_active_points;
+   buf[5] = (double)(COEFX + COEFY);
+   FILE* f = fopen("validation_output.bin", "wb");
+   if (f) {
+      fwrite(buf, sizeof(double), 6, f);
+      fclose(f);
+   }
+}
+
 int main(int argc, char ** argv) {
 
   int    Num_procs;       /* number of ranks                                     */
@@ -462,6 +499,14 @@ int main(int argc, char ** argv) {
     }
   }
   bail_out(error);
+
+  /* Step 0 v8: emit binary validation signature for file-based comparison.
+   * Must be called AFTER the validation block (norm /= f_active_points;
+   * reference_norm computed) and BEFORE MPI_Finalize.  Rank-root-only.
+   */
+  if (my_ID == root) {
+    dumpValidationSignatureBin(norm, reference_norm, iterations, f_active_points);
+  }
 
   if (my_ID == root) {
     /* flops/stencil: 2 flops (fma) for each point in the stencil,
