@@ -2334,9 +2334,18 @@ def _stage_correctness(
             )
             # Compute Z_P once; reused by all 3 fractions via the seed-keyed
             # cache inside _compute_perturbed_baseline.
+            #
+            # build_dir must point at a tree that contains the built vanilla
+            # binary. The legacy `original_build` (build_root / "original")
+            # is empty under the current baseline-cache architecture --
+            # collect_baseline populates baseline_out / "_build" / "_build" /
+            # ... instead. _find_executable walks recursively, so passing
+            # baseline_out as the build_dir resolves the binary correctly.
+            # Bug fix 2026-05-18: original_build was empty -> Stage 1
+            # crashed with FileNotFoundError before the slope test ran.
             z_p_elapsed, z_p_output_file, z_p_value = _compute_perturbed_baseline(
                 original_src=original_src,
-                build_dir=original_build,
+                build_dir=baseline_out,
                 executable_name=(
                     getattr(args, "original_executable_name", None)
                     or args.executable_name
