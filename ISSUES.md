@@ -39,6 +39,26 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #87 — Runner's _symlink_input_data creates symlinks for OUTPUT files too, causing vanilla contamination on rewrite `Open`
+
+**Reported:** 2026-05-18
+
+**Explanation:** Detected during HyPar calibration — `tests/apps/vanillas/HyPar/Examples/1D/FPDoubleWell/errors.dat` got rewritten with new wall-time columns after each run. The file is HyPar's OUTPUT (CFL/error log), not an INPUT, but it lives in the same directory as `physics.inp` (the perturbation target). `runner._symlink_input_data` creates file-level symlinks for every file in that directory; the symlink for `errors.dat` (pointing back to vanilla source) means the binary's `fopen("errors.dat", "w")` writes THROUGH the symlink to the vanilla source file.
+
+Only the wall-time columns changed (the physics columns are deterministic), so the contamination is benign in terms of validation correctness (it doesn't affect cached output comparisons). But it violates the "vanilla source is never modified" invariant from CLAUDE.md / AGENTS.md, and (a) bumps mtime which forces baseline cache MISS on every subsequent run, (b) shows as a stray modification in `git status` that the operator has to manually restore.
+
+Same class of bug as issue #82 (apply_perturbation parent-symlink contamination, fixed in 318add21d). The fix for #82 materialized parent directories; this case needs file-level discrimination — input files (read-only by the binary) are safe to symlink; output files (writable) must be excluded.
+
+**Resolution:** Not yet investigated. Approaches to consider:
+- (a) Have `_symlink_input_data` check file extension and skip known output extensions (`.dat`, `.bin`, `.out`, `.log`, `.csv`) — fragile, app-dependent.
+- (b) Have each app's YAML declare an `output_files: [...]` list that the runner excludes from symlinking.
+- (c) Always copy files instead of symlinking — slower for large input datasets.
+- (d) Run apps in a writable working directory that is FULLY isolated from source (current setup uses cwd=output_dir but apply_perturbation/symlink_input_data plumb through source paths).
+
+For now: restored the contaminated file manually before commit, no behavioral impact on validator. Will revisit when the v2.2 pipeline rollout has more data on which apps have this issue.
+
+---
+
 ### #86 — Calibrator fixes + SAMRAI+Nyx perturbation specs calibrated `Solved`
 
 **Reported:** 2026-05-18

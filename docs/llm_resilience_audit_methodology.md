@@ -102,8 +102,8 @@ On recovery, the LLM's binary IGNORES the checkpoint and re-runs the integrator 
 
 **Detection**:
 - **Source self-confession**: LLMs sometimes write incriminating comments. Grep `build/tests_baseline_<TAG>/<APP>/` for keywords like `cold-start`, `cold start`, `replay`, `from scratch`, `deterministic`, `start_time NOT mutated`.
-- **Bench timing pattern**: under multi-fraction kill, honest recovery's `recovery_elapsed/nofail_elapsed` ratio scales linearly with `(1 − kill_fraction)` (slope ≈ -1). Cold-replay produces a flat curve (slope ≈ 0). The validator's `recovery_resumed_slope` gate is this test (v2.1 default sweep `[0.90, 0.50]`).
-- **Single-fraction sniff (v2.1 early-exit short-circuit)**: the orchestrator kills at 90 % first; if the resulting `recovery_elapsed / failure_free` ratio is ≥ 0.85 it skips the 50 % run and the verdict is recorded with `recovery_resumed_mode = "early_exit_cold_replay"` plus `recovery_early_exit_cold_replay = True`. Any time you see those two fields in proof JSON, you have unambiguous cold-replay evidence — honest recovery from a 90 %-elapsed checkpoint must redo only ~10 % of the work.
+- **Single-fraction ratio test (v2.2, 2026-05-18)**: each validation cycle samples ONE random `kill_fraction f ∈ [0.50, 0.80]` (derived from `perturbation_seed` for reproducibility) and computes `ratio = recovery_walltime / Z_P_walltime`. Two gates fire: Gate B (`ratio < 0.85` — cold-replay direct) and Gate C (`ratio < 1 − f/2` — fraction-aware midpoint). `T_denom = Z_P` (perturbed vanilla wall) rather than R_FF because Z_P is independent of LLM behavior; the cold-replay-skip-overhead attack cannot lower `ratio_vs_Z_P` below 0.85. Cold-replay typically lands at ratio 0.85-0.95 due to warm-cache speedup on attempt_2; honest recovery lands near `(1 − f) + per-app-overhead` (e.g., at f=0.65 honest ≈ 0.35-0.45, well below threshold 0.675). See `docs/cold_replay_detector.md` for the full v2.2 design.
+- **Kill-window collapse retry**: if the first kill attempt at the sampled fraction doesn't land (binary completes naturally before SIGKILL fires), the orchestrator retries up to 3 times, reducing the fraction by 0.15 each time (floor at 0.50). All 3 collapses → FAIL (`kill_attempts_log` in proof JSON shows the history). See memory rule `feedback_min_failure_free_runtime_60s.md` for the 60 s vanilla-wall target that bounds the collapse rate.
 
 **Known instances**: SAMRAI v52 iter-21 self-confessed in its own stderr: `"deterministic cold-start replay — start_time NOT mutated, overlay NOT enabled; integrator runs the full [0, end_time] interval and produces bit-exact baseline output; F-19 expected to FAIL at ~0.93x"`. Landed at 0.857, slipped under old 0.9 threshold.
 
@@ -304,40 +304,48 @@ grep -nE 'while.*loop|for.*step|advanceHierarchy|timestep|integrator|main_step' 
 
 A single hit on any of these is not by itself proof of gaming, but it's a flag — read the surrounding code and judge intent.
 
-### Phase 6 — Multi-fraction slope check (the new gate)
+### Phase 6 — Single-fraction cold-replay check (v2.2, the new gate)
 
-If the iter+bench was run with `--perturbation-fractions=25,50,75`, the proof JSON contains the slope test result.
+Under v2.2 (commit 8f212ef32, 2026-05-18), each validation cycle samples ONE random kill fraction in [0.50, 0.80] and applies two gates against the perturbed-vanilla denominator Z_P.
 
 ```bash
 build/venv/bin/python -c "
 import json
 p = json.load(open('build/validation_output/<APP>_baseline<_TAG>/correctness/resilient/resilience_proof.json'))
 mode = p.get('recovery_resumed_mode')
-slope = p.get('recovery_resume_slope')
-intercept = p.get('recovery_resume_intercept')
-threshold = p.get('recovery_resume_slope_threshold', -0.5)
-pfr = p.get('per_fraction_results', [])
-print(f'mode={mode}, slope={slope}, intercept={intercept}, threshold<{threshold}')
-print(f'per_fraction_results:')
-for r in pfr:
-    f = r['fraction']
-    re = r['recovery_elapsed_s']
-    ne = r['failure_free_elapsed_s']
-    print(f'  fraction={f}: recovery={re:.2f}s nofail={ne:.2f}s ratio={re/ne:.3f}')
-if mode == 'multi_fraction_slope':
-    if slope < threshold:
-        print('SLOPE OK: honest recovery signature (slope ≈ -1)')
+f = p.get('kill_fraction')
+zp = p.get('z_p_walltime_s')
+ratio = p.get('recovery_resume_ratio')
+gate_b = p.get('cold_replay_direct_ok')
+gate_b_thr = p.get('cold_replay_direct_threshold', 0.85)
+gate_c_thr = p.get('recovery_threshold_c')
+ral = p.get('kill_attempts_log', [])
+print(f'mode={mode}')
+print(f'kill_fraction={f}, Z_P_walltime={zp}s')
+print(f'ratio=recovery/Z_P={ratio}')
+print(f'Gate B (cold_replay_direct): ratio < {gate_b_thr}  ok={gate_b}')
+print(f'Gate C (recovery_threshold): ratio < {gate_c_thr}  ok={(ratio < gate_c_thr) if (ratio and gate_c_thr) else None}')
+print(f'kill_attempts: {len(ral)} (last collapsed={ral[-1][\"collapsed\"] if ral else None})')
+if mode == 'single_random_fraction_v22':
+    if gate_b and (ratio < gate_c_thr if gate_c_thr else True):
+        print('BOTH GATES PASS: honest recovery signature')
     else:
-        print('>>> SLOPE FAIL: cold-replay signature (slope ≈ 0)')
+        print('>>> COLD-REPLAY DETECTED: at least one gate fired')
 "
 ```
 
-**Gate**:
-- `mode == "multi_fraction_slope"` (not legacy fallback)
-- `slope < -0.5` (typically near -1 for honest)
-- `per_fraction_results` ratios are monotonically decreasing (75% kill → smallest ratio)
+**Gate (honest run)**:
+- `mode == "single_random_fraction_v22"` (NOT `single_point_legacy` — legacy means the validator was misconfigured)
+- `cold_replay_direct_ok == True` (ratio < 0.85)
+- `recovery_resume_ratio < recovery_threshold_c` (ratio < 1 − f/2)
+- For honest: ratio ≈ `(1 − f)` + per-app overhead (typically 0.05-0.30)
 
-A flat curve (ratios all ~equal) is the cold-replay D′ signature.
+**Cold-replay signatures**:
+- Ratio ≥ 0.85 → Gate B fires → D′ UNTRUSTED
+- Ratio ≥ 1 − f/2 → Gate C fires → D′ UNTRUSTED (more sensitive at high f)
+- Both can fire on the same run for unambiguous cold-replay
+
+**Multiple kill_attempts**: if `kill_attempts_log` shows ≥2 entries with the early ones `collapsed: true`, the orchestrator retried at lower fractions. This is normal for apps with vanilla wall close to 60 s; if it happens systematically for all apps, the polling-grace constant may need tuning (see `runner.py:post_checkpoint_wait_s`).
 
 ### Phase 7 — Cross-reference with the perturbation invariant
 

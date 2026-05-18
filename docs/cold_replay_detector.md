@@ -1,9 +1,13 @@
 # Cold-Replay Detector
 
-> Canonical reference for the input-perturbation + multi-fraction-kill validation
-> pipeline that gates the VeloC iter-loop. Built 2026-05-17 in response to
-> SAMRAI iter-21 gaming. Replaces the old single-point F-19 + F-20 cache
-> detector.
+> Canonical reference for the input-perturbation + single-random-kill-fraction
+> validation pipeline (v2.2, 2026-05-18) that gates the VeloC iter-loop.
+> Built 2026-05-17 in response to SAMRAI iter-21 gaming and refined in v2.2
+> after the multi-fraction slope test (v2/v2.1) was found to either false-
+> pass (when the high-fraction kill collapsed and the legacy < 0.9 fallback
+> caught the 50 % data point) or false-fail (when the slope denominator
+> was the resilient failure-free walltime, which is manipulable via the
+> cold-replay-skip-overhead attack).
 
 ## 1. Why this exists
 
@@ -54,94 +58,139 @@ in advance. This defeats every cache-class attack:
 - Side-car answer files outside VeloC directories
 - Hard-coded `validation_output.bin` contents
 
-### Prong B — multi-fraction kill slope test (v2.1)
+### Prong B — single random kill fraction with retry (v2.2)
 
-Each validation cycle schedules up to two independent kill-and-recovery
-runs at two different kill fractions (default **90% then 50%** of the
-failure-free wall time, in that order). The validator measures
-`recovery_elapsed_i / nofail_elapsed` at each fraction and fits a line.
-Honest recovery's ratio scales linearly with `1 − fraction` (recovery
-does only the remaining work), giving slope ≈ −1. Cold-start replay
-produces the same wall-time regardless of kill position (it re-runs the
-full integrator), giving slope ≈ 0.
+Each validation cycle samples ONE kill fraction `f` uniformly from
+`[_KILL_FRACTION_MIN, _KILL_FRACTION_MAX]` (default `[0.50, 0.80]`),
+**deterministic from `perturbation_seed`** so the run is forensically
+reproducible (same seed → same fraction). Randomization defeats LLM
+gaming that would otherwise tune checkpoint cadence to land exactly
+before a fixed kill point.
 
-Gate: `slope < −0.5`. Immune to per-run timing constants like warm-cache
-speedups that defeated the single-point check.
+The validator measures `ratio = R_recovery_walltime / Z_P_walltime`
+and applies TWO gates:
 
-**Early-exit optimization (v2.1, 2026-05-18)**: the 90 % fraction runs
-first. If its recovery ratio is ≥ 0.85 the second fraction is skipped —
-recovery already did near-full work despite the late kill, which is
-unambiguous cold-replay (honest recovery from a 90 %-elapsed checkpoint
-must redo only ~10 % of the work). The verdict is recorded with
-`recovery_resumed_mode = "early_exit_cold_replay"` and the single data
-point is preserved in the proof JSON. This saves one full mpirun pair
-(kill + recovery) on the gaming path.
+- **Gate B (cold_replay_direct):** `ratio < 0.85`. Cold-replay observed
+  at 0.85–0.95 across apps (5–15 % warm-cache speedup on attempt_2).
+  Any ratio at or above this is unambiguous cold-replay.
+- **Gate C (recovery_threshold):** `ratio < 1 − f/2`. Fraction-aware
+  midpoint between honest expected ratio `(1 − f)` and cold-replay
+  expected ratio `1.0`. At `f=0.50` threshold is 0.75; at `f=0.80`
+  threshold is 0.60.
 
-The two prongs are orthogonal: perturbation kills cache attacks even at a
-single fraction; the slope test kills cold-replay even without
-perturbation. Apps without a perturbation spec still get the slope test;
-the cache-class half of the defense degrades to the old `output_correct`
-check against the cached baseline.
+**Why T_denom is Z_P (perturbed vanilla wall), not R_FF:** a sophisticated
+attack writes real checkpoints during the failure-free leg (to inflate
+R_FF) but skips overhead on attempt_2's recovery (cold-replay), making
+`ratio_vs_R_FF = R_recovery / R_FF` look honest. Z_P is independent
+of LLM behavior, so the same attack cannot lower `ratio_vs_Z_P` below
+the cold-replay floor (~0.85). See ISSUES #85 for the worked-numbers
+analysis on SAMRAI iter-21.
 
-## 3. Gate set — what changed
+**Kill-window collapse retry:** if the first kill attempt at the
+sampled fraction doesn't land (binary completes naturally before
+SIGKILL fires — happens when `(1 − f) × T` is shorter than
+polling+grace ≈ 6 s), the orchestrator retries up to
+`_KILL_RETRY_MAX_ATTEMPTS = 3` times. Each retry reduces the fraction
+by `_KILL_RETRY_FRACTION_REDUCTION = 0.15` (floor at MIN = 0.50) so
+the kill window widens. After 3 collapses → FAIL (app structurally
+unmeasurable; e.g., binary too short for VeloC polling). See memory
+rule `feedback_min_failure_free_runtime_60s.md` for the 60 s vanilla-
+wall target that bounds the collapse rate.
+
+The two prongs are orthogonal: perturbation kills cache attacks
+because the LLM cannot pre-cache outputs for a random input; the
+single-fraction ratio gates kill cold-replay because they evaluate
+the actual recovery wall against an independent reference (Z_P).
+Apps without a perturbation spec still get the ratio gates against
+the cached vanilla baseline (which is also Z_P-equivalent when
+perturbation is absent).
+
+## 3. Gate set — v2.2
 
 | Gate | Status | Notes |
 |---|---|---|
 | `checkpoint_observed` | KEEP | Did the binary write any checkpoint file during the kill attempt? |
-| `output_correct` | KEEP (source changed) | Now compares against `Z_P` when perturbation is active, else cached baseline |
-| `recovery_resumed_slope` | **NEW** — replaces `recovery_actually_resumed` | Multi-fraction slope < `−0.5`. Falls back to legacy single-point ratio < 0.9 when `per_fraction_results` is None |
-| `recovery_floor_ok` (F-4) | KEEP | Recovery > 10% of kill_time (no-op recovery guard) |
+| `output_correct` | KEEP | Recovery output matches `Z_P` (perturbed-vanilla output) when perturbation is active, else cached baseline |
+| `cold_replay_direct_ok` (Gate B) | **NEW v2.2** | `ratio < 0.85` where ratio = `recovery_walltime / Z_P_walltime` |
+| `recovery_threshold_c_ok` (Gate C) | **NEW v2.2** | `ratio < 1 − f/2` (fraction-aware) |
+| `recovery_floor_ok` (F-4) | KEEP | Recovery > 10 % of kill_time (no-op recovery guard) |
 | `fast` | KEEP | Wall-time ratio < per-app `production_cap_ratio` |
-| `perturbation_applied` | NEW (informational) | True iff perturbation was successfully applied this cycle |
+| `kill_window` (implicit) | NEW v2.2 | At least one of 3 kill attempts must land; all-collapses → FAIL |
+| `perturbation_applied` | KEEP (informational) | True iff perturbation was successfully applied this cycle |
+| ~~`recovery_resumed_slope`~~ | **REMOVED v2.2** | Multi-fraction slope test (v2/v2.1) replaced by single-fraction gates B + C |
 | ~~`gaming_artifacts_ok` (F-20)~~ | **REMOVED** from verdict | Covered by perturbation; still computed in legacy mode for backward compat |
 | `sidecar_ok` (F-16) | DEMOTED to informational | Covered by perturbation; still recorded in proof JSON for hygiene |
 | `replay_ok` (F-17) | Informational (unchanged) | Stdout-prefix heuristic; demoted 2026-05-15 |
 | `coordinator_ok` (F-12) | Informational (unchanged) | Source-pattern scan for stripped-library coordinator hits |
 
-## 4. Validation cycle — what happens now
+## 4. Validation cycle — v2.2
 
 Per validation cycle (`_stage_correctness` in `validation/veloc/validate.py`):
 
 ```
 1. Load AppCell from tests/apps/configs/<APP>.yaml
-2. Generate one perturbation_seed for this cycle
+2. perturbation_seed = args.perturbation_seed OR SystemRandom().randint(1, 2**31)
 3. If app has a perturbation: block AND --no-perturbation not set:
-     a. Resolve random perturbation value from seed
-     b. Run vanilla once with perturbation applied → Z_P
+     a. Resolve random perturbation value from perturbation_seed
+     b. Run vanilla once with perturbation applied → Z_P, Z_P_walltime
      c. perturbation_active = True, baseline_output_file = Z_P
    Else:
      a. baseline_output_file = build/baseline_cache/<APP>/validation_output.bin
-     b. perturbation_active = False
-4. For each fraction in [0.90, 0.50] (in order; v2.1 default):
-     a. recovery_timeout_s = max(60, baseline_elapsed * (1 - fraction) * 1.5 + 60)
-     b. run_with_checkpoint_observed_injection(
-            observation_threshold_fraction=fraction,
-            perturbation_spec=..., perturbation_seed=...,
-            recovery_timeout_s=...,
-        )
-     c. Record (fraction, recovery_elapsed_s, failure_free_elapsed_s)
-     d. EARLY EXIT: after the first fraction (0.90), if
-        recovery_elapsed_s / failure_free_elapsed_s >= 0.85, break out
-        of the loop — cold-replay already proven, skip the 0.50 run.
-5. Run resilient binary failure-free leg once (perturbation applied so
-   output matches Z_P)
-6. Compare recovery outputs to baseline_output_file → output_correct
-7. _enforce_validation_b(
+     b. perturbation_active = False, Z_P_walltime = cached vanilla wall
+4. Sample initial_kill_fraction = sample_kill_fraction(perturbation_seed)
+   (uniform in [_KILL_FRACTION_MIN, _KILL_FRACTION_MAX] = [0.50, 0.80])
+   OR override with args.kill_fraction if --kill-fraction supplied.
+5. Up to _KILL_RETRY_MAX_ATTEMPTS = 3 kill attempts:
+     a. Run resilient with kill at used_kill_fraction →
+        fp_result (kill_attempt_elapsed_s, recovery_attempt_elapsed_s)
+     b. If kill landed (fp_result.recovery_attempt_elapsed_s is not None
+        AND fp_result.checkpoint_observed): record attempt, break.
+     c. Else (collapse): record in kill_attempts_log, reduce
+        used_kill_fraction = retry_kill_fraction(used_kill_fraction)
+        = max(_KILL_FRACTION_MIN, used_kill_fraction - 0.15), retry.
+   If all 3 collapse → FAIL (kill_window_collapsed_all_attempts).
+6. Run resilient binary failure-free leg once (perturbation applied so
+   its output matches Z_P).
+7. Compare recovery output to Z_P → output_correct.
+8. _enforce_validation_b(
        signals=...,
-       per_fraction_results=[...1 or 2 tuples...],
        perturbation_active=...,
-       early_exit_cold_replay=...,
+       kill_fraction=used_kill_fraction,
+       z_p_walltime_s=Z_P_walltime,
+       kill_attempts_log=[...],
    )
-8. Proof JSON written with: recovery_resumed_mode (one of
-   "multi_fraction_slope" / "early_exit_cold_replay" /
-   "single_point_legacy"), recovery_resume_slope,
-   recovery_resume_intercept, recovery_resume_ratio,
-   recovery_early_exit_cold_replay, recovery_early_exit_threshold,
-   perturbation_active, per_fraction_results
+9. Gates evaluated in order:
+     - output_correct (Gate A — fail-fast on mismatch)
+     - checkpoint_observed
+     - Gate B: ratio = recovery / Z_P; pass iff ratio < 0.85
+     - Gate C: pass iff ratio < 1 − kill_fraction/2
+     - recovery_floor_ok (F-4)
+     - fast
+10. Proof JSON written with:
+     recovery_resumed_mode: "single_random_fraction_v22"
+                            (or "single_point_legacy" when v2.2 inputs
+                             absent — bare invocations bypassing
+                             _stage_correctness)
+     kill_fraction, z_p_walltime_s, recovery_resume_ratio,
+     recovery_threshold_c, cold_replay_direct_ok,
+     cold_replay_direct_threshold, kill_attempts_log,
+     perturbation_active.  Deprecated v2/v2.1 fields
+     (recovery_resume_slope, recovery_early_exit_cold_replay, etc.)
+     are preserved as None for backwards-compat readers.
 ```
 
-Total `mpirun` invocations per cycle: 4 (1 nofail + 3 once-runs) plus 1
-vanilla baseline if perturbation is active = 4 or 5.
+### Cost per cycle
+
+| Path | Mpirun count | Wall (T = vanilla, ~1×T = single resilient run) |
+|---|---|---|
+| Vanilla cache HIT, kill lands first try | 1 Z_P + 1 R_FF + 1 kill+recovery pair = ~4 mpirun | ~3.5 × T |
+| Vanilla cache HIT, kill collapses once, retry lands | 1 Z_P + 1 R_FF + 2 kill+recovery pairs = ~6 mpirun | ~5 × T |
+| Vanilla cache MISS (warmup + 2 measurement passes) | +3 × T vanilla baseline rebuild | +3 × T |
+| All 3 kill attempts collapse → FAIL | 1 Z_P + 1 R_FF + 3 kill attempts (each ≈ T) = ~5 mpirun | ~5 × T |
+
+Cost reduction vs v2.1 (which had 4 fractions × kill+recovery): ~50 %
+on the typical PASS path, ~30 % on the cold-replay FAIL path (one
+kill+recovery pair sufficient).
 
 ## 5. Per-app YAML perturbation spec
 
