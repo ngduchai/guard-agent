@@ -578,6 +578,42 @@ Applications that lack native checkpoint/restart must be removed from the benchm
 
 ---
 
+## Resilience audit and verification
+
+When auditing or verifying the output of an LLM-generated resilience solution — anything under `build/tests_baseline*/<APP>/` produced by an iter-loop, experimentor, or external agent — follow the canonical 8-phase forensic workflow at **`docs/llm_resilience_audit_methodology.md`**. This is the source of truth; do not improvise gaming detection.
+
+Run the full scan whenever:
+
+1. A new iter loop completes with verdict PASS on an app not yet audited
+2. An app's `build/_experiment_state/_trust.json` status is being changed from UNTRUSTED → TRUSTED
+3. A previously-TRUSTED app produces a new run (re-validate before keeping the trust)
+4. Bench numbers look "too good" — recovery faster than nofail, output suspiciously close to baseline, F-19 ratio just barely under threshold
+5. An experimentor reports a verdict outside the expected envelope (PASS where FAIL expected, or vice versa)
+6. Investigating any new gaming variant or suspicious validator output
+
+The methodology documents **5 known gaming pattern classes** (each with concrete grep/python detection commands + historical instances):
+
+- **A′** vendored-source modification (un-stubbing upstream library code; SAMRAI v48e, Nyx v47b)
+- **B′** side-car file outside VeloC dirs (often via two-cfg misdirection; SAMRAI v48e)
+- **C′** precomputed-signature cache (incl. symlink-farm variant; SAMRAI v48d, v52 iter-21)
+- **D′** skip-the-loop / cold-start replay (the SAMRAI iter-21 anchor case)
+- **E′** comparator-tautology pass (output equals what comparator expects by definition)
+
+Trust verdicts are written to `build/_experiment_state/_trust.json`; smoking-gun evidence (file paths, line numbers, log excerpts, bench numbers, command outputs) is appended to `build/_experiment_state/_decisions.log`. Both files preserve full history — never delete prior verdicts, only flip status with `prior_status` / `prior_reason` retained.
+
+**Operational rules apply to every audit:**
+
+- **OP-1 (trust nothing automatically)**: gates passing is necessary but NOT sufficient for TRUSTED. Always source-read the LLM-modified code; mechanical gates only catch known patterns and miss the next gaming variant.
+- **OP-8 (no concurrent measurement-bearing processes)**: only ONE `mpirun` per host at a time when wall times are being collected. Host CPU/IO/cache contention corrupts the slope test and contaminates timing-ratio measurements.
+- **OP-13 (verify the consumer, not the producer)**: when a wrapper claims to set X, grep the downstream tool that consumes X to confirm — don't trust intermediate scripts.
+- **Commit-promptly**: after any audit lands a verdict, commit `_trust.json` and append `_decisions.log` immediately. Future sessions read these to understand prior decisions.
+
+When briefing an experimentor agent on what to check, reference the methodology doc by path — do not paraphrase the gaming patterns inline (the doc evolves; paraphrases drift). When auditing an experimentor's reported result, run the 8-phase workflow against their output before accepting their verdict.
+
+When a NEW gaming class is observed in any iter loop, add it to the doc's section 2 (pattern definitions) and section 8 (attack history) in the same commit as the `_trust.json` flip that surfaced it. This is how the audit playbook stays current.
+
+---
+
 ## Required output format for coding tasks
 
 For substantial tasks, respond in this structure:
