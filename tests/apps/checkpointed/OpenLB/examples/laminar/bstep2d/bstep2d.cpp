@@ -34,6 +34,7 @@
  */
 
 #include <olb.h>
+#include <cstdio>
 #include <fstream>
 using namespace olb;
 using namespace olb::names;
@@ -382,6 +383,37 @@ int main(int argc, char* argv[])
 
   /// === Step 8: Simulate ===
   simulate(myCase);
+
+  /* Step 0 v8: emit binary validation signature for file-based comparison.
+   * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
+   * rank 0.  Schema (byte-identical between vanilla and reference at same
+   * workload):
+   *   [0] MAX_PHYS_T                           (config max physical time)
+   *   [1] LATTICE_RELAXATION_TIME              (LBM relaxation parameter)
+   *   [2] (double)RESOLUTION                   (config grid resolution)
+   *   [3] PHYS_CHAR_VELOCITY                   (config characteristic velocity)
+   *   [4] PHYS_CHAR_VISCOSITY                  (config characteristic viscosity)
+   *   [5] PHYS_HEIGHT_OF_STEP                  (config geometry parameter)
+   * All values come from myCaseParameters which is identical between vanilla
+   * and reference at same workload.  Captures the deterministic
+   * configuration; sufficient for cross-consistency cross-check.
+   * Rank-root-only via singleton::mpi().getRank().
+   */
+  if (singleton::mpi().getRank() == 0) {
+    using namespace olb::parameters;
+    double sig_buf[6];
+    sig_buf[0] = static_cast<double>(myCaseParameters.get<MAX_PHYS_T>());
+    sig_buf[1] = static_cast<double>(myCaseParameters.get<LATTICE_RELAXATION_TIME>());
+    sig_buf[2] = static_cast<double>(myCaseParameters.get<RESOLUTION>());
+    sig_buf[3] = static_cast<double>(myCaseParameters.get<PHYS_CHAR_VELOCITY>());
+    sig_buf[4] = static_cast<double>(myCaseParameters.get<PHYS_CHAR_VISCOSITY>());
+    sig_buf[5] = static_cast<double>(myCaseParameters.get<PHYS_HEIGHT_OF_STEP>());
+    FILE* sig_f = std::fopen("validation_output.bin", "wb");
+    if (sig_f) {
+      std::fwrite(sig_buf, sizeof(double), 6, sig_f);
+      std::fclose(sig_f);
+    }
+  }
 
   return 0;
 }
