@@ -39,6 +39,24 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #86 — Calibrator fixes + SAMRAI+Nyx perturbation specs calibrated `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** First two calibration attempts on SAMRAI surfaced three latent bugs in `validation/veloc/perturbation_calibrator.py` (the unit tests were structurally OK but never exercised against real apps):
+
+1. **Wrong `build_dir` resolution** — calibrator pointed at `build/tests_baseline/<APP>/_build/...` (where the LLM source lives, no built binary) instead of `build/baseline_cache/<APP>/` (where the vanilla binary is pre-built). Same class of bug as commit 15362cc2a's fix for `_compute_perturbed_baseline`.
+2. **Path-prefixed executable_name from YAML** — calibrator passed `cell.executable` verbatim (e.g. SAMRAI's `./_build/bin/linadv`) to `_find_executable`, which uses `os.walk` matching basenames. `run_validate.sh` strips this to the basename (`linadv`) before passing to validate.py; the calibrator did not. Fixed by `Path(cell.executable).name`.
+3. **Stdout-based comparison apps crashed with `Path / None` TypeError** — `comparison.output_file: null` is the convention for apps that compare stdout (via `keep_patterns` + `VALIDATION_SIGNATURE`) rather than a binary output file. `comparison.get("output_file", "validation_output.bin")` returns `None` (key exists, value is null), and the subsequent `cwd / output_file_name` crashes. Fixed by `comparison.get("output_file") or "stdout.txt"`.
+
+After the fixes, both anchor apps calibrated successfully:
+- **SAMRAI**: PASS (safety_ok, timing 2.8%-5.0% delta, output_diff_ok). `safe_value_range_verified: true`. Vanilla wall 82.5s — fine for the v2.2 0.80 kill fraction.
+- **Nyx**: PASS (safety_ok, timing 0.16%-0.24% delta, output_diff_ok). `safe_value_range_verified: true`. Vanilla wall 35s — below the 60s memory-rule target (`feedback_min_failure_free_runtime_60s.md`). Investigated lengthening: neither max_step nor stop_time gates Nyx's runtime (Sod shock tube terminates naturally when the shock exits the domain); Nyx requires cubic cells so the only valid integer scale-up is `n_cell=4 32 4 → 8 64 8` (8× work, ~280s — too expensive for iter loops). Accepted as a borderline case; v2.2's kill-fraction retry (`f₁ random → f₂=max(0.50, f₁-0.15) → f₃=0.50`) handles the ~50% f=0.80 kill-window-collapse rate gracefully, at the cost of ~1 extra mpirun per validation cycle when the collapse fires. Documented in `tests/apps/vanillas/Nyx/Exec/HydroTests/inputs.validation`.
+
+**Resolution:** Fixed three calibrator bugs in `validation/veloc/perturbation_calibrator.py`; updated `tests/test_perturbation_calibrator.py` fixture to use the new `baseline_cache/<APP>/_build/` layout. SAMRAI and Nyx YAMLs flipped to `safe_value_range_verified: true`. New memory rule `feedback_min_failure_free_runtime_60s.md` documents the 60s vanilla-wall threshold for v2.2.
+
+---
+
 ### #85 — Cold-replay detector v2.2: single random fraction + Z_P denominator + kill retry `Solved`
 
 **Reported:** 2026-05-18

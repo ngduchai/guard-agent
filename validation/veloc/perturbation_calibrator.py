@@ -374,12 +374,34 @@ def calibrate(
     source_dir = VANILLAS_DIR / app
     if not source_dir.exists():
         raise FileNotFoundError(f"vanilla source not found: {source_dir}")
-    build_dir = BUILD_ROOT / "tests_baseline" / app  # reuse existing build
-    executable_name = cell.executable
+    # build_dir must contain the built vanilla binary.  The
+    # baseline_cache layout (populated by collect_baseline) is the
+    # current source of vanilla binaries; the legacy tests_baseline
+    # layout no longer exists for vanilla apps under the perturbation
+    # pipeline.  Same fix as commit 15362cc2a for _compute_perturbed_baseline.
+    build_dir = BUILD_ROOT / "baseline_cache" / app
+    if not (build_dir / "_build").is_dir():
+        raise FileNotFoundError(
+            f"vanilla binary not built yet at {build_dir}/_build — run "
+            f"the validator on {app} once to populate the baseline cache "
+            f"(or call collect_baseline.collect()) before calibrating."
+        )
+    # cell.executable may carry a path prefix (e.g. SAMRAI's
+    # './_build/bin/linadv').  run_validate.sh strips this to the
+    # basename so _find_executable's os.walk-by-basename works against
+    # the baseline_cache layout (which puts the built binary at
+    # _build/_build/bin/<basename>, not _build/bin/<full_path>).
+    # Mirror that normalization here.
+    executable_name = Path(cell.executable).name
     num_procs = cell.mpi_ranks
     app_args = cell.app_args
     comparison = cell.comparison
-    output_file_name = comparison.get("output_file", "validation_output.bin")
+    # `comparison.output_file: null` means the per-app comparison is
+    # stdout-based (via keep_patterns / VALIDATION_SIGNATURE) rather
+    # than file-based.  In that case the "output" to compare is the
+    # run's stdout, captured by run_once at cwd/stdout.txt.  Default
+    # to validation_output.bin for the more common file-based case.
+    output_file_name = comparison.get("output_file") or "stdout.txt"
     method = comparison.get("method", "numeric-tolerance")
     atol = float(comparison.get("tolerance", 1e-12))
     rtol = atol

@@ -117,9 +117,10 @@ def fake_app_env(tmp_path, monkeypatch):
     (src / "input.txt").write_text("dt = 0.001\n")
     # Build dir + a stub executable so _find_executable doesn't fail (the
     # mock run_once never touches it but the calibrator's setup paths do).
-    build_dir = tmp_path / "tests_baseline" / app
-    build_dir.mkdir(parents=True)
-    (build_dir / "test_exe").touch()
+    # Layout matches the v2.2 calibrator: build/baseline_cache/<app>/_build/...
+    build_dir = tmp_path / "baseline_cache" / app
+    (build_dir / "_build").mkdir(parents=True)
+    (build_dir / "_build" / "test_exe").touch()
     # veloc.cfg in source (copied to cwd by _copy_veloc_cfg)
     (src / "veloc.cfg").write_text("scratch=/tmp/x\npersistent=/tmp/y\nmode=sync\n")
 
