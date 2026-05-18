@@ -15,11 +15,14 @@
 
 #include "input.h"
 #include "library.h"
+#include "atom.h"
+#include "update.h"
 
 #if defined(LAMMPS_EXCEPTIONS)
 #include "exceptions.h"
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 #include <mpi.h>
 
@@ -39,6 +42,43 @@ static void finalize()
 {
   lammps_kokkos_finalize();
   lammps_python_finalize();
+}
+
+/* LAMMPS validation signature dumper (Step 0 v8: file-based comparison).
+ *
+ * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
+ * Byte layout MUST be identical between vanilla and reference at the same
+ * workload so Step 0.6c cross-consistency passes:
+ *   [0] (double)atom->natoms                        (total atoms, globally consistent)
+ *   [1] (double)atom->nlocal                        (rank 0's local atom count)
+ *   [2] (double)update->ntimestep                   (final timestep)
+ *   [3] update->dt                                  (timestep size)
+ *   [4] (double)update->ntimestep * update->dt      (final simulated time)
+ *   [5] (double)world_size                          (number of MPI ranks)
+ *
+ * atom->natoms is a globally consistent count (LAMMPS maintains it via
+ * MPI_Allreduce internally).  atom->nlocal is per-rank; we capture rank 0's
+ * value as a distribution-sanity check.  update->ntimestep and dt are
+ * identical on every rank.  Rank-root-only.
+ */
+static void dumpValidationSignatureBin_lammps(LAMMPS *lammps, MPI_Comm comm)
+{
+  int rank, size;
+  MPI_Comm_rank(comm, &rank);
+  MPI_Comm_size(comm, &size);
+  if (rank != 0) return;
+  double buf[6];
+  buf[0] = (double)lammps->atom->natoms;
+  buf[1] = (double)lammps->atom->nlocal;
+  buf[2] = (double)lammps->update->ntimestep;
+  buf[3] = lammps->update->dt;
+  buf[4] = (double)lammps->update->ntimestep * lammps->update->dt;
+  buf[5] = (double)size;
+  FILE* f = std::fopen("validation_output.bin", "wb");
+  if (f) {
+    std::fwrite(buf, sizeof(double), 6, f);
+    std::fclose(f);
+  }
 }
 
 /* ----------------------------------------------------------------------
@@ -79,6 +119,11 @@ int main(int argc, char **argv)
   try {
     auto lammps = new LAMMPS(argc, argv, lammps_comm);
     lammps->input->file();
+    /* Step 0 v8: emit binary validation signature for file-based comparison.
+     * Must be called after input->file() (simulation done) and before
+     * delete lammps (atom/update members still valid).
+     */
+    dumpValidationSignatureBin_lammps(lammps, lammps_comm);
     delete lammps;
   } catch (LAMMPSAbortException &ae) {
     finalize();
@@ -103,6 +148,11 @@ int main(int argc, char **argv)
   try {
     auto lammps = new LAMMPS(argc, argv, lammps_comm);
     lammps->input->file();
+    /* Step 0 v8: emit binary validation signature for file-based comparison.
+     * Must be called after input->file() (simulation done) and before
+     * delete lammps (atom/update members still valid).
+     */
+    dumpValidationSignatureBin_lammps(lammps, lammps_comm);
     delete lammps;
   } catch (fmt::format_error &fe) {
     fprintf(stderr, "fmt::format_error: %s\n", fe.what());
