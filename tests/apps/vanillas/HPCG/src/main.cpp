@@ -28,6 +28,8 @@
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
+#include <cstdio>
+#include <limits>
 #ifdef HPCG_DETAILED_DEBUG
 using std::cin;
 #endif
@@ -60,6 +62,49 @@ using std::endl;
 #include "TestCG.hpp"
 #include "TestSymmetry.hpp"
 #include "TestNorms.hpp"
+
+// HPCG validation signature dumper (Step 0 v8: file-based comparison).
+//
+// Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
+// Byte layout MUST be identical between vanilla and reference at the same
+// workload so Step 0.6c cross-consistency passes:
+//   [0] sum   of testnorms_data.values[0..numberOfCgSets-1]
+//   [1] sum^2 of testnorms_data.values[0..numberOfCgSets-1]
+//   [2] max   of testnorms_data.values[0..numberOfCgSets-1]
+//   [3] min   of testnorms_data.values[0..numberOfCgSets-1]
+//   [4] count = (double)numberOfCgSets
+//   [5] final-step marker = (double)numberOfCgSets (loop completed N sets)
+//
+// testnorms_data.values is computed identically on every rank (each value is a
+// globally-reduced scaled residual normr/normr0 from CG), so no extra MPI
+// reduction is needed; rank 0 writes the file.
+static void dumpValidationSignatureBin(const TestNormsData& tn,
+                                       int numberOfCgSets,
+                                       int rank) {
+  if (rank != 0) return;
+  double sumv = 0.0, sum2v = 0.0;
+  double maxv = -std::numeric_limits<double>::infinity();
+  double minv =  std::numeric_limits<double>::infinity();
+  for (int i = 0; i < numberOfCgSets; ++i) {
+    const double v = tn.values[i];
+    sumv  += v;
+    sum2v += v * v;
+    if (v > maxv) maxv = v;
+    if (v < minv) minv = v;
+  }
+  double buf[6];
+  buf[0] = sumv;
+  buf[1] = sum2v;
+  buf[2] = maxv;
+  buf[3] = minv;
+  buf[4] = static_cast<double>(numberOfCgSets);
+  buf[5] = static_cast<double>(numberOfCgSets);
+  std::FILE* f = std::fopen("validation_output.bin", "wb");
+  if (f) {
+    std::fwrite(buf, sizeof(double), 6, f);
+    std::fclose(f);
+  }
+}
 
 /*!
   Main driver program: Construct synthetic problem, run V&V tests, compute benchmark parameters, run benchmark, report results.
@@ -367,6 +412,11 @@ int main(int argc, char * argv[]) {
 
   // Test Norm Results
   ierr = TestNorms(testnorms_data);
+
+  // Step 0 v8: emit binary validation signature for file-based comparison.
+  // Must be called after TestNorms (testnorms_data fully populated) and
+  // before delete[] testnorms_data.values below.
+  dumpValidationSignatureBin(testnorms_data, numberOfCgSets, rank);
 
   ////////////////////
   // Report Results //
