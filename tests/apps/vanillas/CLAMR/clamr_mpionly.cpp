@@ -737,6 +737,35 @@ extern "C" void do_calc(void)
          printf("CPU:  refine_smooth_iter per rezone   \t %8.4f\t\n",            (double)mesh->get_cpu_counter(MESH_COUNTER_REFINE_SMOOTH)/(double)mesh->get_cpu_counter(MESH_COUNTER_REZONE) );
       }
 
+      /* Step 0 v8: emit binary validation signature for file-based comparison.
+       * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
+       * rank 0.  Schema (byte-identical between vanilla and reference at
+       * same workload):
+       *   [0] H_sum                            (final total mass, globally reduced)
+       *   [1] H_sum_initial                    (initial total mass)
+       *   [2] percent_mass_diff                (= |H_sum - H_sum_initial| / H_sum_initial * 100)
+       *   [3] (double)ncycle                   (final cycle count)
+       *   [4] simTime                          (final simulated time)
+       *   [5] (double)ncells_global            (final number of cells)
+       * H_sum is computed via state->mass_sum() which is globally reduced;
+       * H_sum_initial / percent_mass_diff / ncycle / simTime / ncells_global
+       * are all in scope at this point.  Rank-root-only.
+       */
+      if (mype == 0) {
+         double buf[6];
+         buf[0] = H_sum;
+         buf[1] = H_sum_initial;
+         buf[2] = percent_mass_diff;
+         buf[3] = (double)ncycle;
+         buf[4] = simTime;
+         buf[5] = (double)ncells_global;
+         FILE* f = fopen("validation_output.bin", "wb");
+         if (f) {
+            fwrite(buf, sizeof(double), 6, f);
+            fclose(f);
+         }
+      }
+
       mesh->terminate();
       state->terminate();
 
