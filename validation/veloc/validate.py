@@ -283,12 +283,38 @@ _RECOVERY_ELAPSED_FLOOR_FRAC = 0.10
 # slope (0).
 _RECOVERY_RESUMED_SLOPE_THRESHOLD = -0.5
 
-# F-19 v2 (2026-05-17): the standard 3 kill fractions for the multi-
-# fraction slope test.  Picked symmetrically around the middle (50%)
-# so the slope fit is balanced; 25/75 give enough kill-fraction spread
-# (>= 50 percentage points) for a meaningful slope.  Configurable per
-# bench cycle via the validator CLI if needed.
-_DEFAULT_KILL_FRACTIONS: tuple[float, ...] = (0.25, 0.50, 0.75)
+# F-19 v2.1 (2026-05-18): kill fractions for the multi-fraction slope
+# test, ORDERED for early-exit optimization.  We kill at 90 % FIRST
+# because honest recovery from a 90 %-elapsed checkpoint must redo only
+# ~10 % of the work (ratio ≈ 0.10), while cold-replay redoes the full
+# integration (ratio ≈ 1.0).  The gap is large enough that a single 90 %
+# data point gives unambiguous cold-replay evidence, letting us skip
+# the more expensive 50 % run when the result is already FAIL.
+#
+# Rationale for dropping the original 0.25:
+#   - At 25 % elapsed many honest apps have not yet written a first
+#     checkpoint (checkpoint cadence is commonly tuned for ~50 % or
+#     later by the LLM), so the runner spends one full bench scenario
+#     just calibrating cadence rather than measuring resilience.
+#   - With (0.90, 0.50) the slope-fit lever-arm is 0.40, more than
+#     enough to distinguish honest (slope ≈ -1) from cold-replay
+#     (slope ≈ 0); the -0.5 threshold has ample margin on both ends.
+#
+# The 90 % fraction MUST come first in the tuple — the orchestrator
+# uses positional order to decide which run to launch first and which
+# data point to inspect for the early-exit check.
+_DEFAULT_KILL_FRACTIONS: tuple[float, ...] = (0.90, 0.50)
+
+# F-19 v2.1 early-exit threshold: if at the 90 % kill the recovery
+# wall-time is >= 0.85 × failure-free wall-time, recovery did
+# essentially the whole job — unambiguous cold-replay, no need to run
+# the second fraction.  0.85 is a safe margin above the honest
+# expectation (~0.10 + per-app overhead) and below the cold-replay
+# expectation (~1.0); empirically anything > 0.5 at the 90 % fraction
+# is already strong evidence (honest recovery has at most ~10 % of
+# work left), but we set the bar high to avoid false-positive
+# early-exit on a high-overhead honest app.
+_EARLY_EXIT_COLD_REPLAY_RATIO = 0.85
 
 
 def compute_recovery_slope(
@@ -303,7 +329,7 @@ def compute_recovery_slope(
 
     * Honest recovery: at kill_fraction f, recovery does roughly the
       remaining (1 - f) of the work, so ratio ≈ (1 - f).  Over the
-      sweep, ratios ≈ [0.75, 0.50, 0.25] for fractions [0.25, 0.50, 0.75],
+      default sweep, ratios ≈ [0.10, 0.50] for fractions [0.90, 0.50],
       slope ≈ -1.0, intercept ≈ 1.0.
     * Cold-start replay: recovery re-runs the full integrator regardless
       of when the kill landed, so ratio ≈ 1.0 at every fraction.
@@ -891,6 +917,7 @@ def _enforce_validation_b(
     legitimate_output_paths: "list[str] | None" = None,
     per_fraction_results: "list[dict] | None" = None,
     perturbation_active: "bool | None" = None,
+    early_exit_cold_replay: bool = False,
 ) -> None:
     """Validation B (production / checkpoint-solution) — checkpoint-observed.
 
@@ -972,7 +999,24 @@ def _enforce_validation_b(
     recovery_resume_intercept: float | None = None
     recovery_resumed_mode: str = "none"
     original_elapsed_for_resume = signals.get("original_elapsed_s")
-    if per_fraction_results is not None and output_correct:
+    # F-19 v2.1 early-exit short-circuit: when the multi-fraction
+    # orchestrator stopped after the first fraction because the recovery
+    # ratio already crossed _EARLY_EXIT_COLD_REPLAY_RATIO, we have a
+    # single (fraction, ratio) point — enough for the verdict but not
+    # for a slope fit.  Record the point directly and set the gate to
+    # FAIL without running the slope computation.
+    if (
+        early_exit_cold_replay
+        and per_fraction_results
+        and per_fraction_results[0].get("failure_free_elapsed_s", 0) > 0
+    ):
+        ear_pt = per_fraction_results[0]
+        recovery_resume_ratio = (
+            ear_pt["recovery_elapsed_s"] / ear_pt["failure_free_elapsed_s"]
+        )
+        recovery_actually_resumed = False
+        recovery_resumed_mode = "early_exit_cold_replay"
+    elif per_fraction_results is not None and output_correct:
         # Multi-fraction slope path.
         try:
             fractions = [r["fraction"] for r in per_fraction_results]
@@ -1171,6 +1215,12 @@ def _enforce_validation_b(
             f"intercept={recovery_resume_intercept if recovery_resume_intercept is None else round(recovery_resume_intercept, 3)}, "
             f"threshold<{_RECOVERY_RESUMED_SLOPE_THRESHOLD}, mode=multi_fraction_slope)"
         )
+    elif recovery_resumed_mode == "early_exit_cold_replay":
+        f19_diag = (
+            f"recovery_actually_resumed={recovery_actually_resumed} "
+            f"(recovery_attempt/failure_free={recovery_resume_ratio if recovery_resume_ratio is None else round(recovery_resume_ratio, 3)}, "
+            f"early_exit_threshold≥{_EARLY_EXIT_COLD_REPLAY_RATIO}, mode=early_exit_cold_replay)"
+        )
     else:
         f19_diag = (
             f"recovery_actually_resumed={recovery_actually_resumed} "
@@ -1221,6 +1271,8 @@ def _enforce_validation_b(
         s["recovery_resume_intercept"] = recovery_resume_intercept
         s["recovery_resume_slope_threshold"] = _RECOVERY_RESUMED_SLOPE_THRESHOLD
         s["recovery_resumed_mode"] = recovery_resumed_mode
+        s["recovery_early_exit_cold_replay"] = bool(early_exit_cold_replay)
+        s["recovery_early_exit_threshold"] = _EARLY_EXIT_COLD_REPLAY_RATIO
         s["perturbation_active"] = perturbation_active
         if per_fraction_results is not None:
             # Keep a compact summary so proof JSON stays scannable.
@@ -1275,6 +1327,20 @@ def _enforce_validation_b(
                     f"and resuming from the checkpoint — likely a cold-restart "
                     f"with the checkpoint files serving only as decoys. "
                     f"(F-19 v2 anti-cold-restart slope gate)"
+                )
+            elif recovery_resumed_mode == "early_exit_cold_replay":
+                first_violation = (
+                    f"The code fails to recover from saved checkpoint: a kill at "
+                    f"~90% of the failure-free wall-time was followed by a recovery "
+                    f"that took ≈ {recovery_resume_ratio:.3f}× of the full failure-free "
+                    f"run-time (threshold for cold-replay detection: ≥ "
+                    f"{_EARLY_EXIT_COLD_REPLAY_RATIO}). Honest mid-simulation resume "
+                    f"from a 90%-elapsed checkpoint must redo only ~10% of the work; "
+                    f"observing near-full work on recovery proves the recovery path "
+                    f"ignored the checkpoint and replayed the whole integrator from "
+                    f"t=0. The lower-fraction (50%) kill was skipped because a single "
+                    f"high-fraction data point already gives unambiguous cold-replay "
+                    f"evidence. (F-19 v2.1 early-exit anti-cold-restart gate)"
                 )
             else:
                 first_violation = (
@@ -1979,11 +2045,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="F1,F2,F3",
         help=(
             "Comma-separated kill fractions for the F-19 v2 multi-fraction "
-            "slope test (e.g. '25,50,75' or '0.25,0.5,0.75').  Each fraction "
-            "is a separate run; the recovery_elapsed/failure_free_elapsed "
-            "ratios are regressed against kill_fraction and the verdict gate "
-            f"is slope < {_RECOVERY_RESUMED_SLOPE_THRESHOLD}.  Default uses "
-            "the canonical {0.25, 0.50, 0.75} from _DEFAULT_KILL_FRACTIONS.  "
+            "slope test (e.g. '90,50' or '0.90,0.50').  ORDER MATTERS: the "
+            "first fraction runs first, and if its recovery_elapsed/"
+            "failure_free ratio exceeds the early-exit threshold "
+            f"({_EARLY_EXIT_COLD_REPLAY_RATIO}) the remaining fractions are "
+            "skipped (already proven cold-replay).  Otherwise all listed "
+            "fractions run and their ratios are regressed against "
+            f"kill_fraction; verdict gate is slope < "
+            f"{_RECOVERY_RESUMED_SLOPE_THRESHOLD}.  Default uses the "
+            "v2.1 sweep {0.90, 0.50} from _DEFAULT_KILL_FRACTIONS.  "
             "Minimum 2 fractions; values in the open interval (0, 1)."
         ),
     )
@@ -2315,10 +2385,10 @@ def _stage_correctness(
         else:
             perturbation_spec = _load_perturbation_spec_for_app(_app_name_for_pert)
         perturbation_active = perturbation_spec is not None
-        # One seed per validation cycle, shared across the 3 fractions so
-        # both the perturbed-vanilla Z_P and every resilient leg see the
-        # same perturbed input.  Logged so the run is forensically
-        # reproducible.
+        # One seed per validation cycle, shared across all fractions
+        # (up to 2 under the v2.1 default) so both the perturbed-vanilla
+        # Z_P and every resilient leg see the same perturbed input.
+        # Logged so the run is forensically reproducible.
         perturbation_seed: "int | None" = None
         z_p_output_file: "Path | None" = None
         if perturbation_active:
@@ -2332,7 +2402,7 @@ def _stage_correctness(
                 f"range={perturbation_spec.value_range})",
                 flush=True,
             )
-            # Compute Z_P once; reused by all 3 fractions via the seed-keyed
+            # Compute Z_P once; reused by all fractions via the seed-keyed
             # cache inside _compute_perturbed_baseline.
             #
             # build_dir must point at a tree that contains the built vanilla
@@ -2379,8 +2449,11 @@ def _stage_correctness(
             )
 
         # Kill fractions for the slope sweep.  CLI override
-        # --perturbation-fractions wins; default (0.25, 0.50, 0.75) lives
-        # at _DEFAULT_KILL_FRACTIONS.
+        # --perturbation-fractions wins; default (0.90, 0.50) lives at
+        # _DEFAULT_KILL_FRACTIONS.  ORDER MATTERS: the orchestrator
+        # walks the tuple in order and may early-exit after the first
+        # fraction if the recovery ratio at 90 % already proves
+        # cold-replay (saving the rest of the sweep).
         kill_fractions = tuple(
             getattr(args, "perturbation_fractions", None) or _DEFAULT_KILL_FRACTIONS
         )
@@ -2394,18 +2467,20 @@ def _stage_correctness(
         print(
             f"\n[validate] Multi-fraction kill sweep: fractions={kill_fractions} "
             f"baseline_elapsed={baseline_elapsed:.1f}s "
-            f"perturbation_active={perturbation_active}",
+            f"perturbation_active={perturbation_active} "
+            f"early_exit_threshold={_EARLY_EXIT_COLD_REPLAY_RATIO} (first fraction only)",
             flush=True,
         )
 
         per_fraction_results: list[dict] = []
-        # The middle fraction (0.50 by convention) provides the
-        # `fp_result` used downstream for resilience signals, checkpoint
-        # metrics capture, F-16 sidecar scan, and stdout comparison.
-        # The other fractions only contribute timing data points.
+        # The 50 % fraction provides the `fp_result` used downstream
+        # for resilience signals, checkpoint metrics capture, F-16
+        # sidecar scan, and stdout comparison; falls back to whichever
+        # fraction actually ran if early-exit skipped 50 %.
         primary_fp_result = None
         primary_fraction = 0.50 if 0.50 in kill_fractions else kill_fractions[len(kill_fractions) // 2]
-        for fraction in kill_fractions:
+        early_exit_triggered = False
+        for fraction_idx, fraction in enumerate(kill_fractions):
             # Per-fraction recovery timeout: less work remains for larger
             # kill_fraction, so cap accordingly.  Floor 60s for MPI startup.
             # Ceiling 900s mirrors the legacy single-point cap.
@@ -2489,6 +2564,33 @@ def _stage_correctness(
                             f"{entry} → {dst}: {exc}",
                             flush=True,
                         )
+
+            # F-19 v2.1 early-exit: after the FIRST fraction (the 90 %
+            # by default), check whether recovery already did near-full
+            # work.  If so, the slope test would only confirm what we
+            # already know (cold-replay), so skip the remaining
+            # fractions.  This saves one full mpirun pair (kill +
+            # recovery) per validation cycle on the gaming path.
+            if (
+                fraction_idx == 0
+                and fp_result_f.recovery_attempt_elapsed_s is not None
+                and baseline_elapsed > 0
+            ):
+                early_ratio = (
+                    fp_result_f.recovery_attempt_elapsed_s / baseline_elapsed
+                )
+                if early_ratio >= _EARLY_EXIT_COLD_REPLAY_RATIO:
+                    print(
+                        f"\n[validate] EARLY EXIT: fraction {fraction:.2%} "
+                        f"recovery_ratio={early_ratio:.3f} ≥ "
+                        f"{_EARLY_EXIT_COLD_REPLAY_RATIO} → recovery did "
+                        f"near-full work despite the late kill (cold-replay "
+                        f"signature). Skipping remaining "
+                        f"{len(kill_fractions) - 1} fraction(s).",
+                        flush=True,
+                    )
+                    early_exit_triggered = True
+                    break
 
         # primary_fp_result is guaranteed non-None: at least one fraction
         # ran in the loop above.  Use it for the legacy `fp_result`
@@ -2963,6 +3065,7 @@ def _stage_correctness(
         # call resilient if a future refactor changes the upstream init.
         _per_fraction_results = locals().get("per_fraction_results")
         _perturbation_active = locals().get("perturbation_active", False)
+        _early_exit_cold_replay = bool(locals().get("early_exit_triggered", False))
         _enforce_validation_b(
             signals=resilience_signals,
             output_correct=bool(result1.passed),
@@ -2979,6 +3082,7 @@ def _stage_correctness(
             legitimate_output_paths=_legitimate_output_paths,
             per_fraction_results=_per_fraction_results,
             perturbation_active=bool(_perturbation_active),
+            early_exit_cold_replay=_early_exit_cold_replay,
         )
 
     # --- Approach correctness checks ---
@@ -3468,7 +3572,7 @@ def _compute_perturbed_baseline(
     output file at ``scratch_root / "seed_<seed>" / output_file_name``.
 
     Caching: the scratch cwd is keyed by ``perturbation_seed``.  When the
-    same seed is requested again (e.g. for the 3 fractions of one
+    same seed is requested again (e.g. for the multiple fractions of one
     validation cycle), the cached output file is returned and ``run_once``
     is not invoked again — but the elapsed time from the original cached
     run is returned so the slope-test denominators stay consistent.
@@ -3504,7 +3608,7 @@ def _compute_perturbed_baseline(
             "got None or 'disabled'"
         )
 
-    # Cache key: one scratch cwd per seed so the 3 fractions of one cycle
+    # Cache key: one scratch cwd per seed so all fractions of one cycle
     # share a single vanilla run.
     cwd = scratch_root / f"seed_{perturbation_seed}"
     cached_output = cwd / output_file_name

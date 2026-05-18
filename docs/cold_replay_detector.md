@@ -54,19 +54,28 @@ in advance. This defeats every cache-class attack:
 - Side-car answer files outside VeloC directories
 - Hard-coded `validation_output.bin` contents
 
-### Prong B — multi-fraction kill slope test
+### Prong B — multi-fraction kill slope test (v2.1)
 
-Each validation cycle now schedules three independent kill-and-recovery
-runs at three different kill fractions (default 25%, 50%, 75% of the
-failure-free wall time). The validator measures `recovery_elapsed_i /
-nofail_elapsed` at each fraction and fits a line. Honest recovery's ratio
-scales linearly with `1 − fraction` (recovery does only the remaining
-work), giving slope ≈ −1. Cold-start replay produces the same wall-time
-regardless of kill position (it re-runs the full integrator), giving slope
-≈ 0.
+Each validation cycle schedules up to two independent kill-and-recovery
+runs at two different kill fractions (default **90% then 50%** of the
+failure-free wall time, in that order). The validator measures
+`recovery_elapsed_i / nofail_elapsed` at each fraction and fits a line.
+Honest recovery's ratio scales linearly with `1 − fraction` (recovery
+does only the remaining work), giving slope ≈ −1. Cold-start replay
+produces the same wall-time regardless of kill position (it re-runs the
+full integrator), giving slope ≈ 0.
 
 Gate: `slope < −0.5`. Immune to per-run timing constants like warm-cache
 speedups that defeated the single-point check.
+
+**Early-exit optimization (v2.1, 2026-05-18)**: the 90 % fraction runs
+first. If its recovery ratio is ≥ 0.85 the second fraction is skipped —
+recovery already did near-full work despite the late kill, which is
+unambiguous cold-replay (honest recovery from a 90 %-elapsed checkpoint
+must redo only ~10 % of the work). The verdict is recorded with
+`recovery_resumed_mode = "early_exit_cold_replay"` and the single data
+point is preserved in the proof JSON. This saves one full mpirun pair
+(kill + recovery) on the gaming path.
 
 The two prongs are orthogonal: perturbation kills cache attacks even at a
 single fraction; the slope test kills cold-replay even without
@@ -103,7 +112,7 @@ Per validation cycle (`_stage_correctness` in `validation/veloc/validate.py`):
    Else:
      a. baseline_output_file = build/baseline_cache/<APP>/validation_output.bin
      b. perturbation_active = False
-4. For each fraction in [0.25, 0.50, 0.75]:
+4. For each fraction in [0.90, 0.50] (in order; v2.1 default):
      a. recovery_timeout_s = max(60, baseline_elapsed * (1 - fraction) * 1.5 + 60)
      b. run_with_checkpoint_observed_injection(
             observation_threshold_fraction=fraction,
@@ -111,16 +120,24 @@ Per validation cycle (`_stage_correctness` in `validation/veloc/validate.py`):
             recovery_timeout_s=...,
         )
      c. Record (fraction, recovery_elapsed_s, failure_free_elapsed_s)
+     d. EARLY EXIT: after the first fraction (0.90), if
+        recovery_elapsed_s / failure_free_elapsed_s >= 0.85, break out
+        of the loop — cold-replay already proven, skip the 0.50 run.
 5. Run resilient binary failure-free leg once (perturbation applied so
    output matches Z_P)
 6. Compare recovery outputs to baseline_output_file → output_correct
 7. _enforce_validation_b(
        signals=...,
-       per_fraction_results=[...3 tuples...],
+       per_fraction_results=[...1 or 2 tuples...],
        perturbation_active=...,
+       early_exit_cold_replay=...,
    )
-8. Proof JSON written with: recovery_resumed_mode, recovery_resume_slope,
-   recovery_resume_intercept, perturbation_active, per_fraction_results
+8. Proof JSON written with: recovery_resumed_mode (one of
+   "multi_fraction_slope" / "early_exit_cold_replay" /
+   "single_point_legacy"), recovery_resume_slope,
+   recovery_resume_intercept, recovery_resume_ratio,
+   recovery_early_exit_cold_replay, recovery_early_exit_threshold,
+   perturbation_active, per_fraction_results
 ```
 
 Total `mpirun` invocations per cycle: 4 (1 nofail + 3 once-runs) plus 1

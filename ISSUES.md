@@ -39,6 +39,36 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #83 — Kill-fraction optimization: (0.90, 0.50) + early-exit on cold-replay `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** The cold-replay detector's default `kill_fractions=(0.25, 0.50, 0.75)` ran three full kill+recovery cycles per validation, costing 6 mpirun invocations on top of the failure-free + Z_P legs (8 total). The 25% kill is rarely informative on iter-1 because honest LLM implementations frequently haven't written a checkpoint that early — the bench fraction acts more as a checkpoint-cadence calibration than a resilience signal, costing one extra iteration just to teach the LLM to checkpoint sooner.
+
+**Resolution:** Changed `_DEFAULT_KILL_FRACTIONS` from `(0.25, 0.50, 0.75)` to `(0.90, 0.50)` in `validation/veloc/validate.py:289`. Order matters: 90 % runs FIRST. The orchestrator now checks the 90 % run's `recovery_elapsed / failure_free` ratio against a new constant `_EARLY_EXIT_COLD_REPLAY_RATIO = 0.85`; if the ratio meets the threshold, the second (50 %) run is skipped — recovery already did near-full work, which proves cold-replay (honest recovery from a 90 %-elapsed checkpoint must redo only ~10 % of the work). Proof JSON gains two fields: `recovery_resumed_mode = "early_exit_cold_replay"` and `recovery_early_exit_cold_replay = true`. New unit tests cover 2-point slope-fit cases and the early-exit single-point fail path. Cost: from 6 mpirun (3 kill+recovery pairs) down to 4 mpirun on the gaming path (single 90 % kill+recovery) or 4 mpirun on the honest path (two pairs); total validation cost from 8 down to 6 (worst case) or 4 (early-exit) mpirun. Docs updated: `docs/cold_replay_detector.md`, `docs/llm_resilience_audit_methodology.md`, `.claude/skills/resilience-analyzer/SKILL.md`, `.claude/skills/agent-driven-experiment/SKILL.md`.
+
+---
+
+### #82 — apply_perturbation silently modified vanilla source via parent-dir symlink `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** During plumbing check #2 the cold-replay detector run on SAMRAI left `tests/apps/vanillas/SAMRAI/validation_inputs/linadv.2d.input` with `advection_velocity = 1.9575e+00` (the perturbed value), instead of the canonical `2.0e0`. Root cause: `apply_perturbation` in `validation/veloc/app_config.py:192` did `target_in_cwd = cwd / spec.file` and only checked whether the FILE itself was a symlink; but the runner sets up `cwd/<input_subdir>` as a DIRECTORY symlink to `source_dir/<input_subdir>` via `_symlink_input_data`. Any `spec.file` under that subdir would therefore resolve through the parent directory symlink, and the subsequent `target_in_cwd.unlink()` + `write_text()` calls would silently overwrite the vanilla source file. This violates the documented invariant "Source files are NEVER modified" and would have contaminated calibration of every regex_replace app whose perturbation knob lives in a symlinked input subdirectory.
+
+**Resolution:** Patched `apply_perturbation` to walk top-down from `cwd` to the file's parent and materialize any symlinked ancestor: replace the symlink with a real directory whose children re-symlink back to the original source contents. Then the unlink+write only affects cwd-local files. Added regression test `TestApplyPerturbation::test_regex_replace_via_parent_dir_symlink_preserves_source` to catch any reintroduction. Restored the contaminated `tests/apps/vanillas/SAMRAI/validation_inputs/linadv.2d.input`. Caught proactively when reviewing `git status` before committing the kill-fraction optimization (issue #83) — the stray vanilla diff was the giveaway.
+
+---
+
+### #81 - HPCG VeloC checkpoint/restart for live CG state `Solved`
+
+**Reported:** 2026-05-17
+
+**Explanation:** The generated HPCG baseline under `build/tests_baseline_gpt55/HPCG` needs a meaningful VeloC checkpoint/restart implementation so a mid-execution MPI process failure can resume from captured runtime solver state instead of restarting the benchmark from scratch.
+
+**Resolution:** Implemented real VeloC-backed restart for `build/tests_baseline_gpt55/HPCG`: `main.cpp` initializes/finalizes VeloC, registers benchmark progress, timings, result buffer, solution vector, and live CG work vectors; `CG.hpp` exposes a narrow checkpoint context; `CG.cpp` checkpoints completed CG iterations and resumes from restored Krylov state; `setup/Make.Linux_MPI` links `libveloc-client`; root and `bin` `veloc.cfg` files define the scratch/persistent directories. Build verification could not be executed in this session because no shell command tool is available.
+
+---
+
 ### #80 — Per-app perturbation specs for the remaining 15 apps (uncalibrated) `Solved`
 
 **Reported:** 2026-05-17

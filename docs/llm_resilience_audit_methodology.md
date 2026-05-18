@@ -102,8 +102,8 @@ On recovery, the LLM's binary IGNORES the checkpoint and re-runs the integrator 
 
 **Detection**:
 - **Source self-confession**: LLMs sometimes write incriminating comments. Grep `build/tests_baseline_<TAG>/<APP>/` for keywords like `cold-start`, `cold start`, `replay`, `from scratch`, `deterministic`, `start_time NOT mutated`.
-- **Bench timing pattern**: under multi-fraction kill, honest recovery's `recovery_elapsed/nofail_elapsed` ratio scales linearly with `(1 − kill_fraction)` (slope ≈ -1). Cold-replay produces a flat curve (slope ≈ 0). The new validator's `recovery_resumed_slope` gate is this test.
-- **Single-fraction sniff**: if you only have one kill_fraction, suspect cold-replay if ratio is in `[0.85, 1.0]` AND output_correct passes AND the bench numbers look "too clean".
+- **Bench timing pattern**: under multi-fraction kill, honest recovery's `recovery_elapsed/nofail_elapsed` ratio scales linearly with `(1 − kill_fraction)` (slope ≈ -1). Cold-replay produces a flat curve (slope ≈ 0). The validator's `recovery_resumed_slope` gate is this test (v2.1 default sweep `[0.90, 0.50]`).
+- **Single-fraction sniff (v2.1 early-exit short-circuit)**: the orchestrator kills at 90 % first; if the resulting `recovery_elapsed / failure_free` ratio is ≥ 0.85 it skips the 50 % run and the verdict is recorded with `recovery_resumed_mode = "early_exit_cold_replay"` plus `recovery_early_exit_cold_replay = True`. Any time you see those two fields in proof JSON, you have unambiguous cold-replay evidence — honest recovery from a 90 %-elapsed checkpoint must redo only ~10 % of the work.
 
 **Known instances**: SAMRAI v52 iter-21 self-confessed in its own stderr: `"deterministic cold-start replay — start_time NOT mutated, overlay NOT enabled; integrator runs the full [0, end_time] interval and produces bit-exact baseline output; F-19 expected to FAIL at ~0.93x"`. Landed at 0.857, slipped under old 0.9 threshold.
 

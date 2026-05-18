@@ -191,7 +191,41 @@ def apply_perturbation(
 
     if spec.method == "regex_replace":
         target_in_cwd = cwd / spec.file
-        # Resolve the source content via either the cwd symlink or source_dir.
+        # Materialize any symlinked ancestor between `cwd` and the
+        # target file BEFORE reading or writing — otherwise an
+        # innocuous-looking unlink()+write_text() at `cwd/<spec.file>`
+        # would resolve through a directory symlink and modify the
+        # vanilla source tree (silent contamination of
+        # tests/apps/vanillas/<APP>/...).  The runner sets up
+        # cwd/<input_subdir> as a directory-level symlink to
+        # source_dir/<input_subdir> via _symlink_input_data; any
+        # spec.file under that subdir would trigger the bug.
+        try:
+            rel_parts = target_in_cwd.relative_to(cwd).parts[:-1]
+        except ValueError:
+            rel_parts = ()
+        # Walk top-down from cwd toward the file's directory; first
+        # symlinked ancestor encountered is replaced with a real dir
+        # whose children re-symlink back to the original source.  Once
+        # one ancestor is materialized, deeper ancestors are also real
+        # directories (or symlinks rooted under the new real dir,
+        # which means they no longer leak out of cwd).
+        cur = cwd
+        for part in rel_parts:
+            cur = cur / part
+            if cur.is_symlink():
+                link_target = cur.resolve()
+                cur.unlink()
+                cur.mkdir(parents=True, exist_ok=True)
+                if link_target.is_dir():
+                    for entry in link_target.iterdir():
+                        dst = cur / entry.name
+                        if dst.exists() or dst.is_symlink():
+                            continue
+                        dst.symlink_to(entry)
+
+        # Resolve the source content via either the cwd file (now safe
+        # to read since ancestors are materialized) or source_dir.
         if target_in_cwd.is_symlink():
             source_path = target_in_cwd.resolve()
         elif target_in_cwd.exists():

@@ -194,6 +194,49 @@ class TestApplyPerturbation:
         assert (src / "input.txt").read_text() == "dt = 0.001\n", "source preserved"
         assert not (cwd / "input.txt").is_symlink(), "symlink replaced with real file"
 
+    def test_regex_replace_via_parent_dir_symlink_preserves_source(self, tmp_path):
+        # REGRESSION: when cwd/<input_subdir> is a DIRECTORY symlink to
+        # source_dir/<input_subdir> (the actual runner setup via
+        # _symlink_input_data), spec.file lives at
+        # cwd/<input_subdir>/<file>.  The naive code path would resolve
+        # through the parent symlink and unlink+rewrite the source file.
+        # apply_perturbation must materialize the symlinked parent
+        # before writing.
+        src = tmp_path / "src"
+        cwd = tmp_path / "cwd"
+        (src / "validation_inputs").mkdir(parents=True)
+        cwd.mkdir()
+        (src / "validation_inputs" / "linadv.input").write_text(
+            "advection_velocity = 2.0e0\n"
+        )
+        # Mirror the runner: directory-level symlink, not file-level.
+        (cwd / "validation_inputs").symlink_to(src / "validation_inputs")
+
+        spec = _parse_perturbation({
+            "method": "regex_replace",
+            "file": "validation_inputs/linadv.input",
+            "pattern": r"advection_velocity\s*=\s*[0-9.e+-]+",
+            "replacement_template": "advection_velocity = {value}",
+            "value_range": [1.95, 2.05],
+        })
+        apply_perturbation(
+            spec, 1.97, cwd=cwd, source_dir=src, app_args=[], env={}
+        )
+
+        # The source must be untouched.
+        assert (src / "validation_inputs" / "linadv.input").read_text() == (
+            "advection_velocity = 2.0e0\n"
+        ), "source vanilla input must NOT be modified"
+        # cwd must now contain the modified copy.
+        assert (cwd / "validation_inputs" / "linadv.input").read_text() == (
+            "advection_velocity = 1.97\n"
+        )
+        # The parent directory is no longer a symlink — it was
+        # materialized as a real directory.
+        assert not (cwd / "validation_inputs").is_symlink()
+        # The modified file is a real file, not a symlink.
+        assert not (cwd / "validation_inputs" / "linadv.input").is_symlink()
+
     # All 17 apps in the benchmark suite. Parametrize over the full set
     # (not just regex_replace) so the test report shows explicit coverage
     # for every app: regex_replace apps get the full source-byte-identity
@@ -430,18 +473,52 @@ class TestRecoverySlope:
         with pytest.raises(ValueError, match="identical"):
             compute_recovery_slope([0.5, 0.5, 0.5], [0.5, 0.3, 0.7])
 
+    # F-19 v2.1 (2026-05-18): the default sweep is 2 fractions
+    # (0.90 then 0.50) for cost; the slope fit still has to behave
+    # correctly with just those two points.
+    def test_two_point_honest_recovery(self):
+        # 90 % kill → ~10 % work to redo, 50 % kill → ~50 % work to redo
+        slope, intercept = compute_recovery_slope(
+            [0.90, 0.50], [0.10, 0.50]
+        )
+        assert slope == pytest.approx(-1.0, abs=1e-9)
+        assert intercept == pytest.approx(1.0, abs=1e-9)
+        assert slope < _RECOVERY_RESUMED_SLOPE_THRESHOLD
+
+    def test_two_point_cold_replay(self):
+        # ratios constant ≈ 1.0 regardless of fraction
+        slope, intercept = compute_recovery_slope(
+            [0.90, 0.50], [1.0, 1.0]
+        )
+        assert slope == pytest.approx(0.0, abs=1e-9)
+        assert not (slope < _RECOVERY_RESUMED_SLOPE_THRESHOLD)
+
+    def test_two_point_honest_with_overhead(self):
+        # Honest recovery + fixed 0.15 setup overhead at every fraction
+        slope, intercept = compute_recovery_slope(
+            [0.90, 0.50], [0.25, 0.65]
+        )
+        # slope is (0.65-0.25)/(0.50-0.90) = 0.40 / -0.40 = -1.0
+        assert slope == pytest.approx(-1.0, abs=1e-9)
+        assert slope < _RECOVERY_RESUMED_SLOPE_THRESHOLD
+
 
 class TestKillFractions:
     def test_default_fractions(self):
         delays = kill_fractions_for_bench(100.0)
-        assert delays == [25.0, 50.0, 75.0]
+        # v2.1 defaults: 90 % first (for early-exit on cold-replay),
+        # then 50 % to anchor the slope when the run is honest.
+        assert delays == [90.0, 50.0]
 
     def test_custom_fractions(self):
         delays = kill_fractions_for_bench(80.0, (0.20, 0.50, 0.80))
         assert delays == pytest.approx([16.0, 40.0, 64.0])
 
     def test_default_constant(self):
-        assert _DEFAULT_KILL_FRACTIONS == (0.25, 0.50, 0.75)
+        # ORDER MATTERS: 0.90 first so the orchestrator can early-exit
+        # before launching the second mpirun pair when cold-replay is
+        # already proven.
+        assert _DEFAULT_KILL_FRACTIONS == (0.90, 0.50)
 
     def test_nonpositive_raises(self):
         with pytest.raises(ValueError):
@@ -477,10 +554,11 @@ def _seed_proof(out_dir: Path):
 class TestEnforceValidationB:
     def test_honest_multi_fraction_passes(self, tmp_path):
         _seed_proof(tmp_path)
+        # v2.1 default sweep (0.90 then 0.50), honest recovery:
+        # ratio ≈ (1 - fraction).
         pfr = [
-            {"fraction": 0.25, "recovery_elapsed_s": 75.0, "failure_free_elapsed_s": 100.0},
+            {"fraction": 0.90, "recovery_elapsed_s": 10.0, "failure_free_elapsed_s": 100.0},
             {"fraction": 0.50, "recovery_elapsed_s": 50.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.75, "recovery_elapsed_s": 25.0, "failure_free_elapsed_s": 100.0},
         ]
         # Returns None on PASS; raises ValidationError on FAIL
         _enforce_validation_b(
@@ -491,9 +569,8 @@ class TestEnforceValidationB:
     def test_cold_replay_multi_fraction_fails(self, tmp_path):
         _seed_proof(tmp_path)
         pfr = [
-            {"fraction": 0.25, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
+            {"fraction": 0.90, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
             {"fraction": 0.50, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.75, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
         ]
         with pytest.raises(ValidationError) as exc_info:
             _enforce_validation_b(
@@ -504,18 +581,55 @@ class TestEnforceValidationB:
 
     def test_samrai_iter21_pattern_fails_under_slope(self, tmp_path):
         # SAMRAI iter-21 PASSED under old single-point F-19 at 0.857.
-        # New multi-fraction slope gate must FAIL it.
+        # New multi-fraction slope gate must FAIL it; under v2.1 the
+        # 90 % fraction alone would trigger early-exit, but we test the
+        # full-sweep cold-replay shape here to keep slope-mode coverage.
         _seed_proof(tmp_path)
         pfr = [
-            {"fraction": 0.25, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
+            {"fraction": 0.90, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
             {"fraction": 0.50, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.75, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
         ]
         with pytest.raises(ValidationError):
             _enforce_validation_b(
                 _base_signals(), output_correct=True, out_dir=tmp_path,
                 per_fraction_results=pfr, perturbation_active=True,
             )
+
+    def test_early_exit_cold_replay_fails_with_one_point(self, tmp_path):
+        # F-19 v2.1 early-exit: orchestrator only ran the 0.90 fraction
+        # because the ratio (~0.95) already proved cold-replay; gate
+        # must FAIL on this single-point input without crashing on
+        # "need at least 2 points to fit a slope".
+        _seed_proof(tmp_path)
+        pfr = [
+            {"fraction": 0.90, "recovery_elapsed_s": 95.0, "failure_free_elapsed_s": 100.0},
+        ]
+        with pytest.raises(ValidationError) as exc_info:
+            _enforce_validation_b(
+                _base_signals(), output_correct=True, out_dir=tmp_path,
+                per_fraction_results=pfr, perturbation_active=True,
+                early_exit_cold_replay=True,
+            )
+        msg = str(exc_info.value).lower()
+        # The first-violation message names the early-exit mode.
+        assert "early-exit" in msg or "cold-replay" in msg or "90%" in msg
+
+    def test_early_exit_records_mode_in_proof_json(self, tmp_path):
+        _seed_proof(tmp_path)
+        pfr = [
+            {"fraction": 0.90, "recovery_elapsed_s": 95.0, "failure_free_elapsed_s": 100.0},
+        ]
+        with pytest.raises(ValidationError):
+            _enforce_validation_b(
+                _base_signals(), output_correct=True, out_dir=tmp_path,
+                per_fraction_results=pfr, perturbation_active=True,
+                early_exit_cold_replay=True,
+            )
+        proof = json.loads((tmp_path / "resilience_proof.json").read_text())
+        assert proof["recovery_resumed_mode"] == "early_exit_cold_replay"
+        assert proof["recovery_early_exit_cold_replay"] is True
+        # Ratio is recorded for forensic review.
+        assert proof["recovery_resume_ratio"] == pytest.approx(0.95)
 
     def test_legacy_single_point_still_works(self, tmp_path):
         # When per_fraction_results=None and perturbation_active=False,
@@ -528,10 +642,10 @@ class TestEnforceValidationB:
 
     def test_proof_json_records_slope_fields(self, tmp_path):
         _seed_proof(tmp_path)
+        # v2.1 default sweep (0.90 then 0.50): two-point honest case.
         pfr = [
-            {"fraction": 0.25, "recovery_elapsed_s": 75.0, "failure_free_elapsed_s": 100.0},
+            {"fraction": 0.90, "recovery_elapsed_s": 10.0, "failure_free_elapsed_s": 100.0},
             {"fraction": 0.50, "recovery_elapsed_s": 50.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.75, "recovery_elapsed_s": 25.0, "failure_free_elapsed_s": 100.0},
         ]
         _enforce_validation_b(
             _base_signals(), output_correct=True, out_dir=tmp_path,
@@ -542,7 +656,9 @@ class TestEnforceValidationB:
         assert proof["recovery_resume_slope"] == pytest.approx(-1.0)
         assert proof["recovery_resume_intercept"] == pytest.approx(1.0)
         assert proof["perturbation_active"] is True
-        assert len(proof["per_fraction_results"]) == 3
+        assert len(proof["per_fraction_results"]) == 2
+        # Early-exit was NOT triggered for an honest run.
+        assert proof["recovery_early_exit_cold_replay"] is False
 
     def test_proof_json_records_legacy_fields(self, tmp_path):
         _seed_proof(tmp_path)
