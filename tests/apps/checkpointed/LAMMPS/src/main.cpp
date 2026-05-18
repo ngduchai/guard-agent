@@ -22,6 +22,7 @@
 #include "exceptions.h"
 #endif
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <mpi.h>
@@ -48,35 +49,51 @@ static void finalize()
  *
  * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
  * Byte layout MUST be identical between vanilla and reference at the same
- * workload so Step 0.6c cross-consistency passes:
- *   [0] (double)atom->natoms                        (total atoms, globally consistent)
- *   [1] (double)atom->nlocal                        (rank 0's local atom count)
- *   [2] (double)update->ntimestep                   (final timestep)
- *   [3] update->dt                                  (timestep size)
- *   [4] (double)update->ntimestep * update->dt      (final simulated time)
- *   [5] (double)world_size                          (number of MPI ranks)
+ * workload so Step 0.6c cross-consistency passes.
  *
- * atom->natoms is a globally consistent count (LAMMPS maintains it via
- * MPI_Allreduce internally).  atom->nlocal is per-rank; we capture rank 0's
- * value as a distribution-sanity check.  update->ntimestep and dt are
- * identical on every rank.  Rank-root-only.
+ * SCHEMA REDESIGN (2026-05-18 v2, was v1 = commit 1249d9b76): v1 captured
+ * only seed-INVARIANT counts/timesteps (natoms, nlocal, ntimestep, dt,
+ * world_size).  The perturbation knob for LAMMPS is the velocity seed which
+ * only affects initial atom velocities and resulting equilibrium configs,
+ * NOT counts or timestep counts.  v1 calibration would fail.  v2 captures
+ * per-atom-state sums via MPI_Reduce so the signature reacts to seed
+ * changes:
+ *   [0] global sum of |x[i][0]|  (x positions)
+ *   [1] global sum of |x[i][1]|  (y positions)
+ *   [2] global sum of |x[i][2]|  (z positions)
+ *   [3] global sum of |v[i][0]|  (x velocities)
+ *   [4] global sum of |v[i][1]|  (y velocities)
+ *   [5] global sum of |v[i][2]|  (z velocities)
+ *
+ * Local sums computed by walking atom->x[0..nlocal-1] and atom->v[...].
+ * Global sums via MPI_Reduce(MPI_SUM).  Absolute values used so positions
+ * in symmetric domains don't cancel.  Rank-root-only file write.
  */
 static void dumpValidationSignatureBin_lammps(LAMMPS *lammps, MPI_Comm comm)
 {
-  int rank, size;
+  int rank;
   MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &size);
+
+  double **x = lammps->atom->x;
+  double **v = lammps->atom->v;
+  int nlocal = lammps->atom->nlocal;
+  double local_sums[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  for (int i = 0; i < nlocal; i++) {
+    local_sums[0] += std::abs(x[i][0]);
+    local_sums[1] += std::abs(x[i][1]);
+    local_sums[2] += std::abs(x[i][2]);
+    local_sums[3] += std::abs(v[i][0]);
+    local_sums[4] += std::abs(v[i][1]);
+    local_sums[5] += std::abs(v[i][2]);
+  }
+  double global_sums[6];
+  MPI_Reduce(local_sums, global_sums, 6, MPI_DOUBLE, MPI_SUM, 0, comm);
+
   if (rank != 0) return;
-  double buf[6];
-  buf[0] = (double)lammps->atom->natoms;
-  buf[1] = (double)lammps->atom->nlocal;
-  buf[2] = (double)lammps->update->ntimestep;
-  buf[3] = lammps->update->dt;
-  buf[4] = (double)lammps->update->ntimestep * lammps->update->dt;
-  buf[5] = (double)size;
+
   FILE* f = std::fopen("validation_output.bin", "wb");
   if (f) {
-    std::fwrite(buf, sizeof(double), 6, f);
+    std::fwrite(global_sums, sizeof(double), 6, f);
     std::fclose(f);
   }
 }

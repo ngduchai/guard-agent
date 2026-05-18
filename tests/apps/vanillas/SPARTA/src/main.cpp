@@ -17,6 +17,7 @@
 #include "input.h"
 #include "particle.h"
 #include "update.h"
+#include <cmath>
 #include <cstdio>
 
 using namespace SPARTA_NS;
@@ -25,38 +26,48 @@ using namespace SPARTA_NS;
  *
  * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
  * Byte layout MUST be identical between vanilla and reference at the same
- * workload so Step 0.6c cross-consistency passes:
- *   [0] global nparticles (MPI_SUM of particle->nlocal across ranks)
- *   [1] (double)update->ntimestep                   (final timestep)
- *   [2] update->dt                                  (timestep size)
- *   [3] (double)update->ntimestep * update->dt      (final simulated time)
- *   [4] (double)update->firststep                   (first step of run)
- *   [5] (double)update->laststep                    (last step of run)
+ * workload so Step 0.6c cross-consistency passes.
  *
- * particle->nlocal is per-rank; reduced via MPI_Reduce(MPI_SUM) onto rank 0.
- * The other Update fields are identical on every rank.
+ * SCHEMA REDESIGN (2026-05-18 v2, was v1 = commit 2980e5f20): v1 captured
+ * only seed-INVARIANT counts/timesteps (nparticles, ntimestep, dt, firststep,
+ * laststep).  The perturbation knob for SPARTA is the RNG seed which only
+ * affects particle positions/velocities/states, NOT counts.  v1 calibration
+ * would fail.  v2 captures per-particle-state sums via MPI_Reduce so the
+ * signature reacts to seed changes:
+ *   [0] global sum of |x[0]|  (x positions)
+ *   [1] global sum of |x[1]|  (y positions)
+ *   [2] global sum of |x[2]|  (z positions)
+ *   [3] global sum of |v[0]|  (x velocities)
+ *   [4] global sum of |v[1]|  (y velocities)
+ *   [5] global sum of |v[2]|  (z velocities)
+ *
+ * Local sums computed by walking particle->particles[0..nlocal-1].  Global
+ * sums via MPI_Reduce(MPI_SUM).  Absolute values used so positions in
+ * symmetric domains don't cancel.  Rank-root-only file write.
  */
 static void dumpValidationSignatureBin_sparta(SPARTA *sparta) {
   int rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-  long long local_n = (long long)sparta->particle->nlocal;
-  long long global_n = 0;
-  MPI_Reduce(&local_n, &global_n, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+  Particle::OnePart *parts = sparta->particle->particles;
+  int nlocal = sparta->particle->nlocal;
+  double local_sums[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  for (int i = 0; i < nlocal; i++) {
+    local_sums[0] += std::abs(parts[i].x[0]);
+    local_sums[1] += std::abs(parts[i].x[1]);
+    local_sums[2] += std::abs(parts[i].x[2]);
+    local_sums[3] += std::abs(parts[i].v[0]);
+    local_sums[4] += std::abs(parts[i].v[1]);
+    local_sums[5] += std::abs(parts[i].v[2]);
+  }
+  double global_sums[6];
+  MPI_Reduce(local_sums, global_sums, 6, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
   if (rank != 0) return;
 
-  double buf[6];
-  buf[0] = (double)global_n;
-  buf[1] = (double)sparta->update->ntimestep;
-  buf[2] = sparta->update->dt;
-  buf[3] = (double)sparta->update->ntimestep * sparta->update->dt;
-  buf[4] = (double)sparta->update->firststep;
-  buf[5] = (double)sparta->update->laststep;
-
   FILE* f = std::fopen("validation_output.bin", "wb");
   if (f) {
-    std::fwrite(buf, sizeof(double), 6, f);
+    std::fwrite(global_sums, sizeof(double), 6, f);
     std::fclose(f);
   }
 }
