@@ -61,6 +61,44 @@
 #include "F77_FUNC.h"
 #include "EWCuda.h"
 
+// SW4lite validation signature dumper (Step 0 v8: file-based comparison).
+//
+// Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
+// Byte layout MUST be identical between vanilla and reference at the same
+// workload so Step 0.6c cross-consistency passes:
+//   [0] errInf                          (Linf error vs exact solution)
+//   [1] errL2                           (L2 error vs exact solution)
+//   [2] solInf                          (Linf norm of solution itself)
+//   [3] (double)t                       (final simulated time)
+//   [4] (double)mNumberOfTimeSteps      (timestep count)
+//   [5] (double)mNumberOfGrids          (number of refinement grids)
+//
+// All three error scalars are produced by EW::normOfDifference() which calls
+// MPI_Allreduce internally (EW.C:4445-4447), so the values are identical on
+// every rank after that call.  This dumper is rank-root-only by construction;
+// caller MUST invoke from inside the existing `if (m_point_source_test)` /
+// `if (m_myrank == 0)` block in timesteploop after normOfDifference returns.
+//
+// File static (not member) so reference's CheckPoint.C path can call the same
+// function without depending on EW class layout.
+static void dumpValidationSignatureBin_sw4(double errInf, double errL2,
+                                           double solInf, double t,
+                                           int nTimeSteps, int nGrids)
+{
+   double buf[6];
+   buf[0] = errInf;
+   buf[1] = errL2;
+   buf[2] = solInf;
+   buf[3] = t;
+   buf[4] = (double)nTimeSteps;
+   buf[5] = (double)nGrids;
+   FILE* f = std::fopen("validation_output.bin", "wb");
+   if (f) {
+      std::fwrite(buf, sizeof(double), 6, f);
+      std::fclose(f);
+   }
+}
+
 #ifndef SW4_CROUTINES
 extern "C" {
    void F77_FUNC(rhs4th3fortsgstr,RHS4TH3FORTSGSTR)( int*, int*, int*, int*, int*, int*, int*, int*, 
@@ -2900,6 +2938,13 @@ void EW::timesteploop( vector<Sarray>& U, vector<Sarray>& Um )
 	 esave.precision(12);
 	 esave << t << " " << errInf << " " << errL2 << " " << solInf << endl;
 	 esave.close();
+
+	 // Step 0 v8: emit binary validation signature for file-based comparison.
+	 // errInf/errL2/solInf are already globally reduced by normOfDifference;
+	 // rank-root-only by construction (we are inside `if (m_myrank == 0)`).
+	 dumpValidationSignatureBin_sw4((double)errInf, (double)errL2,
+	                                (double)solInf, (double)t,
+	                                mNumberOfTimeSteps, mNumberOfGrids);
       }
    }
    for (int ts=0; ts<m_GlobalTimeSeries.size(); ts++)
