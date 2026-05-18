@@ -518,15 +518,17 @@ def run_once(
     cwd.mkdir(parents=True, exist_ok=True)
 
     # Ensure veloc.cfg is present in the CWD so VeloC can find it.
+    # Always overwrite from the source list — a stale cfg from a prior run in
+    # the same cwd (e.g. resilient_clean/) would otherwise win.  Matches
+    # _copy_veloc_cfg's unconditional-copy semantics.
     if veloc_config_sources:
         cfg_dst = cwd / veloc_config_name
-        if not cfg_dst.exists():
-            for src_dir in veloc_config_sources:
-                cfg_src = src_dir / veloc_config_name
-                if cfg_src.exists():
-                    shutil.copy2(cfg_src, cfg_dst)
-                    print(f"[runner] copied {cfg_src} → {cfg_dst}", flush=True)
-                    break
+        for src_dir in veloc_config_sources:
+            cfg_src = src_dir / veloc_config_name
+            if cfg_src.exists():
+                shutil.copy2(cfg_src, cfg_dst)
+                print(f"[runner] copied {cfg_src} → {cfg_dst}", flush=True)
+                break
 
     # Clear VeloC checkpoint/scratch directories before running so that leftover
     # checkpoints from a previous run cannot be accidentally picked up.
