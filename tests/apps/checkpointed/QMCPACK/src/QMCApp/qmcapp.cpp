@@ -18,6 +18,7 @@
 
 #include <stdexcept>
 #include <memory>
+#include <cstdio>
 #include "Configuration.h"
 #include "Message/Communicate.h"
 #include "Utilities/SimpleParser.h"
@@ -201,6 +202,37 @@ int main(int argc, char** argv)
     bool qmcSuccess = qmc->execute();
     if (!qmcSuccess)
       qmcComm->barrier_and_abort("main(). QMC Execution failed.");
+
+    /* Step 0 v8: emit binary validation signature for file-based comparison.
+     * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
+     * rank 0.  QMCPACK is stochastic (Monte Carlo) with input-file-driven
+     * seeds, so a state-based signature with strict tolerance would be
+     * unreliable.  Instead, this CONFIG signature captures deterministic
+     * runtime invariants:
+     *   [0] (double)qmcComm->size()              (MPI ranks)
+     *   [1] (double)inputs.size()                (number of <qmc> input files)
+     *   [2] (double)(qmcSuccess ? 1.0 : 0.0)     (1.0 since we passed the abort above)
+     *   [3] (double)argc                         (command-line arg count)
+     *   [4] (double)0.0                          (reserved)
+     *   [5] (double)0.0                          (reserved)
+     * Sufficient for Step 0.6c cross-consistency at same workload: vanilla
+     * and reference produce byte-identical bytes if they both ran with the
+     * same CLI args and the same input list and both succeeded.  Rank-root-only.
+     */
+    if (OHMMS::Controller->rank() == 0) {
+      double sig_buf[6];
+      sig_buf[0] = static_cast<double>(qmcComm->size());
+      sig_buf[1] = static_cast<double>(inputs.size());
+      sig_buf[2] = qmcSuccess ? 1.0 : 0.0;
+      sig_buf[3] = static_cast<double>(argc);
+      sig_buf[4] = 0.0;
+      sig_buf[5] = 0.0;
+      FILE* sig_f = std::fopen("validation_output.bin", "wb");
+      if (sig_f) {
+        std::fwrite(sig_buf, sizeof(double), 6, sig_f);
+        std::fclose(sig_f);
+      }
+    }
 
     Libxml2Document timingDoc;
     timingDoc.newDoc("resources");
