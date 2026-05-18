@@ -3573,8 +3573,38 @@ def _autodetect_or_collect_baseline_cache(
     and writes the cache.  Any failure raises — there is no fallback,
     because the only alternative would be a duplicate 3-pass code path
     in ``validate.py`` and the design goal is one canonical path.
+
+    Optimisation (2026-05-18): when the bench stage is being skipped
+    (--skip-benchmarks) AND v2.2 perturbation is active for this app,
+    pass binary_only=True to the collector.  The iter-loop only needs
+    the built vanilla binary (to feed _compute_perturbed_baseline for
+    Z_P) and does NOT use the cached vanilla wall-time (Z_P provides
+    T_denom directly).  Saves ~2 × T per cache MISS event for the
+    typical iter-loop validation cycle.  Bench stage callers always
+    get full measurements (the collector detects binary_only cache and
+    forces full re-collection when bench needs authoritative timing).
     """
     from .collect_baseline import collect
+
+    # binary_only is safe ONLY when:
+    # (a) --skip-benchmarks: bench won't need cached vanilla wall, AND
+    # (b) the app has an active perturbation spec: Z_P provides T_denom,
+    #     so cached vanilla wall is unused.
+    # If either is False, fall back to full collection so downstream
+    # consumers get authoritative wall measurements.
+    skip_bench = bool(getattr(args, "skip_benchmarks", False))
+    no_pert = bool(getattr(args, "no_perturbation", False))
+    _app_name_for_pert = _strip_output_dir_suffix(
+        Path(args.output_dir).name
+        if hasattr(args, "output_dir") and args.output_dir
+        else original_src.name
+    )
+    _spec = None if no_pert else _load_perturbation_spec_for_app(_app_name_for_pert)
+    pert_active = (
+        _spec is not None
+        and getattr(_spec, "method", None) != "disabled"
+    )
+    binary_only = skip_bench and pert_active
 
     cache_dir = _default_baseline_cache_dir(original_src)
     cache_dir, _meta, _was_hit = collect(
@@ -3591,6 +3621,7 @@ def _autodetect_or_collect_baseline_cache(
         cache_dir=cache_dir,
         force=False,
         check_only=False,
+        binary_only=binary_only,
     )
     return cache_dir
 

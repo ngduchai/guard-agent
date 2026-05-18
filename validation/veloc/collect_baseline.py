@@ -262,8 +262,20 @@ def _do_collection(
     cache_key_hash: str,
     vanilla_src_max_mtime: float,
     vanilla_src_file_count: int,
+    binary_only: bool = False,
 ) -> dict:
     """Run warmup + 2 measurement passes; write meta atomically.  Return meta dict.
+
+    When ``binary_only=True``: run ONLY the warmup pass (which builds the
+    vanilla binary + executes it once into cache_dir, populating the
+    expected output_file_name path).  Skip pass-1/pass-2.  Useful for the
+    v2.2 perturbation-active iter-loop, which only needs the built vanilla
+    binary (to run Z_P with perturbed input via _compute_perturbed_baseline)
+    and not the cached vanilla wall time (Z_P provides T_denom directly).
+    Saves ~2 × T per cache-MISS event.  Meta is marked
+    ``binary_only=True``; callers that need authoritative wall measurements
+    (e.g., bench stage's vanilla reference timing) should detect this flag
+    and force re-collection.
     """
     warmup_dir = cache_dir / "_warmup"
     pass2_dir = cache_dir / "_pass2"
@@ -274,14 +286,19 @@ def _do_collection(
     # writes into _pass2/ so its outputs are available if it beats pass 1.
     print(
         f"[collect_baseline] warmup pass (timing discarded; "
-        f"build_dir={build_dir.name})...",
+        f"build_dir={build_dir.name}; binary_only={binary_only})...",
         flush=True,
     )
     warmup_res = _run_baseline_or_raise(
         "warmup",
         source_dir=original_src,
         build_dir=build_dir,
-        output_dir=warmup_dir,
+        # Under binary_only mode, write warmup outputs directly to
+        # cache_dir so the cached output_file_name path is populated
+        # (validate.py expects it for output_correct fallback when
+        # perturbation is inactive).  Otherwise warmup goes to its
+        # discardable _warmup/ scratch.
+        output_dir=(cache_dir if binary_only else warmup_dir),
         executable_name=executable_name,
         num_procs=num_procs,
         app_args=app_args,
@@ -292,6 +309,37 @@ def _do_collection(
         f"[collect_baseline] warmup elapsed {warmup_res.elapsed_s:.1f}s",
         flush=True,
     )
+
+    # binary_only short-circuit: skip the two measurement passes; mark meta
+    # so future callers needing authoritative wall measurements force a
+    # re-collection.
+    if binary_only:
+        print(
+            "[collect_baseline] binary_only=True: skipping measurement "
+            "passes (warmup output promoted; cached wall=warmup wall, "
+            "not authoritative)",
+            flush=True,
+        )
+        meta = {
+            "schema_version": SCHEMA_VERSION,
+            # elapsed_s is the warmup wall — NOT a clean measurement.
+            # Callers that need authoritative timing must re-collect with
+            # binary_only=False.
+            "elapsed_s": warmup_res.elapsed_s,
+            "baseline_pass1_elapsed_s": None,
+            "baseline_pass2_elapsed_s": None,
+            "baseline_warmup_elapsed_s": warmup_res.elapsed_s,
+            "cache_key": cache_key,
+            "cache_key_hash": cache_key_hash,
+            "vanilla_src_max_mtime": vanilla_src_max_mtime,
+            "vanilla_src_file_count": vanilla_src_file_count,
+            "cached_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "collector_host": socket.gethostname(),
+            "collector_version": COLLECTOR_VERSION,
+            "binary_only": True,
+        }
+        _atomic_write_meta(cache_dir, meta)
+        return meta
 
     print("[collect_baseline] measurement pass 1 of 2...", flush=True)
     res1 = _run_baseline_or_raise(
@@ -348,6 +396,7 @@ def _do_collection(
         "baseline_pass1_elapsed_s": res1.elapsed_s,
         "baseline_pass2_elapsed_s": res2.elapsed_s,
         "baseline_warmup_elapsed_s": warmup_res.elapsed_s,
+        "binary_only": False,
         "cache_key": cache_key,
         "cache_key_hash": cache_key_hash,
         "vanilla_src_max_mtime": vanilla_src_max_mtime,
@@ -372,11 +421,14 @@ def collect(
     cache_dir: Path,
     force: bool = False,
     check_only: bool = False,
+    binary_only: bool = False,
 ) -> tuple[Path, dict, bool]:
     """Public entry point.  Returns ``(cache_dir, meta, was_hit)``.
 
     On a cache hit (and ``not force``): returns ``was_hit=True`` without
-    re-running.
+    re-running.  Caveat: if the cached meta has ``binary_only=True`` and
+    the caller is NOT binary_only, we force a re-collection (binary_only
+    caches don't have authoritative wall-time measurements).
 
     On a miss / stale / forced: acquires an exclusive flock, re-checks
     (handling concurrent populators), then runs warmup + 2 measurement
@@ -384,6 +436,14 @@ def collect(
 
     With ``check_only=True``: raises ``CacheMiss`` if the cache is not valid.
     Never invokes ``run_baseline()``.
+
+    With ``binary_only=True``: skip pass-1/pass-2; run warmup only (which
+    builds the vanilla binary and runs it once into cache_dir).  Cached
+    elapsed_s is the warmup wall and NOT authoritative.  Use this from
+    the v2.2 perturbation-active iter-loop, which needs only the built
+    vanilla binary (to feed _compute_perturbed_baseline for Z_P) and
+    doesn't use the cached vanilla wall (Z_P provides T_denom directly).
+    Saves ~2 × T per cache MISS event.
     """
     original_src = Path(original_src).resolve()
     cache_dir = Path(cache_dir)
@@ -406,17 +466,32 @@ def collect(
         valid, reason = _is_cache_valid(cache_dir, cache_key_hash, max_mtime)
         if valid:
             meta = json.loads((cache_dir / META_FILENAME).read_text())
+            cached_binary_only = bool(meta.get("binary_only", False))
+            # Mismatch: cached is binary_only but caller wants real
+            # measurements → force a re-collection (full warmup+pass1+pass2).
+            # Reverse direction (cached is full, caller wants binary_only)
+            # is fine: just use the cached full result.
+            if cached_binary_only and not binary_only:
+                print(
+                    f"[collect_baseline] cache HIT but binary_only=True; "
+                    f"caller wants authoritative wall measurements -- "
+                    f"forcing full re-collection",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[collect_baseline] cache HIT for {original_src.name} "
+                    f"(elapsed_s={meta['elapsed_s']:.1f}s, "
+                    f"cached_at={meta.get('cached_at','?')}, "
+                    f"binary_only={cached_binary_only})",
+                    flush=True,
+                )
+                return cache_dir, meta, True
+        else:
             print(
-                f"[collect_baseline] cache HIT for {original_src.name} "
-                f"(elapsed_s={meta['elapsed_s']:.1f}s, "
-                f"cached_at={meta.get('cached_at','?')})",
+                f"[collect_baseline] cache MISS for {original_src.name}: {reason}",
                 flush=True,
             )
-            return cache_dir, meta, True
-        print(
-            f"[collect_baseline] cache MISS for {original_src.name}: {reason}",
-            flush=True,
-        )
 
     if check_only:
         raise CacheMiss(f"cache invalid: {reason if not force else 'forced'}")
@@ -463,6 +538,7 @@ def collect(
             cache_key_hash=cache_key_hash,
             vanilla_src_max_mtime=max_mtime,
             vanilla_src_file_count=file_count,
+            binary_only=binary_only,
         )
         return cache_dir, meta, False
 
