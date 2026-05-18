@@ -26,7 +26,12 @@ from validation.veloc.app_config import (
     resolve_perturbation_value,
 )
 from validation.veloc.validate import (
+    _COLD_REPLAY_DIRECT_THRESHOLD,
     _DEFAULT_KILL_FRACTIONS,
+    _KILL_FRACTION_MAX,
+    _KILL_FRACTION_MIN,
+    _KILL_RETRY_FRACTION_REDUCTION,
+    _KILL_RETRY_MAX_ATTEMPTS,
     _RECOVERY_RESUMED_SLOPE_THRESHOLD,
     ValidationError,
     _build_parser,
@@ -37,6 +42,9 @@ from validation.veloc.validate import (
     _strip_output_dir_suffix,
     compute_recovery_slope,
     kill_fractions_for_bench,
+    recovery_threshold_for_fraction,
+    retry_kill_fraction,
+    sample_kill_fraction,
 )
 
 
@@ -504,27 +512,92 @@ class TestRecoverySlope:
 
 
 class TestKillFractions:
-    def test_default_fractions(self):
-        delays = kill_fractions_for_bench(100.0)
-        # v2.1 defaults: 90 % first (for early-exit on cold-replay),
-        # then 50 % to anchor the slope when the run is honest.
-        assert delays == [90.0, 50.0]
-
+    # v2.2: the legacy helper is retained for backwards-compat imports
+    # but the orchestrator now uses sample_kill_fraction() instead.
     def test_custom_fractions(self):
         delays = kill_fractions_for_bench(80.0, (0.20, 0.50, 0.80))
         assert delays == pytest.approx([16.0, 40.0, 64.0])
-
-    def test_default_constant(self):
-        # ORDER MATTERS: 0.90 first so the orchestrator can early-exit
-        # before launching the second mpirun pair when cold-replay is
-        # already proven.
-        assert _DEFAULT_KILL_FRACTIONS == (0.90, 0.50)
 
     def test_nonpositive_raises(self):
         with pytest.raises(ValueError):
             kill_fractions_for_bench(0.0)
         with pytest.raises(ValueError):
             kill_fractions_for_bench(-5.0)
+
+
+class TestSampleKillFraction:
+    """v2.2: single-fraction sampling with seed-derived reproducibility."""
+
+    def test_seed_is_deterministic(self):
+        f1 = sample_kill_fraction(42)
+        f2 = sample_kill_fraction(42)
+        assert f1 == f2
+
+    def test_different_seeds_differ(self):
+        f1 = sample_kill_fraction(42)
+        f2 = sample_kill_fraction(43)
+        assert f1 != f2
+
+    def test_within_bounds(self):
+        for seed in range(1, 50):
+            f = sample_kill_fraction(seed)
+            assert _KILL_FRACTION_MIN <= f <= _KILL_FRACTION_MAX
+
+    def test_none_seed_uses_entropy(self):
+        f = sample_kill_fraction(None)
+        assert _KILL_FRACTION_MIN <= f <= _KILL_FRACTION_MAX
+
+
+class TestRetryKillFraction:
+    """v2.2: kill-window-collapse retry reduces the fraction monotonically."""
+
+    def test_reduces_by_fixed_amount(self):
+        f1 = _KILL_FRACTION_MAX
+        f2 = retry_kill_fraction(f1)
+        assert f2 == pytest.approx(f1 - _KILL_RETRY_FRACTION_REDUCTION)
+
+    def test_floors_at_min(self):
+        assert retry_kill_fraction(_KILL_FRACTION_MIN) == _KILL_FRACTION_MIN
+
+    def test_below_min_clamps_to_min(self):
+        assert retry_kill_fraction(0.40) == _KILL_FRACTION_MIN
+
+    def test_three_attempts_max_yields_min(self):
+        # Worst case starting at MAX: 3rd retry lands at MIN.
+        f = _KILL_FRACTION_MAX
+        for _ in range(_KILL_RETRY_MAX_ATTEMPTS - 1):
+            f = retry_kill_fraction(f)
+        assert f == _KILL_FRACTION_MIN
+
+
+class TestRecoveryThresholdForFraction:
+    """v2.2 Gate C threshold formula: ratio < 1 - kill_fraction/2."""
+
+    def test_at_kill_50_threshold_is_0_75(self):
+        assert recovery_threshold_for_fraction(0.50) == pytest.approx(0.75)
+
+    def test_at_kill_80_threshold_is_0_60(self):
+        assert recovery_threshold_for_fraction(0.80) == pytest.approx(0.60)
+
+    def test_at_kill_65_threshold_is_0_675(self):
+        assert recovery_threshold_for_fraction(0.65) == pytest.approx(0.675)
+
+    def test_samrai_iter21_cold_replay_ratio_fails_at_every_fraction(self):
+        # iter-21 cold-replay observed ratio 0.851 (recovery/Z_P).
+        # Gate C threshold = 1 - f/2.  For f in [0.50, 0.80], 0.851 > threshold.
+        cold_replay_ratio = 0.851
+        for f in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+            threshold = recovery_threshold_for_fraction(f)
+            assert cold_replay_ratio > threshold, (
+                f"SAMRAI iter-21 cold-replay should FAIL Gate C at f={f}: "
+                f"ratio={cold_replay_ratio}, threshold={threshold}"
+            )
+
+    def test_cold_replay_direct_threshold_is_0_85(self):
+        # Gate B is fraction-independent: ratio < _COLD_REPLAY_DIRECT_THRESHOLD.
+        # The threshold is 0.85; SAMRAI iter-21's 0.851 fails this too.
+        assert _COLD_REPLAY_DIRECT_THRESHOLD == 0.85
+        assert 0.851 >= _COLD_REPLAY_DIRECT_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -552,113 +625,92 @@ def _seed_proof(out_dir: Path):
 
 
 class TestEnforceValidationB:
-    def test_honest_multi_fraction_passes(self, tmp_path):
+    def test_honest_v22_passes(self, tmp_path):
         _seed_proof(tmp_path)
-        # v2.1 default sweep (0.90 then 0.50), honest recovery:
-        # ratio ≈ (1 - fraction).
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 10.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.50, "recovery_elapsed_s": 50.0, "failure_free_elapsed_s": 100.0},
-        ]
-        # Returns None on PASS; raises ValidationError on FAIL
+        # v2.2 single-fraction honest: kill at f=0.65, recovery=35,
+        # Z_P=100 → ratio=0.35.  Gate B (<0.85) PASS, Gate C (<0.675) PASS.
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 35.0
         _enforce_validation_b(
-            _base_signals(), output_correct=True, out_dir=tmp_path,
-            per_fraction_results=pfr, perturbation_active=True,
+            sigs, output_correct=True, out_dir=tmp_path,
+            perturbation_active=True,
+            kill_fraction=0.65, z_p_walltime_s=100.0,
         )
 
-    def test_cold_replay_multi_fraction_fails(self, tmp_path):
+    def test_cold_replay_v22_fails_gate_b(self, tmp_path):
+        # SAMRAI iter-21 anchor: ratio = 85.1/100 = 0.851 → FAIL Gate B (≥0.85).
         _seed_proof(tmp_path)
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.50, "recovery_elapsed_s": 100.0, "failure_free_elapsed_s": 100.0},
-        ]
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 85.1
         with pytest.raises(ValidationError) as exc_info:
             _enforce_validation_b(
-                _base_signals(), output_correct=True, out_dir=tmp_path,
-                per_fraction_results=pfr, perturbation_active=True,
-            )
-        assert "slope" in str(exc_info.value).lower()
-
-    def test_samrai_iter21_pattern_fails_under_slope(self, tmp_path):
-        # SAMRAI iter-21 PASSED under old single-point F-19 at 0.857.
-        # New multi-fraction slope gate must FAIL it; under v2.1 the
-        # 90 % fraction alone would trigger early-exit, but we test the
-        # full-sweep cold-replay shape here to keep slope-mode coverage.
-        _seed_proof(tmp_path)
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.50, "recovery_elapsed_s": 85.7, "failure_free_elapsed_s": 100.0},
-        ]
-        with pytest.raises(ValidationError):
-            _enforce_validation_b(
-                _base_signals(), output_correct=True, out_dir=tmp_path,
-                per_fraction_results=pfr, perturbation_active=True,
-            )
-
-    def test_early_exit_cold_replay_fails_with_one_point(self, tmp_path):
-        # F-19 v2.1 early-exit: orchestrator only ran the 0.90 fraction
-        # because the ratio (~0.95) already proved cold-replay; gate
-        # must FAIL on this single-point input without crashing on
-        # "need at least 2 points to fit a slope".
-        _seed_proof(tmp_path)
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 95.0, "failure_free_elapsed_s": 100.0},
-        ]
-        with pytest.raises(ValidationError) as exc_info:
-            _enforce_validation_b(
-                _base_signals(), output_correct=True, out_dir=tmp_path,
-                per_fraction_results=pfr, perturbation_active=True,
-                early_exit_cold_replay=True,
+                sigs, output_correct=True, out_dir=tmp_path,
+                perturbation_active=True,
+                kill_fraction=0.65, z_p_walltime_s=100.0,
             )
         msg = str(exc_info.value).lower()
-        # The first-violation message names the early-exit mode.
-        assert "early-exit" in msg or "cold-replay" in msg or "90%" in msg
+        assert "cold-replay" in msg or "single-fraction" in msg
 
-    def test_early_exit_records_mode_in_proof_json(self, tmp_path):
+    def test_cold_replay_v22_fails_gate_c_at_high_fraction(self, tmp_path):
+        # At f=0.80, gate C threshold = 0.60.  ratio=0.70 fails Gate C
+        # (passes Gate B since 0.70 < 0.85).
         _seed_proof(tmp_path)
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 95.0, "failure_free_elapsed_s": 100.0},
-        ]
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 70.0
         with pytest.raises(ValidationError):
             _enforce_validation_b(
-                _base_signals(), output_correct=True, out_dir=tmp_path,
-                per_fraction_results=pfr, perturbation_active=True,
-                early_exit_cold_replay=True,
+                sigs, output_correct=True, out_dir=tmp_path,
+                perturbation_active=True,
+                kill_fraction=0.80, z_p_walltime_s=100.0,
             )
-        proof = json.loads((tmp_path / "resilience_proof.json").read_text())
-        assert proof["recovery_resumed_mode"] == "early_exit_cold_replay"
-        assert proof["recovery_early_exit_cold_replay"] is True
-        # Ratio is recorded for forensic review.
-        assert proof["recovery_resume_ratio"] == pytest.approx(0.95)
 
-    def test_legacy_single_point_still_works(self, tmp_path):
-        # When per_fraction_results=None and perturbation_active=False,
-        # the gate falls back to the single-point F-19 check.
+    def test_samrai_iter21_anchor_pattern_v22(self, tmp_path):
+        # SAMRAI iter-21 production numbers under v2.2: ratio = 70.79/83.2 = 0.851.
+        # Must FAIL at every random fraction in [0.50, 0.80] via Gate B or C.
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 70.79
+        for f in [0.50, 0.60, 0.65, 0.70, 0.80]:
+            (tmp_path / "resilience_proof.json").write_text("{}")
+            with pytest.raises(ValidationError):
+                _enforce_validation_b(
+                    sigs, output_correct=True, out_dir=tmp_path,
+                    perturbation_active=True,
+                    kill_fraction=f, z_p_walltime_s=83.2,
+                )
+
+    def test_legacy_single_point_fallback_when_v22_inputs_absent(self, tmp_path):
+        # Bare invocation without v2.2 inputs falls back to v1 single-point check.
         _seed_proof(tmp_path)
         _enforce_validation_b(
             _base_signals(), output_correct=True, out_dir=tmp_path,
             per_fraction_results=None, perturbation_active=False,
         )
 
-    def test_proof_json_records_slope_fields(self, tmp_path):
+    def test_proof_json_records_v22_fields(self, tmp_path):
         _seed_proof(tmp_path)
-        # v2.1 default sweep (0.90 then 0.50): two-point honest case.
-        pfr = [
-            {"fraction": 0.90, "recovery_elapsed_s": 10.0, "failure_free_elapsed_s": 100.0},
-            {"fraction": 0.50, "recovery_elapsed_s": 50.0, "failure_free_elapsed_s": 100.0},
-        ]
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 35.0
         _enforce_validation_b(
-            _base_signals(), output_correct=True, out_dir=tmp_path,
-            per_fraction_results=pfr, perturbation_active=True,
+            sigs, output_correct=True, out_dir=tmp_path,
+            perturbation_active=True,
+            kill_fraction=0.65, z_p_walltime_s=100.0,
+            kill_attempts_log=[{
+                "attempt": 1, "kill_fraction": 0.65,
+                "checkpoint_observed": True,
+                "kill_attempt_elapsed_s": 65.0,
+                "recovery_attempt_elapsed_s": 35.0,
+                "collapsed": False,
+            }],
         )
         proof = json.loads((tmp_path / "resilience_proof.json").read_text())
-        assert proof["recovery_resumed_mode"] == "multi_fraction_slope"
-        assert proof["recovery_resume_slope"] == pytest.approx(-1.0)
-        assert proof["recovery_resume_intercept"] == pytest.approx(1.0)
-        assert proof["perturbation_active"] is True
-        assert len(proof["per_fraction_results"]) == 2
-        # Early-exit was NOT triggered for an honest run.
-        assert proof["recovery_early_exit_cold_replay"] is False
+        assert proof["recovery_resumed_mode"] == "single_random_fraction_v22"
+        assert proof["kill_fraction"] == pytest.approx(0.65)
+        assert proof["z_p_walltime_s"] == pytest.approx(100.0)
+        assert proof["recovery_resume_ratio"] == pytest.approx(0.35)
+        assert proof["recovery_threshold_c"] == pytest.approx(0.675)
+        assert proof["cold_replay_direct_ok"] is True
+        assert proof["cold_replay_direct_threshold"] == 0.85
+        assert len(proof["kill_attempts_log"]) == 1
 
     def test_proof_json_records_legacy_fields(self, tmp_path):
         _seed_proof(tmp_path)

@@ -39,6 +39,43 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #85 — Cold-replay detector v2.2: single random fraction + Z_P denominator + kill retry `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** v2.1 (issue #83) used kill fractions (0.90, 0.50) with an early-exit on 90 % cold-replay. End-to-end verification on SAMRAI iter-21 exposed two structural problems: (1) at 90 % the kill window often collapsed (binary completed before SIGKILL could land, since polling+grace ate the remaining ~3 s of wall time for short-runtime apps); (2) with only the 50 % fraction yielding data, the validator fell back to the legacy single-point F-19 check (threshold 0.9), which had originally false-passed SAMRAI iter-21 cold-replay at ratio 0.857 — and false-passed again at ratio 0.851 in this run. Two distinct gaming patterns were also identified that need different denominators: cold-replay-without-overhead (LLM writes real checkpoints during failure-free leg to satisfy `checkpoint_observed`, then skips overhead on attempt_2) artificially lowers ratio_vs_R_FF below threshold, so a vanilla-derived denominator (Z_P) is required to catch it.
+
+**Resolution:** Rewrote the v2 / v2.1 multi-fraction slope test as v2.2 single-random-fraction with retry-on-collapse.
+
+Key design points:
+- Single kill fraction sampled uniformly from `[0.50, 0.80]`, derived from `perturbation_seed` so the run is forensically reproducible. Randomization prevents the LLM from tuning checkpoint cadence to land right before a fixed kill point.
+- `T_denom` for the cold-replay ratio is **Z_P** (perturbed-vanilla failure-free walltime), not the resilient failure-free walltime. Z_P is independent of LLM behavior, so the cold-replay-skip-overhead attack cannot artificially lower the ratio below Gate B's floor.
+- Two gates: Gate B (`ratio < 0.85`, cold_replay_direct) and Gate C (`ratio < 1 - kill_fraction/2`, fraction-aware midpoint between honest expected and cold-replay).
+- Kill-window collapse: up to 3 attempts, each reducing the fraction by 0.15 (floor at 0.50). If all 3 collapse → FAIL (app structurally unmeasurable).
+- Resilient failure-free leg retained for Gate A (output correctness only); its walltime is NOT used in the ratio denominator.
+- Gate F (fast) removed from correctness stage (still reported in bench stage).
+- New CLI flags: `--perturbation-seed` (enables forensic reproducibility + parallel Z_P pre-compute) and `--kill-fraction` (debug override). `--perturbation-fractions` deprecated but accepted for backward compat.
+
+Verification:
+- **SAMRAI iter-21**: FAIL via Gate B (ratio 0.858 ≥ 0.85, kill_fraction=0.632, mode=single_random_fraction_v22). Caught cold-replay correctly. ✓
+- **Nyx iter-6**: FAIL via Gate A (output_correct: 11 extra timesteps from state drift after recovery). v2.2 exposed a real state-preservation bug in iter-6's checkpoint implementation that the old pipeline missed — the smoking gun is that Z_P ends with TIME=3.995317439 then TIME=4 while resilient recovery ends with TIME=3.997481703 then TIME=4 (different CFL-derived timestep choices due to drifted state). The old TRUSTED status for iter-6 was based on weaker comparison (no perturbation, no length check).
+
+Test suite: 304 tests green (113 perturbation tests + full sweep), 1 pre-existing unrelated test deselected.
+
+Cost reduction vs v2.1: from ~9 × T per validation cycle (cache miss) down to ~3.5 × T worst case; from ~6 × T (cache hit) down to ~2.5 × T.
+
+---
+
+### #84 — Verification finding: Nyx iter-6 has a real state-preservation bug in checkpoint/restart `Open`
+
+**Reported:** 2026-05-18
+
+**Explanation:** While verifying v2.2 (issue #85), Nyx iter-6 (previously TRUSTED under the pre-perturbation pipeline) failed Gate A (output_correct). Investigation showed the failure-free leg passes perfectly (score=1.0, max_relative_diff=0) but the failure-prone recovery produces 11 extra timesteps. Concretely: Z_P ends with TIME=3.995317439 then TIME=4; resilient recovery ends with TIME=3.997481703 then TIME=4. Both runs reach simulation end TIME=4 but with slightly different CFL-derived timestep sequences. Same gamma, same code, same inputs — the only difference is that resilient went through a kill+recovery cycle. The drift signature (different timestep counts, slightly different MASS at same TIME) is consistent with a checkpoint that doesn't preserve the full state vector — e.g., saves only the conservative variables but not the primitive variables or the AMR mesh metadata or the timestep-controller state, then on restart re-derives the missing fields with slight numerical error.
+
+**Resolution:** Not yet investigated. Recommended actions: (a) read iter-6's checkpoint registration code (`build/tests_baseline/Nyx/Source/IO/Nyx_output.cpp` and related); (b) compare against the AMReX reference checkpoint code in `tests/apps/checkpointed/Nyx/`; (c) re-iterate Nyx with the v2.2 validator to let the LLM find a clean implementation. This entry is informational — Nyx iter-6 should NOT be used as a reference honest implementation, and its TRUSTED status from the old pipeline is misleading.
+
+---
+
 ### #83 — Kill-fraction optimization: (0.90, 0.50) + early-exit on cold-replay `Solved`
 
 **Reported:** 2026-05-18
