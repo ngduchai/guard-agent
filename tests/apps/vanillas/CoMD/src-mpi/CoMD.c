@@ -80,6 +80,39 @@ static void printThings(SimFlat* s, int iStep, double elapsedTime);
 static void printSimulationDataYaml(FILE* file, SimFlat* s);
 static void sanityChecks(Command cmd, double cutoff, double latticeConst, char latticeType[8]);
 
+// CoMD validation signature dumper (Step 0 v8: file-based comparison).
+//
+// Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
+// Byte layout MUST be identical between vanilla and reference at the same
+// workload so Step 0.6c cross-consistency passes:
+//   [0] sim->ePotential                                    (final global potential energy)
+//   [1] sim->eKinetic                                      (final global kinetic energy)
+//   [2] (ePotential + eKinetic) / atoms->nGlobal           (per-atom total energy)
+//   [3] (double)atoms->nGlobal                             (atom count, conserved)
+//   [4] (double)sim->nSteps                                (intended timestep count)
+//   [5] sim->dt * sim->nSteps                              (final simulated time)
+//
+// sim->ePotential and sim->eKinetic are globally reduced via MPI_Allreduce
+// inside kineticEnergy() (timestep.c) at the end of each timestep, so by the
+// time main() reaches validateResult these are deterministic global scalars.
+// No additional MPI reduction needed here; rank 0 writes the file.
+static void dumpValidationSignatureBin(const SimFlat* sim)
+{
+   if (getMyRank() != 0) return;
+   double buf[6];
+   buf[0] = (double)sim->ePotential;
+   buf[1] = (double)sim->eKinetic;
+   buf[2] = ((double)sim->ePotential + (double)sim->eKinetic)
+            / (double)sim->atoms->nGlobal;
+   buf[3] = (double)sim->atoms->nGlobal;
+   buf[4] = (double)sim->nSteps;
+   buf[5] = (double)sim->dt * (double)sim->nSteps;
+   FILE* f = fopen("validation_output.bin", "wb");
+   if (f) {
+      fwrite(buf, sizeof(double), 6, f);
+      fclose(f);
+   }
+}
 
 int main(int argc, char** argv)
 {
@@ -133,6 +166,11 @@ int main(int argc, char** argv)
    // Epilog
    validateResult(validate, sim);
    profileStop(totalTimer);
+
+   // Step 0 v8: emit binary validation signature for file-based comparison.
+   // Must be called after validateResult (energies + atom counts finalised)
+   // and before destroySimulation below (sim becomes invalid).
+   dumpValidationSignatureBin(sim);
 
    printPerformanceResults(sim->atoms->nGlobal, sim->printRate);
    printPerformanceResultsYaml(yamlFile);
