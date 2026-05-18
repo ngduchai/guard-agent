@@ -110,28 +110,32 @@ fi
 #
 # When cell N runs after cells 1..N-1, those earlier cells' tagged source
 # dirs (build/tests_baseline_<OTHER_TAG>/) sit on disk.  Also the upstream
-# reference checkpointed source (tests/apps/checkpointed/<APP>/).  OpenCode's
+# reference checkpointed source (tests/apps/checkpointed/<APP>/), AND the
+# un-suffixed Opus 4.7 1M baseline (build/tests_baseline/<APP>/).  OpenCode's
 # read/grep/glob tools have full FS visibility, so cell N's LLM could read
 # any of those and crib from them, contaminating the experiment.
 #
-# Mitigation: move every OTHER cell's tagged dir and the per-app reference
-# into a SINGLE isolation folder under /tmp/ (outside the project tree, so
-# not discoverable by globbing build/) and chmod 000 the folder so the OS
-# itself denies traversal regardless of what OpenCode tries.  Restore on
-# any exit (normal, error, signal).  Same effect as the existing per-iter
-# reference-hiding in run_iterative.sh, just scaled to cover other-cell
-# sources and centralised in one place so the OS perm bit lifts both kinds
-# of isolation atomically.
+# Mitigation: move every OTHER cell's tagged dir, the un-suffixed baseline,
+# and the per-app reference into a SINGLE isolation folder UNDER build/
+# (NOT /tmp — /tmp is subject to systemd-tmpfiles / cron cleanup, which
+# would delete hidden sources mid-run and leave the wrapper unable to
+# restore them).  chmod 000 the folder so the OS itself denies traversal
+# regardless of what OpenCode tries.  Restore on any exit (normal, error,
+# signal).  Same effect as the existing per-iter reference-hiding in
+# run_iterative.sh, just scaled to cover other-cell sources and centralised
+# in one place so the OS perm bit lifts both kinds of isolation atomically.
+#
+# Defense in depth: also denied in ~/.config/opencode/opencode.json for
+# permission.read and permission.edit on `**/build/_cell_isolation/**`,
+# in case OpenCode tries to glob the path before hitting the chmod 000.
 #
 # NOT hidden:
 #   - This cell's own tests_baseline_${MODEL_TAG}/ (obviously)
-#   - The un-suffixed tests_baseline/ (Opus 4.7 1M baseline) — covered by
-#     OpenCode permission.read deny at ~/.config/opencode/opencode.json
 # ---------------------------------------------------------------------------
 
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
-ISOLATION_DIR="${ISOLATION_DIR:-/tmp/.cell_iso_${MODEL_TAG}_$$}"
+ISOLATION_DIR="${ISOLATION_DIR:-$BUILD_DIR/_cell_isolation/${MODEL_TAG}_$$}"
 HIDDEN_ENTRIES=()  # entries: "<isolation_path>|<original_path>"
 
 # Pull --baseline <APP> out of the forwarded args so we know which app's
@@ -152,6 +156,15 @@ done
 
 mkdir -p "$ISOLATION_DIR"
 
+# Parent build/_cell_isolation/ gets its own gitignore so any stray
+# isolation dirs (e.g. from a crashed wrapper that couldn't run the
+# restore trap) don't get accidentally committed.  build/ itself is
+# already gitignored project-wide, but be explicit.
+PARENT_ISOLATION_DIR="$(dirname "$ISOLATION_DIR")"
+if [ ! -f "$PARENT_ISOLATION_DIR/.gitignore" ]; then
+  echo "*" > "$PARENT_ISOLATION_DIR/.gitignore" 2>/dev/null || true
+fi
+
 # Move other cells' tagged source dirs into the isolation folder.
 if [ -d "$BUILD_DIR" ]; then
   for d in "$BUILD_DIR"/tests_baseline_*/; do
@@ -167,6 +180,22 @@ if [ -d "$BUILD_DIR" ]; then
       echo "[run_iterative_for_model] hid $d → isolation"
     fi
   done
+fi
+
+# Move the un-suffixed (Opus 4.7 1M baseline) tests_baseline dir into
+# isolation.  Closes the gap that the broken opencode.json read-deny was
+# trying to plug — the wrapper's chmod 000 is OS-enforced and cannot be
+# bypassed by an in-process tool config error.  Caveat: any concurrent
+# baseline iter loop on the same host would have its working dir hidden
+# out from under it; this is acceptable because OP-8 forbids concurrent
+# mpirun on the host anyway, so concurrent runs cannot happen.
+BASELINE_DIR="$BUILD_DIR/tests_baseline"
+if [ -d "$BASELINE_DIR" ]; then
+  target="$ISOLATION_DIR/tests_baseline"
+  if mv "$BASELINE_DIR" "$target" 2>/dev/null; then
+    HIDDEN_ENTRIES+=("$target|$BASELINE_DIR")
+    echo "[run_iterative_for_model] hid baseline $BASELINE_DIR → isolation"
+  fi
 fi
 
 # Move the per-app upstream reference source into the same isolation folder.

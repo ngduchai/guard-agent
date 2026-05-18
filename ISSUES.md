@@ -39,6 +39,45 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #89 — Cross-cell isolation hardening: hide baseline + move isolation under build/ `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** Two gaps in the per-cell isolation introduced in commit 145f7df95, surfaced after issue #88:
+
+1. **Tagged cells could still read the un-suffixed Opus 4.7 baseline.** `run_iterative_for_model.sh` hid OTHER tagged cells (`build/tests_baseline_<other_tag>/`) and the upstream reference (`tests/apps/checkpointed/<APP>/`), but NOT `build/tests_baseline/` (the baseline). The original plug for this gap was an OpenCode `permission.read` deny rule, but that rule was both syntactically broken and logically backwards (issue #88).
+
+2. **Isolation folder under /tmp could be deleted mid-run.** `ISOLATION_DIR` defaulted to `/tmp/.cell_iso_<TAG>_<PID>`, subject to systemd-tmpfiles or cron cleanup. If the cleanup fires while a long-running iter loop has files moved into isolation, the hidden sources are deleted permanently and the wrapper's restore trap fails.
+
+**Resolution:**
+
+- Moved `ISOLATION_DIR` default from `/tmp/.cell_iso_${MODEL_TAG}_$$` to `build/_cell_isolation/${MODEL_TAG}_$$`. `build/` is project-local, gitignored, and not touched by any cleanup script.
+- Added `mv build/tests_baseline/` (baseline) into isolation alongside the other-cell + reference moves. Closes the gap from #88.
+- Added defense-in-depth OpenCode deny rules for `**/build/_cell_isolation/**` in both `permission.read` and `permission.edit`. The OS-level chmod 000 is the primary protection; the OpenCode rules catch any glob attempt before it hits the syscall.
+- Wrapper creates a `.gitignore` under `build/_cell_isolation/` so any stray isolation dirs from crashed wrappers don't leak into git history.
+
+Caveat: any concurrent baseline iter loop on the same host while a tagged cell runs would have its working dir hidden out from under it. OP-8 (single mpirun per host) forbids concurrent runs anyway, so this cannot happen in practice.
+
+---
+
+### #88 — OpenCode config: `permission.read` block with `_comment` key + `tests_baseline/** deny` blocks all iter loops `Solved`
+
+**Reported:** 2026-05-18
+
+**Explanation:** The `~/.config/opencode/opencode.json` was edited on 2026-05-17 23:29 to add a 3-D-experiment isolation `permission.read` block. Two issues prevent ALL iter loops from progressing:
+
+1. **Syntax**: an inline `_comment` key in `permission.read` (line 86) fails OpenCode's schema validation with `Error: Configuration is invalid at /home/ndhai/.config/opencode/opencode.json ↳ Invalid input permission`. The permission block only accepts `<glob>: "allow"|"deny"` entries.
+
+2. **Semantics**: the three deny entries (`tests_baseline/**: deny`) contradict the `permission.edit` allow for the same paths (lines 68-71). OpenCode cannot edit a file it cannot read, so even fixing the syntax leaves iter loops broken for any app whose baseline lives in `build/tests_baseline/<APP>/`.
+
+**Observed during HyPar v2.2 sanity test (2026-05-18 05:06 UTC)**: every iter exits OpenCode in ~1.1s with `Tokens: input=0 output=0 total=0`; validator then FATALs because the unmodified vanilla source has no `veloc.cfg` and the checkpoint-observed injection strategy has no scratch dirs to poll. Cost so far: ~5 min per iter × however many fired before user intervention.
+
+**Resolution:** User chose Option A at 2026-05-18 05:20:51 — restored `"read": "allow"` (matches the pre-edit backup state). OpenCode config now loads cleanly; iter loop will pick up the new config on the next iteration (iter 4+). 3-D experiment isolation work remains deferred for future per-cell config-generation work.
+
+Pre-edit backup: `/home/ndhai/.config/opencode/opencode.json.bak.preread_1779060524`.
+
+---
+
 ### #87 — Runner's _symlink_input_data creates symlinks for OUTPUT files too, causing vanilla contamination on rewrite `Open`
 
 **Reported:** 2026-05-18
