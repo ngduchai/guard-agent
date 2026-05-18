@@ -608,9 +608,11 @@ Trust verdicts are written to `build/_experiment_state/_trust.json`; smoking-gun
 - **OP-13 (verify the consumer, not the producer)**: when a wrapper claims to set X, grep the downstream tool that consumes X to confirm — don't trust intermediate scripts.
 - **Commit-promptly**: after any audit lands a verdict, commit `_trust.json` and append `_decisions.log` immediately. Future sessions read these to understand prior decisions.
 
-When briefing an experimentor agent on what to check, reference the methodology doc by path — do not paraphrase the gaming patterns inline (the doc evolves; paraphrases drift). When auditing an experimentor's reported result, run the 8-phase workflow against their output before accepting their verdict.
+**How to actually invoke the audit**: the local skill `resilience-analyzer` (under `.claude/skills/resilience-analyzer/`, project-local — `.claude/` is gitignored so each developer maintains their own copy) operationalizes the 8-phase workflow with concrete commands per phase. Invoke it via the `Skill` tool with `skill: resilience-analyzer` rather than open-coding the checks. The skill embeds the 5 gaming pattern classes inline so it runs without depending on the methodology doc; the doc remains the canonical longform reference (historical instances, schema details, full file-path table, where to add new gaming classes).
 
-When a NEW gaming class is observed in any iter loop, add it to the doc's section 2 (pattern definitions) and section 8 (attack history) in the same commit as the `_trust.json` flip that surfaced it. This is how the audit playbook stays current.
+When briefing an experimentor agent on what to check, reference the methodology doc by path — do not paraphrase the gaming patterns inline (the doc evolves; paraphrases drift). When auditing an experimentor's reported result, invoke the `resilience-analyzer` skill against their output before accepting their verdict.
+
+When a NEW gaming class is observed in any iter loop, add it to the doc's section 2 (pattern definitions) and section 8 (attack history) **AND** to the `resilience-analyzer` skill's pattern catalog, in the same commit as the `_trust.json` flip that surfaced it. This is how the audit playbook stays current.
 
 ---
 
