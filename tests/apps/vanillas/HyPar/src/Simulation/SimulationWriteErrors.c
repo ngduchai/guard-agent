@@ -12,6 +12,39 @@
 #include <mpivars.h>
 #include <simulation_object.h>
 
+/* HyPar validation signature dumper (Step 0 v8: file-based comparison).
+ *
+ * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank 0.
+ * Byte layout MUST be identical between vanilla and reference at the same
+ * workload so Step 0.6c cross-consistency passes:
+ *   [0] sim[0].solver.error[0]                     (L1 error)
+ *   [1] sim[0].solver.error[1]                     (L2 error)
+ *   [2] sim[0].solver.error[2]                     (Linfinity error)
+ *   [3] (double)nsims                              (number of simulations)
+ *   [4] (double)sim[0].solver.ndims                (spatial dimensions)
+ *   [5] sim[0].solver.dt                           (time step size)
+ *
+ * solver.error[] is computed at end-of-run by HyPar's existing error-computation
+ * machinery (already includes global MPI reductions per HyPar's design).  The
+ * dumper is rank-root-only by construction; caller MUST invoke from inside the
+ * existing `if (!rank)` block in SimWriteErrors.
+ */
+static void dumpValidationSignatureBin_hypar(const SimulationObject* sim, int nsims)
+{
+  double buf[6];
+  buf[0] = sim[0].solver.error[0];
+  buf[1] = sim[0].solver.error[1];
+  buf[2] = sim[0].solver.error[2];
+  buf[3] = (double)nsims;
+  buf[4] = (double)sim[0].solver.ndims;
+  buf[5] = sim[0].solver.dt;
+  FILE* f = fopen("validation_output.bin", "wb");
+  if (f) {
+    fwrite(buf, sizeof(double), 6, f);
+    fclose(f);
+  }
+}
+
 /*! Writes out the errors and other data for each simulation.
 */
 
@@ -138,6 +171,15 @@ void SimWriteErrors(void  *s,               /*!< Array of simulations of type #S
     printf("Solver runtime (in seconds): %1.16E\n",solver_runtime);
     printf("Total  runtime (in seconds): %1.16E\n",main_runtime);
     if (nsims > 1) printf("\n");
+
+    /* Step 0 v8: emit binary validation signature for file-based comparison.
+     * Rank-root-only by construction (we are inside `if (!rank)`).  Uses
+     * sim[0]'s error values + dt + dims, which are populated by HyPar's
+     * existing error computation machinery before SimWriteErrors is called.
+     */
+    if (nsims > 0) {
+      dumpValidationSignatureBin_hypar(sim, nsims);
+    }
 
   }
 
