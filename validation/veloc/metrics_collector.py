@@ -1697,6 +1697,14 @@ def run_benchmark_sweep(
     # is ~25% slower than steady-state (OpenLB 2026-05-19: nofail run_1 154s
     # vs runs 2+3 at 124s; mean ratio fell to 0.931 and tripped F-19 mean
     # check despite the LLM being honest).
+    #
+    # FIX 2026-05-19: must thread extra_source_dirs (resilient codebase) and
+    # priority_source_dirs through to _run_scenario_once so apps with
+    # multi-source input-file dependencies (LAMMPS bench/in.lj_long lives
+    # only in vanilla source; SW4lite/Athena++/QMCPACK similar classes)
+    # set up their cwd correctly during warmup.  v1 of this block omitted
+    # these and caused 4/12 vanilla-once backfill failures (exit=1) — see
+    # _decisions.log 2026-05-19 14:15:00Z PRIORITY-3 [f].
     if warmup_runs_per_codebase > 0 and scenarios:
         warmup_scenario = scenarios[0]  # use first scenario's args
         # Always do nofail warmup for cache-priming regardless of scenario inject setting.
@@ -1706,12 +1714,23 @@ def run_benchmark_sweep(
         except TypeError:
             # Fall back to a plain attribute copy if Scenario isn't a dataclass.
             warmup_scen = warmup_scenario
-        for codebase_name, src_dir, build_dir, exe_name in [
+        for codebase_name, src_dir, b_dir, exe_name in [
             ("original", original_source_dir, original_build_dir, original_executable_name),
             ("resilient", resilient_source_dir, resilient_build_dir, resilient_executable_name),
         ]:
             if codebase_name == "original" and skip_original_codebase:
                 continue
+            # Match the per-codebase _run_scenario_once parameter setup of
+            # the real measured runs below (lines ~1785 original / ~1824
+            # resilient) so warmup cwd setup is byte-equivalent to measured.
+            if codebase_name == "resilient":
+                warmup_extra_source_dirs = [original_source_dir]
+                warmup_priority_source_dirs = resilient_priority_source_dirs
+                warmup_run_install = install_resilient
+            else:
+                warmup_extra_source_dirs = None
+                warmup_priority_source_dirs = None
+                warmup_run_install = False
             for w in range(warmup_runs_per_codebase):
                 print(
                     f"[metrics] --- WARMUP run {w+1}/{warmup_runs_per_codebase} "
@@ -1724,11 +1743,14 @@ def run_benchmark_sweep(
                         codebase=codebase_name,
                         run_index=-1,  # negative index marks warmup run dir
                         source_dir=src_dir,
-                        build_dir=build_dir,
+                        build_dir=b_dir,
                         output_dir=benchmarks_dir,
                         executable_name=exe_name,
                         veloc_config_name=veloc_config_name,
+                        run_install=warmup_run_install,
                         app_input_subdir=app_input_subdir,
+                        extra_source_dirs=warmup_extra_source_dirs,
+                        priority_source_dirs=warmup_priority_source_dirs,
                     )
                 except Exception as exc:
                     # Warmup failures are non-fatal — proceed to measured runs
@@ -1742,7 +1764,7 @@ def run_benchmark_sweep(
                 _cleanup_checkpoints_post_run(
                     run_output_dir=_warm_dir,
                     veloc_cfg_name=veloc_config_name,
-                    veloc_cfg_search_dirs=[src_dir, build_dir],
+                    veloc_cfg_search_dirs=[src_dir, b_dir],
                 )
 
     for scenario_idx, scenario in enumerate(scenarios, 1):
