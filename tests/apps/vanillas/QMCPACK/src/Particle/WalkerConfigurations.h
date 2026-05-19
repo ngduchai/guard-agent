@@ -51,7 +51,6 @@ struct MCDataType
   T LivingFraction;
 };
 
- */
 class WalkerConfigurations
 {
 public:
