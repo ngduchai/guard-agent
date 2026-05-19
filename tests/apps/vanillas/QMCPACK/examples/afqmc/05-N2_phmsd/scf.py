@@ -39,7 +39,7 @@ def gen_wavefunction_and_hamil(tol=0.02):
     occb = [numpy.array(core + [o + mc.ncore for o in ob]) for ob in occb]
     # b. Generate Hamiltonian.
     # Passing 'mccsf' will tell helper function to read mo_coeff/mo_occ from mcscf
-    # group in checkpoint file. We will rotate the integrals by mc.mo_coeff.
+    # group in data file. We will rotate the integrals by mc.mo_coeff.
     scf_data = load_from_pyscf_chk_mol('scf.chk', 'mcscf')
     write_hamil_mol(scf_data, 'afqmc.h5', 1e-5, verbose=True)
     ci = numpy.array(ci, dtype=numpy.complex128)

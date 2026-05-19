@@ -30,7 +30,6 @@ class DiagnosticRadiationSpectrum;
 //  --------------------------------------------------------------------------------------------------------------------
 class SmileiMPI
 {
-    friend class Checkpoint;
     friend class PatchesFactory;
     friend class Patch;
     friend class VectorPatch;

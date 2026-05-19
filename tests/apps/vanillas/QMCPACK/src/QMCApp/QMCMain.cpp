@@ -594,7 +594,6 @@ bool QMCMain::runQMC(xmlNodePtr cur, bool reuse)
     qmc_driver->setStatus(my_project_.currentMainRoot(), "", append_run);
     // PD:
     // Q: How does walker_set_in end up being non empty?
-    // A: Anytime that we aren't doing a restart.
     // So put walkers is an exceptional call. This code does not tell a useful
     // story of a QMCDriver's life.
     qmc_driver->putWalkers(walker_set_in_);
@@ -628,7 +627,6 @@ bool QMCMain::runQMC(xmlNodePtr cur, bool reuse)
 }
 
 
-/** Reads walkers sets from the restart file during XML validation
  *
  *  TODO: Move this, it is not a concern of QMCMain
  */

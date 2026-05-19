@@ -312,4 +312,3 @@ The last two cells are the replay action that can be quickly iterated: change ``
    * Keep an eye on the terminal, if a replay action is erroneous it will show up on the terminal that started the docker container.
      (TODO: We might want to catch that inside python and print it in Jupyter instead.)
    * If you remove a "key" from the replay action, you might see an error in the ``AscentViewer``.
-     Restart and execute all cells in that case.

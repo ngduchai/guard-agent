@@ -209,7 +209,6 @@ int WalkerControlBase::branch(int iter, MCWalkerConfiguration& W, FullPrecRealTy
     walker->Multiplicity = 1.0;
   }
 
-  // Update offsets in non-MPI case, needed to ensure checkpoint outputs the correct
   W.setWalkerOffsets({0, nw_tot});
   return nw_tot;
 }

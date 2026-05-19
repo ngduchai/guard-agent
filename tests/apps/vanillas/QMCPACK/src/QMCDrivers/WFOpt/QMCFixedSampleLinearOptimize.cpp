@@ -1536,7 +1536,7 @@ void QMCFixedSampleLinearOptimize::start()
   app_log() << "</opt>" << std::endl;
   app_log() << R"(<opt stage="main" walkers=")" << optTarget->getNumSamples() << "\">" << std::endl;
   app_log() << "  <log>" << std::endl;
-  t1.restart();
+  t1.reset_clock();
 }
 
 #ifdef HAVE_LMY_ENGINE
@@ -1575,7 +1575,7 @@ void QMCFixedSampleLinearOptimize::engine_start(cqmc::engine::LMYEngine<ValueTyp
   app_log() << "</opt>" << std::endl;
   app_log() << R"(<opt stage="main" walkers=")" << optTarget->getNumSamples() << "\">" << std::endl;
   app_log() << "  <log>" << std::endl;
-  t1.restart();
+  t1.reset_clock();
 }
 #endif
 
@@ -1621,7 +1621,7 @@ void QMCFixedSampleLinearOptimize::generateSamples()
   //vmcEngine->setValue("recordWalkers",1);//set record
   vmcEngine->setValue("current", 0); //reset CurrentStep
   app_log() << R"(<vmc stage="main" blocks=")" << nBlocks << "\">" << std::endl;
-  t1.restart();
+  t1.reset_clock();
   //     W.reset();
   branchEngine->flush(0);
   branchEngine->reset();

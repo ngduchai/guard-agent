@@ -179,10 +179,8 @@ void QMCDriverNew::setStatus(const std::string& aname, const std::string& h5name
  *
  * All this does is look in the walker xml section for the hdf file.
  * It reads that (I think) and if there are active walkers 
- * declares it a restart run.
  *
  * This inferred behavior is asking for trouble.
- * Unified driver will not support until restart feature is
  * re-architected
  */
 void QMCDriverNew::putWalkers(std::vector<xmlNodePtr>& wset)

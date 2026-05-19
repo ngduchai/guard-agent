@@ -227,7 +227,7 @@ void VectorPatch::createDiags( Params &params, SmileiMPI *smpi, OpenPMDparams &o
 void VectorPatch::configuration( Params &params, Timers &timers, int itime )
 {
 
-    timers.reconfiguration.restart();
+    timers.reconfiguration.resume();
 
     unsigned int npatches = this->size();
 
@@ -263,7 +263,7 @@ void VectorPatch::configuration( Params &params, Timers &timers, int itime )
 void VectorPatch::reconfiguration( Params &params, Timers &timers, int itime )
 {
 
-    timers.reconfiguration.restart();
+    timers.reconfiguration.resume();
 
     unsigned int npatches = this->size();
 
@@ -335,7 +335,7 @@ void VectorPatch::dynamics( Params &params,
         diag_flag = ( needsRhoJsNow( itime ) || params.is_spectral );
     }
 
-    timers.particles.restart();
+    timers.particles.resume();
     ostringstream t;
 
 #ifdef _PARTEVENTTRACING
@@ -420,7 +420,7 @@ void VectorPatch::projectionForDiags( Params &params,
 void VectorPatch::initExchParticles( Params &params, SmileiMPI *smpi, SimWindow *simWindow,
         double time_dual, Timers &timers, int itime )
 {
-    timers.syncPart.restart();
+    timers.syncPart.resume();
     for( unsigned int ispec=0 ; ispec<( *this )( 0 )->vecSpecies.size(); ispec++ ) {
         if( species( 0, ispec )->hasMoved( time_dual, simWindow ) ) {
             SyncVectorPatch::initExchParticles( *this, ispec, params, smpi );
@@ -435,7 +435,7 @@ void VectorPatch::initExchParticles( Params &params, SmileiMPI *smpi, SimWindow 
 void VectorPatch::finalizeExchParticlesAndSort( Params &params, SmileiMPI *smpi, SimWindow *simWindow,
         double time_dual, Timers &timers, int itime )
 {
-    timers.syncPart.restart();
+    timers.syncPart.resume();
 
 
     // Particle synchronization and sorting
@@ -469,7 +469,7 @@ void VectorPatch::finalizeExchParticlesAndSort( Params &params, SmileiMPI *smpi,
 //! Perform the particles merging on all patches
 void VectorPatch::mergeParticles(Params &params, double time_dual,Timers &timers, int itime )
 {
-    timers.particleMerging.restart();
+    timers.particleMerging.resume();
 
     #pragma omp for schedule(runtime)
     for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
@@ -493,7 +493,7 @@ void VectorPatch::mergeParticles(Params &params, double time_dual,Timers &timers
 //! Clean MPI buffers and resize particle arrays to save memory
 void VectorPatch::cleanParticlesOverhead(Params &params, Timers &timers, int itime )
 {
-    timers.syncPart.restart();
+    timers.syncPart.resume();
 
     if( itime%params.every_clean_particles_overhead==0 ) {
         #pragma omp master
@@ -510,7 +510,7 @@ void VectorPatch::cleanParticlesOverhead(Params &params, Timers &timers, int iti
 void VectorPatch::injectParticlesFromBoundaries(Params &params, Timers &timers, unsigned int itime )
 {
 
-    timers.particleInjection.restart();
+    timers.particleInjection.resume();
 
     //#pragma omp for schedule(runtime)
     #pragma omp master
@@ -830,7 +830,7 @@ void VectorPatch::sumDensities( Params &params, double time_dual, Timers &timers
         return;
     }
 
-    timers.densities.restart();
+    timers.densities.resume();
     if( diag_flag ) {
         #pragma omp for schedule(static)
         for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
@@ -852,7 +852,7 @@ void VectorPatch::sumDensities( Params &params, double time_dual, Timers &timers
     }
     timers.densities.update();
 
-    timers.syncDens.restart();
+    timers.syncDens.resume();
     if( params.geometry != "AMcylindrical" ) {
         if ( (!params.multiple_decomposition)||(itime==0) )
             SyncVectorPatch::sumRhoJ( params, ( *this ), smpi ); // MPI
@@ -907,7 +907,7 @@ void VectorPatch::sumSusceptibility( Params &params, double time_dual, Timers &t
         return;
     }
 
-    timers.susceptibility.restart();
+    timers.susceptibility.resume();
     if( diag_flag ) {
         #pragma omp for schedule(static)
         for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
@@ -927,7 +927,7 @@ void VectorPatch::sumSusceptibility( Params &params, double time_dual, Timers &t
 
     timers.susceptibility.update();
 
-    timers.susceptibility.restart();
+    timers.susceptibility.resume();
 
     SyncVectorPatch::sumEnvChi( params, ( *this ), smpi ); // MPI
 
@@ -964,7 +964,7 @@ void VectorPatch::sumSusceptibility( Params &params, double time_dual, Timers &t
 // ---------------------------------------------------------------------------------------------------------------------
 void VectorPatch::solveMaxwell( Params &params, SimWindow *simWindow, int itime, double time_dual, Timers &timers, SmileiMPI *smpi )
 {
-    timers.maxwell.restart();
+    timers.maxwell.resume();
 
     // Current filter in intermediate space
     if (params.currentFilter_passes.size() > 0){
@@ -1028,7 +1028,7 @@ void VectorPatch::solveMaxwell( Params &params, SimWindow *simWindow, int itime,
 
     if ( (params.multiple_decomposition) && ( itime!=0 ) && ( time_dual > params.time_fields_frozen ) ) { // When using spectral solver multiple_decomposition is necessarily true.
 
-        timers.maxwellBC.restart();
+        timers.maxwellBC.resume();
         #pragma omp for schedule(static)
         for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
             // Applies boundary conditions on B
@@ -1037,7 +1037,7 @@ void VectorPatch::solveMaxwell( Params &params, SimWindow *simWindow, int itime,
         timers.maxwellBC.update(params.printNow( itime ));
 
         // Sync E and B fields now after BC
-        timers.syncField.restart();
+        timers.syncField.resume();
         if( params.geometry != "AMcylindrical" ) {
              if( params.is_spectral ) SyncVectorPatch::exchangeE( params, ( *this ), smpi );
             SyncVectorPatch::exchangeB( params, ( *this ), smpi );
@@ -1085,7 +1085,7 @@ void VectorPatch::solveEnvelope( Params &params, SimWindow *simWindow, int, doub
 
     if( ( *this )( 0 )->EMfields->envelope!=NULL ) {
 
-        timers.envelope.restart();
+        timers.envelope.resume();
         // Exchange susceptibility
         SyncVectorPatch::exchangeEnvChi( params, ( *this ), smpi );
 
@@ -1158,7 +1158,7 @@ void VectorPatch::finalizeSyncAndBCFields( Params &params, SmileiMPI *smpi, SimW
 {
     if ( (!params.multiple_decomposition) && ( itime!=0 ) && ( time_dual > params.time_fields_frozen ) ) { // not multiple_decomposition => not spectral here.
 
-        timers.maxwellBC.restart();
+        timers.maxwellBC.resume();
         SMILEI_PY_SAVE_MASTER_THREAD
         #pragma omp for schedule(static)
         for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
@@ -1173,7 +1173,7 @@ void VectorPatch::finalizeSyncAndBCFields( Params &params, SmileiMPI *smpi, SimW
 
 
         // Sync B field now after BC
-        timers.syncField.restart();
+        timers.syncField.resume();
         if( params.geometry != "AMcylindrical" ) {
             SyncVectorPatch::exchangeB( params, ( *this ), smpi );
         } else {
@@ -1190,7 +1190,7 @@ void VectorPatch::finalizeSyncAndBCFields( Params &params, SmileiMPI *smpi, SimW
         timers.syncField.update( params.printNow( itime ) );
 
 
-        timers.maxwell.restart();
+        timers.maxwell.resume();
         #pragma omp for schedule(static)
         for( unsigned int ipatch=0 ; ipatch<this->size() ; ipatch++ ) {
             // Computes B at time n using B and B_m.
@@ -1286,7 +1286,7 @@ void VectorPatch::runAllDiags( Params &/*params*/, SmileiMPI *smpi, unsigned int
 #endif
 
     // Global diags: scalars + particles
-    timers.diags.restart();
+    timers.diags.resume();
 
     // Determine which data is required from the device
 #if defined( SMILEI_ACCELERATOR_GPU )
@@ -1353,7 +1353,7 @@ void VectorPatch::runAllDiags( Params &/*params*/, SmileiMPI *smpi, unsigned int
     // Pre-process for binning diags with auto limits
     vector<double> MPI_mins, MPI_maxs;
     for( unsigned int idiag = 0 ; idiag < globalDiags.size() ; idiag++ ) {
-        diag_timers_[idiag]->restart();
+        diag_timers_[idiag]->resume();
 
         #pragma omp single
         globalDiags[idiag]->theTimeIsNow_ = globalDiags[idiag]->prepare( itime );
@@ -1431,7 +1431,7 @@ void VectorPatch::runAllDiags( Params &/*params*/, SmileiMPI *smpi, unsigned int
 
     // Global diags: scalars + binnings
     for( unsigned int idiag = 0 ; idiag < globalDiags.size() ; idiag++ ) {
-        diag_timers_[idiag]->restart();
+        diag_timers_[idiag]->resume();
 
         #pragma omp single
         globalDiags[idiag]->theTimeIsNow_ = globalDiags[idiag]->prepare( itime );
@@ -1457,7 +1457,7 @@ void VectorPatch::runAllDiags( Params &/*params*/, SmileiMPI *smpi, unsigned int
 
     // Local diags : fields, probes, tracks
     for( unsigned int idiag = 0 ; idiag < localDiags.size() ; idiag++ ) {
-        diag_timers_[globalDiags.size()+idiag]->restart();
+        diag_timers_[globalDiags.size()+idiag]->resume();
 
         #pragma omp single
         localDiags[idiag]->theTimeIsNow_ = localDiags[idiag]->prepare( itime );
@@ -1524,7 +1524,7 @@ void VectorPatch::solvePoisson( Params &params, SmileiMPI *smpi )
 {
     Timer ptimer( "global" );
     ptimer.init( smpi );
-    ptimer.restart();
+    ptimer.resume();
 
 
     unsigned int iteration_max = params.poisson_max_iteration;
@@ -2054,7 +2054,7 @@ void VectorPatch::solveRelativisticPoisson( Params &params, SmileiMPI *smpi, dou
 
     //Timer ptimer("global");
     //ptimer.init(smpi);
-    //ptimer.restart();
+    //ptimer.resume();
 
     // Assumption: one or more species move in vacuum with mean lorentz gamma factor gamma_mean in the x direction,
     // with low energy spread.
@@ -2089,7 +2089,7 @@ void VectorPatch::solveRelativisticPoisson( Params &params, SmileiMPI *smpi, dou
 
     //Timer ptimer("global");
     //ptimer.init(smpi);
-    //ptimer.restart();
+    //ptimer.resume();
 
     double gamma_mean = gamma_global/( double )nparticles_global;
 
@@ -2468,7 +2468,7 @@ void VectorPatch::solveRelativisticPoissonAM( Params &params, SmileiMPI *smpi, d
 
     //Timer ptimer("global");
     //ptimer.init(smpi);
-    //ptimer.restart();
+    //ptimer.resume();
 
     // Assumption: one or more species move in vacuum with mean lorentz gamma factor gamma_mean in the x direction,
     // with low energy spread.
@@ -2504,7 +2504,7 @@ void VectorPatch::solveRelativisticPoissonAM( Params &params, SmileiMPI *smpi, d
 
     //Timer ptimer("global");
     //ptimer.init(smpi);
-    //ptimer.restart();
+    //ptimer.resume();
 
     double gamma_mean = gamma_global/( double )nparticles_global;
 
@@ -3911,7 +3911,7 @@ void VectorPatch::applyAntennas( double time )
 // For each patch, apply the binary processes
 void VectorPatch::applyBinaryProcesses( Params &params, int itime, Timers &timers )
 {
-    timers.collisions.restart();
+    timers.collisions.resume();
 
     if( BinaryProcesses::debye_length_required_ ) {
         #pragma omp for schedule(runtime)
@@ -4146,8 +4146,6 @@ void VectorPatch::checkExpectedDiskUsage( SmileiMPI *smpi, Params &params )
         MESSAGE( 1, "   especially when particles are created at runtime (ionization, pair generation, etc.)" );
         MESSAGE( 1, "" );
 
-        // Restart support has been removed from this vanilla; the simulation always
-        // runs from timestep 0 to params.n_time.
         const int istart = 0;
         const int istop = params.n_time;
 
@@ -4185,7 +4183,7 @@ void VectorPatch::moveWindow(
     int       itime
     )
 {
-    timers.movWindow.restart();
+    timers.movWindow.resume();
 
     // Bring all particles and field grids to the Host (except species grids)
     // This part can be optimized by copying only the patch to be destructed
@@ -4279,7 +4277,7 @@ void VectorPatch::ponderomotiveUpdateSusceptibilityAndMomentum( Params &params,
     #pragma omp single
     diag_flag = needsRhoJsNow( itime );
 
-    timers.particles.restart();
+    timers.particles.resume();
 
 #  ifdef _PARTEVENTTRACING
     bool diag_PartEventTracing = smpi->diagPartEventTracing( time_dual, params.timestep);
@@ -4289,7 +4287,7 @@ void VectorPatch::ponderomotiveUpdateSusceptibilityAndMomentum( Params &params,
     #pragma omp single
     diag_flag = needsRhoJsNow( itime );
 
-    timers.particles.restart();
+    timers.particles.resume();
 
     ponderomotiveUpdateSusceptibilityAndMomentumWithoutTasks( params, smpi, simWindow,
                           time_dual, timers, itime );
@@ -4312,7 +4310,7 @@ void VectorPatch::ponderomotiveUpdatePositionAndCurrents( Params &params,
     #pragma omp single
     diag_flag = needsRhoJsNow( itime );
 
-    timers.particles.restart();
+    timers.particles.resume();
 
 #ifdef _PARTEVENTTRACING
     bool diag_PartEventTracing {false};

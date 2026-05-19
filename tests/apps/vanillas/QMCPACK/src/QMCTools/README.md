@@ -23,7 +23,6 @@ Base:
 Representation:
 - EshdfFilePw (plane-wave)
 Application:
-- EshdfFilePwGpaw (´Eshdf_gpaw.py´)
 
 This is work-in-progress, and other features are coming up.
 
@@ -31,9 +30,8 @@ This is work-in-progress, and other features are coming up.
 # GPAW4QMCPACK
 
 Converter of electronic orbitals from GPAW (https://wiki.fysik.dtu.dk/gpaw/)
-is implemented in ´gpaw4qmcpack.py´, using the ESHDF Python class.
 
-The converter is run on the command line. It requires a GPAW restart file
+The converter is run on the command line. It requires a GPAW data file
 (.gpw) with orbitals included with ´mode=all´, and produces an ESHDF file (.h5)
 that can be used in QMCPACK.
 

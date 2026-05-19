@@ -78,7 +78,7 @@ public:
     AMREX_FORCE_INLINE
     void setVerbose (int v) override { m_solver->setVerbose(v); }
 
-    //! Sets restart length. The default is 30.
+    //! Sets cycle length. The default is 30.
     AMREX_FORCE_INLINE
     void setRestartLength (int rl) override { m_solver->setRestartLength(rl); }
 

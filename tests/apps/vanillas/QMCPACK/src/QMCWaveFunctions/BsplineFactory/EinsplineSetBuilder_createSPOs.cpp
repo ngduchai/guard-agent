@@ -83,13 +83,13 @@ void EinsplineSetBuilder::set_metadata(int numOrbs,
   // Read the basic orbital information, without reading all the //
   // orbitals themselves.                                        //
   /////////////////////////////////////////////////////////////////
-  orb_info_timer.restart();
+  orb_info_timer.reset_clock();
   if (myComm->rank() == 0)
     ReadOrbitalInfo(skipChecks);
   app_log() << "TIMER  EinsplineSetBuilder::ReadOrbitalInfo " << orb_info_timer.elapsed() << std::endl;
   myComm->barrier();
 
-  orb_info_timer.restart();
+  orb_info_timer.reset_clock();
   BroadcastOrbitalInfo();
   app_log() << "TIMER  EinsplineSetBuilder::BroadcastOrbitalInfo " << orb_info_timer.elapsed() << std::endl;
   app_log().flush();
@@ -255,7 +255,7 @@ std::unique_ptr<SPOSet> EinsplineSetBuilder::createSPOSetFromXML(const xmlNodePt
   // Create the OrbitalSet object
   //////////////////////////////////
   Timer mytimer;
-  mytimer.restart();
+  mytimer.reset_clock();
   OccupyBands(spinSet, sortBands, numOrbs, skipChecks);
   if (spinSet == 0)
     TileIons();

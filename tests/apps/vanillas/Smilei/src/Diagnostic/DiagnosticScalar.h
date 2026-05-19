@@ -103,7 +103,6 @@ public:
 class DiagnosticScalar : public Diagnostic
 {
     friend class SmileiMPI;
-    friend class Checkpoint;
 public :
     //! Default constructor
     DiagnosticScalar( Params &params, SmileiMPI *smpi, Patch *patch );

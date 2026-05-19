@@ -39,7 +39,7 @@ m_rd_name{rd_name}
     pp_rd.query("extension", m_extension);
     pp_rd_name.query("extension", m_extension);
 
-    const bool IsNotRestart = true;
+    const bool IsFirstRun = true;
 
     if (ParallelDescriptor::IOProcessor())
     {
@@ -50,7 +50,7 @@ m_rd_name{rd_name}
 
         // replace / create output file
         const std::string rd_full_file_name = m_path + m_rd_name + "." + m_extension;
-        m_write_header = IsNotRestart || !amrex::FileExists(rd_full_file_name); // not a restart or file doesn't exist
+        m_write_header = IsFirstRun || !amrex::FileExists(rd_full_file_name); // first run or file doesn't exist
         if (m_write_header)
         {
             std::ofstream ofs{rd_full_file_name, std::ios::trunc};
@@ -95,14 +95,14 @@ void ReducedDiags::ComputeDiagsMidStep (int /*step*/)
     // (instead of at the end of the step).
 }
 
-void ReducedDiags::WriteCheckpointData (std::string const & /*dir*/)
+void ReducedDiags::WriteSnapshotData (std::string const & /*dir*/)
 {
     // Function used to write out and data needed by the diagnostic in
 }
 
-void ReducedDiags::ReadCheckpointData (std::string const & /*dir*/)
+void ReducedDiags::ReadSnapshotData (std::string const & /*dir*/)
 {
-    // when doing a restart.
+    // when re-loading prior state.
 }
 
 void ReducedDiags::BackwardCompatibility () const

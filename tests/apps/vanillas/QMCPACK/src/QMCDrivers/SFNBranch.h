@@ -48,10 +48,8 @@ namespace qmcplusplus
  *   a. If TargetWalkers isn't known
  *      aa. allreduce and updates MCMW globalWalkers.
  *      bb. sets target walkers to whatever current total active walkers is.
- *   b. If not a restart
  *      aa. saves fixW and killWalker to internal params, otherwise just discards.
  *      bb. updates SFNB copy of MAX/MINWALKRS from walker controller, 
- *          these were set in constructer but I guess thats ony if this is a restart
  * 7. updateParam after each walker control branch (outside SFNBranch)
  *   a. Not first iter during warmup then call WalkerController branch.
  *      else call WC doNotBranch, returns pop_now

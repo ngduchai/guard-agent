@@ -16,7 +16,7 @@ using namespace std;
 // ------------------------------------------------------------
 void DoubleGrids::syncCurrentsOnRegion( VectorPatch &vecPatches, Region &region, Params &params, SmileiMPI *smpi, Timers &timers )
 {
-    timers.grids.restart();
+    timers.grids.resume();
 
     // Loop / additional_patches_ ( = patches included in the local vecPatches but not in local Region, the Region of others MPI will need this data )
     //        additional_patches_ranks stores the MPI rank of the Region which owns additional_patches_
@@ -122,7 +122,7 @@ void DoubleGrids::currentsOnRegionRecv( ElectroMagn* globalfields, unsigned int 
 // ---------------------------------------------------------------------------
 void DoubleGrids::syncFieldsOnPatches( Region &region, VectorPatch &vecPatches, Params &params, SmileiMPI *smpi, Timers &timers )
 {
-    timers.grids.restart();
+    timers.grids.resume();
 
     // Loop / additional_patches_ ( within local vecPatches but not in local Region )
     //                            get data from Region of others MPI
@@ -370,7 +370,7 @@ void DoubleGrids::fieldsOnRegionRecv( ElectroMagn* globalfields, unsigned int hi
 // ---------------------------------------------------------------------------
 void DoubleGrids::syncBOnPatches( Region &region, VectorPatch &vecPatches, Params &params, SmileiMPI *smpi, Timers &timers )
 {
-    timers.grids.restart();
+    timers.grids.resume();
 
     // Loop / additional_patches_ ( within local vecPatches but not in local Region )
     //                            get data from Region of others MPI
@@ -460,7 +460,7 @@ void DoubleGrids::bOnPatchesSend( ElectroMagn* globalfields, unsigned int hindex
 // ---------------------------------------------------------------------------
 void DoubleGrids::syncCurrentsOnPatches( Region &region, VectorPatch &vecPatches, Params &params, SmileiMPI *smpi, Timers &timers )
 {
-    timers.grids.restart();
+    timers.grids.resume();
 
     // Loop / additional_patches_ ( within local vecPatches but not in local Region )
     //                            get data from Region of others MPI

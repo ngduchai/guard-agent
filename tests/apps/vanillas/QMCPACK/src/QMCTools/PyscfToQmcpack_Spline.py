@@ -933,7 +933,7 @@ class InputXml:
         '''
 
         vmc_init = '''
-        <qmc method="vmc" move="pbyp" checkpoint="-1">
+        <qmc method="vmc" move="pbyp">
           <estimator name="LocalEnergy" hdf5="no"/>
           <parameter name="warmupSteps">100</parameter>
           <parameter name="blocks">20</parameter>
@@ -953,7 +953,7 @@ class InputXml:
 
         loop= '''
         <loop max="4">
-          <qmc method="linear" move="pbyp" checkpoint="-1">
+          <qmc method="linear" move="pbyp">
             <estimator name="LocalEnergy" hdf5="no"/>
             <parameter name="warmupSteps">100</parameter>
             <parameter name="blocks">20</parameter>
@@ -974,7 +974,7 @@ class InputXml:
 
         loop_followup = '''
         <loop max="10">
-          <qmc method="linear" move="pbyp" checkpoint="-1">
+          <qmc method="linear" move="pbyp">
             <estimator name="LocalEnergy" hdf5="no"/>
             <parameter name="warmupSteps">100</parameter>
             <parameter name="blocks">20</parameter>
@@ -995,7 +995,7 @@ class InputXml:
         wavefunction file, do not reoptimize.'''
 
         vmc = ''' 
-        <qmc method="vmc" move="pbyp" checkpoint="-1">
+        <qmc method="vmc" move="pbyp">
           <estimator name="LocalEnergy" hdf5="no"/>
           <parameter name="warmupSteps">100</parameter>
           <parameter name="blocks">200</parameter>
@@ -1009,7 +1009,7 @@ class InputXml:
 
         dmc_comment = ""
         dmc ='''
-        <qmc method="dmc" move="pbyp" checkpoint="20">
+        <qmc method="dmc" move="pbyp">
           <estimator name="LocalEnergy" hdf5="no"/>
           <parameter name="targetwalkers">16000</parameter>
           <parameter name="reconfiguration">no</parameter>

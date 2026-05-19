@@ -248,7 +248,7 @@ void EstimatorManagerBase::stop()
 
 void EstimatorManagerBase::startBlock(int steps)
 {
-  MyTimer.restart();
+  MyTimer.reset_clock();
   BlockWeight = 0.0;
 }
 

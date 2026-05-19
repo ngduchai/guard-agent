@@ -71,10 +71,8 @@ class EstimatorManagerBase;
  *      bb. resets walker offsets
  *      cc. sets target walkers to whatever current total active walkers is.
  *   c. resets WalkerController
- *   d. If not a restart
  *      aa. saves fixW and killWalker to internal params, otherwise just discards.
  *      bb. updates SFNB copy of MAX/MINWALKRS from walker controller, 
- *          these were set in constructer but I guess thats ony if this is a restart
  *   e. setWalkerId
  *      aa. call start()
  *         1. Which calls reset which crucially calculates and update logN state.
@@ -420,7 +418,6 @@ struct SimpleFixedNodeBranch : public QMCTraits
    */
   void collect(int iter, MCWalkerConfiguration& w);
 
-  /** restart averaging
    * @param counter Counter to determine the cummulative average will be reset.
    */
   void flush(int counter);

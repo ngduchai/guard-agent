@@ -140,7 +140,7 @@ bool Libxml2Document::parse(const std::string& xmlfile)
   qmcplusplus::Timer aClock;
   int length   = 0;
   std::string buffer;
-  aClock.restart();
+  aClock.reset_clock();
   if (OHMMS::Controller->master())
   {
     std::ifstream is(xmlfile.c_str());

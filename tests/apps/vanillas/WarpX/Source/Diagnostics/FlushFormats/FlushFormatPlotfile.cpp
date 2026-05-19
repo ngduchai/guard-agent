@@ -264,7 +264,7 @@ FlushFormatPlotfile::WriteWarpXHeader(
 
         HeaderFile.precision(17);
 
-        HeaderFile << "Checkpoint version: 1\n";
+        HeaderFile << "Header version: 1\n";
 
         const int nlevels = warpx.finestLevel()+1;
         HeaderFile << nlevels << "\n";

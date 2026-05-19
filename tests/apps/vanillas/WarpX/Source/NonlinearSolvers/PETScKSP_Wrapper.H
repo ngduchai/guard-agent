@@ -86,7 +86,7 @@ public:
     //! Sets verbosity.
     void setVerbose (int v) override { m_solver->setVerbose(v); }
 
-    //! Sets restart length. The default is 30.
+    //! Sets cycle length. The default is 30.
     void setRestartLength (int rl) override { amrex::ignore_unused(rl); }
 
     //! Sets the max number of iterations

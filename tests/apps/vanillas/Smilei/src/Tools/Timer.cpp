@@ -130,7 +130,7 @@ void Timer::updateThreaded( VectorPatch &vecPatches, bool store )
 
 #endif
 
-void Timer::restart()
+void Timer::resume()
 {
     #pragma omp barrier
     #pragma omp master
@@ -139,8 +139,8 @@ void Timer::restart()
     }
 }
 
-// restart in a task
-void Timer::restartInTask()
+// resume in a task
+void Timer::resumeInTask()
 {
     last_start_ = MPI_Wtime();
 }

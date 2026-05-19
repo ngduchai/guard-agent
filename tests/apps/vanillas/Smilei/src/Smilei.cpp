@@ -336,12 +336,11 @@ int main( int argc, char *argv[] )
     // Print in stdout MPI, OpenMP, patchs parameters
     params.print_parallelism_params( &smpi );
 
-    // Checkpoint/restart support has been removed from this vanilla.
     const unsigned int this_run_start_step = 0;
 
     // ------------------------------------------------------------------------
     // Initialize the simulation times time_prim at n=0 and time_dual at n=+1/2
-    // Update in "if restart" if necessary
+    // Update in "if resume" if necessary
     // ------------------------------------------------------------------------
 
     // time at integer time-steps (primal grid)
@@ -384,7 +383,6 @@ int main( int argc, char *argv[] )
     // ---------------------------------------------------------------------
     multiphoton_Breit_Wheeler_tables_.initialization( params, &smpi );
 
-    // Restart support has been removed from this vanilla; always initialize a fresh simulation.
     {
 
         PatchesFactory::createVector( vecPatches, params, &smpi, openPMD, &radiation_tables_, 0 );
@@ -672,13 +670,13 @@ int main( int argc, char *argv[] )
 
                 //here filter + divergence cleaning
                 if ( params.is_spectral && params.geometry == "AMcylindrical") {
-                    timers.densitiesCorrection.restart();
+                    timers.densitiesCorrection.resume();
                     region.vecPatch_( 0 )->EMfields->MaxwellAmpereSolver_->densities_correction( region.vecPatch_( 0 )->EMfields );
                     timers.densitiesCorrection.update();
                 }
 
 
-                timers.syncDens.restart();
+                timers.syncDens.resume();
                 if( params.geometry != "AMcylindrical" )
                     SyncVectorPatch::sumRhoJ( params, region.vecPatch_, &smpi ); // MPI
                 else
@@ -817,7 +815,7 @@ int main( int argc, char *argv[] )
                 }
             }
 
-            timers.loadBal.restart();
+            timers.loadBal.resume();
             #pragma omp single
             vecPatches.loadBalance( params, time_dual, &smpi, simWindow, itime );
             timers.loadBal.update( params.printNow( itime ) );
@@ -939,7 +937,6 @@ int executeTestMode( VectorPatch &vecPatches,
                      OpenPMDparams &openPMD,
                      RadiationTables * radiation_tables_ )
 {
-    // Restart support has been removed from this vanilla.
     int itime = 0;
     int moving_window_movement = 0;
     (void) region;

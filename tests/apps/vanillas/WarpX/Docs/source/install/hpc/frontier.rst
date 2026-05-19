@@ -193,7 +193,6 @@ When starting up a post-processing session, run this in your first cells:
    # next Jupyter cell: the software you want
    !mamba install --quiet -c conda-forge -y openpmd-api openpmd-viewer ipympl ipywidgets fast-histogram yt
 
-   # restart notebook
 
 .. _known-frontier-issues:
 
@@ -249,7 +248,6 @@ Known System Issues
    Checkpoints and AMReX plotfile I/O at scale is very slow with the default Lustre filesystem configuration.
    Using openPMD with ADIOS2 is the best performing output for regular diagnostics.
 
-   For checkpoint-restart, you have no choice and need to use AMReX plotfiles.
    Please test checkpointing and I/O with short ``#SBATCH -q debug`` runs before running the full simulation.
    Set `the following options for performance of plotfiles/checkpoints <https://github.com/AMReX-Codes/amrex/pull/4426>`__:
 

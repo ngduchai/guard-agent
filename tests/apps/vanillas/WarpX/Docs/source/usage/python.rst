@@ -123,7 +123,6 @@ Diagnostics
 
 .. autoclass:: pywarpx.picmi.ElectrostaticFieldDiagnostic
 
-.. autoclass:: pywarpx.picmi.Checkpoint
 
 .. autoclass:: pywarpx.picmi.ReducedDiagnostic
 

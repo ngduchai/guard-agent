@@ -93,14 +93,6 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
     TimeInitialize(sim, nsims, rank, nproc, &TS);
     double ti_runtime = 0.0;
 
-    /* Native checkpoint/restart removed: the upstream loop started from
-     * TS.restart_iter (a parameter loaded from solver.inp), and emitted
-     * intermediate `op_NNNNN.dat` snapshots every `file_op_iter` steps via
-     * OutputSolution()/WriteArray().  Both behaviours (the resume-from-snapshot
-     * start point and the periodic snapshot writes) constituted the app's
-     * native restart capability and have been stripped from the vanilla.
-     * The loop now always runs from 0 to n_iter and produces no
-     * intermediate solution files. */
     if (!rank) printf("Solving in time (from %d to %d iterations)\n", 0, TS.n_iter);
     for (TS.iter = 0; TS.iter < TS.n_iter; TS.iter++) {
 
@@ -129,8 +121,6 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
       /* Print information to screen */
       TimePrintStep(&TS);
 
-      /* Periodic intermediate-solution write removed (native checkpoint). */
-
     }
 
     double t_final = TS.waqt;
@@ -147,8 +137,6 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
       CalculateError(&(sim[ns].solver),
                      &(sim[ns].mpi) );
     }
-
-    /* Final-solution file write removed (native checkpoint). */
 
 #ifdef with_librom
     op_times_arr.push_back(TS.waqt);
@@ -219,7 +207,7 @@ int Solve(  void  *s,     /*!< Array of simulation objects of type #SimulationOb
     rom_interface.projectInitialSolution(sim);
 
     {
-      int start_iter = 0; /* native restart removed */
+      int start_iter = 0;
       int n_iter = sim[0].solver.n_iter;
       double dt = sim[0].solver.dt;
 

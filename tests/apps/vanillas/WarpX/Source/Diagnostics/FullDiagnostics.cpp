@@ -92,7 +92,7 @@ FullDiagnostics::InitializeParticleBuffer (const MultiParticleContainer& mpc)
 
     // If not specified, dump all species
     if (m_output_species_names.empty()) {
-        if (m_format == "checkpoint") {
+        if (m_format == "snapshot") {
             m_output_species_names = mpc.GetSpeciesAndLasersNames();
         } else {
             m_output_species_names = mpc.GetSpeciesNames();
@@ -675,8 +675,8 @@ FullDiagnostics::AddRZModesToOutputNames (const std::string& field, int ncomp){
 
 
 void
-FullDiagnostics::InitializeBufferData (int i_buffer, int lev, bool restart ) {
-    amrex::ignore_unused(restart);
+FullDiagnostics::InitializeBufferData (int i_buffer, int lev, bool secondary_init ) {
+    amrex::ignore_unused(secondary_init);
     auto & warpx = WarpX::GetInstance();
     amrex::RealBox diag_dom;
     bool use_warpxba = true;

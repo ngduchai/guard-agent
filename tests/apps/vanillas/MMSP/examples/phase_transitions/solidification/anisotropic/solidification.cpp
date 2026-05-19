@@ -155,7 +155,7 @@ template <int dim, typename T> void update(grid<dim,vector<T> >& oldGrid, int st
 			T dTdt = DiffT * lapT+(oldX[0] - refGrid(i))/dt;
 			newX[1] = oldX[1] + dt*dTdt;
 
-			// store old-old values of u since newGrid is lost after each checkpoint
+			// store old-old values of u since newGrid is lost after each step
 			refGrid(i) = oldX[0];
 		}
 

@@ -49,7 +49,7 @@ typedef enum {
   DONE,       /* finished check, done -- remain here until reset */
   BAD,        /* got a data error -- remain here until reset */
   MEM,        /* got an inflate() memory error -- remain here until reset */
-  SYNC        /* looking for synchronization bytes to restart inflate() */
+  SYNC        /* looking for synchronization bytes to resume inflate() */
 } inflate_mode;
 
 /*

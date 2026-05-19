@@ -114,7 +114,6 @@ class ElectroMagn
 {
     friend class SmileiMPI;
     friend class SimWindow;
-    friend class Checkpoint;
     friend class DiagnosticScalar;
 
 public:

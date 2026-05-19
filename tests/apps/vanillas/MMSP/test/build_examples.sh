@@ -51,8 +51,8 @@ MFLAG="-s"
 # Default execution parameters
 DIM=2            # grid dimensions
 ITERS=1000       # number of steps
-INTER=500        # steps between checkpoint
-ZED="0000"       # checkpoint filename format
+INTER=500        # steps between snapshots
+ZED="0000"       # snapshot filename format
 CORES=4          # MPI ranks to use
 COREMAX=$(nproc) # MPI ranks available
 if [[ $CORES -gt $COREMAX ]]

@@ -119,11 +119,6 @@ add_subdirectory(type_traits)
 add_subdirectory(Concurrency)
 add_subdirectory(spline2)
 
-if(QMC_BUILD_SANDBOX_ONLY)
-
-  message(STATUS "Minimal build: only Sandbox")
-  add_subdirectory(Sandbox)
-
 else() #{{{
 
   add_subdirectory(QMCWaveFunctions)
@@ -139,9 +134,6 @@ else() #{{{
     add_subdirectory(formic/utils)
   endif(BUILD_LMYENGINE_INTERFACE)
 
-  if(BUILD_AFQMC)
-    add_subdirectory(AFQMC)
-  endif(BUILD_AFQMC)
 
   add_subdirectory(QMCApp)
   add_subdirectory(QMCTools)

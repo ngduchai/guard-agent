@@ -193,8 +193,6 @@ public:
 
     [[nodiscard]] bool ok () const { return m_ok; }
 
-    void Restart (ablastr::fields::MultiFabRegister& fields, const std::string& dir);
-
     static void Exchange (amrex::MultiFab& pml, amrex::MultiFab& reg, const amrex::Geometry& geom, int do_pml_in_domain);
 
 private:

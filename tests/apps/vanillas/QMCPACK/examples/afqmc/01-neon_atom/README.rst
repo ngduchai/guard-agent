@@ -28,7 +28,7 @@ The pyscf scf script is given below (scf.py in the current directory):
     ecorr_ccsdt = ccsd_t.kernel(ccsd, ccsd.ao2mo())
     print("E(CCSD(T)) = {}".format(ehf+ecorr_ccsd+ecorr_ccsdt))
 
-The most important point above is that we create a scf checkpoint file by specifying the
+The most important point above is that we create a scf data file by specifying the
 `mf.chkfile` mol member variable. Note we will also compute the CCSD and CCSD(T) energies
 for comparison puposes since this system is trivially small.
 
@@ -56,7 +56,7 @@ full explanation of the various options available for `pyscf_to_afqmc.py` you ca
 
     pyscf_to_afqmc.py -h
 
-In the above example, `-i` designates the input pyscf checkpoint file, `-o` speficies the
+In the above example, `-i` designates the input pyscf data file, `-o` speficies the
 output filename to write the qmcpack hamiltonian/wavefunction to, `-t` specifies the
 convergence threshold for the Cholesky decomposition, `-v` increases verbosity.
 You can optionally pass the `-q/--qmcpack-input` to generate a qmcpack input

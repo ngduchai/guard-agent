@@ -373,10 +373,10 @@ int SparseGridsSimulation::InitializeSolversBarebones( SimulationObject *sim /*!
               ns, solver->op_file_format);
       return(1);
     }
-    if ((!strcmp(solver->op_overwrite,"no")) && solver->restart_iter) {
-      /* if it's a restart run, fast-forward the filename */
+    if ((!strcmp(solver->op_overwrite,"no")) && solver->start_iter) {
+      /* if start_iter > 0, fast-forward the filename */
       int t;
-      for (t=0; t<solver->restart_iter; t++)
+      for (t=0; t<solver->start_iter; t++)
         if ((t+1)%solver->file_op_iter == 0) IncrementFilenameIndex(solver->filename_index,solver->index_length);
     }
   } else if (!strcmp(solver->output_mode,"parallel")) {

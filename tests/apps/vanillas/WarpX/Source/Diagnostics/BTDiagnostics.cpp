@@ -96,7 +96,7 @@ void BTDiagnostics::DerivedInitData ()
     m_snapshot_full.resize( m_num_buffers );
     m_lastValidZSlice.resize( m_num_buffers );
     m_buffer_k_index_hi.resize(m_num_buffers);
-    m_first_flush_after_restart.resize(m_num_buffers);
+    m_first_flush_after_init.resize(m_num_buffers);
     m_snapshot_geometry_defined.resize(m_num_buffers);
     m_field_buffer_multifab_defined.resize(m_num_buffers);
     for (int i = 0; i < m_num_buffers; ++i) {
@@ -104,7 +104,7 @@ void BTDiagnostics::DerivedInitData ()
         m_snapshot_full[i] = 0;
         m_lastValidZSlice[i] = 0;
         m_buffer_flush_counter[i] = 0;
-        m_first_flush_after_restart[i] = 1;
+        m_first_flush_after_init[i] = 1;
         m_snapshot_geometry_defined[i] = 0;
         m_field_buffer_multifab_defined[i] = 0;
     }
@@ -336,7 +336,7 @@ BTDiagnostics::DoComputeAndPack (int step, bool force_flush)
 }
 
 void
-BTDiagnostics::InitializeBufferData ( int i_buffer , int lev, bool restart)
+BTDiagnostics::InitializeBufferData ( int i_buffer , int lev, bool secondary_init)
 {
     auto & warpx = WarpX::GetInstance();
 
@@ -346,7 +346,7 @@ BTDiagnostics::InitializeBufferData ( int i_buffer , int lev, bool restart)
     const amrex::Real boosted_moving_window_v = (m_moving_window_beta - m_beta_boost)
                                         / (1._rt - m_beta_boost*m_moving_window_beta);
     // Lab-frame time for the i^th snapshot
-    if (!restart) {
+    if (!secondary_init) {
         const amrex::Real zmax_boost = warpx.Geom(lev).ProbHi(m_moving_window_dir);
         m_t_lab.at(i_buffer) = m_intervals.GetBTDIteration(i_buffer) * m_dt_snapshots_lab
             + m_gamma_boost*m_beta_boost*zmax_boost/PhysConst::c;
@@ -475,7 +475,7 @@ BTDiagnostics::InitializeBufferData ( int i_buffer , int lev, bool restart)
     // number of cells in z is modified since each buffer multifab always
     // contains a minimum m_buffer_size=256 cells
     const int num_z_cells_in_snapshot = m_max_buffer_multifabs[i_buffer] * m_buffer_size;
-    if (!restart) {
+    if (!secondary_init) {
         m_snapshot_domain_lab[i_buffer] = diag_dom;
         m_snapshot_domain_lab[i_buffer].setLo(m_moving_window_dir,
                                       zmin_buffer_lab + WarpX::moving_window_v * m_t_lab[i_buffer]);
@@ -504,7 +504,7 @@ BTDiagnostics::InitializeBufferData ( int i_buffer , int lev, bool restart)
     m_snapshot_box[i_buffer].setSmall( m_moving_window_dir,
                                        snapshot_kindex_hi - (num_z_cells_in_snapshot-1) );
     // Setting hi k-index for the first buffer
-    if (!restart) {
+    if (!secondary_init) {
         m_buffer_k_index_hi[i_buffer] = m_snapshot_box[i_buffer].bigEnd(m_moving_window_dir);
     }
 }
@@ -853,7 +853,7 @@ BTDiagnostics::PrepareFieldDataForOutput ()
                 const bool kindexInSnapshotBox = GetKIndexInSnapshotBoxFlag (i_buffer, lev);
                 if (kindexInSnapshotBox) {
                     if ( buffer_empty(i_buffer) ) {
-                        if ( m_buffer_flush_counter[i_buffer] == 0 || m_first_flush_after_restart[i_buffer] == 1) {
+                        if ( m_buffer_flush_counter[i_buffer] == 0 || m_first_flush_after_init[i_buffer] == 1) {
                             // Compute the geometry, snapshot lab-domain extent
                             // and box-indices
                             DefineSnapshotGeometry(i_buffer, lev);
@@ -1183,7 +1183,7 @@ void BTDiagnostics::MergeBuffersForPlotfile (int i_snapshot)
         const std::string recent_Buffer_Level0_path = recent_Buffer_filepath + "/Level_0";
         const std::string recent_Buffer_FabHeaderFilename = recent_Buffer_Level0_path + "/Cell_H";
         // Create directory only when the first buffer is flushed out.
-        if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_restart[i_snapshot] == 1) {
+        if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_init[i_snapshot] == 1) {
             // Create Level_0 directory to store all Cell_D and Cell_H files
             if (!amrex::UtilCreateDirectory(snapshot_Level0_path, permission_flag_rwxrxrx) ) {
                 amrex::CreateDirectoryFailed(snapshot_Level0_path);
@@ -1232,7 +1232,7 @@ void BTDiagnostics::MergeBuffersForPlotfile (int i_snapshot)
             // Cell_D_<number> is padded with 5 zeros as that is the default AMReX output
             const std::string new_snapshotFabFilename = amrex::Concatenate("Cell_D_", m_buffer_flush_counter[i_snapshot], amrex_fabfile_digits);
 
-            if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_restart[i_snapshot] == 1) {
+            if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_init[i_snapshot] == 1) {
                 WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
                     std::rename(recent_Header_filename.c_str(), snapshot_Header_filename.c_str()) == 0,
                     std::string("Renaming ").append(recent_Header_filename).append(" to ").append(snapshot_Header_filename).append(" has failed"));
@@ -1283,7 +1283,7 @@ void BTDiagnostics::MergeBuffersForPlotfile (int i_snapshot)
                 m_buffer_flush_counter[i_snapshot],
                 amrex_partfile_digits);
 
-            if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_restart[i_snapshot] == 1) {
+            if (m_buffer_flush_counter[i_snapshot] == 0 || m_first_flush_after_init[i_snapshot] == 1) {
                 BufferSpeciesHeader.set_DataIndex(0,0,m_buffer_flush_counter[i_snapshot]);
                 BufferSpeciesHeader.WriteHeader();
 

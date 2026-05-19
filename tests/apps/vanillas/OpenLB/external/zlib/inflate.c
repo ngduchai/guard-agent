@@ -1431,7 +1431,7 @@ z_streamp strm;
     strm->next_in += len;
     strm->total_in += len;
 
-    /* return no joy or set up to restart inflate() on a new block */
+    /* return no joy or set up to resume inflate() on a new block */
     if (state->have != 4) return Z_DATA_ERROR;
     in = strm->total_in;  out = strm->total_out;
     inflateReset(strm);

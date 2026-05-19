@@ -51,7 +51,6 @@ struct MCDataType
   T LivingFraction;
 };
 
-/** A set of light weight walkers that are carried between driver sections and restart
  */
 class WalkerConfigurations
 {

@@ -396,7 +396,7 @@ void MergingVranicSpherical::operator() (
             }
 
             // ---------------------------------------------------------------------------------------------------------
-            // Checkpoint for debugging
+            // Debug trace marker
             //
             // if (std::isnan(theta_min[phi_i])
             //   || std::isnan(theta_max[phi_i])
@@ -529,7 +529,7 @@ void MergingVranicSpherical::operator() (
                                         + theta_i) * mr_dim + mr_i;
 
                 // -----------------------------------------------------------------------------------------------------
-                // Checkpoint for debugging
+                // Debug trace marker
                 // if ( (mr_i < 0 || mr_i > (mr_dim-1) || std::isnan(mr_i))
                 //      || (phi_i < 0 || phi_i > (phi_dim-1) || std::isnan(phi_i))
                 //      || (theta_i < 0 || theta_i > (theta_dim[phi_i]-1) || std::isnan(theta_i))
@@ -564,7 +564,7 @@ void MergingVranicSpherical::operator() (
                                         + theta_i) * mr_dim + mr_i;
 
                 // -----------------------------------------------------------------------------------------------------
-                // Checkpoint for debugging
+                // Debug trace marker
                 //
                 // if ( (mr_i < 0 || mr_i > (mr_dim-1) || std::isnan(mr_i))
                 //      || (phi_i < 0 || phi_i > (phi_dim-1) || std::isnan(phi_i))
@@ -913,7 +913,7 @@ void MergingVranicSpherical::operator() (
                                 }
 
                                 // -------------------------------------------------------------------------------------
-                                // Checkpoint for debugging
+                                // Debug trace marker
 
                                 // double mr = sqrt(momentum_x[ip]*momentum_x[ip] +
                                 //           momentum_y[ip]*momentum_y[ip] +

@@ -256,7 +256,7 @@ void EstimatorManagerNew::stopDriverRun() { h_file.reset(); }
 
 void EstimatorManagerNew::startBlock(int steps)
 {
-  block_timer_.restart();
+  block_timer_.reset_clock();
   for (auto& op_est : operator_ests_)
     op_est->startBlock(steps);
 }

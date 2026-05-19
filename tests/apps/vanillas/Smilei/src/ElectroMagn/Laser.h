@@ -46,7 +46,6 @@ class Laser
 {
     friend class SmileiMPI;
     friend class Patch;
-    friend class Checkpoint;
 public:
     //! Normal laser constructor
     Laser( Params &params, int ilaser, Patch *patch, bool verbose = false );
@@ -158,7 +157,6 @@ private:
 class LaserProfileFile : public LaserProfile
 {
     friend class SmileiMPI;
-    friend class Checkpoint;
 public:
     LaserProfileFile( std::string file_, Profile *ep_, bool pr_, unsigned int axis )
         : magnitude( NULL ), phase( NULL ), file( file_ ), extraProfile( ep_ ), primal_( pr_ ), axis_( axis ) {};

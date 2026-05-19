@@ -137,9 +137,9 @@ private:
      *  m_t_lab, and z-positions for the i^th snapshot, i_buffer, and level, lev.
      * \param[in] i_buffer i^th snapshot or buffer
      * \param[in] lev mesh-refinement level for which the field and/or particle buffer data is initialized.
-     * \param[in] restart whether this is called upon restarting a previous simulation
+     * \param[in] secondary_init whether this is the secondary init pass
      */
-    void InitializeBufferData ( int i_buffer , int lev, bool restart=false) override;
+    void InitializeBufferData ( int i_buffer , int lev, bool secondary_init=false) override;
     /** Whether to compute back-tranformed values for field-data.
      *  default value is true.
      */
@@ -319,12 +319,12 @@ private:
     }
 
     /** Vector of integers to indicate if is the first flush for a snapshot so that appropriate meta-data and geometry is written (0 if not, 1 if yes). */
-    amrex::Vector<int> m_first_flush_after_restart;
+    amrex::Vector<int> m_first_flush_after_init;
 
     /** Resets integer for first flush to 0 for the ith snapshot (i_buffer).
      *  This function is called after flush the first buffer after restarting the simulation
      */
-    void NullifyFirstFlush(int i_buffer) {m_first_flush_after_restart[i_buffer] = 0;}
+    void NullifyFirstFlush(int i_buffer) {m_first_flush_after_init[i_buffer] = 0;}
 
     /** Vector of integers to indicate if the snapshot geometry is defined. */
     amrex::Vector<int> m_snapshot_geometry_defined;

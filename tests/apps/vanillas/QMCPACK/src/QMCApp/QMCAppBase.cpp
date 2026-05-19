@@ -69,10 +69,8 @@ bool QMCAppBase::parse(const std::string& infile)
 
 void QMCAppBase::saveXml()
 {
-  // Native checkpoint disabled in the vanilla benchmark.  The original
   // implementation wrote a `.cont.xml` continuation file (a serialized copy
   // of the input XML augmented with <mcwalkerset> so the run could be
-  // resumed); writing it would let the LLM re-enable native restart simply
   // by re-pointing qmcpack at the saved XML.  No file is written.
 }
 

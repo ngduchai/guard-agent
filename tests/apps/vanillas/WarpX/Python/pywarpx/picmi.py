@@ -1824,8 +1824,8 @@ class GMRESLinearSolver(picmistandard.base._ClassWithInit):
     verbose_int: integer, default=2
         Level of verbosity of output
 
-    restart_length: integer, default=30
-       How often to restart the GMRES iterations
+    cycle_length: integer, default=30
+       How often to re-init the GMRES iterations
 
     absolute_tolerance: float, default=0.
         Absoluate tolerence of the convergence
@@ -3258,9 +3258,6 @@ class Simulation(picmistandard.PICMI_Simulation):
         Whether AMReX should perform checks on the input
         (primarily related to the max grid size and blocking factors)
 
-    warpx_amr_restart: string, optional
-        The name of the restart to use
-
     warpx_amrex_the_arena_is_managed: bool, optional
         Whether to use managed memory in the AMReX Arena
 
@@ -3298,9 +3295,6 @@ class Simulation(picmistandard.PICMI_Simulation):
 
     warpx_break_signals: list of strings
         Signals on which to break
-
-    warpx_checkpoint_signals: list of strings
-        Signals on which to write out a checkpoint
 
     warpx_synchronize_velocity: bool, default=False
         Flags whether the particle velocities are synchronized in time with
@@ -3596,9 +3590,6 @@ class Simulation(picmistandard.PICMI_Simulation):
         for diagnostic in self.diagnostics:
             diagnostic.diagnostic_initialize_inputs()
 
-        if self.amr_restart:
-            pywarpx.amr.restart = self.amr_restart
-
         if self.amrex_the_arena_is_managed is not None:
             pywarpx.amrex.the_arena_is_managed = self.amrex_the_arena_is_managed
 
@@ -3738,7 +3729,7 @@ class FieldDiagnostic(picmistandard.PICMI_FieldDiagnostic, WarpXDiagnosticBase):
     warpx_plot_raw_fields_guards: bool, optional
         Flag whether the raw fields should include the guard cells
 
-    warpx_format: {plotfile, checkpoint, openpmd, ascent, sensei}, optional
+    warpx_format: {plotfile, openpmd, ascent, sensei}, optional
         Diagnostic file format
 
     warpx_openpmd_backend: {bp, h5, json}, optional
@@ -3985,58 +3976,13 @@ class TimeAveragedFieldDiagnostic(FieldDiagnostic):
         self.diagnostic.average_start_step = self.average_start_step
 
 
-class Checkpoint(picmistandard.base._ClassWithInit, WarpXDiagnosticBase):
-    """
-    Sets up checkpointing of the simulation, allowing for later restarts
-
-    See `Input Parameters <https://warpx.readthedocs.io/en/latest/usage/parameters.html>`__ for more information.
-
-    Parameters
-    ----------
-    warpx_file_prefix: string
-        The prefix to the checkpoint directory names
-
-    warpx_file_min_digits: integer
-        Minimum number of digits for the time step number in the checkpoint
-        directory name.
-
-    warpx_verbose: int, optional
-        Verbosity level to use for printing diagnostic output information.
-    """
-
-    def __init__(self, period=1, write_dir=None, name=None, **kw):
-        self.period = period
-        self.write_dir = write_dir
-        self.file_prefix = kw.pop("warpx_file_prefix", None)
-        self.file_min_digits = kw.pop("warpx_file_min_digits", None)
-        self.name = name
-
-        if self.name is None:
-            self.name = "chkpoint"
-
-        self.verbose = kw.pop("warpx_verbose", None)
-
-        self.handle_init(kw)
-
-    def diagnostic_initialize_inputs(self):
-        self.add_diagnostic()
-
-        self.diagnostic.intervals = self.period
-        self.diagnostic.diag_type = "Full"
-        self.diagnostic.format = "checkpoint"
-        self.diagnostic.file_min_digits = self.file_min_digits
-        self.diagnostic.set_or_replace_attr("verbose", self.verbose)
-
-        self.set_write_dir()
-
-
 class ParticleDiagnostic(picmistandard.PICMI_ParticleDiagnostic, WarpXDiagnosticBase):
     """
     See `Input Parameters <https://warpx.readthedocs.io/en/latest/usage/parameters.html>`__ for more information.
 
     Parameters
     ----------
-    warpx_format: {plotfile, checkpoint, openpmd, ascent, sensei}, optional
+    warpx_format: {plotfile, openpmd, ascent, sensei}, optional
         Diagnostic file format
 
     warpx_openpmd_backend: {bp, h5, json}, optional

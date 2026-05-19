@@ -56,7 +56,6 @@ QMCDriver::QMCDriver(const ProjectData& project_data,
       W(w),
       Psi(psi),
       H(h),
-      checkpoint_timer_(createGlobalTimer("checkpoint::recordBlock", timer_level_medium)),
       driver_scope_profiler_(enable_profiling)
 {
   ResetRandom       = false;
@@ -294,15 +293,8 @@ std::string QMCDriver::getLastRotationName(std::string RootName)
   return r_RootName;
 }
 
-void QMCDriver::recordBlock(int block)
+void QMCDriver::recordBlock(int /*block*/)
 {
-  if (DumpConfig && block % Period4CheckPoint == 0)
-  {
-    ScopedTimer local(checkpoint_timer_);
-    wOut->dump(W, block);
-    branchEngine->write(RootName, true); //save energy_history
-    RandomNumberControl::write(RootName, myComm);
-  }
 }
 
 bool QMCDriver::finalize(int block, bool dumpwalkers)
@@ -378,12 +370,7 @@ void QMCDriver::setWalkerOffsets()
 
 /** Parses the xml input file for parameter definitions for a single qmc simulation.
  *
- * Basic parameters are handled here and each driver will perform its own initialization with the input
- * attribute list
- * - checkpoint="-1|0|n" default=-1
- *   -- 1 = do not write anything
- *   -- 0 = dump after the completion of a qmc section
- *   -- n = dump after n blocks
+ * Basic parameters are handled here and each driver will perform its own initialization with the input.
  */
 bool QMCDriver::putQMCInfo(xmlNodePtr cur)
 {
@@ -393,14 +380,6 @@ bool QMCDriver::putQMCInfo(xmlNodePtr cur)
     return true;
   }
 
-  ////store the current nSteps and nStepsBetweenSamples
-  //int oldStepsBetweenSamples=nStepsBetweenSamples;
-  //int oldSteps=nSteps;
-
-  //set the default walker to the number of threads times 10
-  // Native checkpoint disabled in the vanilla benchmark — pinned at -1
-  // (no dump) so the LLM cannot re-enable native restart by toggling the
-  // <qmc> @c checkpoint XML attribute.  Attribute parsing removed.
   Period4CheckPoint = -1;
   int defaultw      = omp_get_max_threads();
   OhmmsAttributeSet aAttrib;
@@ -422,11 +401,6 @@ bool QMCDriver::putQMCInfo(xmlNodePtr cur)
         rAttrib.add(Period4WalkerDump, "stride");
         rAttrib.add(Period4WalkerDump, "period");
         rAttrib.put(tcur);
-      }
-      else if (cname == "checkpoint")
-      {
-        // Native checkpoint disabled — child <checkpoint> element is silently
-        // ignored so the LLM cannot re-enable native restart by adding it.
       }
       else if (cname == "dumpconfig")
       {

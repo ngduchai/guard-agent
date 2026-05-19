@@ -469,11 +469,6 @@ We follow the same naming, but remove the ``SIG`` prefix, e.g., the WarpX signal
     A list of signal names or numbers that the simulation should
     handle by cleanly terminating at the next timestep
 
-* ``warpx.checkpoint_signals`` (array of `string`, separated by spaces) optional
-    A list of signal names or numbers that the simulation should
-    handle by outputting a checkpoint at the next timestep. A
-    diagnostic of type `checkpoint` must be configured.
-
 .. note::
 
    Certain signals are only available on specific platforms, please see the links above for details.
@@ -488,7 +483,6 @@ We follow the same naming, but remove the ``SIG`` prefix, e.g., the WarpX signal
 .. tip::
 
    For example, the following logic can be added to `Slurm batch scripts <https://docs.gwdg.de/doku.php?id=en:services:application_services:high_performance_computing:running_jobs_slurm:signals>`__ (`signal name to number mapping here <https://en.wikipedia.org/wiki/Signal_(IPC)#Default_action>`__) to gracefully shut down 6 min prior to walltime.
-   If you have a checkpoint diagnostics in your inputs file, this automatically will write a checkpoint due to the default ``<diag_name>.dump_last_timestep = 1`` option in WarpX.
 
    .. code-block:: bash
 
@@ -3084,8 +3078,6 @@ In-situ capabilities can be used by turning on Sensei or Ascent (provided they a
 
     * ``plotfile`` for native AMReX format.
 
-    * ``checkpoint`` for a checkpoint file, only works with ``<diag_name>.diag_type = Full``.
-
     * ``openpmd`` for OpenPMD format `openPMD <https://www.openPMD.org>`_.
       Requires to build WarpX with ``USE_OPENPMD=TRUE`` (see :ref:`instructions <building-openpmd>`).
 
@@ -3249,7 +3241,7 @@ In-situ capabilities can be used by turning on Sensei or Ascent (provided they a
     Higher corner of the output fields (if larger than ``warpx.dom_hi``, then set to ``warpx.dom_hi``). Currently, when the ``diag_hi`` is different from ``warpx.dom_hi``, particle output is disabled.
 
 * ``<diag_name>.write_species`` (`0` or `1`) optional (default `1`)
-    Whether to write species output or not. For checkpoint format, always set this parameter to 1.
+    Whether to write species output or not.
 
 * ``<diag_name>.species`` (list of `string`, default all physical species in the simulation)
     Which species dumped in this diagnostics.
@@ -4229,19 +4221,6 @@ Schwinger process
     value here will make the simulation unphysical, but will allow QED effects to become more apparent.
     Note that this option will only have an effect if the ``warpx.use_Hybrid_QED`` flag is also triggered.
     This feature does not require to compile with ``-DWarpX_QED=ON``.
-
-
-Checkpoints and restart
------------------------
-WarpX supports checkpoints/restart via AMReX.
-The checkpoint capability can be turned with regular diagnostics: ``<diag_name>.format = checkpoint``.
-
-* ``amr.restart`` (`string`)
-    Name of the checkpoint file to restart from. Returns an error if the folder does not exist
-    or if it is not properly formatted.
-
-* ``warpx.write_diagnostics_on_restart`` (`bool`) optional (default `false`)
-    When `true`, write the diagnostics after restart at the time of the restart.
 
 
 .. _running-cpp-parameters-test-debug:

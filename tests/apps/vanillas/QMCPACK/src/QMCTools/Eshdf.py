@@ -22,7 +22,6 @@ from numpy import array
 # Representation:
 #   EshdfFilePw
 # Application:
-#   EshdfFilePwGpaw  <- found in Eshdf_gpaw.py
 
 
 # define dtypes for the HDF5

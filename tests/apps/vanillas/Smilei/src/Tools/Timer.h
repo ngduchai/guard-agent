@@ -35,9 +35,9 @@ public:
 #endif
     
     //! Start a new cumulative period
-    void restart();
+    void resume();
     //! Start a new cumulative period without omp master for tasking
-    void restartInTask();
+    void resumeInTask();
 
     
     //! Start a new cumulative period

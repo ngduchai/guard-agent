@@ -232,7 +232,6 @@ Note that we currently obey the following snake\_case naming conventions for tes
 
 #. **PICMI test names** start with the string ``test_1d_``, ``test_2d_``, ``test_3d_`` or ``test_rz_``, followed by a string that is descriptive of the test, and end with the string ``_picmi``. For example, ``test_3d_laser_acceleration_picmi``.
 
-#. **Restart test names** end with the string ``_restart``. For example, ``test_3d_laser_acceleration_restart``.
 
 #. **Test input files** start with the string ``inputs_`` followed by the test name. For example, ``inputs_test_3d_laser_acceleration`` or ``inputs_test_3d_laser_acceleration_picmi.py`` or ``inputs_test_3d_laser_acceleration_restart``.
 

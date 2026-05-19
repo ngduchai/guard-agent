@@ -473,7 +473,7 @@ void DiracParser::getSpinors(std::istream& is)
     std::cout << "  irrep " << irreps[i].get_label() << " with " << irreps[i].get_num_spinors() << " spinors and "
               << irreps[i].get_num_ao() << " AO coefficients." << std::endl;
 
-  std::string searchstr = (version > 22) ? "Coefficients from CHECKPOINT" : "Coefficients from DFCOEF"; 
+  std::string searchstr = (version > 22) ? "Coefficients from CHK" : "Coefficients from DFCOEF"; 
   search(is, searchstr, aline);
   std::streampos startspinors = is.tellg();
 

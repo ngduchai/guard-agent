@@ -234,7 +234,7 @@ void RandomNumberControl::read_parallel(hdf_archive& hin, Communicate* comm)
               << "\n  Using the random streams generated at the initialization.\n";
     return;
   }
-  app_log() << "  Restart from the random number streams from the previous configuration.\n";
+  app_log() << "  Re-seeding the random number streams from the previous configuration.\n";
 
   vt.resize(nthreads * Random.state_size()); //buffer for children[ip]
   mt.resize(Random.state_size());            //buffer for single thread Random object of random nums
@@ -339,7 +339,7 @@ void RandomNumberControl::read_rank_0(hdf_archive& hin, Communicate* comm)
               << "\n  Using the random streams generated at the initialization.\n";
     return;
   }
-  app_log() << "  Restart from the random number streams from the previous configuration.\n";
+  app_log() << "  Re-seeding the random number streams from the previous configuration.\n";
 
   vt.resize(nthreads * Random.state_size()); //buffer for random nums in children of each thread
   mt.resize(Random.state_size());            //buffer for random numbers from single Random object

@@ -26,7 +26,7 @@ Assign the question to one or more of these categories:
 |---|---|
 | **A. Installation / Build** | CMake errors, missing libraries, conda/spack, CUDA compilation, module conflicts |
 | **B. Input File / Parameters** | Wrong parameter name or value, PICMI vs native syntax, laser setup, particle injection, boundary conditions |
-| **C. Diagnostics & Output** | Output format, reduced diagnostics syntax, checkpoint/restart, post-processing |
+| **C. Diagnostics & Output** | Output format, reduced diagnostics syntax, post-processing |
 | **D. Physics / Numerical** | Numerical heating, energy non-conservation, CFL, boosted frame artifacts, resolution |
 | **E. Feature Availability** | "Does WarpX support X?" |
 | **F. Performance & HPC** | Slow I/O, OOM, multi-node MPI, GPU choice |

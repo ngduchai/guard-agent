@@ -39,7 +39,6 @@ Functions can be called at the following times:
 * ``beforestep``: before the time step
 * ``afterstep``: after the time step
 * ``afterdiagnostics``: after diagnostic output
-* ``oncheckpointsignal``: on a checkpoint signal
 * ``onbreaksignal``: on a break signal. These callbacks will be the last ones executed before the simulation ends.
 * ``particlescraper``: before particle boundary conditions are applied
 * ``particleloader``: at the time that the standard particle loader is called
@@ -165,7 +164,7 @@ class CallbackFunctions(object):
                     print("For %s" % self.name)
                 print("Only callable objects can be installed.")
                 print("It is possible that the callable's name has been overwritten")
-                print("by something not callable. This can happen during restart")
+                print("by something not callable. This can happen during re-init")
                 print("if a function name had later been used as a variable name.")
                 print(self.name)
                 if isinstance(f, str):

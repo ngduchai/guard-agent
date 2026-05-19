@@ -309,12 +309,12 @@ void FieldPoyntingFlux::ComputePoyntingFlux ()
 }
 
 void
-FieldPoyntingFlux::WriteCheckpointData (std::string const & dir)
+FieldPoyntingFlux::WriteSnapshotData (std::string const & dir)
 {
     // Write out the current values of the time integrated data
     std::ofstream chkfile{dir + "/FieldPoyntingFlux_data.txt", std::ofstream::out};
     if (!chkfile.good()) {
-        WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::WriteCheckpointData: could not open file for writing checkpoint data");
+        WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::WriteSnapshotData: could not open file for writing snapshot data");
     }
 
     chkfile.precision(17);
@@ -325,12 +325,12 @@ FieldPoyntingFlux::WriteCheckpointData (std::string const & dir)
 }
 
 void
-FieldPoyntingFlux::ReadCheckpointData (std::string const & dir)
+FieldPoyntingFlux::ReadSnapshotData (std::string const & dir)
 {
     // Read in the current values of the time integrated data
     std::ifstream chkfile{dir + "/FieldPoyntingFlux_data.txt", std::ifstream::in};
     if (!chkfile.good()) {
-        WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::ReadCheckpointData: could not open file for reading checkpoint data");
+        WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::ReadSnapshotData: could not open file for reading snapshot data");
     }
 
     for (int i=0; i < 2*AMREX_SPACEDIM; i++) {
@@ -338,7 +338,7 @@ FieldPoyntingFlux::ReadCheckpointData (std::string const & dir)
         if (chkfile >> data) {
             m_data[2*AMREX_SPACEDIM + i] = data;
         } else {
-            WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::ReadCheckpointData: could not read in time integrated data");
+            WARPX_ABORT_WITH_MESSAGE("FieldPoyntingFlux::ReadSnapshotData: could not read in time integrated data");
         }
     }
 }

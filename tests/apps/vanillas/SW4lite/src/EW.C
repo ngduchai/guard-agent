@@ -2733,10 +2733,7 @@ void EW::timesteploop( vector<Sarray>& U, vector<Sarray>& Um )
 	    cout << t << " " << errInf << " " << errL2 << " " << solInf << endl;
       }
       //      time_measure[9] = MPI_Wtime();	  	
-      time_measure[11] = MPI_Wtime();	  
-// // See if it is time to write a restart file
-// //      if (mRestartDumpInterval > 0 &&  currentTimeStep % mRestartDumpInterval == 0)
-// //        serialize(currentTimeStep, U, Um);  
+      time_measure[11] = MPI_Wtime();
       if( currentTimeStep > 1 )
       {
 	 time_sum[0] += time_measure[1]-time_measure[0] + time_measure[5]-time_measure[4]; // F

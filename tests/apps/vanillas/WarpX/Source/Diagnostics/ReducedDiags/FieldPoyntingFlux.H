@@ -425,9 +425,9 @@ public:
      */
     void ComputePoyntingFlux ();
 
-    void WriteCheckpointData (std::string const & dir) final;
+    void WriteSnapshotData (std::string const & dir) final;
 
-    void ReadCheckpointData (std::string const & dir) final;
+    void ReadSnapshotData (std::string const & dir) final;
 
 private:
 

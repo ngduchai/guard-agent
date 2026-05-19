@@ -18,7 +18,6 @@
  * @brief STRIPPED definition of HDFWalkerOutput.  The original implementation
  *        wrote *.config.h5 walker checkpoints; in the vanilla benchmark this
  *        capability is intentionally disabled so the LLM cannot re-enable
- *        native checkpoint/restart by toggling the <qmc> @c checkpoint
  *        attribute.  All public methods retain their signatures but perform
  *        no I/O.
  */
@@ -42,7 +41,6 @@ HDFWalkerOutput::~HDFWalkerOutput() = default;
 
 bool HDFWalkerOutput::dump(const WalkerConfigurations& /*W*/, int /*nblock*/)
 {
-  // Native checkpoint disabled in the vanilla benchmark — no .config.h5 file
   // is written.  Returning true keeps callers' control flow unchanged.
   return true;
 }
@@ -51,7 +49,6 @@ void HDFWalkerOutput::write_configuration(const WalkerConfigurations& /*W*/,
                                           hdf_archive& /*hout*/,
                                           int /*nblock*/)
 {
-  // Native checkpoint disabled in the vanilla benchmark.
 }
 
 } // namespace qmcplusplus

@@ -9,7 +9,6 @@
 class DiagnosticProbes : public Diagnostic
 {
     friend class SmileiMPI;
-    friend class Checkpoint;
     
 public :
 

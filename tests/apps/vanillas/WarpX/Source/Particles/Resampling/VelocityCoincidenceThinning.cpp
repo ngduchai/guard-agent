@@ -316,7 +316,7 @@ void VelocityCoincidenceThinning::operator() (
                         }
                     }
 
-                    // restart the tallies
+                    // reset the tallies
                     particles_in_bin = 0;
                     total_weight = 0._prt;
                     total_energy = 0._prt;

@@ -24,12 +24,7 @@ namespace qmcplusplus
 {
 /** Reads qmc section xml node parameters
  *
- * All shared parameters are read here
- * attribute list
- * - checkpoint="-1|0|n" default=-1
- *   -- 1 = do not write anything
- *   -- 0 = dump after the completion of a qmc section
- *   -- n = dump after n blocks
+ * All shared parameters are read here.
  */
 void QMCDriverInput::readXML(xmlNodePtr cur)
 {
@@ -38,10 +33,6 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
 
   std::string debug_checks_str;
   std::string measure_imbalance_str;
-  // Native checkpoint disabled in the vanilla benchmark — pinned at -1
-  // (no dump) so the LLM cannot re-enable native restart by toggling the
-  // <qmc> @c checkpoint XML attribute.
-  int Period4CheckPoint{-1};
   int dummy_int = 0;
 
   ParameterSet parameter_set;
@@ -83,13 +74,8 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
   aAttrib.add(qmc_method_, "method");
   aAttrib.add(update_mode_, "move");
   aAttrib.add(scoped_profiling_, "profiling");
-  // Native checkpoint disabled — `checkpoint` attribute parsing removed.
   // This does all the parameter parsing setup in the constructor
   aAttrib.put(cur);
-
-  //set default to match legacy QMCDriver
-  check_point_period_.stride = Period4CheckPoint;
-  check_point_period_.period = Period4CheckPoint;
 
   if (cur != NULL)
   {
@@ -108,11 +94,6 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
         rAttrib.add(walker_dump_period_.stride, "stride");
         rAttrib.add(walker_dump_period_.period, "period");
         rAttrib.put(tcur);
-      }
-      else if (cname == "checkpoint")
-      {
-        // Native checkpoint disabled — child <checkpoint> element is silently
-        // ignored so the LLM cannot re-enable native restart by adding it.
       }
       else if (cname == "dumpconfig")
       {

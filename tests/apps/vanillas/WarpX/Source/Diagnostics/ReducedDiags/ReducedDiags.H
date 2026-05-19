@@ -100,9 +100,9 @@ public:
     /** Check if diag should be done */
     [[nodiscard]] bool DoDiags(int step) const { return m_intervals.contains(step+1); }
 
-        virtual void WriteCheckpointData (std::string const & dir);
+        virtual void WriteSnapshotData (std::string const & dir);
 
-        virtual void ReadCheckpointData (std::string const & dir);
+        virtual void ReadSnapshotData (std::string const & dir);
 
     /**
      * This function queries deprecated input parameters and aborts

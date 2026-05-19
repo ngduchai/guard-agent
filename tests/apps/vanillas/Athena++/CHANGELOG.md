@@ -69,8 +69,6 @@ The automatically-generated content should be used for reference when writing th
 - Fix an indexing bug in x3v in disk.cpp [\#458](https://github.com/PrincetonUniversity/athena/pull/458) ([tomo-ono](https://github.com/tomo-ono))
 - Change SMALL\_NUMBER to 10^-4 in the HLLD-series Riemann solvers [\#457](https://github.com/PrincetonUniversity/athena/pull/457) ([tomidakn](https://github.com/tomidakn))
 - Fix hang when using shearing box + STS [\#456](https://github.com/PrincetonUniversity/athena/pull/456) ([pdmullen](https://github.com/pdmullen))
-- Apply output time cadence changes even if no input file is provided during restarts [\#454](https://github.com/PrincetonUniversity/athena/pull/454) ([felker](https://github.com/felker))
-- Fixing the restart error reported in \#449 [\#453](https://github.com/PrincetonUniversity/athena/pull/453) ([tomidakn](https://github.com/tomidakn))
 - Fixed bug in fixup routine for SRMHD [\#452](https://github.com/PrincetonUniversity/athena/pull/452) ([c-white](https://github.com/c-white))
 - Fixed passive scalar + AMR bug [\#446](https://github.com/PrincetonUniversity/athena/pull/446) ([c-white](https://github.com/c-white))
 - Initialize pointer fv\_new\_ to nullptr [\#445](https://github.com/PrincetonUniversity/athena/pull/445) ([kahoooo](https://github.com/kahoooo))
@@ -82,16 +80,13 @@ The automatically-generated content should be used for reference when writing th
 - Extend the x2 loop limit by 1 for x3 outflow outer bc [\#404](https://github.com/PrincetonUniversity/athena/pull/404) ([felker](https://github.com/felker))
 - Update plotting slices and add polar projection view  [\#394](https://github.com/PrincetonUniversity/athena/pull/394) ([kurtsansom](https://github.com/kurtsansom))
 - Fixed typo in GR Bondi problem generator [\#385](https://github.com/PrincetonUniversity/athena/pull/385) ([c-white](https://github.com/c-white))
-- Fix of bug in the strat pgen for a restart run [\#384](https://github.com/PrincetonUniversity/athena/pull/384) ([tomo-ono](https://github.com/tomo-ono))
 - Fix typo in setting of shearing boundary flag [\#379](https://github.com/PrincetonUniversity/athena/pull/379) ([tomo-ono](https://github.com/tomo-ono))
 - Fix shearing boundary flag for corner neighbors [\#378](https://github.com/PrincetonUniversity/athena/pull/378) ([tomo-ono](https://github.com/tomo-ono))
 - Fix a bug in OA hydro source term [\#368](https://github.com/PrincetonUniversity/athena/pull/368) ([tomo-ono](https://github.com/tomo-ono))
 - Correct calculations of the energy viscous flux [\#363](https://github.com/PrincetonUniversity/athena/pull/363) ([tomo-ono](https://github.com/tomo-ono))
 - Fix a bug in history output again [\#360](https://github.com/PrincetonUniversity/athena/pull/360) ([kahoooo](https://github.com/kahoooo))
-- Fix a bug that takes up unnecessary space in restart file [\#358](https://github.com/PrincetonUniversity/athena/pull/358) ([kahoooo](https://github.com/kahoooo))
 - Fix a bug in history output [\#357](https://github.com/PrincetonUniversity/athena/pull/357) ([kahoooo](https://github.com/kahoooo))
 - Make variables used in simd loops private [\#355](https://github.com/PrincetonUniversity/athena/pull/355) ([pgrete](https://github.com/pgrete))
-- Don't load conserved variables into additional buffers from .rst [\#353](https://github.com/PrincetonUniversity/athena/pull/353) ([felker](https://github.com/felker))
 - Fix 4th-order hydro with non-periodic BCs [\#347](https://github.com/PrincetonUniversity/athena/pull/347) ([pdmullen](https://github.com/pdmullen))
 - Reduce overly greedy NGHOST requirement for PPM+MHD [\#346](https://github.com/PrincetonUniversity/athena/pull/346) ([felker](https://github.com/felker))
 - Bug fix of OA for MHD [\#345](https://github.com/PrincetonUniversity/athena/pull/345) ([tomo-ono](https://github.com/tomo-ono))
@@ -108,9 +103,7 @@ The automatically-generated content should be used for reference when writing th
 - FileNotFoundError for regression tests when "python" is not in PATH but "python3" is [\#479](https://github.com/PrincetonUniversity/athena/issues/479)
 - Command-line output\#/dt and output\#/next\_time are handled incorrectly [\#451](https://github.com/PrincetonUniversity/athena/issues/451)
 - Method for gravity source terms should be documented [\#450](https://github.com/PrincetonUniversity/athena/issues/450)
-- Restart with too few cores produces confusing error [\#449](https://github.com/PrincetonUniversity/athena/issues/449)
 - pgen 'disk' behaving strangely on KNL with --eos adiabatic [\#435](https://github.com/PrincetonUniversity/athena/issues/435)
-- Unable to restart a simulation [\#429](https://github.com/PrincetonUniversity/athena/issues/429)
 - HDF5 writer: Segfault in memory access  [\#416](https://github.com/PrincetonUniversity/athena/issues/416)
 - Incorrect running index for face-centered variable  [\#403](https://github.com/PrincetonUniversity/athena/issues/403)
 - Write generated configuration to file [\#396](https://github.com/PrincetonUniversity/athena/issues/396)
@@ -282,8 +275,6 @@ The automatically-generated content should be used for reference when writing th
 - Python reader fails for slices taken across multiple blocks [\#159](https://github.com/PrincetonUniversity/athena/issues/159)
 - Python HDF5 reader no longer returns refinement levels [\#156](https://github.com/PrincetonUniversity/athena/issues/156)
 - Is ApplyPrimitiveFloors\(\) being called too often? [\#153](https://github.com/PrincetonUniversity/athena/issues/153)
-- Fix bug when saving zero scalars to restart file [\#285](https://github.com/PrincetonUniversity/athena/pull/285) ([msbc](https://github.com/msbc))
-- Fix bug when saving multiple scalars to restart file [\#283](https://github.com/PrincetonUniversity/athena/pull/283) ([msbc](https://github.com/msbc))
 - Fix minor issues with Python HDF5 reader [\#278](https://github.com/PrincetonUniversity/athena/pull/278) ([c-white](https://github.com/c-white))
 - Fix curvilinear reconstruction, add regression test scripts \(passive scalars, MPI shearing box, etc.\), and other QoL improvements [\#274](https://github.com/PrincetonUniversity/athena/pull/274) ([felker](https://github.com/felker))
 - Revert GR optimizations [\#272](https://github.com/PrincetonUniversity/athena/pull/272) ([c-white](https://github.com/c-white))
@@ -442,11 +433,9 @@ The automatically-generated content should be used for reference when writing th
 
 - Pass MeshBlock to user defined diffusivity function [\#130](https://github.com/PrincetonUniversity/athena/pull/130) ([jmshi](https://github.com/jmshi))
 - Use native HDF5 byte order [\#109](https://github.com/PrincetonUniversity/athena/issues/109)
-- Conflicting restart and input parameters for writing output [\#62](https://github.com/PrincetonUniversity/athena/issues/62)
 - Add double precision option for HDF5 output [\#28](https://github.com/PrincetonUniversity/athena/issues/28)
 - Improve vectorization for loops in PPM [\#121](https://github.com/PrincetonUniversity/athena/pull/121) ([beiwang2003](https://github.com/beiwang2003))
 - Improve symmetry-preservation of HLLD floating-point operations [\#120](https://github.com/PrincetonUniversity/athena/pull/120) ([felker](https://github.com/felker))
-- Fix restarted simulation calculation of next\_time for writing outputs [\#116](https://github.com/PrincetonUniversity/athena/pull/116) ([felker](https://github.com/felker))
 - Support double precision floating-point HDF5 output [\#108](https://github.com/PrincetonUniversity/athena/pull/108) ([felker](https://github.com/felker))
 - Add templates for Issue and PR; creating draft of CONTRIBUTING.md [\#93](https://github.com/PrincetonUniversity/athena/pull/93) ([felker](https://github.com/felker))
 - Make athdf a class which will delay reading until data is requested [\#84](https://github.com/PrincetonUniversity/athena/pull/84) ([msbc](https://github.com/msbc))
@@ -469,7 +458,6 @@ The automatically-generated content should be used for reference when writing th
 - FFTBlock.norm\_factor\_ may be uninitialized [\#51](https://github.com/PrincetonUniversity/athena/issues/51)
 - Regression test suite with MPI causes nonblocking IO write errors on macOS [\#47](https://github.com/PrincetonUniversity/athena/issues/47)
 - UserWorkAfterLoop is called before final outputs [\#45](https://github.com/PrincetonUniversity/athena/issues/45)
-- Restart regression test fails due to FFT input parameter parsing [\#42](https://github.com/PrincetonUniversity/athena/issues/42)
 - Incorrect initialization of scopy\_ used for AthenaArray deep copy [\#38](https://github.com/PrincetonUniversity/athena/issues/38)
 - Need better default behavior when setting start\_time [\#36](https://github.com/PrincetonUniversity/athena/issues/36)
 - Fix SIMD vectorization and regression tests for diffusion module [\#127](https://github.com/PrincetonUniversity/athena/pull/127) ([jmshi](https://github.com/jmshi))
@@ -611,7 +599,6 @@ The automatically-generated content should be used for reference when writing th
 
 #### Fixed bugs:
 
-- Restart output problem due to next\_time=0 [\#7](https://github.com/PrincetonUniversity/athena/issues/7)
 
 #### Closed issues:
 

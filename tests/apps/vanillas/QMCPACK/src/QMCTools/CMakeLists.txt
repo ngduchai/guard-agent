@@ -58,8 +58,6 @@ if(USE_OBJECT_TARGET)
   target_link_libraries(qmcfinitesize qmcparticle qmcparticle_omptarget qmcutil)
 endif()
 
-file(CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/gpaw4qmcpack.py ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/gpaw4qmcpack.py SYMBOLIC)
-install(FILES gpaw4qmcpack.py DESTINATION bin)
 
 foreach(EXE_TARGET convert4qmc qmc-extract-eshdf-kvectors qmc-get-supercell qmc-check-affinity convertpw4qmc
                    qmcfinitesize)

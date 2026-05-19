@@ -274,7 +274,6 @@ This version is intended for long-term support of v3 of QMCPACK. Development eff
 tests, fixes, and features from users and developers are still welcome to v3 for a potential future release. However, these will not
 be ported towards v4 by the core QMCPACK developers without prior arrangement. Please discuss options with QMCPACK developers.
 
-* Simplified checkpointing and enabled it in the batched drivers. Users now only need specify checkpoint={-1,0,N} to checkpoint
   between blocks. [#4646](https://github.com/QMCPACK/qmcpack/pull/4646)
 * NERSC Perlmutter build recipe. [#4698](https://github.com/QMCPACK/qmcpack/pull/4698)
 * qmc-fit: Now supports parameter fitting with jackknife for e.g. DFT+U, EXX scans
@@ -636,7 +635,6 @@ and further upgrades to the test system.
 * ppconvert executable automatically built when configured. [\#2904](https://github.com/QMCPACK/qmcpack/pull/2904).
 * Tests added for ppconvert. [\#2929](https://github.com/QMCPACK/qmcpack/issues/2929).
 * Fixed SIMD alignment for AVX512 on some systems. [\#2981](https://github.com/QMCPACK/qmcpack/pull/2981).
-* Improved wavefunction restart logic in AFQMC. [\#2942](https://github.com/QMCPACK/qmcpack/pull/2942).
 * Spin-density supported in batched code. [\#2840](https://github.com/QMCPACK/qmcpack/pull/2840).
 * Reduced I/O operations during cmake. [\#2808](https://github.com/QMCPACK/qmcpack/pull/2808).
 * Improved detection of unsupported-by-Intel combinations of Intel compilers and libstdc++. [\#2794](https://github.com/QMCPACK/qmcpack/pull/2794).
@@ -1200,7 +1198,6 @@ testing. It is a recommended update.
 * Added NiO based VMC and DMC performance tests and description in manual. Wavefunction files accessed via QMC_DATA.
 * Added DMC tests with locality and t-moves approximations.
 * Added AFQMC tests.
-* Added test of real space QMC restart capabilities.
 * Added tests for several estimators.
 * Added unit test for DMC walker propagation, effective core potentials, and OhmmsPETE.
 * To avoid filesystem limitations, QMC_SYMLINK_TEST_FILES can be set to symlink (1) or copy test files (0).

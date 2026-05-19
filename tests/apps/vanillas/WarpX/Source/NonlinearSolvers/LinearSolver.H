@@ -54,7 +54,7 @@ public:
     //! Sets verbosity.
     virtual void setVerbose (int v) = 0;
 
-    //! Sets restart length for GMRES-like solvers. Base implementation
+    //! Sets cycle length for GMRES-like solvers. Base implementation
     //! provided for solvers that don't need this.
     virtual void setRestartLength (int rl) { amrex::ignore_unused(rl); }
 

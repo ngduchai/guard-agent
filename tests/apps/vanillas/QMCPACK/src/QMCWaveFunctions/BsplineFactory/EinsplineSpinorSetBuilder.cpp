@@ -158,7 +158,7 @@ std::unique_ptr<SPOSet> EinsplineSpinorSetBuilder::createSPOSetFromXML(xmlNodePt
   // Create the OrbitalSet object
   //////////////////////////////////
   Timer mytimer;
-  mytimer.restart();
+  mytimer.reset_clock();
   OccupyBands(spinSet, sortBands, numOrbs, skipChecks);
   if (spinSet == 0)
     TileIons();

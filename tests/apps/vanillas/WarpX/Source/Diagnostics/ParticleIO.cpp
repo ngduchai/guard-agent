@@ -126,7 +126,7 @@ PhysicalParticleContainer::WriteHeader (std::ostream& os) const
 }
 
 void
-MultiParticleContainer::Restart (const std::string& dir)
+MultiParticleContainer::LoadFromDir (const std::string& dir)
 {
     // note: all containers is sorted like this
     // - species_names
@@ -168,7 +168,7 @@ MultiParticleContainer::Restart (const std::string& dir)
                 search != real_comp_names.end(),
                 "Species " + species_names[i]
                 + " needs runtime real component " +  comp
-                + ", but it was not found in the checkpoint file."
+                + ", but it was not found in the snapshot file."
             );
         }
 
@@ -177,7 +177,7 @@ MultiParticleContainer::Restart (const std::string& dir)
             if (!pc->HasRealComp(comp_name)) {
                 amrex::Print() << Utils::TextMsg::Info(
                     "Runtime real component " + comp_name
-                    + " was found in the checkpoint file, but it has not been added yet. "
+                    + " was found in the snapshot file, but it has not been added yet. "
                     + " Adding it now."
                 );
                 pc->AddRealComp(comp_name);
@@ -204,7 +204,7 @@ MultiParticleContainer::Restart (const std::string& dir)
             WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
                 search != int_comp_names.end(),
                 "Species " + species_names[i] + " needs runtime int component " + comp
-                + ", but it was not found in the checkpoint file."
+                + ", but it was not found in the snapshot file."
             );
         }
 
@@ -213,17 +213,17 @@ MultiParticleContainer::Restart (const std::string& dir)
             if (!pc->HasIntComp(comp_name)) {
                 amrex::Print()<< Utils::TextMsg::Info(
                     "Runtime int component " + comp_name
-                    + " was found in the checkpoint file, but it has not been added yet. "
+                    + " was found in the snapshot file, but it has not been added yet. "
                     + " Adding it now."
                 );
                 pc->AddIntComp(comp_name);
             }
         }
 
-        pc->Restart(dir, species_names.at(i));
+        pc->LoadFromDir(dir, species_names.at(i));
     }
     for (unsigned i = species_names.size(); i < species_names.size()+lasers_names.size(); ++i) {
-        allcontainers.at(i)->Restart(dir, lasers_names.at(i-species_names.size()));
+        allcontainers.at(i)->LoadFromDir(dir, lasers_names.at(i-species_names.size()));
     }
 }
 

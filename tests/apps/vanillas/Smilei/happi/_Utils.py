@@ -26,12 +26,12 @@ def setMatplotLibBackend(show=True):
 	usingAgg = (matplotlib.get_backend().lower() == "agg")
 	if not show and not usingAgg:
 		if "matplotlib.pyplot" in sys.modules:
-			print("WARNING: 'show=False' requires you restart python.")
+			print("WARNING: 'show=False' requires you re-launch python.")
 		else:
 			matplotlib.use("Agg")
 	if show and usingAgg:
 		if "matplotlib.pyplot" in sys.modules:
-			print("WARNING: 'show=False' was set earlier. Restart python if you want figures to appear.")
+			print("WARNING: 'show=False' was set earlier. Re-launch python if you want figures to appear.")
 	matplotlib.rcParams['font.family'] = 'serif'
 	matplotlib.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif', 'Liberation Serif']
 

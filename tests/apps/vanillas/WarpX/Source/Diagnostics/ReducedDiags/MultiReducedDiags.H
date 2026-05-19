@@ -60,9 +60,9 @@ public:
     /** Check if any diagnostics will be done */
     bool DoDiags(int step);
 
-        void WriteCheckpointData (std::string const & dir);
+        void WriteSnapshotData (std::string const & dir);
 
-        void ReadCheckpointData (std::string const & dir);
+        void ReadSnapshotData (std::string const & dir);
 };
 
 #endif

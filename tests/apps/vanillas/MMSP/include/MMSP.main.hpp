@@ -234,15 +234,6 @@ int main(int argc, char* argv[]) {
 
 		input.close();
 
-		// Native checkpoint/restart removed: the upstream code parsed an
-		// iteration index out of the input filename to set
-		// `iterations_start`, and wrote `outfile.NNNN` snapshots every
-		// `increment` steps inside the time loop.  That mechanism is the
-		// app's native restart capability and has been stripped from the
-		// vanilla so the LLM cannot bypass injection by relying on it.
-		// The simulation now always runs from step 0 to `steps` and
-		// produces no file output during the run.
-
 		if (dim == 1) {
 			// construct grid object
 			GRID1D grid(argv[1]);

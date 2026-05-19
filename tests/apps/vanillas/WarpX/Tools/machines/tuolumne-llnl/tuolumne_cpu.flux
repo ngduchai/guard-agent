@@ -26,7 +26,7 @@
 EXE="./warpx.2d"
 INPUTS="./inputs_hist_10.input"
 
-# clean shutdown close to walltime (or checkpoint)
+# clean shutdown close to walltime
 # https://warpx.readthedocs.io/en/latest/usage/parameters.html#signal-handling
 FLUX_WT_SIG="--signal=SIGUSR1@120s"
 WARPX_WT="warpx.break_signals=USR1"

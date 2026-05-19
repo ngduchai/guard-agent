@@ -26,7 +26,7 @@ struct Timer
   using Clock = std::chrono::system_clock;
   Clock::time_point start_time;
   inline Timer() { start_time = Clock::now(); }
-  inline void restart() { start_time = Clock::now(); }
+  inline void reset_clock() { start_time = Clock::now(); }
   inline double elapsed() const
   {
     std::chrono::duration<double> elapsed = Clock::now() - start_time;

@@ -197,7 +197,7 @@ class TrackParticles(ParticleList):
 			elif last_timestep < self._maxAvailableTime:
 				# If the file says finished_ordering, but the last ordered timestep
 				# is inconsistent with the last available timestep, then it means
-				# that a new restart has been added to the list.
+				# that a new run has been added to the list.
 				raise Exception("Cannot open a TrackParticles diagnostic that was previously opened with a different list of simulations.\n"
 				+"Remove or backup the following file: " + orderedfile)
 		return False

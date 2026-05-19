@@ -387,8 +387,8 @@ Diagnostics::InitDataAfterRestart (const MultiParticleContainer& mpc)
     }
     if (write_species == 0) {
         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-            m_format != "checkpoint",
-            "For checkpoint format, write_species flag must be 1."
+            m_format != "snapshot",
+            "For snapshot format, write_species flag must be 1."
         );
         // if user-defined value for write_species == 0, then clear species vector
         for (int i_buffer = 0; i_buffer < m_num_buffers; ++i_buffer ) {
@@ -467,8 +467,8 @@ Diagnostics::InitData (const MultiParticleContainer& mpc)
 
     if (write_species == 0) {
         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
-            m_format != "checkpoint",
-            "For checkpoint format, write_species flag must be 1."
+            m_format != "snapshot",
+            "For snapshot format, write_species flag must be 1."
         );
         // if user-defined value for write_species == 0, then clear species vector
         for (int i_buffer = 0; i_buffer < m_num_buffers; ++i_buffer ) {
@@ -515,7 +515,7 @@ Diagnostics::InitBaseData ()
     nmax_lev = warpx.maxLevel() + 1;
     m_all_field_functors.resize( nmax_lev );
 
-    // For restart, move the m_lo and m_hi of the diag consistent with the
+    // Move the m_lo and m_hi of the diag consistent with the
     // current moving_window location
     if (WarpX::do_moving_window) {
         const int moving_dir = WarpX::moving_window_dir;

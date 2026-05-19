@@ -196,7 +196,7 @@ protected:
   DriftModifierBase* DriftModifier;
   ///randomize it
   bool ResetRandom;
-  ///flag to append or restart the run
+  ///flag to append or re-init the run
   bool AppendRun;
   ///flag to turn off dumping configurations
   bool DumpConfig;
@@ -209,10 +209,7 @@ protected:
    * using MyCounter++ as in RQMC.
    */
   int MyCounter;
-  /** period of dumping walker configurations and everything else for restart
-   *
-   * The unit is a block.
-   */
+  /** period for walker dumping; unit is a block. */
   int Period4CheckPoint;
   /** period of dumping walker positions and IDs for Forward Walking
   *
@@ -343,7 +340,6 @@ protected:
   const std::string& get_root_name() const override { return RootName; }
 
 private:
-  NewTimer& checkpoint_timer_;
   ///profile the driver lifetime
   ScopedProfiler driver_scope_profiler_;
 };

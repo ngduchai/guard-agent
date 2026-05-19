@@ -14,15 +14,6 @@ from checksumAPI import evaluate_checksum
 def main(args):
     # parse test name from test directory
     test_name = os.path.split(os.getcwd())[1]
-    if "_restart" in test_name:
-        rtol_restart = 1e-12
-        print(
-            f"Warning: Setting relative tolerance {rtol_restart} for restart checksum analysis"
-        )
-        # use original test's checksums
-        test_name = test_name.replace("_restart", "")
-        # reset relative tolerance
-        args.rtol = rtol_restart
     # TODO check environment and reset tolerance (portable, machine precision)
     # compare checksums
     evaluate_checksum(

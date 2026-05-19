@@ -17,9 +17,7 @@
 /** @file
  * @brief STRIPPED definition of HDFWalkerInputManager.  The original
  *        implementation read .config.h5 walker checkpoints via
- *        HDFWalkerInput_0_4.  In the vanilla benchmark this restart capability
  *        is intentionally disabled so the LLM cannot re-enable native
- *        checkpoint/restart by toggling input flags.  put() always returns
  *        false (no walker set was loaded), and getFileRoot() returns "".
  */
 #include "HDFWalkerInputManager.h"
@@ -34,7 +32,6 @@ HDFWalkerInputManager::~HDFWalkerInputManager() {}
 
 bool HDFWalkerInputManager::put(xmlNodePtr /*cur*/)
 {
-  // Native checkpoint/restart disabled in the vanilla benchmark.  Returning
   // false signals that no walker configurations were loaded from file; the
   // caller falls back to fresh walker initialization.
   return false;

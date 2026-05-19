@@ -1033,7 +1033,7 @@ void SpeciesV::mergeParticles( double time_dual )
         //particles->cell_keys.resize(particles->last_index.back());
 
         // -------------------------------------------------------------------------------------
-        // Checkpoint for debugging
+        // Debug trace marker
 
         // for (unsigned int ip = 0; ip < (unsigned int)(particles->last_index.back()) ; ip++) {
         //         weight_after += particles->weight(ip);
@@ -1051,7 +1051,7 @@ void SpeciesV::mergeParticles( double time_dual )
         // -------------------------------------------------------------------------------------
 
         // -------------------------------------------------------------------------------------
-        // Checkpoint for debugging
+        // Debug trace marker
 
         // for( scell = 0 ; scell < particles->first_index.size(); scell++ ) {
         //     for (unsigned int ip = particles->first_index[scell] ; ip  < particles->last_index[scell] ; ip ++) {

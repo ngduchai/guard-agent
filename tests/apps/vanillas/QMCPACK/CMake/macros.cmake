@@ -13,14 +13,11 @@
 #     Run QMCPACK on the given input file and check output
 #     using a specified script
 #############################################################
-
 include(test_labels)
-
 # Function to copy a directory
 function(COPY_DIRECTORY SRC_DIR DST_DIR)
   execute_process(COMMAND ${CMAKE_COMMAND} -E copy_directory "${SRC_DIR}" "${DST_DIR}")
 endfunction()
-
 # Create symlinks for a list of files.
 function(SYMLINK_LIST_OF_FILES FILENAMES DST_DIR)
   foreach(F IN LISTS FILENAMES)
@@ -28,7 +25,6 @@ function(SYMLINK_LIST_OF_FILES FILENAMES DST_DIR)
     file(CREATE_LINK ${F} "${DST_DIR}/${NAME_ONLY}" SYMBOLIC)
   endforeach()
 endfunction()
-
 # Function to copy a directory using symlinks for the files to save storage space.
 # Subdirectories are ignored.
 # SRC_DIR must be an absolute path
@@ -43,7 +39,6 @@ function(COPY_DIRECTORY_USING_SYMLINK SRC_DIR DST_DIR)
     "${SRC_DIR}/*")
   symlink_list_of_files("${FILE_ONLY_NAMES}" "${DST_DIR}")
 endfunction()
-
 # Copy selected files only. h5, pseudopotentials, wavefunction, structure and the used one input file are copied.
 function(COPY_DIRECTORY_USING_SYMLINK_LIMITED SRC_DIR DST_DIR ${ARGN})
   file(MAKE_DIRECTORY "${DST_DIR}")
@@ -60,7 +55,6 @@ function(COPY_DIRECTORY_USING_SYMLINK_LIMITED SRC_DIR DST_DIR ${ARGN})
     "${SRC_DIR}/*.ccECP.xml"
     "${SRC_DIR}/*.py"
     "${SRC_DIR}/*.sh"
-    "${SRC_DIR}/*.restart.xml"
     "${SRC_DIR}/Li.xml"
     "${SRC_DIR}/H.xml"
     "${SRC_DIR}/*.L2_test.xml"
@@ -83,7 +77,6 @@ function(COPY_DIRECTORY_USING_SYMLINK_LIMITED SRC_DIR DST_DIR ${ARGN})
     symlink_list_of_files("${ENSEMBLE_INPUTS}" "${DST_DIR}")
   endif()
 endfunction()
-
 # Control copy vs. symlink with top-level variable
 function(COPY_DIRECTORY_MAYBE_USING_SYMLINK SRC_DIR DST_DIR ${ARGN})
   if(QMC_SYMLINK_TEST_FILES)
@@ -92,7 +85,6 @@ function(COPY_DIRECTORY_MAYBE_USING_SYMLINK SRC_DIR DST_DIR ${ARGN})
     copy_directory("${SRC_DIR}" "${DST_DIR}")
   endif()
 endfunction()
-
 # Symlink or copy an individual file
 function(MAYBE_SYMLINK SRC_FILE DST_FILE)
   if(QMC_SYMLINK_TEST_FILES)
@@ -105,7 +97,6 @@ function(MAYBE_SYMLINK SRC_FILE DST_FILE)
     configure_file(${SRC_FILE} ${DST_FILE} COPYONLY)
   endif()
 endfunction()
-
 # Macro to create the test name
 macro(CREATE_TEST_NAME TEST ${ARGN})
   set(TESTNAME "${TEST}")
@@ -114,7 +105,6 @@ macro(CREATE_TEST_NAME TEST ${ARGN})
   endforeach()
   # STRING(REGEX REPLACE "--" "-" TESTNAME ${TESTNAME} )
 endmacro()
-
 # Runs qmcpack
 #  Note that TEST_ADDED is an output variable
 function(
@@ -129,7 +119,6 @@ function(
   math(EXPR TOT_PROCS "${PROCS} * ${THREADS}")
   set(QMC_APP $<TARGET_FILE:qmcpack>)
   set(TEST_ADDED_TEMP FALSE)
-
   if(NOT QMC_OMP)
     if(${THREADS} GREATER 1)
       message(VERBOSE
@@ -137,7 +126,6 @@ function(
       return()
     endif()
   endif()
-
   if(HAVE_MPI)
     if(${TOT_PROCS} GREATER ${TEST_MAX_PROCS})
       message(VERBOSE "Disabling test ${TESTNAME} (exceeds maximum number of processors ${TEST_MAX_PROCS})")
@@ -188,7 +176,6 @@ function(
       message(VERBOSE "Disabling test ${TESTNAME} (building without MPI)")
     endif()
   endif()
-
   # set additional test properties when the test gets added
   set(TEST_LABELS_TEMP "")
   if(TEST_ADDED_TEMP)
@@ -197,14 +184,12 @@ function(
       TEST ${TESTNAME}
       APPEND
       PROPERTY LABELS "QMCPACK")
-
     if(ENABLE_CUDA
        OR ENABLE_ROCM
        OR ENABLE_SYCL
        OR ENABLE_OFFLOAD)
       set_tests_properties(${TESTNAME} PROPERTIES RESOURCE_LOCK exclusively_owned_gpus)
     endif()
-
     if(ENABLE_OFFLOAD)
       set_property(TEST ${TESTNAME} APPEND PROPERTY ENVIRONMENT "OMP_TARGET_OFFLOAD=mandatory")
     endif()
@@ -216,7 +201,6 @@ function(
       ${TEST_LABELS_TEMP}
       PARENT_SCOPE)
 endfunction()
-
 # Runs qmcpack
 #  Note that TEST_ADDED is an output variable
 function(
@@ -233,7 +217,6 @@ function(
   if(INPUT_FILE_LENGTH GREATER 1)
     message(FATAL_ERROR "Incorrect invocation of RUN_QMC_APP by ${TESTNAME}. ARGN value is \"${ARGN}\"")
   endif()
-
   copy_directory_maybe_using_symlink("${SRC_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/${TESTNAME}" "${ARGN}")
   set(TEST_ADDED_TEMP FALSE)
   set(TEST_LABELS_TEMP "")
@@ -252,19 +235,14 @@ function(
       ${TEST_LABELS_TEMP}
       PARENT_SCOPE)
 endfunction()
-
 if(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
   function(QMC_RUN_AND_CHECK)
-
   endfunction()
   function(QMC_RUN_AND_CHECK_CUSTOM_SCALAR)
-
   endfunction()
   function(SIMPLE_RUN_AND_CHECK)
-
   endfunction()
 else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
-
   # Add a test run and associated scalar checks
   # ---required inputs---
   # BASE_NAME - name of test (number of MPI processes, number of threads, and value to check (if applicable)
@@ -284,7 +262,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
   # SCALAR_VALUES - list of output values to check with check_scalars.py
   #                 The list entries alternate between the value name and the value (usually a string with the
   #                 both the average and error).
-
   function(
     QMC_RUN_AND_CHECK
     BASE_NAME
@@ -363,7 +340,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
       "--kec"
       "--mpc"
       "--sopp")
-
     set(TEST_ADDED FALSE)
     set(TEST_LABELS "")
     set(FULL_NAME "${BASE_NAME}-r${PROCS}-t${THREADS}")
@@ -376,12 +352,10 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
       TEST_ADDED
       TEST_LABELS
       ${INPUT_FILE})
-
     if(TEST_ADDED AND NOT SHOULD_SUCCEED)
       set_property(TEST ${FULL_NAME} APPEND PROPERTY WILL_FAIL TRUE)
       #MESSAGE("Test ${FULL_NAME} should fail")
     endif()
-
     if(TEST_ADDED AND SHOULD_SUCCEED)
       set(IDX0 0)
       foreach(V ${ARGN})
@@ -403,10 +377,8 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
               set(SCALAR_VALUE_FOUND TRUE)
               list(FIND SCALAR_CHECK_TYPE ${SCALAR_CHECK} IDX)
               list(GET CHECK_SCALAR_FLAG ${IDX} FLAG)
-
               math(EXPR IDX2 "${IDX1} + 1")
               list(GET ${SCALAR_VALUES} ${IDX2} VALUE)
-
               if(IDX0 LESS 2)
                 set(TEST_NAME "${FULL_NAME}-${SCALAR_CHECK}")
               else()
@@ -443,7 +415,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
       endforeach(V)
     endif()
   endfunction()
-
   # Add a test run and associated scalar checks for a custom named scalar
   # Arguments
   # BASE_NAME - name of test (number of MPI processes, number of threads, and value to check (if applicable)
@@ -458,7 +429,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
   #                 The list entries contain consecutively the name, the value, and the error.
   #                 The name of the variable is passed (instead of the value) in case future support
   #                 for multiple SERIES/SCALAR_VALUES pairs is added
-
   function(QMC_RUN_AND_CHECK_CUSTOM_SCALAR)
     set(OPTIONS SHOULD_FAIL)
     set(ONE_VALUE_ARGS
@@ -473,29 +443,23 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
         EQUILIBRATION)
     # Eventually many want to support multiple SERIES/SCALAR_VALUES pairs
     #SET(MULTI_VALUE_ARGS SERIES SCALAR_VALUES)
-
     cmake_parse_arguments(QRC "${options}" "${ONE_VALUE_ARGS}" "${MULTI_VALUE_ARGS}" ${ARGN})
-
     set(PROCS 1)
     if(QRC_PROCS)
       set(PROCS ${QRC_PROCS})
     endif()
-
     set(THREADS 1)
     if(QRC_THREADS)
       set(THREADS ${QRC_THREADS})
     endif()
-
     set(BASE_NAME ${QRC_BASE_NAME})
     set(BASE_DIR ${QRC_BASE_DIR})
     set(PREFIX ${QRC_PREFIX})
     set(INPUT_FILE ${QRC_INPUT_FILE})
-
     set(EQUIL 2)
     if(DEFINED QRC_EQUILIBRATION)
       set(EQUIL ${QRC_EQUILIBRATION})
     endif()
-
     set(TEST_ADDED FALSE)
     set(TEST_LABELS "")
     set(FULL_NAME "${BASE_NAME}-r${PROCS}-t${THREADS}")
@@ -511,26 +475,20 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
     if(TEST_ADDED)
       set_property(TEST ${FULL_NAME} APPEND PROPERTY LABELS "QMCPACK")
     endif()
-
     if(TEST_ADDED AND SHOULD_FAIL)
       set_property(TEST ${FULL_NAME} APPEND PROPERTY WILL_FAIL TRUE)
     endif()
-
     if(TEST_ADDED AND NOT SHOULD_FAIL)
       # Derefence the list of scalar values by variable name
       set(SCALAR_VALUES "${${QRC_SCALAR_VALUES}}")
-
       list(LENGTH SCALAR_VALUES listlen)
       math(EXPR listlen2 "${listlen}-1")
       foreach(sv_idx RANGE 0 ${listlen2} 3)
-
         math(EXPR sv_idx_p1 "${sv_idx}+1")
         math(EXPR sv_idx_p2 "${sv_idx}+2")
-
         list(GET SCALAR_VALUES ${sv_idx} SCALAR_NAME)
         list(GET SCALAR_VALUES ${sv_idx_p1} SCALAR_VALUE)
         list(GET SCALAR_VALUES ${sv_idx_p2} SCALAR_ERROR)
-
         set(SERIES 0)
         if(QRC_SERIES)
           set(SERIES ${QRC_SERIES})
@@ -564,7 +522,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
       endforeach()
     endif()
   endfunction()
-
   function(
     SIMPLE_RUN_AND_CHECK
     base_name
@@ -573,16 +530,13 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
     procs
     threads
     check_script)
-
     # "simple run and check" function does 2 things:
     #  1. run qmcpack executable on $input_file located in $base_dir
     #  2. run $check_script located in the same folder ($base_dir)
     # note: NAME, COMMAND, and WORKING_DIRECTORY must be upper case in add_test!
-
     # build test name
     set(full_name "${base_name}-${procs}-${threads}")
     message(VERBOSE "Adding test ${full_name}")
-
     # add run (task 1)
     set(test_added false)
     set(test_labels "")
@@ -597,7 +551,6 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
     if(NOT test_added)
       return()
     endif()
-
     # set up command to run check, assume check_script is in the same folder as input
     if(EXISTS "${CMAKE_CURRENT_BINARY_DIR}/${full_name}/${check_script}")
       set(check_cmd "${CMAKE_CURRENT_BINARY_DIR}/${full_name}/${check_script}")
@@ -607,25 +560,19 @@ else(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
       message(FATAL_ERROR "Check script not found: ${check_script}")
     endif()
     #message(${check_cmd})
-
     # add test (task 2)
     set(test_name "${full_name}-check") # hard-code for single test
     set(work_dir "${CMAKE_CURRENT_BINARY_DIR}/${full_name}")
     #message(${work_dir})
-
     add_test(
       NAME "${test_name}"
       COMMAND ${Python3_EXECUTABLE} ${check_cmd} ${ARGN}
       WORKING_DIRECTORY "${work_dir}")
-
     # make test depend on the run
     set_property(TEST ${test_name} APPEND PROPERTY DEPENDS ${full_name})
     set_property(TEST ${test_name} APPEND PROPERTY LABELS ${test_labels})
-
   endfunction()
-
 endif(QMC_NO_SLOW_CUSTOM_TESTING_COMMANDS)
-
 function(COVERAGE_RUN TESTNAME SRC_DIR PROCS THREADS ${ARGN})
   set(FULLNAME "coverage-${TESTNAME}")
   set(TEST_ADDED FALSE)
@@ -642,7 +589,6 @@ function(COVERAGE_RUN TESTNAME SRC_DIR PROCS THREADS ${ARGN})
     set_property(TEST ${FULLNAME} APPEND PROPERTY LABELS "coverage")
   endif()
 endfunction()
-
 function(
   CPU_LIMIT_RUN
   TESTNAME
@@ -667,7 +613,6 @@ function(
     set_property(TEST ${FULLNAME} APPEND PROPERTY PASS_REGULAR_EXPRESSION "Time limit reached for")
   endif()
 endfunction()
-
 # Add a test to see if a file exists in the desired location.
 function(add_test_check_file_existence TEST_DEP_IN FILE_NAME SHOULD_SUCCEED)
   if(TEST ${TEST_DEP_IN})

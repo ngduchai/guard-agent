@@ -13,7 +13,7 @@ bool fexists(const char *filename) {
 
 int main(int argc, char* argv[]) {
 #ifdef DEBUG
-	int checkpoint = 0;
+	int phase = 0;
 #endif
 	// command line error check
 	if (argc < 3) {
@@ -99,7 +99,7 @@ int main(int argc, char* argv[]) {
 
 	for (int i = 0; i < blocks; i++) {
 #ifdef DEBUG
-		checkpoint = 0;
+		phase = 0;
 		std::cout << "\nProcessing block " << i << ".\n" << std::endl;
 #endif
 		// read block limits
@@ -112,8 +112,8 @@ int main(int argc, char* argv[]) {
 			output.write(reinterpret_cast<char*>(&lmax[j]), sizeof(lmax[j]));
 		}
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 
 		// read grid data
@@ -121,8 +121,8 @@ int main(int argc, char* argv[]) {
 		input->read(reinterpret_cast<char*>(&size), sizeof(size)); // read raw size
 		output.write(reinterpret_cast<char*>(&size), sizeof(size)); // write raw size
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 		compressedSize = 1.125 * size + 12;
 		assert(compressedSize - 12 > size);
@@ -130,8 +130,8 @@ int main(int argc, char* argv[]) {
 		input->read(raw_buffer, size);
 		char* buffer = new char[compressedSize];
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 		int status;
 		const int level = 9;
@@ -151,21 +151,21 @@ int main(int argc, char* argv[]) {
 		}
 		delete [] raw_buffer;
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 		output.write(reinterpret_cast<char*>(&compressedSize), sizeof(compressedSize)); // write compressed size
 		output.write(reinterpret_cast<char*>(buffer), compressedSize); // write compressed data
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 
 		// clean up
 		delete [] buffer;
 #ifdef DEBUG
-		++checkpoint;
-		std::cout << "Debug:\tcheckpoint " << checkpoint << " reached." << std::endl;
+		++phase;
+		std::cout << "Debug:\tphase " << phase << " reached." << std::endl;
 #endif
 
 	}

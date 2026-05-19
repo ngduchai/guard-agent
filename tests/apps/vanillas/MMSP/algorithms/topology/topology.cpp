@@ -142,7 +142,7 @@ int Grain::checkFaces() {
 							eitr = edges.begin();
 							if (edges.size() == 0) break;
 							set_itr = eitr->first.begin();
-							break; // restart outer loop: check for more invalid faces
+							break; // re-enter outer loop: check for more invalid faces
 						}
 						if (edges.size() == 0) break;
 					}

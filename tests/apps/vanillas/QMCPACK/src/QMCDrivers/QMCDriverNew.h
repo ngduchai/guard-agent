@@ -148,7 +148,7 @@ public:
    *
    *  \param[in]  project_data         ...
    *  \param[in]  input                in theory immutable parameters controlling the driver should come from here.
-   *  \param[in]  wc                   incoming walker configurations from previous run (or restart?)
+   *  \param[in]  wc                   incoming walker configurations from previous run 
    *  \param[in]  population           rank scope container for population <em>walker elements</em>
    *  \param[in]  pset_pool            global particle set pool, allows retrieval of "named" particle sets.
    *                                   currently only the EnergyDensityEstimator requries this.
@@ -472,8 +472,6 @@ protected:
   // ///samples per thread
   // IndexType nSamplesPerThread;
 
-  //  TODO: restart
-  //  /** period of dumping walker configurations and everything else for restart
   //  *
   //  * The unit is a block.
   //  */

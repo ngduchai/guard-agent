@@ -312,7 +312,7 @@ ZEXTERN int ZEXPORT deflate OF((z_streamp strm, int flush));
 
     If flush is set to Z_FULL_FLUSH, all output is flushed as with
   Z_SYNC_FLUSH, and the compression state is reset so that decompression can
-  restart from this point if previous compressed data has been damaged or if
+  resume from this point if previous compressed data has been damaged or if
   random access is desired.  Using Z_FULL_FLUSH too often can seriously degrade
   compression.
 

@@ -199,9 +199,9 @@ protected:
     /** Initialize m_mf_output vectors and data required to construct the buffers
      * \param[in] i_buffer index of buffer for which the output MultiFab is defined.
      * \param[in] lev level on which the output MultiFab is defined
-     * \param[in] restart whether this is called upon restarting a previous simulation
+     * \param[in] secondary_init whether this is the secondary init pass
      */
-    virtual void InitializeBufferData (int i_buffer, int lev, bool restart=false) = 0;
+    virtual void InitializeBufferData (int i_buffer, int lev, bool secondary_init=false) = 0;
     /** Initialize member variables and arrays specific to the diagnostics in the
      *  derived classes.(FullDiagnostics, BTDiagnostics)
      */

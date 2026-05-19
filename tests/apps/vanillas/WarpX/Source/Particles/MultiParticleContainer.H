@@ -224,7 +224,7 @@ public:
     [[nodiscard]] amrex::Box ComputeSchwingerGlobalBox () const;
 #endif
 
-    void Restart (const std::string& dir);
+    void LoadFromDir (const std::string& dir);
 
     void PostRestart ();
 

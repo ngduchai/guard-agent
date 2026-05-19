@@ -74,7 +74,6 @@ behavior of *each* individual MPI rank. The workflow for doing so is the followi
         a few PIC iterations (e.g. 10-20 PIC iterations), in order to improve
         readability. If the interesting PIC iterations occur only late in a
         simulation, you can run the first part of the simulation without
-        profiling, the create a checkpoint, and then restart the simulation for
         10-20 steps with the full profiler on.
 
 .. note::

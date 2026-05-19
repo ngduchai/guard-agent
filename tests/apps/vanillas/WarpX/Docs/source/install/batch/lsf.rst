@@ -27,7 +27,6 @@ Job Control
   * ``bkill <job id>`` abort job
   * ``bpeek [-f] <job id>`` peek into ``stdout``/``stderr`` of a job
   * ``bkill -s <signal number> <job id>`` send signal or signal name to job
-  * ``bchkpnt`` and ``brestart`` checkpoint and restart job (untested/unimplemented)
   * ``bmod -W 1:30 12345`` change the walltime of a job (currently not allowed)
   * ``bstop <job id>`` prevent the job from starting
   * ``bresume <job id>`` release the job to be eligible for run (after it was set on hold)

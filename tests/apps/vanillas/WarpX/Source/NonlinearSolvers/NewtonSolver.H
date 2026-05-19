@@ -87,7 +87,7 @@ public:
         auto linsol_name = amrex::getEnumNameString(m_linear_solver_type);
         amrex::Print()     << "Newton linear solver:       " << linsol_name << "\n";
         amrex::Print()     << "Linear solver (" << linsol_name << ") verbose:            " << m_linsol_verbose_int << "\n";
-        amrex::Print()     << "Linear solver (" << linsol_name << ") restart length:     " << m_linsol_restart_length << "\n";
+        amrex::Print()     << "Linear solver (" << linsol_name << ") cycle length:     " << m_linsol_cycle_length << "\n";
         amrex::Print()     << "Linear solver (" << linsol_name << ") max iterations:     " << m_linsol_maxits << "\n";
         amrex::Print()     << "Linear solver (" << linsol_name << ") relative tolerance: " << m_linsol_rtol << "\n";
         amrex::Print()     << "Linear solver (" << linsol_name << ") absolute tolerance: " << m_linsol_atol << "\n";
@@ -159,9 +159,9 @@ private:
     int m_linsol_verbose_int = 2;
 
     /**
-     * \brief Restart iteration for linear solver.
+     * \brief Re-init iteration for linear solver.
      */
-    int m_linsol_restart_length = 30;
+    int m_linsol_cycle_length = 30;
 
     /**
      * \brief Preconditioner type
@@ -233,7 +233,7 @@ void NewtonSolver<Vec,Ops>::Define ( const Vec&  a_U,
     }
     m_linear_solver->define(*m_linear_function);
     m_linear_solver->setVerbose( m_linsol_verbose_int );
-    m_linear_solver->setRestartLength( m_linsol_restart_length );
+    m_linear_solver->setRestartLength( m_linsol_cycle_length );
     m_linear_solver->setMaxIters( m_linsol_maxits );
 
     this->m_is_defined = true;
@@ -289,7 +289,7 @@ void NewtonSolver<Vec,Ops>::ParseParameters ()
 
     const amrex::ParmParse pp_l(amrex::getEnumNameString(m_linear_solver_type));
     pp_l.query("verbose_int",         m_linsol_verbose_int);
-    pp_l.query("restart_length",      m_linsol_restart_length);
+    pp_l.query("restart_length",      m_linsol_cycle_length);
     pp_l.query("absolute_tolerance",  m_linsol_atol);
     pp_l.query("relative_tolerance",  m_linsol_rtol);
     pp_l.query("max_iterations",      m_linsol_maxits);
@@ -297,7 +297,7 @@ void NewtonSolver<Vec,Ops>::ParseParameters ()
     /* backward compatibility */
     const amrex::ParmParse pp_gmres("gmres");
     pp_gmres.query("verbose_int",         m_linsol_verbose_int);
-    pp_gmres.query("restart_length",      m_linsol_restart_length);
+    pp_gmres.query("restart_length",      m_linsol_cycle_length);
     pp_gmres.query("absolute_tolerance",  m_linsol_atol);
     pp_gmres.query("relative_tolerance",  m_linsol_rtol);
     pp_gmres.query("max_iterations",      m_linsol_maxits);
