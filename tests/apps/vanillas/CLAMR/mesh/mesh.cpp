@@ -1531,7 +1531,7 @@ void Mesh::init(int nx, int ny, real_t circ_radius, partition_method initial_ord
    }
 
    //KDTree_Initialize(&tree);
-   if (ncells > 0) { // this is a restart.
+   if (ncells > 0) {
        if (parallel && numpe > 1) {
 #ifdef HAVE_MPI
           int ncells_int = ncells;
