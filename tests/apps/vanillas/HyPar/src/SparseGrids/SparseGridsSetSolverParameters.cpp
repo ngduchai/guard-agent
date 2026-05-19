@@ -34,7 +34,7 @@ int SparseGridsSimulation::SetSolverParameters( SimulationObject&       a_dst_si
   }
 
   a_dst_sim.solver.n_iter       = a_src_sim.solver.n_iter;
-  a_dst_sim.solver.restart_iter = a_src_sim.solver.restart_iter;
+  a_dst_sim.solver.start_iter = a_src_sim.solver.start_iter;
 
   strcpy(a_dst_sim.solver.time_scheme, a_src_sim.solver.time_scheme);
   strcpy(a_dst_sim.solver.time_scheme_type, a_src_sim.solver.time_scheme_type);

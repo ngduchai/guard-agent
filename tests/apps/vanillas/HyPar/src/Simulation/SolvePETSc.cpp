@@ -790,7 +790,7 @@ int SolvePETSc( void* s, /*!< Array of simulation objects of type #SimulationObj
     ((libROMInterface*)context.rom_interface)->projectInitialSolution(sim);
 
     {
-      int start_iter = sim[0].solver.restart_iter;
+      int start_iter = sim[0].solver.start_iter;
       int n_iter = sim[0].solver.n_iter;
       double dt = sim[0].solver.dt;
 

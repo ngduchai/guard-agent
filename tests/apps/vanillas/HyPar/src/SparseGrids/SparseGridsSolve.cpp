@@ -66,10 +66,10 @@ int SparseGridsSimulation::Solve()
 
   if (!m_rank) {
     printf( "Solving in time (from %d to %d iterations)\n",
-            TS.restart_iter,TS.n_iter);
+            TS.start_iter,TS.n_iter);
   }
 
-  for (TS.iter = TS.restart_iter; TS.iter < TS.n_iter; TS.iter++) {
+  for (TS.iter = TS.start_iter; TS.iter < TS.n_iter; TS.iter++) {
 
     /* Write initial solution to file if this is the first iteration */
     if (!TS.iter) OutputSolution(TS.waqt);
