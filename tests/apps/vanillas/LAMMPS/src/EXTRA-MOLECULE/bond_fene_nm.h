@@ -31,8 +31,6 @@ class BondFENENM : public BondFENE {
   void coeff(int, char **) override;
   void init_style() override;
   double equilibrium_distance(int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
   double single(int, double, int, int, double &) override;
   void born_matrix(int, double, int, int, double &, double &) override;

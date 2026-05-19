@@ -686,69 +686,6 @@ void Group::molring(int n, char *cbuf, void *ptr)
     if (hash->find(molecule[i]) != hash->end()) mask[i] |= molbit;
 }
 
-/* ----------------------------------------------------------------------
-   write group info to a restart file
-   only called by proc 0
-------------------------------------------------------------------------- */
-
-void Group::write_restart(FILE *fp)
-{
-  fwrite(&ngroup,sizeof(int),1,fp);
-
-  // use count to not change restart format with deleted groups
-  // remove this on next major release
-
-  int n;
-  int count = 0;
-  for (int i = 0; i < MAX_GROUP; i++) {
-    if (names[i]) n = strlen(names[i]) + 1;
-    else n = 0;
-    fwrite(&n,sizeof(int),1,fp);
-    if (n) {
-      fwrite(names[i],sizeof(char),n,fp);
-      count++;
-    }
-    if (count == ngroup) break;
-  }
-}
-
-/* ----------------------------------------------------------------------
-   read group info from a restart file
-   proc 0 reads, bcast to all procs
-------------------------------------------------------------------------- */
-
-void Group::read_restart(FILE *fp)
-{
-  int i,n;
-
-  // delete existing group names
-  // atom masks will be overwritten by reading of restart file
-
-  for (i = 0; i < MAX_GROUP; i++) delete [] names[i];
-
-  if (me == 0) utils::sfread(FLERR,&ngroup,sizeof(int),1,fp,nullptr,error);
-  MPI_Bcast(&ngroup,1,MPI_INT,0,world);
-
-  // use count to not change restart format with deleted groups
-  // remove this on next major release
-
-  int count = 0;
-  for (i = 0; i < MAX_GROUP; i++) {
-    if (count == ngroup) {
-      names[i] = nullptr;
-      continue;
-    }
-    if (me == 0) utils::sfread(FLERR,&n,sizeof(int),1,fp,nullptr,error);
-    MPI_Bcast(&n,1,MPI_INT,0,world);
-    if (n) {
-      names[i] = new char[n];
-      if (me == 0) utils::sfread(FLERR,names[i],sizeof(char),n,fp,nullptr,error);
-      MPI_Bcast(names[i],n,MPI_CHAR,0,world);
-      count++;
-    } else names[i] = nullptr;
-  }
-}
-
 // ----------------------------------------------------------------------
 // computations on a group of atoms
 // ----------------------------------------------------------------------

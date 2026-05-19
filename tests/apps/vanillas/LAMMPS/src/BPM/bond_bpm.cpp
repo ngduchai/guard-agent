@@ -311,25 +311,6 @@ double BondBPM::equilibrium_distance(int /*i*/)
   return max_stretch * r0_max_estimate / 1.5;
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void BondBPM::write_restart(FILE *fp)
-{
-  fwrite(&overlay_flag, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void BondBPM::read_restart(FILE *fp)
-{
-  if (comm->me == 0) utils::sfread(FLERR, &overlay_flag, sizeof(int), 1, fp, nullptr, error);
-  MPI_Bcast(&overlay_flag, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 void BondBPM::process_broken(int i, int j)

@@ -579,25 +579,6 @@ int FixSRP::size_restart(int /*nlocal*/)
 }
 
 /* ----------------------------------------------------------------------
-   pack global state of Fix
-------------------------------------------------------------------------- */
-
-void FixSRP::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[3];
-  list[n++] = comm->cutghostuser;
-  list[n++] = btype;
-  list[n++] = bptype;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

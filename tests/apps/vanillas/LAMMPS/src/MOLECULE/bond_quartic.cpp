@@ -252,43 +252,6 @@ double BondQuartic::equilibrium_distance(int /*i*/)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void BondQuartic::write_restart(FILE *fp)
-{
-  fwrite(&k[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&b1[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&b2[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&rc[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&u0[1], sizeof(double), atom->nbondtypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void BondQuartic::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &b1[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &b2[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &rc[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &u0[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&k[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&b1[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&b2[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&rc[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&u0[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

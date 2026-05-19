@@ -228,37 +228,6 @@ double AngleCosinePeriodic::equilibrium_angle(int i)
   return MY_PI*(1.0 - ((b[i]>0) ? 0.0 : (1.0/static_cast<double>(multiplicity[i]))));
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void AngleCosinePeriodic::write_restart(FILE *fp)
-{
-  fwrite(&k[1],sizeof(double),atom->nangletypes,fp);
-  fwrite(&b[1],sizeof(int),atom->nangletypes,fp);
-  fwrite(&multiplicity[1],sizeof(int),atom->nangletypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void AngleCosinePeriodic::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&k[1],sizeof(double),atom->nangletypes,fp,nullptr,error);
-    utils::sfread(FLERR,&b[1],sizeof(int),atom->nangletypes,fp,nullptr,error);
-    utils::sfread(FLERR,&multiplicity[1],sizeof(int),atom->nangletypes,fp,nullptr,error);
-  }
-
-  MPI_Bcast(&k[1],atom->nangletypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&b[1],atom->nangletypes,MPI_INT,0,world);
-  MPI_Bcast(&multiplicity[1],atom->nangletypes,MPI_INT,0,world);
-  for (int i = 1; i <= atom->nangletypes; i++) setflag[i] = 1;
-}
-
 
 /* ----------------------------------------------------------------------
    proc 0 writes to data file

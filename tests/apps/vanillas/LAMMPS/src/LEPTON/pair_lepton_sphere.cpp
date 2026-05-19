@@ -181,25 +181,6 @@ void PairLeptonSphere::init_style()
   neighbor->add_request(this);
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairLeptonSphere::write_restart_settings(FILE *fp)
-{
-  fwrite(&cut_global, sizeof(double), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairLeptonSphere::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) { utils::sfread(FLERR, &cut_global, sizeof(double), 1, fp, nullptr, error); }
-  MPI_Bcast(&cut_global, 1, MPI_DOUBLE, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double PairLeptonSphere::single(int i, int j, int itype, int jtype, double rsq,

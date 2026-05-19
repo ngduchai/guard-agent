@@ -149,34 +149,6 @@ double BondGromos::equilibrium_distance(int i)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void BondGromos::write_restart(FILE *fp)
-{
-  fwrite(&k[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&r0[1], sizeof(double), atom->nbondtypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void BondGromos::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &r0[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&k[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&r0[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

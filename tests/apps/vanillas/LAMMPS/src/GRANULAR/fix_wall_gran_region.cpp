@@ -522,19 +522,6 @@ int FixWallGranRegion::size_restart(int nlocal)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixWallGranRegion::write_restart(FILE *fp)
-{
-  if (comm->me) return;
-  int len = 0;
-  region->length_restart_string(len);
-  fwrite(&len, sizeof(int), 1, fp);
-  region->write_restart(fp);
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

@@ -30,8 +30,6 @@ class DihedralFourier : public Dihedral {
   ~DihedralFourier() override;
   void compute(int, int) override;
   void coeff(int, char **) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
 
  protected:

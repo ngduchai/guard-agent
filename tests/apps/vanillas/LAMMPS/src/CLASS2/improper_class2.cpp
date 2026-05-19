@@ -565,55 +565,6 @@ void ImproperClass2::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void ImproperClass2::write_restart(FILE *fp)
-{
-  fwrite(&k0[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&chi0[1],sizeof(double),atom->nimpropertypes,fp);
-
-  fwrite(&aa_k1[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&aa_k2[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&aa_k3[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&aa_theta0_1[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&aa_theta0_2[1],sizeof(double),atom->nimpropertypes,fp);
-  fwrite(&aa_theta0_3[1],sizeof(double),atom->nimpropertypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void ImproperClass2::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&k0[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&chi0[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-
-    utils::sfread(FLERR,&aa_k1[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&aa_k2[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&aa_k3[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&aa_theta0_1[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&aa_theta0_2[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&aa_theta0_3[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-  }
-  MPI_Bcast(&k0[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&chi0[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-
-  MPI_Bcast(&aa_k1[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&aa_k2[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&aa_k3[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&aa_theta0_1[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&aa_theta0_2[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&aa_theta0_3[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->nimpropertypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    angle-angle interactions within improper
 ------------------------------------------------------------------------- */
 

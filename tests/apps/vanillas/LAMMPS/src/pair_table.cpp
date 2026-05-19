@@ -917,64 +917,6 @@ double PairTable::splint(double *xa, double *ya, double *y2a, int n, double x)
   return y;
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairTable::write_restart(FILE *fp)
-{
-  write_restart_settings(fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairTable::read_restart(FILE *fp)
-{
-  read_restart_settings(fp);
-  allocate();
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairTable::write_restart_settings(FILE *fp)
-{
-  fwrite(&tabstyle, sizeof(int), 1, fp);
-  fwrite(&tablength, sizeof(int), 1, fp);
-  fwrite(&ewaldflag, sizeof(int), 1, fp);
-  fwrite(&pppmflag, sizeof(int), 1, fp);
-  fwrite(&msmflag, sizeof(int), 1, fp);
-  fwrite(&dispersionflag, sizeof(int), 1, fp);
-  fwrite(&tip4pflag, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairTable::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &tabstyle, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &tablength, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &ewaldflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &pppmflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &msmflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &dispersionflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &tip4pflag, sizeof(int), 1, fp, nullptr, error);
-  }
-  MPI_Bcast(&tabstyle, 1, MPI_INT, 0, world);
-  MPI_Bcast(&tablength, 1, MPI_INT, 0, world);
-  MPI_Bcast(&ewaldflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&pppmflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&msmflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&dispersionflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&tip4pflag, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double PairTable::single(int /*i*/, int /*j*/, int itype, int jtype, double rsq,

@@ -308,30 +308,6 @@ void ImproperAmoeba::init_style()
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void ImproperAmoeba::write_restart(FILE *fp)
-{
-  fwrite(&k[1],sizeof(double),atom->nimpropertypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void ImproperAmoeba::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0)
-    utils::sfread(FLERR,&k[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-  MPI_Bcast(&k[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->nimpropertypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

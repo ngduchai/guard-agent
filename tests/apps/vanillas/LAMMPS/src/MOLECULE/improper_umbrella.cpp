@@ -283,37 +283,6 @@ void ImproperUmbrella::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void ImproperUmbrella::write_restart(FILE *fp)
-{
-  fwrite(&kw[1], sizeof(double), atom->nimpropertypes, fp);
-  fwrite(&w0[1], sizeof(double), atom->nimpropertypes, fp);
-  fwrite(&C[1], sizeof(double), atom->nimpropertypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void ImproperUmbrella::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &kw[1], sizeof(double), atom->nimpropertypes, fp, nullptr, error);
-    utils::sfread(FLERR, &w0[1], sizeof(double), atom->nimpropertypes, fp, nullptr, error);
-    utils::sfread(FLERR, &C[1], sizeof(double), atom->nimpropertypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&kw[1], atom->nimpropertypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&w0[1], atom->nimpropertypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&C[1], atom->nimpropertypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nimpropertypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

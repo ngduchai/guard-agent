@@ -35,7 +35,6 @@ class FixEventPRD : public FixEvent {
 
   FixEventPRD(class LAMMPS *, int, char **);
 
-  void write_restart(FILE *) override;
   void restart(char *) override;
 
   // methods specific to FixEventPRD, invoked by PRD

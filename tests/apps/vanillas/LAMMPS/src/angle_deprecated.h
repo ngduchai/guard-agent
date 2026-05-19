@@ -32,8 +32,6 @@ class AngleDeprecated : public Angle {
   void settings(int, char **) override;
   void coeff(int, char **) override {}
   double equilibrium_angle(int) override { return 0.0; }
-  void write_restart(FILE *) override {}
-  void read_restart(FILE *) override {}
   double single(int, int, int, int) override { return 0.0; }
 };
 

@@ -39,11 +39,6 @@ class PairSpinMagelec : public PairSpin {
   void compute_magelec(int, int, double *, double *, double *);
   void compute_magelec_mech(int, int, double *, double *, double *);
 
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
-
   double cut_spin_magelec_global;    // global me cutoff
 
  protected:

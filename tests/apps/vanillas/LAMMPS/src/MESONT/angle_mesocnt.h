@@ -37,8 +37,6 @@ class AngleMesoCNT : public Angle {
   void coeff(int, char **) override;
   void init_style() override;
   double equilibrium_angle(int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
   double single(int, int, int, int) override;
 

@@ -33,10 +33,6 @@ class PairTracker : public Pair {
   void coeff(int, char **) override;
   void init_style() override;
   double init_one(int, int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
   double single(int, int, int, int, double, double, double, double &) override;
   double atom2cut(int) override;
   double radii2cut(double, double) override;

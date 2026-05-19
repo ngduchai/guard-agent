@@ -52,26 +52,6 @@ void FixEventTAD::store_event_tad(bigint ntimestep)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixEventTAD::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[4];
-  list[n++] = event_number;
-  list[n++] = event_timestep;
-  list[n++] = tlo;
-  list[n++] = ebarrier;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

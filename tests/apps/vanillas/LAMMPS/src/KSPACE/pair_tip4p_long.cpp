@@ -454,44 +454,6 @@ double PairTIP4PLong::init_one(int i, int j)
 }
 
 /* ----------------------------------------------------------------------
-  proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairTIP4PLong::write_restart_settings(FILE *fp)
-{
-  PairCoulLong::write_restart_settings(fp);
-
-  fwrite(&typeO,sizeof(int),1,fp);
-  fwrite(&typeH,sizeof(int),1,fp);
-  fwrite(&typeB,sizeof(int),1,fp);
-  fwrite(&typeA,sizeof(int),1,fp);
-  fwrite(&qdist,sizeof(double),1,fp);
-}
-
-/* ----------------------------------------------------------------------
-  proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairTIP4PLong::read_restart_settings(FILE *fp)
-{
-  PairCoulLong::read_restart_settings(fp);
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&typeO,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&typeH,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&typeB,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&typeA,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&qdist,sizeof(double),1,fp,nullptr,error);
-  }
-
-  MPI_Bcast(&typeO,1,MPI_INT,0,world);
-  MPI_Bcast(&typeH,1,MPI_INT,0,world);
-  MPI_Bcast(&typeB,1,MPI_INT,0,world);
-  MPI_Bcast(&typeA,1,MPI_INT,0,world);
-  MPI_Bcast(&qdist,1,MPI_DOUBLE,0,world);
-}
-
-/* ----------------------------------------------------------------------
   compute position xM of fictitious charge site for O atom and 2 H atoms
   return it as xM
 ------------------------------------------------------------------------- */

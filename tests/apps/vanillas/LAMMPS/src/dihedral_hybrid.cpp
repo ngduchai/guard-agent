@@ -327,49 +327,6 @@ void DihedralHybrid::init_style()
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void DihedralHybrid::write_restart(FILE *fp)
-{
-  fwrite(&nstyles, sizeof(int), 1, fp);
-
-  int n;
-  for (int m = 0; m < nstyles; m++) {
-    n = strlen(keywords[m]) + 1;
-    fwrite(&n, sizeof(int), 1, fp);
-    fwrite(keywords[m], sizeof(char), n, fp);
-    styles[m]->write_restart_settings(fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void DihedralHybrid::read_restart(FILE *fp)
-{
-  int me = comm->me;
-  if (me == 0) utils::sfread(FLERR, &nstyles, sizeof(int), 1, fp, nullptr, error);
-  MPI_Bcast(&nstyles, 1, MPI_INT, 0, world);
-  styles = new Dihedral *[nstyles];
-  keywords = new char *[nstyles];
-
-  allocate();
-
-  int n, dummy;
-  for (int m = 0; m < nstyles; m++) {
-    if (me == 0) utils::sfread(FLERR, &n, sizeof(int), 1, fp, nullptr, error);
-    MPI_Bcast(&n, 1, MPI_INT, 0, world);
-    keywords[m] = new char[n];
-    if (me == 0) utils::sfread(FLERR, keywords[m], sizeof(char), n, fp, nullptr, error);
-    MPI_Bcast(keywords[m], n, MPI_CHAR, 0, world);
-    styles[m] = force->new_dihedral(keywords[m], 0, dummy);
-    styles[m]->read_restart_settings(fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    memory usage
 ------------------------------------------------------------------------- */
 

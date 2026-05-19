@@ -1087,24 +1087,6 @@ double FixWidom::memory_usage()
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixWidom::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[3];
-  list[n++] = random_equal->state();
-  list[n++] = next_reneighbor;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

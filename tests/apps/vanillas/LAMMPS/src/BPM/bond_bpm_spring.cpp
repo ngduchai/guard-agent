@@ -316,61 +316,6 @@ void BondBPMSpring::settings(int narg, char **arg)
   }
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void BondBPMSpring::write_restart(FILE *fp)
-{
-  BondBPM::write_restart(fp);
-  write_restart_settings(fp);
-
-  fwrite(&k[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&ecrit[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&gamma[1], sizeof(double), atom->nbondtypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void BondBPMSpring::read_restart(FILE *fp)
-{
-  BondBPM::read_restart(fp);
-  read_restart_settings(fp);
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &ecrit[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &gamma[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&k[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&ecrit[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&gamma[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void BondBPMSpring::write_restart_settings(FILE *fp)
-{
-  fwrite(&smooth_flag, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void BondBPMSpring::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) utils::sfread(FLERR, &smooth_flag, sizeof(int), 1, fp, nullptr, error);
-  MPI_Bcast(&smooth_flag, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double BondBPMSpring::single(int type, double rsq, int i, int j, double &fforce)

@@ -351,26 +351,6 @@ int FixTTMGrid::unpack_read_grid(int /*nlines*/, char *buffer)
 }
 
 /* ----------------------------------------------------------------------
-   pack state of Fix into one write, but not per-grid values
-------------------------------------------------------------------------- */
-
-void FixTTMGrid::write_restart(FILE *fp)
-{
-  double rlist[4];
-
-  rlist[0] = nxgrid;
-  rlist[1] = nygrid;
-  rlist[2] = nzgrid;
-  rlist[3] = seed;
-
-  if (comm->me == 0) {
-    int size = 4 * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(rlist,sizeof(double),4,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

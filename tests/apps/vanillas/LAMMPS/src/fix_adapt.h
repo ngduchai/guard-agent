@@ -39,7 +39,6 @@ class FixAdapt : public Fix {
   void setup_pre_force_respa(int, int) override;
   void pre_force_respa(int, int, int) override;
   void set_arrays(int) override;
-  void write_restart(FILE *) override;
   void restart(char *) override;
 
  private:

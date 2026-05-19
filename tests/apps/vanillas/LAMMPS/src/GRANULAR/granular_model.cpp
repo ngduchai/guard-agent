@@ -305,58 +305,6 @@ int GranularModel::mix_coeffs(GranularModel *g1, GranularModel *g2)
 
 /* ---------------------------------------------------------------------- */
 
-void GranularModel::write_restart(FILE *fp)
-{
-  int num_char, num_coeffs;
-
-  for (int i = 0; i < NSUBMODELS; i++) {
-    num_char = sub_models[i]->name.length();
-    num_coeffs = sub_models[i]->num_coeffs;
-    fwrite(&num_char, sizeof(int), 1, fp);
-    fwrite(sub_models[i]->name.data(), sizeof(char), num_char, fp);
-    fwrite(&num_coeffs, sizeof(int), 1, fp);
-    fwrite(sub_models[i]->coeffs, sizeof(double), num_coeffs, fp);
-  }
-
-  fwrite(&limit_damping, sizeof(int), 1, fp);
-}
-
-/* ---------------------------------------------------------------------- */
-
-void GranularModel::read_restart(FILE *fp)
-{
-  int num_char, num_coeff;
-
-  for (int i = 0; i < NSUBMODELS; i++) {
-    if (comm->me == 0)
-      utils::sfread(FLERR, &num_char, sizeof(int), 1, fp, nullptr, error);
-    MPI_Bcast(&num_char, 1, MPI_INT, 0, world);
-
-    std::string model_name (num_char, ' ');
-    if (comm->me == 0)
-      utils::sfread(FLERR, const_cast<char*>(model_name.data()), sizeof(char),num_char, fp, nullptr, error);
-    MPI_Bcast(const_cast<char*>(model_name.data()), num_char, MPI_CHAR, 0, world);
-    construct_sub_model(model_name, (SubModelType) i);
-
-    if (comm->me == 0)
-      utils::sfread(FLERR, &num_coeff, sizeof(int), 1, fp, nullptr, error);
-    MPI_Bcast(&num_coeff, 1, MPI_INT, 0, world);
-    if (num_coeff != sub_models[i]->num_coeffs)
-      error->all(FLERR, "Invalid granular model written to restart file");
-
-    if (comm->me == 0)
-      utils::sfread(FLERR, sub_models[i]->coeffs, sizeof(double), num_coeff, fp, nullptr, error);
-    MPI_Bcast(sub_models[i]->coeffs, num_coeff, MPI_DOUBLE, 0, world);
-    sub_models[i]->coeffs_to_local();
-  }
-
-  if (comm->me == 0)
-    utils::sfread(FLERR, &limit_damping, sizeof(int), 1, fp, nullptr, error);
-  MPI_Bcast(&limit_damping, 1, MPI_INT, 0, world);
-}
-
-/* ---------------------------------------------------------------------- */
-
 bool GranularModel::check_contact()
 {
   if (contact_type == WALL) {

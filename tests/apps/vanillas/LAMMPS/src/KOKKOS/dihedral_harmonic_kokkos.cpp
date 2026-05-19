@@ -372,31 +372,6 @@ void DihedralHarmonicKokkos<DeviceType>::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-template<class DeviceType>
-void DihedralHarmonicKokkos<DeviceType>::read_restart(FILE *fp)
-{
-  DihedralHarmonic::read_restart(fp);
-
-  int n = atom->ndihedraltypes;
-  for (int i = 1; i <= n; i++) {
-    k_k.h_view[i] = k[i];
-    k_cos_shift.h_view[i] = cos_shift[i];
-    k_sin_shift.h_view[i] = sin_shift[i];
-    k_sign.h_view[i] = sign[i];
-    k_multiplicity.h_view[i] = multiplicity[i];
-  }
-
-  k_k.template modify<LMPHostType>();
-  k_cos_shift.template modify<LMPHostType>();
-  k_sin_shift.template modify<LMPHostType>();
-  k_sign.template modify<LMPHostType>();
-  k_multiplicity.template modify<LMPHostType>();
-}
-
-/* ----------------------------------------------------------------------
    tally energy and virial into global and per-atom accumulators
    virial = r1F1 + r2F2 + r3F3 + r4F4 = (r1-r2) F1 + (r3-r2) F3 + (r4-r2) F4
           = (r1-r2) F1 + (r3-r2) F3 + (r4-r3 + r3-r2) F4

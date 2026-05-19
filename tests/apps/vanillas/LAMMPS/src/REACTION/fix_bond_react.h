@@ -218,7 +218,6 @@ class FixBondReact : public Fix {
   int insert_atoms(tagint **, int);
   void unlimit_bond(); // removes atoms from stabilization, and other post-reaction every-step operations
   void dedup_mega_gloves(int);    //dedup global mega_glove
-  void write_restart(FILE *) override;
   void restart(char *buf) override;
 
   // store restart data

@@ -273,24 +273,6 @@ void RegIntersect::length_restart_string(int &n)
   for (int ilist = 0; ilist < nregion; ilist++) reglist[ilist]->length_restart_string(n);
 }
 /* ----------------------------------------------------------------------
-   region writes its current position/angle
-   needed by fix/wall/gran/region to compute velocity by differencing scheme
-------------------------------------------------------------------------- */
-
-void RegIntersect::write_restart(FILE *fp)
-{
-  int sizeid = (strlen(id) + 1);
-  int sizestyle = (strlen(style) + 1);
-  fwrite(&sizeid, sizeof(int), 1, fp);
-  fwrite(id, 1, sizeid, fp);
-  fwrite(&sizestyle, sizeof(int), 1, fp);
-  fwrite(style, 1, sizestyle, fp);
-  fwrite(&nregion, sizeof(int), 1, fp);
-
-  for (int ilist = 0; ilist < nregion; ilist++) { reglist[ilist]->write_restart(fp); }
-}
-
-/* ----------------------------------------------------------------------
    region reads its previous position/angle
    needed by fix/wall/gran/region to compute velocity by differencing scheme
 ------------------------------------------------------------------------- */

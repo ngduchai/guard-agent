@@ -234,23 +234,6 @@ double FixTempRescale::compute_scalar()
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixTempRescale::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[1];
-  list[n++] = energy;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

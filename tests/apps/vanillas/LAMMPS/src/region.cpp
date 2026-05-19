@@ -532,23 +532,6 @@ void Region::length_restart_string(int &n)
 }
 
 /* ----------------------------------------------------------------------
-   region writes its current style, id, number of sub-regions, position/angle
-   needed by fix/wall/gran/region to compute velocity by differencing scheme
-------------------------------------------------------------------------- */
-
-void Region::write_restart(FILE *fp)
-{
-  int sizeid = (strlen(id) + 1);
-  int sizestyle = (strlen(style) + 1);
-  fwrite(&sizeid, sizeof(int), 1, fp);
-  fwrite(id, 1, sizeid, fp);
-  fwrite(&sizestyle, sizeof(int), 1, fp);
-  fwrite(style, 1, sizestyle, fp);
-  fwrite(&nregion, sizeof(int), 1, fp);
-  fwrite(prev, sizeof(double), size_restart, fp);
-}
-
-/* ----------------------------------------------------------------------
    region reads style, id, number of sub-regions from restart file
    if they match current region, also read previous position/angle
    needed by fix/wall/gran/region to compute velocity by differencing scheme

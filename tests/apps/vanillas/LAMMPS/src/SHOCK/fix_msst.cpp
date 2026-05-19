@@ -786,26 +786,6 @@ void FixMSST::remap(int flag)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixMSST::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[5];
-  list[n++] = omega[direction];
-  list[n++] = e0;
-  list[n++] = v0;
-  list[n++] = p0;
-  list[n++] = TS_int;
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(&list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

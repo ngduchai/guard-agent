@@ -738,22 +738,6 @@ void Pair::compute_dummy(int eflag, int vflag)
   ev_init(eflag,vflag);
 }
 
-/* ---------------------------------------------------------------------- */
-
-void Pair::read_restart(FILE *)
-{
-  if (comm->me == 0)
-    error->warning(FLERR,"Pair style restartinfo set but has no restart support");
-}
-
-/* ---------------------------------------------------------------------- */
-
-void Pair::write_restart(FILE *)
-{
-  if (comm->me == 0)
-    error->warning(FLERR,"Pair style restartinfo set but has no restart support");
-}
-
 /* -------------------------------------------------------------------
    register a callback to a compute, so it can compute and accumulate
    additional properties during the pair computation from within

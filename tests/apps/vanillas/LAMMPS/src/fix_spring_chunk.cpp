@@ -235,22 +235,6 @@ void FixSpringChunk::min_post_force(int vflag)
 }
 
 /* ----------------------------------------------------------------------
-   writ number of chunks and position of original COM into restart
-------------------------------------------------------------------------- */
-
-void FixSpringChunk::write_restart(FILE *fp)
-{
-  double n = nchunk;
-
-  if (comm->me == 0) {
-    int size = (3*n+1) * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(&n,sizeof(double),1,fp);
-    fwrite(&com0[0][0],3*sizeof(double),nchunk,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

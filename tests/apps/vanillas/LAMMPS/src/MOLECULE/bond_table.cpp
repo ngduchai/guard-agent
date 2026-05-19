@@ -215,49 +215,6 @@ double BondTable::equilibrium_distance(int i)
   return r0[i];
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void BondTable::write_restart(FILE *fp)
-{
-  write_restart_settings(fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void BondTable::read_restart(FILE *fp)
-{
-  read_restart_settings(fp);
-  allocate();
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void BondTable::write_restart_settings(FILE *fp)
-{
-  fwrite(&tabstyle, sizeof(int), 1, fp);
-  fwrite(&tablength, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void BondTable::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &tabstyle, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &tablength, sizeof(int), 1, fp, nullptr, error);
-  }
-  MPI_Bcast(&tabstyle, 1, MPI_INT, 0, world);
-  MPI_Bcast(&tablength, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double BondTable::single(int type, double rsq, int /*i*/, int /*j*/, double &fforce)

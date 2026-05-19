@@ -285,37 +285,6 @@ void DihedralHelix::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void DihedralHelix::write_restart(FILE *fp)
-{
-  fwrite(&aphi[1],sizeof(double),atom->ndihedraltypes,fp);
-  fwrite(&bphi[1],sizeof(double),atom->ndihedraltypes,fp);
-  fwrite(&cphi[1],sizeof(double),atom->ndihedraltypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void DihedralHelix::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&aphi[1],sizeof(double),atom->ndihedraltypes,fp,nullptr,error);
-    utils::sfread(FLERR,&bphi[1],sizeof(double),atom->ndihedraltypes,fp,nullptr,error);
-    utils::sfread(FLERR,&cphi[1],sizeof(double),atom->ndihedraltypes,fp,nullptr,error);
-  }
-  MPI_Bcast(&aphi[1],atom->ndihedraltypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&bphi[1],atom->ndihedraltypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&cphi[1],atom->ndihedraltypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

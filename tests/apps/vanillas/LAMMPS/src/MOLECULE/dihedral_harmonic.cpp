@@ -287,46 +287,6 @@ void DihedralHarmonic::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void DihedralHarmonic::write_restart(FILE *fp)
-{
-  fwrite(&k[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&sign[1], sizeof(int), atom->ndihedraltypes, fp);
-  fwrite(&multiplicity[1], sizeof(int), atom->ndihedraltypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void DihedralHarmonic::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &sign[1], sizeof(int), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &multiplicity[1], sizeof(int), atom->ndihedraltypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&k[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&sign[1], atom->ndihedraltypes, MPI_INT, 0, world);
-  MPI_Bcast(&multiplicity[1], atom->ndihedraltypes, MPI_INT, 0, world);
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++) {
-    setflag[i] = 1;
-    if (sign[i] == 1) {
-      cos_shift[i] = 1;
-      sin_shift[i] = 0;
-    } else {
-      cos_shift[i] = -1;
-      sin_shift[i] = 0;
-    }
-  }
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

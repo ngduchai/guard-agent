@@ -131,36 +131,6 @@ void PairCoulDebye::settings(int narg, char **arg)
   }
 }
 
-/* ----------------------------------------------------------------------
-  proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairCoulDebye::write_restart_settings(FILE *fp)
-{
-  fwrite(&cut_global,sizeof(double),1,fp);
-  fwrite(&kappa,sizeof(double),1,fp);
-  fwrite(&offset_flag,sizeof(int),1,fp);
-  fwrite(&mix_flag,sizeof(int),1,fp);
-}
-
-/* ----------------------------------------------------------------------
-  proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairCoulDebye::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&cut_global,sizeof(double),1,fp,nullptr,error);
-    utils::sfread(FLERR,&kappa,sizeof(double),1,fp,nullptr,error);
-    utils::sfread(FLERR,&offset_flag,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&mix_flag,sizeof(int),1,fp,nullptr,error);
-  }
-  MPI_Bcast(&cut_global,1,MPI_DOUBLE,0,world);
-  MPI_Bcast(&kappa,1,MPI_DOUBLE,0,world);
-  MPI_Bcast(&offset_flag,1,MPI_INT,0,world);
-  MPI_Bcast(&mix_flag,1,MPI_INT,0,world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double PairCoulDebye::single(int i, int j, int /*itype*/, int /*jtype*/,

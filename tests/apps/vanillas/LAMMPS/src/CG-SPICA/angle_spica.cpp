@@ -327,37 +327,6 @@ double AngleSPICA::equilibrium_angle(int i)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void AngleSPICA::write_restart(FILE *fp)
-{
-  fwrite(&k[1],sizeof(double),atom->nangletypes,fp);
-  fwrite(&theta0[1],sizeof(double),atom->nangletypes,fp);
-  fwrite(&repscale[1],sizeof(double),atom->nangletypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void AngleSPICA::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&k[1],sizeof(double),atom->nangletypes,fp,nullptr,error);
-    utils::sfread(FLERR,&theta0[1],sizeof(double),atom->nangletypes,fp,nullptr,error);
-    utils::sfread(FLERR,&repscale[1],sizeof(double),atom->nangletypes,fp,nullptr,error);
-  }
-  MPI_Bcast(&k[1],atom->nangletypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&theta0[1],atom->nangletypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&repscale[1],atom->nangletypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->nangletypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

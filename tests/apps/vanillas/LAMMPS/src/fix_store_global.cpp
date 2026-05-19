@@ -114,29 +114,6 @@ void FixStoreGlobal::reset_global(int n1_caller, int n2_caller)
 }
 
 /* ----------------------------------------------------------------------
-   write global vector/array to restart file
-------------------------------------------------------------------------- */
-
-void FixStoreGlobal::write_restart(FILE *fp)
-{
-  // fill rbuf with size and vector/array values
-
-  rbuf[0] = n1;
-  rbuf[1] = n2;
-  if (vecflag)
-    memcpy(&rbuf[2], vstore, n1 * sizeof(double));
-  else if (arrayflag)
-    memcpy(&rbuf[2], &astore[0][0], sizeof(double) * n1 * n2);
-
-  int n = n1 * n2 + 2;
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size, sizeof(int), 1, fp);
-    fwrite(rbuf, sizeof(double), n, fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use global array from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

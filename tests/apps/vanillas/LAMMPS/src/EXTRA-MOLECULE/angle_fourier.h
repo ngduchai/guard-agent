@@ -31,8 +31,6 @@ class AngleFourier : public Angle {
   void compute(int, int) override;
   void coeff(int, char **) override;
   double equilibrium_angle(int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
   double single(int, int, int, int) override;
   void born_matrix(int type, int i1, int i2, int i3, double &du, double &du2) override;

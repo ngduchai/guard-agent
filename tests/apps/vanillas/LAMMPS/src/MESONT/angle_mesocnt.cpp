@@ -315,43 +315,6 @@ double AngleMesoCNT::equilibrium_angle(int /*i*/)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void AngleMesoCNT::write_restart(FILE *fp)
-{
-  fwrite(&buckling[1], sizeof(int), atom->nangletypes, fp);
-  fwrite(&kh[1], sizeof(double), atom->nangletypes, fp);
-  fwrite(&kb[1], sizeof(double), atom->nangletypes, fp);
-  fwrite(&thetab[1], sizeof(double), atom->nangletypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void AngleMesoCNT::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &buckling[1], sizeof(int), atom->nangletypes, fp, nullptr, error);
-    utils::sfread(FLERR, &kh[1], sizeof(double), atom->nangletypes, fp, nullptr, error);
-    utils::sfread(FLERR, &kb[1], sizeof(double), atom->nangletypes, fp, nullptr, error);
-    utils::sfread(FLERR, &thetab[1], sizeof(double), atom->nangletypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&buckling[1], atom->nangletypes, MPI_INT, 0, world);
-  MPI_Bcast(&kh[1], atom->nangletypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&kb[1], atom->nangletypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&thetab[1], atom->nangletypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nangletypes; i++) {
-    theta0[i] = 180.0;
-    setflag[i] = 1;
-  }
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

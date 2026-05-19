@@ -35,7 +35,6 @@ class FixMesoMove : public Fix {
   void final_integrate() override;
 
   double memory_usage() override;
-  void write_restart(FILE *) override;
   void restart(char *) override;
   void grow_arrays(int) override;
   void copy_arrays(int, int, int) override;

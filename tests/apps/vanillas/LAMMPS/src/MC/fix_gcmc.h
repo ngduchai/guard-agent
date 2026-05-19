@@ -33,7 +33,6 @@ class FixGCMC : public Fix {
   void pre_exchange() override;
   double compute_vector(int) override;
   double memory_usage() override;
-  void write_restart(FILE *) override;
   void restart(char *) override;
   void *extract(const char *, int &) override;
 

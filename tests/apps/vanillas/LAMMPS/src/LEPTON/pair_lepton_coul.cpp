@@ -201,42 +201,6 @@ void PairLeptonCoul::init_style()
   neighbor->add_request(this);
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairLeptonCoul::write_restart_settings(FILE *fp)
-{
-  fwrite(&cut_global, sizeof(double), 1, fp);
-  fwrite(&ewaldflag, sizeof(int), 1, fp);
-  fwrite(&pppmflag, sizeof(int), 1, fp);
-  fwrite(&msmflag, sizeof(int), 1, fp);
-  fwrite(&dispersionflag, sizeof(int), 1, fp);
-  fwrite(&tip4pflag, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairLeptonCoul::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &cut_global, sizeof(double), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &ewaldflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &pppmflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &msmflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &dispersionflag, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &tip4pflag, sizeof(int), 1, fp, nullptr, error);
-  }
-  MPI_Bcast(&cut_global, 1, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&ewaldflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&pppmflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&msmflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&dispersionflag, 1, MPI_INT, 0, world);
-  MPI_Bcast(&tip4pflag, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double PairLeptonCoul::single(int i, int j, int itype, int jtype, double rsq, double factor_coul,

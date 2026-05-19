@@ -48,8 +48,6 @@ class PairHybrid : public Pair {
   double init_one(int, int) override;
   void setup() override;
   void finish() override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   double single(int, int, int, int, double, double, double, double &) override;
   void born_matrix(int, int, int, int, double, double, double, double &, double &) override;
 

@@ -817,27 +817,6 @@ void FixDeposit::options(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixDeposit::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[5];
-  list[n++] = random->state();
-  list[n++] = ninserted;
-  list[n++] = ubuf(nfirst).d;
-  list[n++] = ubuf(next_reneighbor).d;
-  list[n++] = ubuf(update->ntimestep).d;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

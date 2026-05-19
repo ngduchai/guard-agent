@@ -931,19 +931,6 @@ void FixDeform::end_of_step()
 }
 
 /* ----------------------------------------------------------------------
-   write Set data to restart file
-------------------------------------------------------------------------- */
-
-void FixDeform::write_restart(FILE *fp)
-{
-  if (comm->me == 0) {
-    int size = 6*sizeof(Set);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(set,sizeof(Set),6,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use selected state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

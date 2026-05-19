@@ -725,41 +725,6 @@ double FixAveCorrelateLong::memory_usage() {
    Write Restart data to restart file
 ------------------------------------------------------------------------- */
 // Save everything except t and f
-void FixAveCorrelateLong::write_restart(FILE *fp) {
-  if (comm->me == 0) {
-    int nsize = 3*npair*numcorrelators*p + 2*npair*numcorrelators
-                + numcorrelators*p + 2*numcorrelators + 6;
-    int n=0;
-    double *list;
-    memory->create(list,nsize,"correlator:list");
-    list[n++] = npair;
-    list[n++] = numcorrelators;
-    list[n++] = p;
-    list[n++] = m;
-    list[n++] = last_accumulated_step;
-    for (int i=0; i < npair; i++)
-      for (int j=0; j < numcorrelators; j++) {
-        for (unsigned int k=0; k < p; k++) {
-          list[n++]=shift[i][j][k];
-          list[n++]=shift2[i][j][k];
-          list[n++]=correlation[i][j][k];
-        }
-        list[n++]=accumulator[i][j];
-        list[n++]=accumulator2[i][j];
-      }
-    for (int i=0; i<numcorrelators; i++) {
-      for (unsigned int j=0; j < p; j++) list[n++]=ncorrelation[i][j];
-      list[n++]=naccumulator[i];
-      list[n++]=insertindex[i];
-    }
-
-    int size = n*sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-    memory->destroy(list);
-  }
-}
-
 /* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */

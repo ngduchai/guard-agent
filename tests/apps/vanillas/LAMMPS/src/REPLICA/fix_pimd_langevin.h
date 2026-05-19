@@ -178,7 +178,6 @@ class FixPIMDLangevin : public Fix {
   void compute_cvir();
   void compute_totenthalpy();
 
-  void write_restart(FILE *fp) override;
   int size_restart_global();
   int pack_restart_data(double *list);
   void restart(char *buf) override;

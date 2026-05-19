@@ -426,47 +426,6 @@ void DihedralCharmmfsw::init_style()
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void DihedralCharmmfsw::write_restart(FILE *fp)
-{
-  fwrite(&k[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&multiplicity[1], sizeof(int), atom->ndihedraltypes, fp);
-  fwrite(&shift[1], sizeof(int), atom->ndihedraltypes, fp);
-  fwrite(&weight[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&weightflag, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void DihedralCharmmfsw::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &multiplicity[1], sizeof(int), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &shift[1], sizeof(int), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &weight[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &weightflag, sizeof(int), 1, fp, nullptr, error);
-  }
-  MPI_Bcast(&k[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&multiplicity[1], atom->ndihedraltypes, MPI_INT, 0, world);
-  MPI_Bcast(&shift[1], atom->ndihedraltypes, MPI_INT, 0, world);
-  MPI_Bcast(&weight[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&weightflag, 1, MPI_INT, 0, world);
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++) {
-    setflag[i] = 1;
-    cos_shift[i] = cos(DEG2RAD * shift[i]);
-    sin_shift[i] = sin(DEG2RAD * shift[i]);
-  }
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

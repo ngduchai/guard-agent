@@ -42,8 +42,6 @@ class AngleHarmonicKokkos : public AngleHarmonic {
   ~AngleHarmonicKokkos() override;
   void compute(int, int) override;
   void coeff(int, char **) override;
-  void read_restart(FILE *) override;
-
   template<int NEWTON_BOND, int EVFLAG>
   KOKKOS_INLINE_FUNCTION
   void operator()(TagAngleHarmonicCompute<NEWTON_BOND,EVFLAG>, const int&, EV_FLOAT&) const;

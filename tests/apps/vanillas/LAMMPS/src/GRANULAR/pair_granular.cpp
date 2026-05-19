@@ -622,63 +622,6 @@ double PairGranular::init_one(int i, int j)
   return cutoff;
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairGranular::write_restart(FILE *fp)
-{
-  int i,j;
-  fwrite(&nmodels,sizeof(int),1,fp);
-  for (i = 0; i < nmodels; i++) models_list[i]->write_restart(fp);
-
-  for (i = 1; i <= atom->ntypes; i++) {
-    for (j = i; j <= atom->ntypes; j++) {
-      fwrite(&setflag[i][j],sizeof(int),1,fp);
-      if (setflag[i][j]) {
-        fwrite(&cutoff_type[i][j],sizeof(double),1,fp);
-        fwrite(&types_indices[i][j],sizeof(int),1,fp);
-      }
-    }
-  }
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairGranular::read_restart(FILE *fp)
-{
-  allocate();
-  int i,j;
-  int me = comm->me;
-
-  if (me == 0) utils::sfread(FLERR,&nmodels,sizeof(int),1,fp,nullptr,error);
-  MPI_Bcast(&nmodels,1,MPI_INT,0,world);
-
-  for (i = 0; i < nmodels; i++) {
-    delete models_list[i];
-    models_list[i] = new GranularModel(lmp);
-    models_list[i]->read_restart(fp);
-    models_list[i]->init();
-  }
-
-  for (i = 1; i <= atom->ntypes; i++) {
-    for (j = i; j <= atom->ntypes; j++) {
-      if (me == 0) utils::sfread(FLERR,&setflag[i][j],sizeof(int),1,fp,nullptr,error);
-      MPI_Bcast(&setflag[i][j],1,MPI_INT,0,world);
-      if (setflag[i][j]) {
-        if (me == 0) {
-          utils::sfread(FLERR,&cutoff_type[i][j],sizeof(double),1,fp,nullptr,error);
-          utils::sfread(FLERR,&types_indices[i][j],sizeof(int),1,fp,nullptr,error);
-        }
-        MPI_Bcast(&cutoff_type[i][j],1,MPI_DOUBLE,0,world);
-        MPI_Bcast(&types_indices[i][j],1,MPI_INT,0,world);
-      }
-    }
-  }
-}
-
 /* ---------------------------------------------------------------------- */
 
 void PairGranular::reset_dt()

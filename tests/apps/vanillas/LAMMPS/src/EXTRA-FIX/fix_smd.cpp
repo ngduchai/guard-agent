@@ -428,27 +428,6 @@ void FixSMD::smd_couple()
 
 /* ---------------------------------------------------------------------- */
 
-void FixSMD::write_restart(FILE *fp)
-{
-#define RESTART_ITEMS 5
-  double buf[RESTART_ITEMS], fsign;
-
-  if (comm->me == 0) {
-    // make sure we project the force into the direction of the pulling.
-    fsign  = (v_smd<0.0) ? -1.0 : 1.0;
-    buf[0] = r_old;
-    buf[1] = xn*fsign;
-    buf[2] = yn*fsign;
-    buf[3] = zn*fsign;
-    buf[4] = pmf;
-    int size = RESTART_ITEMS*sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(&buf[0],sizeof(double),RESTART_ITEMS,fp);
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
 void FixSMD::restart(char *buf)
 {
   auto list = (double *)buf;

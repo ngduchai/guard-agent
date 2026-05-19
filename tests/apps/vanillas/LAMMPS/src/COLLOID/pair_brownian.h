@@ -33,11 +33,6 @@ class PairBrownian : public Pair {
   void coeff(int, char **) override;
   double init_one(int, int) override;
   void init_style() override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
-
  protected:
   double cut_inner_global, cut_global;
   double t_target, mu;

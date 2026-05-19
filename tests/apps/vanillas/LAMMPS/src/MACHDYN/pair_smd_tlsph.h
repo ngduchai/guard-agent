@@ -46,8 +46,6 @@ class PairTlsph : public Pair {
   double init_one(int, int) override;
   void init_style() override;
   void init_list(int, class NeighList *) override;
-  void write_restart_settings(FILE *) override {}
-  void read_restart_settings(FILE *) override {}
   double memory_usage() override;
   void compute_shape_matrix();
   void material_model();

@@ -166,7 +166,6 @@ class Fix : protected Pointers {
   virtual void fused_integrate(int) {}
   virtual void end_of_step() {}
   virtual void post_run() {}
-  virtual void write_restart(FILE *) {}
   virtual void write_restart_file(const char *) {}
   virtual void restart(char *) {}
 

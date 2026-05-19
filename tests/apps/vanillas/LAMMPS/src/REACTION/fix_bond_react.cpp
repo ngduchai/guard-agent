@@ -4467,40 +4467,6 @@ void FixBondReact::unpack_reverse_comm(int n, int *list, double *buf)
 }
 
 /* ----------------------------------------------------------------------
-   write Set data to restart file
-------------------------------------------------------------------------- */
-
-void FixBondReact::write_restart(FILE *fp)
-{
-  int revision = 1;
-  set[0].nreacts = nreacts;
-  set[0].max_rate_limit_steps = max_rate_limit_steps;
-
-  for (int i = 0; i < nreacts; i++) {
-    set[i].reaction_count_total = reaction_count_total[i];
-
-    strncpy(set[i].rxn_name,rxn_name[i],MAXNAME-1);
-    set[i].rxn_name[MAXNAME-1] = '\0';
-  }
-
-  int rbufcount = max_rate_limit_steps*nreacts;
-  int *rbuf;
-  if (rbufcount) {
-    memory->create(rbuf,rbufcount,"bond/react:rbuf");
-    memcpy(rbuf,&store_rxn_count[0][0],sizeof(int)*rbufcount);
-  }
-
-  if (comm->me == 0) {
-    int size = nreacts*sizeof(Set)+(rbufcount+1)*sizeof(int);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(&revision,sizeof(int),1,fp);
-    fwrite(set,sizeof(Set),nreacts,fp);
-    if (rbufcount) fwrite(rbuf,sizeof(int),rbufcount,fp);
-  }
-  if (rbufcount) memory->destroy(rbuf);
-}
-
-/* ----------------------------------------------------------------------
    use selected state info from restart file to restart the Fix
    bond/react restart revisions numbers added after LAMMPS version 3 Nov 2022
 ------------------------------------------------------------------------- */

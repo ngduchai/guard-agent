@@ -31,8 +31,6 @@ class DihedralDeprecated : public Dihedral {
   void compute(int, int) override {}
   void settings(int, char **) override;
   void coeff(int, char **) override {}
-  void write_restart(FILE *) override {}
-  void read_restart(FILE *) override {}
 };
 
 }    // namespace LAMMPS_NS

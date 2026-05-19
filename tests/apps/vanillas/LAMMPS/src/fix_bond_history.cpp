@@ -258,24 +258,6 @@ double FixBondHistory::memory_usage()
 
 /* ---------------------------------------------------------------------- */
 
-void FixBondHistory::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[1];
-  list[n++] = stored_flag;
-
-  // Update stored values if needed
-  pre_exchange();
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size, sizeof(int), 1, fp);
-    fwrite(list, sizeof(double), n, fp);
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
 void FixBondHistory::restart(char *buf)
 {
   int n = 0;

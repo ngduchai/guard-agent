@@ -690,25 +690,6 @@ int FixATC::size_restart(int /* nlocal */) {
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-   ------------------------------------------------------------------------- */
-
-void FixATC::write_restart(FILE * /* fp */) {
-
-  char *args[2];
-  args[0] = utils::strdup("write_restart");
-  args[1] = utils::strdup("ATC.restart");
-
-  // Then call all objects I own to write their data
-  if (comm->me == 0) {
-    atc_->modify(2,args);
-  }
-
-  delete[] args[0];
-  delete[] args[1];
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
    ------------------------------------------------------------------------- */
 

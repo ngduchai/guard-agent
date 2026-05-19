@@ -32,7 +32,6 @@ class FixDeposit : public Fix {
   void init() override;
   void setup_pre_exchange() override;
   void pre_exchange() override;
-  void write_restart(FILE *) override;
   void restart(char *) override;
   void *extract(const char *, int &) override;
 

@@ -292,32 +292,6 @@ double FixTempCSLD::compute_scalar()
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixTempCSLD::write_restart(FILE *fp)
-{
-  const int PRNGSIZE = 98+2+3;
-  int nsize = PRNGSIZE*comm->nprocs+2; // pRNG state per proc + nprocs + energy
-  double *list = nullptr;
-  if (comm->me == 0) {
-    list = new double[nsize];
-    list[0] = energy;
-    list[1] = comm->nprocs;
-  }
-  double state[PRNGSIZE];
-  random->get_state(state);
-  MPI_Gather(state,PRNGSIZE,MPI_DOUBLE,list+2,PRNGSIZE,MPI_DOUBLE,0,world);
-
-  if (comm->me == 0) {
-    int size = nsize * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),nsize,fp);
-    delete[] list;
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

@@ -76,7 +76,6 @@ class Output : protected Pointers {
   void setup(int memflag = 1);    // initial output before run/min
   void write(bigint);             // output for current timestep
   void write_dump(bigint);        // force output of dump snapshots
-  void write_restart(bigint);     // force output of a restart file
   void reset_timestep(bigint);    // reset output which depends on timestep
   void reset_dt();                // reset output which depends on timestep size
 

@@ -42,8 +42,6 @@ class ImproperHarmonicKokkos : public ImproperHarmonic {
   ~ImproperHarmonicKokkos() override;
   void compute(int, int) override;
   void coeff(int, char **) override;
-  void read_restart(FILE *) override;
-
   template<int NEWTON_BOND, int EVFLAG>
   KOKKOS_INLINE_FUNCTION
   void operator()(TagImproperHarmonicCompute<NEWTON_BOND,EVFLAG>, const int&, EV_FLOAT&) const;

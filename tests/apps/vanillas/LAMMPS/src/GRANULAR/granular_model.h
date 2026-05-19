@@ -58,9 +58,6 @@ class GranularModel : protected Pointers {
   void construct_sub_model(std::string, SubModelType);
   int mix_coeffs(GranularModel*, GranularModel*);
 
-  void write_restart(FILE *);
-  void read_restart(FILE *);
-
   // Sub models
   GranSubModNormal *normal_model;
   GranSubModDamping *damping_model;

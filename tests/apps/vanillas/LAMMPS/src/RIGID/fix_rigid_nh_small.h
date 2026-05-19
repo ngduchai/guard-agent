@@ -29,7 +29,6 @@ class FixRigidNHSmall : public FixRigidSmall {
   void final_integrate() override;
   double compute_scalar() override;
   int modify_param(int, char **) override;
-  void write_restart(FILE *) override;
   void restart(char *buf) override;
   void reset_target(double) override;
 

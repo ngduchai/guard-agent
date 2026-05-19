@@ -133,36 +133,6 @@ void PairCoulSlaterCut::settings(int narg, char **arg)
   }
 }
 
-/* ----------------------------------------------------------------------
-  proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void PairCoulSlaterCut::write_restart_settings(FILE *fp)
-{
-  fwrite(&cut_global,sizeof(double),1,fp);
-  fwrite(&lamda,sizeof(double),1,fp);
-  fwrite(&offset_flag,sizeof(int),1,fp);
-  fwrite(&mix_flag,sizeof(int),1,fp);
-}
-
-/* ----------------------------------------------------------------------
-  proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void PairCoulSlaterCut::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&cut_global,sizeof(double),1,fp,nullptr,error);
-    utils::sfread(FLERR,&lamda,sizeof(double),1,fp,nullptr,error);
-    utils::sfread(FLERR,&offset_flag,sizeof(int),1,fp,nullptr,error);
-    utils::sfread(FLERR,&mix_flag,sizeof(int),1,fp,nullptr,error);
-  }
-  MPI_Bcast(&cut_global,1,MPI_DOUBLE,0,world);
-  MPI_Bcast(&lamda,1,MPI_DOUBLE,0,world);
-  MPI_Bcast(&offset_flag,1,MPI_INT,0,world);
-  MPI_Bcast(&mix_flag,1,MPI_INT,0,world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double PairCoulSlaterCut::single(int i, int j, int /*itype*/, int /*jtype*/,

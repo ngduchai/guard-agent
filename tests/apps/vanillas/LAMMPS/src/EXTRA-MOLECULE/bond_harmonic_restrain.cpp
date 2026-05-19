@@ -190,34 +190,6 @@ void BondHarmonicRestrain::init_style()
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void BondHarmonicRestrain::write_restart(FILE *fp)
-{
-  fwrite(&natoms, sizeof(bigint), 1, fp);
-  fwrite(&k[1], sizeof(double), atom->nbondtypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void BondHarmonicRestrain::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &natoms, sizeof(bigint), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &k[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&natoms, 1, MPI_LMP_BIGINT, 0, world);
-  MPI_Bcast(&k[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

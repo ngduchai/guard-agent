@@ -756,19 +756,6 @@ void FixAdapt::set_arrays(int i)
 }
 
 /* ----------------------------------------------------------------------
-   write scale factors for diameter and charge to restart file
-------------------------------------------------------------------------- */
-
-void FixAdapt::write_restart(FILE *fp)
-{
-  int size = 2*sizeof(double);
-
-  fwrite(&size,sizeof(int),1,fp);
-  fwrite(&previous_diam_scale,sizeof(double),1,fp);
-  fwrite(&previous_chg_scale,sizeof(double),1,fp);
-}
-
-/* ----------------------------------------------------------------------
    use scale factors from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

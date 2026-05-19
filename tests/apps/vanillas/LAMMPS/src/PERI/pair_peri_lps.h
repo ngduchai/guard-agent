@@ -31,10 +31,6 @@ class PairPeriLPS : public PairPeri {
   void compute(int, int) override;
   void coeff(int, char **) override;
   double init_one(int, int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override {}
-  void read_restart_settings(FILE *) override {}
 };
 
 }    // namespace LAMMPS_NS

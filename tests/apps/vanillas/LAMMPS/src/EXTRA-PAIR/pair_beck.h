@@ -32,10 +32,6 @@ class PairBeck : public Pair {
   void settings(int, char **) override;
   void coeff(int, char **) override;
   double init_one(int, int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
   double single(int, int, int, int, double, double, double, double &) override;
 
  protected:

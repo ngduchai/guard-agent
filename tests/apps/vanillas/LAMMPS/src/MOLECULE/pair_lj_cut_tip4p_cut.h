@@ -33,10 +33,6 @@ class PairLJCutTIP4PCut : public Pair {
   void coeff(int, char **) override;
   void init_style() override;
   double init_one(int, int) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
   void write_data_all(FILE *) override;
   void *extract(const char *, int &) override;

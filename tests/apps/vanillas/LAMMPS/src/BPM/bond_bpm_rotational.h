@@ -32,10 +32,6 @@ class BondBPMRotational : public BondBPM {
   void coeff(int, char **) override;
   void init_style() override;
   void settings(int, char **) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
   double single(int, double, int, int, double &) override;
 
  protected:

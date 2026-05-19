@@ -593,34 +593,6 @@ int Output::check_time_dumps(bigint ntimestep)
 }
 
 /* ----------------------------------------------------------------------
-   force restart file(s) to be written
-   called from PRD and TAD
-------------------------------------------------------------------------- */
-
-void Output::write_restart(bigint ntimestep)
-{
-  if (restart_flag_single) {
-    std::string file = restart1;
-    std::size_t found = file.find('*');
-    if (found != std::string::npos)
-      file.replace(found,1,fmt::format("{}",update->ntimestep));
-    restart->write(file);
-  }
-
-  if (restart_flag_double) {
-    if (restart_toggle == 0) {
-      restart->write(restart2a);
-      restart_toggle = 1;
-    } else {
-      restart->write(restart2b);
-      restart_toggle = 0;
-    }
-  }
-
-  last_restart = ntimestep;
-}
-
-/* ----------------------------------------------------------------------
    timestep is being changed, called by update->reset_timestep()
    for dumps, require that no dump is "active"
    meaning that a snapshot has already been output

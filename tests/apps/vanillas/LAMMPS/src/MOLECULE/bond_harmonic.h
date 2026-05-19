@@ -31,8 +31,6 @@ class BondHarmonic : public Bond {
   void compute(int, int) override;
   void coeff(int, char **) override;
   double equilibrium_distance(int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   void write_data(FILE *) override;
   double single(int, double, int, int, double &) override;
   void born_matrix(int, double, int, int, double &, double &) override;

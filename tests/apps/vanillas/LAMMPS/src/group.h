@@ -36,9 +36,6 @@ class Group : protected Pointers {
   void create(const std::string &, int *);    // add flagged atoms to a group
   int find(const std::string &);              // lookup name in list of groups
   int find_or_create(const char *);           // lookup name or create new group
-  void write_restart(FILE *);
-  void read_restart(FILE *);
-
   bigint count_all();             // count atoms in group all
   bigint count(int);              // count atoms in group
   bigint count(int, Region *);    // count atoms in group & region

@@ -36,8 +36,6 @@ class DihedralHybrid : public Dihedral {
   void settings(int, char **) override;
   void coeff(int, char **) override;
   void init_style() override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
   double memory_usage() override;
 
  private:

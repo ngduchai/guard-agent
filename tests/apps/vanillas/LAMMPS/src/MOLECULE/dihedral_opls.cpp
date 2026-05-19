@@ -291,40 +291,6 @@ void DihedralOPLS::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void DihedralOPLS::write_restart(FILE *fp)
-{
-  fwrite(&k1[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&k2[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&k3[1], sizeof(double), atom->ndihedraltypes, fp);
-  fwrite(&k4[1], sizeof(double), atom->ndihedraltypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void DihedralOPLS::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &k1[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &k2[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &k3[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-    utils::sfread(FLERR, &k4[1], sizeof(double), atom->ndihedraltypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&k1[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&k2[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&k3[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&k4[1], atom->ndihedraltypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

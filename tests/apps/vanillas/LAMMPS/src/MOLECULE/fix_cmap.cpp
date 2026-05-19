@@ -1141,19 +1141,6 @@ void FixCMAP::write_data_section(int /*mth*/, FILE *fp,
 // ----------------------------------------------------------------------
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixCMAP::write_restart(FILE *fp)
-{
-  if (comm->me == 0) {
-    int size = sizeof(bigint);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(&ncmap,sizeof(bigint),1,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

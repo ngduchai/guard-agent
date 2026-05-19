@@ -49,7 +49,6 @@ class FixPeriNeigh : public Fix {
   void copy_arrays(int, int, int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  void write_restart(FILE *) override;
   void restart(char *) override;
   int pack_restart(int, double *) override;
   void unpack_restart(int, int) override;

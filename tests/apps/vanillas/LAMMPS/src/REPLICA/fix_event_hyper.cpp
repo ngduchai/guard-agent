@@ -51,28 +51,6 @@ void FixEventHyper::store_event_hyper(bigint ntimestep, int delta_clock)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixEventHyper::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[6];
-  list[n++] = ubuf(event_number).d;
-  list[n++] = ubuf(event_timestep).d;
-  list[n++] = ubuf(clock).d;
-  list[n++] = ubuf(replica_number).d;
-  list[n++] = ubuf(correlated_event).d;
-  list[n++] = ubuf(ncoincident).d;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

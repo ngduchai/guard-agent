@@ -1404,27 +1404,6 @@ void FixPIMDLangevin::compute_totenthalpy()
     totenthalpy = tote + 1.5 * W * vw[0] * vw[0] * inverse_np + p_hydro * (volume - vol0);
 }
 
-/* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixPIMDLangevin::write_restart(FILE *fp)
-{
-  int nsize = size_restart_global();
-
-  double *list;
-  memory->create(list, nsize, "FixPIMDLangevin:list");
-
-  pack_restart_data(list);
-
-  if (comm->me == 0) {
-    int size = nsize * sizeof(double);
-    fwrite(&size, sizeof(int), 1, fp);
-    fwrite(list, sizeof(double), nsize, fp);
-  }
-
-  memory->destroy(list);
-}
 /* ---------------------------------------------------------------------- */
 
 int FixPIMDLangevin::size_restart_global()

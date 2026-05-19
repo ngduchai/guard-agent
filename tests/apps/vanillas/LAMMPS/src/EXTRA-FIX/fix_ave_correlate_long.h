@@ -33,7 +33,6 @@ class FixAveCorrelateLong : public Fix {
   void setup(int) override;
   void end_of_step() override;
 
-  void write_restart(FILE *) override;
   void restart(char *) override;
   double memory_usage() override;
 

@@ -39,11 +39,6 @@ class PairSpinDmi : public PairSpin {
   void compute_dmi(int, int, double *, double *, double *);
   void compute_dmi_mech(int, int, double, double *, double *, double *, double *);
 
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
-
   double cut_spin_dmi_global;    // short range pair cutoff
 
  protected:

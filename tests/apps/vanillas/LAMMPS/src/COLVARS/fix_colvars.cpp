@@ -934,21 +934,6 @@ void FixColvars::end_of_step()
 
 /* ---------------------------------------------------------------------- */
 
-void FixColvars::write_restart(FILE *fp)
-{
-  if (me == 0) {
-    std::string rest_text;
-    proxy->serialize_status(rest_text);
-    // TODO call write_output_files()
-    const char *cvm_state = rest_text.c_str();
-    int len = strlen(cvm_state) + 1; // need to include terminating null byte.
-    fwrite(&len,sizeof(int),1,fp);
-    fwrite(cvm_state,1,len,fp);
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
 void FixColvars::restart(char *buf)
 {
   one_time_init();

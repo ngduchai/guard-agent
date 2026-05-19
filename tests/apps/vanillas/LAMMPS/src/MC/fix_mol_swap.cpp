@@ -461,27 +461,6 @@ double FixMolSwap::compute_vector(int n)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixMolSwap::write_restart(FILE *fp)
-{
-  int n = 0;
-  double list[6];
-  list[n++] = random->state();
-  list[n++] = ubuf(next_reneighbor).d;
-  list[n++] = nswap_attempt;
-  list[n++] = nswap_accept;
-  list[n++] = ubuf(update->ntimestep).d;
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),n,fp);
-  }
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 

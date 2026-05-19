@@ -167,34 +167,6 @@ double BondSpecial::equilibrium_distance(int /*i*/)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void BondSpecial::write_restart(FILE *fp)
-{
-  fwrite(&factor_lj[1],sizeof(double),atom->nbondtypes,fp);
-  fwrite(&factor_coul[1],sizeof(double),atom->nbondtypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void BondSpecial::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&factor_lj[1],sizeof(double),atom->nbondtypes,fp,nullptr,error);
-    utils::sfread(FLERR,&factor_coul[1],sizeof(double),atom->nbondtypes,fp,nullptr,error);
-  }
-  MPI_Bcast(&factor_lj[1],atom->nbondtypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&factor_coul[1],atom->nbondtypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

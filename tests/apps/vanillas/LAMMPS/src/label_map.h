@@ -37,9 +37,6 @@ class LabelMap : protected Pointers {
   // input/output for atom class label map
 
   void write_data(FILE *);
-  void read_restart(FILE *fp);
-  void write_restart(FILE *);
-
  protected:
   int natomtypes, nbondtypes, nangletypes, ndihedraltypes, nimpropertypes;
   std::vector<std::string> typelabel, btypelabel, atypelabel;

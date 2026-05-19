@@ -1355,28 +1355,6 @@ void FixBocs::remap()
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixBocs::write_restart(FILE *fp)
-{
-  int nsize = size_restart_global();
-
-  double *list;
-  memory->create(list,nsize,"nh:list");
-
-  pack_restart_data(list);
-
-  if (comm->me == 0) {
-    int size = nsize * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(list,sizeof(double),nsize,fp);
-  }
-
-  memory->destroy(list);
-}
-
-/* ----------------------------------------------------------------------
     calculate the number of data to be packed
 ------------------------------------------------------------------------- */
 

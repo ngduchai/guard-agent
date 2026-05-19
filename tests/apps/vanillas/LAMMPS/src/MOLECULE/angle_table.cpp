@@ -278,49 +278,6 @@ double AngleTable::equilibrium_angle(int i)
   return theta0[i];
 }
 
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void AngleTable::write_restart(FILE *fp)
-{
-  write_restart_settings(fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void AngleTable::read_restart(FILE *fp)
-{
-  read_restart_settings(fp);
-  allocate();
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 writes to restart file
- ------------------------------------------------------------------------- */
-
-void AngleTable::write_restart_settings(FILE *fp)
-{
-  fwrite(&tabstyle, sizeof(int), 1, fp);
-  fwrite(&tablength, sizeof(int), 1, fp);
-}
-
-/* ----------------------------------------------------------------------
-    proc 0 reads from restart file, bcasts
- ------------------------------------------------------------------------- */
-
-void AngleTable::read_restart_settings(FILE *fp)
-{
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &tabstyle, sizeof(int), 1, fp, nullptr, error);
-    utils::sfread(FLERR, &tablength, sizeof(int), 1, fp, nullptr, error);
-  }
-  MPI_Bcast(&tabstyle, 1, MPI_INT, 0, world);
-  MPI_Bcast(&tablength, 1, MPI_INT, 0, world);
-}
-
 /* ---------------------------------------------------------------------- */
 
 double AngleTable::single(int type, int i1, int i2, int i3)

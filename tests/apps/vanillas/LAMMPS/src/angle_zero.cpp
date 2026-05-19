@@ -113,30 +113,6 @@ double AngleZero::equilibrium_angle(int i)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void AngleZero::write_restart(FILE *fp)
-{
-  fwrite(&theta0[1], sizeof(double), atom->nangletypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void AngleZero::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &theta0[1], sizeof(double), atom->nangletypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&theta0[1], atom->nangletypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nangletypes; i++) setflag[i] = 1;
-}
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

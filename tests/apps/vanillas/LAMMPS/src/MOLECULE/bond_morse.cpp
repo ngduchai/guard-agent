@@ -158,37 +158,6 @@ double BondMorse::equilibrium_distance(int i)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes to restart file
-------------------------------------------------------------------------- */
-
-void BondMorse::write_restart(FILE *fp)
-{
-  fwrite(&d0[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&alpha[1], sizeof(double), atom->nbondtypes, fp);
-  fwrite(&r0[1], sizeof(double), atom->nbondtypes, fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads from restart file, bcasts
-------------------------------------------------------------------------- */
-
-void BondMorse::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR, &d0[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &alpha[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-    utils::sfread(FLERR, &r0[1], sizeof(double), atom->nbondtypes, fp, nullptr, error);
-  }
-  MPI_Bcast(&d0[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&alpha[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-  MPI_Bcast(&r0[1], atom->nbondtypes, MPI_DOUBLE, 0, world);
-
-  for (int i = 1; i <= atom->nbondtypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

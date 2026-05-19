@@ -35,11 +35,6 @@ class PairLJLongDipoleLong : public Pair {
   void coeff(int, char **) override;
   void init_style() override;
   double init_one(int, int) override;
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
   void *extract(const char *, int &) override;
 
  protected:

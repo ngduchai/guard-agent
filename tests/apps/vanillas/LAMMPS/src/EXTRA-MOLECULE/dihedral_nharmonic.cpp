@@ -284,45 +284,6 @@ void DihedralNHarmonic::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-
-void DihedralNHarmonic::write_restart(FILE *fp)
-{
-  fwrite(&nterms[1],sizeof(int),atom->ndihedraltypes,fp);
-  for (int i = 1; i <= atom->ndihedraltypes; i++)
-    fwrite(a[i],sizeof(double),nterms[i],fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-void DihedralNHarmonic::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0)
-    utils::sfread(FLERR,&nterms[1],sizeof(int),atom->ndihedraltypes,fp,nullptr,error);
-
-  MPI_Bcast(&nterms[1],atom->ndihedraltypes,MPI_INT,0,world);
-
-  // allocate
-  for (int i = 1; i <= atom->ndihedraltypes; i++)
-    a[i] = new double [nterms[i]];
-
-  if (comm->me == 0) {
-    for (int i = 1; i <= atom->ndihedraltypes; i++)
-      utils::sfread(FLERR,a[i],sizeof(double),nterms[i],fp,nullptr,error);
-  }
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++ )
-     MPI_Bcast(a[i],nterms[i],MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->ndihedraltypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

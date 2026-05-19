@@ -274,32 +274,6 @@ void ImproperCossq::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 writes out coeffs to restart file
-------------------------------------------------------------------------- */
-void ImproperCossq::write_restart(FILE *fp)
-{
-   fwrite(&k[1],sizeof(double),atom->nimpropertypes,fp);
-   fwrite(&chi[1],sizeof(double),atom->nimpropertypes,fp);
-}
-
-/* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-void ImproperCossq::read_restart(FILE *fp)
-{
-  allocate();
-
-  if (comm->me == 0) {
-    utils::sfread(FLERR,&k[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-    utils::sfread(FLERR,&chi[1],sizeof(double),atom->nimpropertypes,fp,nullptr,error);
-  }
-  MPI_Bcast(&k[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-  MPI_Bcast(&chi[1],atom->nimpropertypes,MPI_DOUBLE,0,world);
-
-  for (int i = 1; i <= atom->nimpropertypes; i++) setflag[i] = 1;
-}
-
-/* ----------------------------------------------------------------------
    proc 0 writes to data file
 ------------------------------------------------------------------------- */
 

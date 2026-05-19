@@ -260,22 +260,6 @@ void AngleCosineKokkos<DeviceType>::coeff(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   proc 0 reads coeffs from restart file, bcasts them
-------------------------------------------------------------------------- */
-
-template<class DeviceType>
-void AngleCosineKokkos<DeviceType>::read_restart(FILE *fp)
-{
-  AngleCosine::read_restart(fp);
-
-  int n = atom->nangletypes;
-  for (int i = 1; i <= n; i++)
-    k_k.h_view[i] = k[i];
-
-  k_k.template modify<LMPHostType>();
-}
-
-/* ----------------------------------------------------------------------
    tally energy and virial into global and per-atom accumulators
    virial = r1F1 + r2F2 + r3F3 = (r1-r2) F1 + (r3-r2) F3 = del1*f1 + del2*f3
 ------------------------------------------------------------------------- */

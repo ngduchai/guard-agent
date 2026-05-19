@@ -40,11 +40,6 @@ class PairSpinNeel : public PairSpin {
   void compute_neel_mech(int, int, double, double *, double *, double *, double *);
   double compute_neel_energy(int, int, double, double *, double *, double *);
 
-  void write_restart(FILE *) override;
-  void read_restart(FILE *) override;
-  void write_restart_settings(FILE *) override;
-  void read_restart_settings(FILE *) override;
-
   double cut_spin_neel_global;    // global neel cutoff distance
 
  protected:

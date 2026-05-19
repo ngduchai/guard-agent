@@ -554,37 +554,6 @@ void FixTTM::grow_arrays(int ngrow)
 }
 
 /* ----------------------------------------------------------------------
-   pack entire state of Fix into one write
-------------------------------------------------------------------------- */
-
-void FixTTM::write_restart(FILE *fp)
-{
-  double *rlist;
-  memory->create(rlist,nxgrid*nygrid*nzgrid+4,"ttm:rlist");
-
-  int n = 0;
-  rlist[n++] = nxgrid;
-  rlist[n++] = nygrid;
-  rlist[n++] = nzgrid;
-  rlist[n++] = seed;
-
-  // store global grid values
-
-  for (int iz = 0; iz < nzgrid; iz++)
-    for (int iy = 0; iy < nygrid; iy++)
-      for (int ix = 0; ix < nxgrid; ix++)
-        rlist[n++] =  T_electron[iz][iy][ix];
-
-  if (comm->me == 0) {
-    int size = n * sizeof(double);
-    fwrite(&size,sizeof(int),1,fp);
-    fwrite(rlist,sizeof(double),n,fp);
-  }
-
-  memory->destroy(rlist);
-}
-
-/* ----------------------------------------------------------------------
    use state info from restart file to restart the Fix
 ------------------------------------------------------------------------- */
 
