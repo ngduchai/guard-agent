@@ -64,20 +64,12 @@ bool* Serializer::getNextBlock(std::size_t& sizeBlock, bool loadingMode)
 template<bool includeLogOutputDir>
 bool Serializer::load(std::string /*fileName*/, bool /*enforceUint*/)
 {
-  // Native checkpoint/restart disabled in the vanilla benchmark.  The
-  // upstream implementation read a `<fileName>.dat` checkpoint produced by
-  // Serializer::save and rebuilt the Serializable's state.  Stripping this
-  // path so the LLM cannot delegate restart to OpenLB's native API by
-  // calling `sLattice.load("checkpoint")`.  Returns false (no state loaded).
   return false;
 }
 
 template<bool includeLogOutputDir>
 bool Serializer::save(std::string /*fileName*/, bool /*enforceUint*/)
 {
-  // Native checkpoint disabled in the vanilla benchmark — see Serializer::load.
-  // Returns false (no file written).  The buffer-based save(uint8_t*) below is
-  // preserved because OpenLB uses it for in-process MPI state exchange.
   return false;
 }
 
@@ -129,14 +121,12 @@ const std::string Serializer::getFullFileName(const std::string& fileName)
 template<bool includeLogOutputDir>
 bool Serializable::save(std::string /*fileName*/, const bool /*enforceUint*/)
 {
-  // Native checkpoint disabled — see Serializer::save above.
   return false;
 }
 
 template<bool includeLogOutputDir>
 bool Serializable::load(std::string /*fileName*/, const bool /*enforceUint*/)
 {
-  // Native checkpoint disabled — see Serializer::load above.
   return false;
 }
 

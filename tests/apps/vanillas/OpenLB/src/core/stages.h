@@ -54,9 +54,6 @@ struct Collide { };
 /// Result evaluation (for custom tasks only needed for results export)
 struct Evaluation { };
 
-struct WriteCheckpoint { };
-struct ReadCheckpoint { };
-
 /// Seperate step only used for extracting expression tree
 struct CSE { };
 

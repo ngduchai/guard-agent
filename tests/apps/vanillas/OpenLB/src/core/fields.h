@@ -50,7 +50,7 @@ using array_of = descriptors::POINTER_FIELD_BASE<FIELD>;
 template <typename FIELD>
 using identity = FIELD;
 
-/// Copy of FIELD without inheritance (used for checkpointing)
+/// Copy of FIELD without inheritance
 template <typename FIELD>
 struct copy_of {
   template <typename T>

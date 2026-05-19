@@ -24,9 +24,7 @@
  */
 
 /* bstep2d.cpp:
- * The implementation of a backward facing step. It is furthermore
- * shown how to use checkpointing to save the state of the
- * simulation regularly.
+ * The implementation of a backward facing step.
  * The geometry of the step is based on the experiment described in
  * [Armaly, B.F., Durst, F., Pereira, J. C. F. and Schönung, B. Experimental
  * and theoretical investigation of backward-facing step flow. 1983.
