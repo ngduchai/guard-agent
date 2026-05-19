@@ -11,7 +11,6 @@ set(_input_files
    inputs.3d.sph.sedov
    inputs.regtest.sedov
    inputs.regtest.test2
-   inputs.restarttest.test2
    inputs-sod-y
    inputs-test2-x
    inputs-test2-z
