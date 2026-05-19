@@ -466,7 +466,20 @@ def configure_and_build(
 
 
 def _find_executable(build_dir: Path, executable_name: str) -> Path:
-    """Locate the built executable under *build_dir*, searching recursively."""
+    """Locate the built executable under *build_dir*.
+
+    Prefers canonical build locations (`_build/bin/`, `_build/`, `bin/`) over
+    a top-level or recursive match: wrapper scripts (e.g. HPCG's xhpcg_run)
+    can appear at multiple paths in a build tree but only function when their
+    sibling binary is alongside them in `_build/bin/`.
+    """
+    for canonical in (
+        build_dir / "_build" / "bin" / executable_name,
+        build_dir / "_build" / executable_name,
+        build_dir / "bin" / executable_name,
+    ):
+        if canonical.exists():
+            return canonical
     candidate = build_dir / executable_name
     if candidate.exists():
         return candidate
