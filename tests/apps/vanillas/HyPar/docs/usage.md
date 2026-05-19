@@ -72,7 +72,7 @@ end
 | `iproc` | int[ndims] | MPI processes in each dimension | **must specify** |
 | `ghost` | int | Number of ghost points | 1 |
 | `n_iter` | int | Number of time iterations | 0 |
-| `restart_iter` | int | Iteration to restart from | 0 |
+| `start_iter` | int | Initial iteration | 0 |
 | `time_scheme` | string | Time integration scheme | `euler` |
 | `time_scheme_type` | string | Time scheme type | `none` |
 | `hyp_space_scheme` | string | Spatial scheme for hyperbolic term | `1` |

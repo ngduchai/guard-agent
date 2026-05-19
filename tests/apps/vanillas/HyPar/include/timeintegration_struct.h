@@ -31,8 +31,8 @@ typedef struct time_integration_variables {
   int     iter;
   /*! Total number of iterations */
   int     n_iter;
-  /*! Restart iteration number (0 for a non-restart simulation) */
-  int     restart_iter;
+  /*! Initial iteration number. */
+  int     start_iter;
   /*! Current solution time */
   double  waqt;
   /*! Time step size */

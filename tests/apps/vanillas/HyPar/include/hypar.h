@@ -54,8 +54,8 @@ typedef struct main_parameters {
   /*! Number of time steps (input - \b solver.inp ) */
   int     n_iter;
 
-  /*! If restart run, time step iteration at which to restart. 0 -> not a restart run (input - \b solver.inp ) */
-  int     restart_iter;
+  /*! Initial time-step iteration. */
+  int     start_iter;
 
   /*! for multi-domain simulations, index of this solver object */
   int     my_idx;

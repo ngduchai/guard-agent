@@ -2,7 +2,7 @@
   This code converts a binary solution file to file
   solution.inp in the same format as a binary initial.inp.
   To use is as an initial solution (for example, in a
-  restart run), rename it to initial.inp and place it in
+  resumed run), rename it to initial.inp and place it in
   the run directory.
   If input mode is parallel, use ParallelInput.c
   thereafter.

@@ -46,10 +46,10 @@ int TimeInitialize( void  *s,     /*!< Array of simulation objects of type #Simu
   TS->nproc         = nproc;
 
   TS->n_iter        = sim[0].solver.n_iter;
-  TS->restart_iter  = sim[0].solver.restart_iter;
+  TS->start_iter  = sim[0].solver.start_iter;
   TS->dt            = sim[0].solver.dt;
 
-  TS->waqt          = (double) TS->restart_iter * TS->dt;
+  TS->waqt          = (double) TS->start_iter * TS->dt;
   TS->max_cfl       = 0.0;
   TS->norm          = 0.0;
   TS->TimeIntegrate = sim[0].solver.TimeIntegrate;

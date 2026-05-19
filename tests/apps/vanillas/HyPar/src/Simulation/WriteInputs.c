@@ -63,7 +63,7 @@ int WriteInputs ( void  *s,     /*!< Array of simulation objects of type #Simula
     }
     printf("  No. of ghosts pts                          : %d\n"     ,sim[0].solver.ghosts              );
     printf("  No. of iter.                               : %d\n"     ,sim[0].solver.n_iter              );
-    printf("  Restart iteration                          : %d\n"     ,sim[0].solver.restart_iter        );
+    printf("  Initial iteration                          : %d\n"     ,sim[0].solver.start_iter        );
 #ifdef with_petsc
     if (sim[0].solver.use_petscTS)
       printf("  Time integration scheme                    : PETSc \n"                            );

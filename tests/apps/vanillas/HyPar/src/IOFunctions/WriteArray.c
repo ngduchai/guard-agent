@@ -250,9 +250,8 @@ int WriteArrayParallel(
     MPIGetFilename(filename_root,&mpi->IOWorld,filename);
 
     if (!strcmp(solver->op_overwrite,"no")) {
-      if ((!count) && (!solver->restart_iter)) {
-        /* open a new file, since this function is being called the first time
-           and this is not a restart run*/
+      if ((!count) && (!solver->start_iter)) {
+        
         out = fopen(filename,"wb");
         if (!out) {
           fprintf(stderr,"Error in WriteArrayParallel(): File %s could not be opened for writing.\n",filename);

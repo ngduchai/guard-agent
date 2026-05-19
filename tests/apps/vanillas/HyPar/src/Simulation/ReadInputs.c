@@ -33,7 +33,7 @@
     iproc              | int[ndims]   | #MPIVariables::iproc          | must be specified (see notes below)
     ghost              | int          | #HyPar::ghosts                | 1
     n_iter             | int          | #HyPar::n_iter                | 0
-    restart_iter       | int          | #HyPar::restart_iter          | 0
+    start_iter       | int          | #HyPar::start_iter          | 0
     time_scheme        | char[]       | #HyPar::time_scheme           | euler
     time_scheme_type   | char[]       | #HyPar::time_scheme_type      | none
     hyp_space_scheme   | char[]       | #HyPar::spatial_scheme_hyp    | 1
@@ -119,7 +119,7 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
       sim[n].mpi.N_IORanks          = 1;
       sim[n].solver.dt              = 0.0;
       sim[n].solver.n_iter          = 0;
-      sim[n].solver.restart_iter    = 0;
+      sim[n].solver.start_iter    = 0;
       sim[n].solver.screen_op_iter  = 1;
       sim[n].solver.file_op_iter    = 1000;
       sim[n].solver.write_residual  = 0;
@@ -257,10 +257,6 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
           int n;
           for (n = 1; n < nsims; n++) sim[n].solver.n_iter = sim[0].solver.n_iter;
 
-        /* `restart_iter` parsing removed (native checkpoint stripped from
-         * vanilla); restart_iter remains at its default of 0 from
-         * the initialization above.  Any `restart_iter` line in
-         * solver.inp will fall through to the unknown-keyword warning. */
         } else if (!strcmp(word, "time_scheme")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.time_scheme);
@@ -331,10 +327,6 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
           int n;
           for (n = 1; n < nsims; n++) sim[n].solver.screen_op_iter = sim[0].solver.screen_op_iter;
 
-        /* `file_op_iter` and `op_file_format` parsing removed (native
-         * checkpoint stripped from vanilla).  Defaults from the
-         * initialization above are kept; any matching lines in solver.inp
-         * fall through to the unknown-keyword warning. */
         }  else if (!strcmp(word, "ip_file_type")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.ip_file_type);
@@ -364,8 +356,6 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
             if (strcmp(sim[n].solver.output_mode,"serial")) sim[n].mpi.N_IORanks = sim[0].mpi.N_IORanks;
           }
 
-        /* `op_overwrite` parsing removed (native checkpoint stripped
-         * from vanilla); default from the initialization above is kept. */
         } else if   (!strcmp(word, "plot_solution")) {
 
           ferr = fscanf(in,"%s",sim[0].solver.plot_solution);
@@ -437,7 +427,6 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
       }
       sim[n].solver.flag_ib = strcmp(sim[n].solver.ib_filename,"none");
 
-      /* Native restart check removed (restart_iter is hard-coded to 0). */
     }
   }
 
@@ -458,7 +447,7 @@ int ReadInputs( void  *s,     /*!< Array of simulation objects of type #Simulati
     MPIBroadcast_integer(&(sim[n].mpi.N_IORanks)        ,1                  ,0,&(sim[n].mpi.world));
     MPIBroadcast_integer(&(sim[n].solver.ghosts)        ,1                  ,0,&(sim[n].mpi.world));
     MPIBroadcast_integer(&(sim[n].solver.n_iter)        ,1                  ,0,&(sim[n].mpi.world));
-    MPIBroadcast_integer(&(sim[n].solver.restart_iter)  ,1                  ,0,&(sim[n].mpi.world));
+    MPIBroadcast_integer(&(sim[n].solver.start_iter)  ,1                  ,0,&(sim[n].mpi.world));
     MPIBroadcast_integer(&(sim[n].solver.screen_op_iter),1                  ,0,&(sim[n].mpi.world));
     MPIBroadcast_integer(&(sim[n].solver.file_op_iter)  ,1                  ,0,&(sim[n].mpi.world));
     MPIBroadcast_integer(&(sim[n].solver.flag_ib)       ,1                  ,0,&(sim[n].mpi.world));
