@@ -19,6 +19,7 @@
 #include "spparks.h"
 #include "input.h"
 #include "app.h"
+#include "app_lattice.h"
 #include <cstdio>
 
 using namespace SPPARKS_NS;
@@ -29,25 +30,30 @@ using namespace SPPARKS_NS;
  * Byte layout MUST be identical between vanilla and reference at the same
  * workload so Step 0.6c cross-consistency passes.
  *
- * SCHEMA REDESIGN (2026-05-18 v2, was v1 = commit aae27dc64): v1 captured
- * temperature-INVARIANT counts (nsites, world_size) and app->time which is
- * FIXED by the `run UNTIL time=18800` command in the validation input.  All
- * 6 v1 fields would be perturbation-invariant -> Step B calibration FAIL.
+ * SCHEMA REDESIGN (2026-05-19 v3, was v2 = commit 3fe21a916):
+ * v2 captured per-site spin sums via iarray[0].  In the Ising-model
+ * validation input at T=1.0 (below 2D Ising Tc ~1.13), the system orders
+ * into one of two symmetric phases; ±2% temperature perturbation around T=1.0
+ * doesn't change which phase dominates, so total spin sum is INVARIANT and
+ * Step B calibration reported diff=0.0.
  *
- * v2 captures per-site state aggregates via MPI_Reduce so the signature
- * reacts to temperature changes (KMC accept/reject rates depend on T,
- * producing different final lattice configurations):
- *   [0] global sum of iarray[0][i]    (integer state, e.g. Ising spins)
- *   [1] global sum of iarray[0][i]^2  (state variance amplitude)
- *   [2] global sum of darray[0][i]    (double state, if ndouble>0; else 0)
- *   [3] app->time                     (kept as final-time marker; fixed for
- *                                      `run until time=N` inputs but informative)
- *   [4] (double)global_nsites         (sanity check)
- *   [5] (double)world_size            (decomposition sanity)
+ * v3 captures KMC dynamics counters (naccept, nattempt) from AppLattice
+ * subclass.  These directly track accept/reject rates which depend on
+ * temperature via the Metropolis criterion exp(-ΔE/T) — small T perturbations
+ * produce measurable changes in accept counts.  Keeps a spatial moment
+ * sum(spin[i] * i) for sensitivity to spatial reorganization.  Schema:
+ *   [0] global naccept                                (KMC accept count, T-sensitive)
+ *   [1] global nattempt                               (KMC attempt count)
+ *   [2] global sum of iarray[0][i] * (i + 1)          (spatial moment; rearrangement-sensitive)
+ *   [3] global sum of iarray[0][i]                    (kept from v2 as baseline marker)
+ *   [4] app->time                                     (final-time marker)
+ *   [5] (double)world_size                            (decomposition sanity)
  *
- * Defensive: ninteger >= 1 expected (lattice apps have at least one int
- * per site); ndouble may be 0 (skipped if so).  Local sums over
- * iarray[0][0..nlocal-1] and darray[0][0..nlocal-1].  Global sums via
+ * AppLattice downcast: safe because all SPPARKS lattice-based apps (Ising,
+ * Potts, Diffusion) derive from AppLattice.  Falls back to v2 behavior
+ * (naccept=nattempt=0) if downcast fails (non-lattice apps).
+ *
+ * Local sums via loop over iarray[0][0..nlocal-1].  Global sums via
  * MPI_Reduce(MPI_SUM).  Rank-root-only file write.
  */
 static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
@@ -56,27 +62,28 @@ static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
   int nlocal = spk->app->nlocal;
+  // local_sums layout: [naccept, nattempt, spatial_moment, spin_sum, nlocal]
   double local_sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
-  // Per-site integer state sums (most lattice apps use iarray[0])
+  // Per-site integer state sums + spatial moment (rearrangement-sensitive)
   if (spk->app->ninteger >= 1 && spk->app->iarray != nullptr
       && spk->app->iarray[0] != nullptr) {
     int *iarr = spk->app->iarray[0];
     for (int i = 0; i < nlocal; i++) {
       double v = (double)iarr[i];
-      local_sums[0] += v;
-      local_sums[1] += v * v;
+      local_sums[2] += v * (double)(i + 1);   // spatial moment
+      local_sums[3] += v;                      // simple sum (kept from v2)
     }
   }
-  // Per-site double state sum (if app has continuous per-site values)
-  if (spk->app->ndouble >= 1 && spk->app->darray != nullptr
-      && spk->app->darray[0] != nullptr) {
-    double *darr = spk->app->darray[0];
-    for (int i = 0; i < nlocal; i++) {
-      local_sums[2] += darr[i];
-    }
+
+  // KMC counters via AppLattice downcast (T-sensitive via Metropolis criterion)
+  AppLattice *al = dynamic_cast<AppLattice*>(spk->app);
+  if (al != nullptr) {
+    local_sums[0] = (double)al->naccept;
+    local_sums[1] = (double)al->nattempt;
   }
-  local_sums[3] = (double)nlocal;  // for global nsites computation
+
+  local_sums[4] = (double)nlocal;
 
   double global_sums[5];
   MPI_Reduce(local_sums, global_sums, 5, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -84,12 +91,12 @@ static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
   if (rank != 0) return;
 
   double buf[6];
-  buf[0] = global_sums[0];
-  buf[1] = global_sums[1];
-  buf[2] = global_sums[2];
-  buf[3] = spk->app->time;
-  buf[4] = global_sums[3];  // = global nsites
-  buf[5] = (double)size;
+  buf[0] = global_sums[0];               // global naccept
+  buf[1] = global_sums[1];               // global nattempt
+  buf[2] = global_sums[2];               // global spatial moment
+  buf[3] = global_sums[3];               // global spin sum
+  buf[4] = spk->app->time;               // final time
+  buf[5] = (double)size;                 // world size
 
   FILE* f = std::fopen("validation_output.bin", "wb");
   if (f) {
