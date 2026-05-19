@@ -167,7 +167,7 @@ int Nyx::strang_split = 1;
 int Nyx::strang_grown_box = 1;
 #ifdef SDC
 int Nyx::sdc_split    = 0;
-int Nyx::strang_restart_from_sdc    = 0;
+int Nyx::strang_resume_from_sdc    = 0;
 #endif
 
 Real Nyx::average_gas_density = 0.;
@@ -241,7 +241,6 @@ AtomicRates* atomic_rates_glob;
 #endif
 #endif
 
-// this will be reset upon restart
 Real         Nyx::previousCPUTimeUsed = 0.0;
 
 Real         Nyx::startCPUTime = 0.0;
@@ -484,7 +483,7 @@ Nyx::read_hydro_params ()
 #ifdef HEATCOOL
 #ifdef SDC
     pp_nyx.query("sdc_split", sdc_split);
-    pp_nyx.query("strang_restart_from_sdc", strang_restart_from_sdc);
+    pp_nyx.query("strang_resume_from_sdc", strang_resume_from_sdc);
     if (sdc_split == 1 && strang_split == 1)
         amrex::Error("Cant have strang_split == 1 and sdc_split == 1");
     if (sdc_split == 0 && strang_split == 0)
@@ -686,46 +685,6 @@ Nyx::~Nyx ()
         delete flux_reg;
 #endif
     delete fine_mask;
-}
-
-void
-Nyx::restart (Amr&     papa,
-              istream& is,
-              bool     b_read_special)
-{
-    AmrLevel::restart(papa, is, b_read_special);
-
-    build_metrics();
-
-#ifndef NO_HYDRO
-    if (do_hydro == 1)
-    {
-        BL_ASSERT(flux_reg == 0);
-        if (level > 0 && do_reflux)
-            flux_reg = new FluxRegister(grids, dmap, crse_ratio, level, NUM_STATE);
-    }
-#endif
-
-    if (do_grav && level == 0)
-    {
-        BL_ASSERT(gravity == 0);
-        gravity = new Gravity(parent, parent->finestLevel(), &phys_bc, 0);
-    }
-
-#ifndef NO_HYDRO
-    if (do_forcing)
-    {
-        // forcing is a static object, only alloc if not already there
-        if (forcing == 0)
-           forcing = new StochasticForcing();
-
-        const Real* prob_lo = geom.ProbLo();
-        const Real* prob_hi = geom.ProbHi();
-
-        forcing->init(AMREX_SPACEDIM, prob_lo, prob_hi);
-    }
-#endif
-
 }
 
 void
@@ -1837,11 +1796,6 @@ Nyx::post_init (Real /*stop_time*/)
     BL_PROFILE("Nyx::post_init()");
     if (level > 0) {
         return;
-    }
-
-    // If we restarted from a plotfile, we need to reset the level_steps counter
-    if ( ! parent->theRestartPlotFile().empty()) {
-        parent->setLevelSteps(0,nsteps_from_plotfile);
     }
 
     //

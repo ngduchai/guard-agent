@@ -487,7 +487,6 @@ Nyx::get_comoving_a (Real time)
 {
     const Real eps         = 0.0001 * (new_a_time - old_a_time);
 
-    // Test on whether time == old_a_time == new_a_time -- for example after restart
     //   before a has been integrated for the new time step.
     if ( ( std::abs(time - old_a_time) <= 1.e-12*old_a_time ) &&
          ( std::abs(time - new_a_time) <= 1.e-12*new_a_time ) &&

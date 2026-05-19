@@ -98,10 +98,6 @@ public:
 
     //
     //
-    virtual void restart(amrex::Amr& papa, istream& is, bool b_read_special=false) override;
-
-    //
-    //
     // A string written as the first item in `write_plot_file()` at level zero.
     // It is so we can distinguish between different types of plot files. For
     // Nyx it has the form: Nyx-Vnnn.
@@ -162,11 +158,6 @@ public:
     //Initialize grid data at problem start-up.
     //
     virtual void initData() override;
-
-    //
-    //Initialize grid data from a plotfile at problem start-up.
-    //
-    void init_from_plotfile();
 
     //
     //Initialize grid data from a plotfile at problem start-up.
@@ -299,7 +290,6 @@ public:
     void forcing_check_point (const std::string& dir);
 
     //
-    // Restore spectrum at restart
     //
     void integrate_state_force(
             amrex::Box const& bx,
@@ -351,7 +341,6 @@ public:
     void particle_plot_file(const std::string& dir);
 
     //
-    // How to initialize at restart
     //
     //
     // Redistribute
@@ -641,7 +630,6 @@ int integrate_state_struct
     virtual void post_regrid(int lbase, int new_finest) override;
 
     //
-    // Do work after a `restart()`.
     //
     //
     // Do work after `init()`.
@@ -959,7 +947,7 @@ protected:
 #ifdef SDC
     // if true , use SDC to couple hydro and reactions
     static int sdc_split;
-    static int strang_restart_from_sdc;
+    static int strang_resume_from_sdc;
 #endif
 
     // There can be only one Gravity object, it covers all levels:
@@ -988,7 +976,6 @@ protected:
   static long int new_max_sundials_steps;
 
   // for keeping track of the amount of CPU time used -- this will persist
-  // after restarts
   static amrex::Real      previousCPUTimeUsed;
   static amrex::Real      startCPUTime;
 

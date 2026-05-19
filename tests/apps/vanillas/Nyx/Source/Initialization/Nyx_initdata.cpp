@@ -216,15 +216,8 @@ void
 Nyx::initData ()
 {
     BL_PROFILE("Nyx::initData()");
-    
-    // Here we initialize the grid data and the particles from a plotfile.
-    if (!parent->theRestartPlotFile().empty())
-    {
-        amrex::Abort("AmrData requires fortran");
-        return;
-    }
 
-#ifndef NO_HYDRO    
+#ifndef NO_HYDRO
     MultiFab&   S_new    = get_new_data(State_Type);
 
     // We need this because otherwise we might operate on uninitialized data.
@@ -414,61 +407,6 @@ Nyx::initData ()
 }
 
 #if 0
-void
-Nyx::init_from_plotfile ()
-{
-    BL_PROFILE("Nyx::init_from_plotfile()");
-    if (verbose && ParallelDescriptor::IOProcessor())
-    {
-        std::cout << " " << std::endl; 
-        std::cout << "Initializing the data from " << parent->theRestartPlotFile() << std::endl;
-    }
-
-    if (parent->maxLevel() > 0)
-        amrex::Abort("We can only restart from single-level plotfiles");
-
-    // Make sure to read in "a" before we call ReadPlotFile since we will use a 
-    //      when we construct e from T.
-
-    
-
-    // Now read in the time as well as the grid and particle data
-    bool first = true;
-    bool rhoe_infile;
-    ReadPlotFile(first,parent->theRestartPlotFile(),rhoe_infile);
-
-    // This is just a dummy value so that we can set the current time of the StateData
-    Real dummy_dt = 1.e100;
-    setTimeLevel(parent->cumTime(), dummy_dt, dummy_dt);
-
-#ifndef NO_HYDRO
-    for (int lev = 0; lev <= parent->finestLevel(); ++lev)
-    {
-        Nyx& nyx_lev = get_level(lev);
-        MultiFab& S_new = nyx_lev.get_new_data(State_Type);
-        MultiFab& D_new = nyx_lev.get_new_data(DiagEOS_Type);
-        int ns = S_new.nComp();
-        int nd = D_new.nComp();
-
-        // Construct internal energy given density, temperature and species
-        if (! rhoe_infile)
-           init_e_from_T(old_a);
-
-        // Define (rho E) given (rho e) and the momenta
-        nyx_lev.enforce_consistent_e(S_new);
-    }
-
-    if (verbose && ParallelDescriptor::IOProcessor())
-        std::cout << "Done initializing the grid data from " << parent->theRestartPlotFile() << std::endl;
-#endif
-
-    // Now read the particles from the plotfile
-    if (verbose && ParallelDescriptor::IOProcessor())
-    {
-        std::cout << "Done initializing the particles from the plotfile " << std::endl;
-        std::cout << " " << std::endl; 
-    }
-}
 #endif
 
 #ifndef NO_HYDRO

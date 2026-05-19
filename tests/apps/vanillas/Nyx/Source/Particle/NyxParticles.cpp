@@ -13,7 +13,6 @@ namespace
     std::string ascii_particle_file;
     std::string binary_particle_file;
     std::string    sph_particle_file;
-    std::string restart_particle_file;
 
 #ifdef AGN
     std::string agn_particle_file;
@@ -287,8 +286,6 @@ Nyx::read_particle_params ()
     pp.query("particle_inituniform_vx", particle_inituniform_vx);
     pp.query("particle_inituniform_vy", particle_inituniform_vy);
     pp.query("particle_inituniform_vz", particle_inituniform_vz);
-
-    pp.query("restart_particle_file", restart_particle_file);
 
     // Input error check
     if (do_dm_particles && !ascii_particle_file.empty() && particle_init_type != "AsciiFile")
@@ -579,10 +576,6 @@ Nyx::init_particles ()
           DMPC->InitFromBinaryMortonFile(binary_particle_file,
                                          AMREX_SPACEDIM + 1,
                                          particle_skip_factor);
-        }
-        else if (particle_init_type == "Restart")
-        {
-            DMPC->Restart(restart_particle_file, dm_chk_particle_file);
         }
         else
         {
