@@ -33,7 +33,6 @@ FixEvent::FixEvent(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg != 3) error->all(FLERR,"Illegal fix event command");
 
-  restart_global = 1;
 
   // perform initial allocation of atom-based array
   // register with Atom class

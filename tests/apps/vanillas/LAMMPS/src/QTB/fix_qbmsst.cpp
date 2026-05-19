@@ -68,7 +68,6 @@ FixQBMSST::FixQBMSST(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
   extscalar = 1;
   extvector = 0;
   nevery = 1;
-  restart_global = 1;
   time_integrate = 1;
   scalar_flag = 1;
   vector_flag = 1;

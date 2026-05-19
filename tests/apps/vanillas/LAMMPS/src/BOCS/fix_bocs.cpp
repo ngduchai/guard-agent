@@ -80,7 +80,6 @@ FixBocs::FixBocs(LAMMPS *lmp, int narg, char **arg) :
 
   if (narg < 4) error->all(FLERR,"Illegal fix bocs command");
 
-  restart_global = 1;
   dynamic_group_allow = 1;
   time_integrate = 1;
   scalar_flag = 1;

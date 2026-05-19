@@ -39,7 +39,6 @@ FixStoreState::FixStoreState(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg < 5) utils::missing_cmd_args(FLERR,"fix store/state", error);
 
-  restart_peratom = 1;
   peratom_freq = 1;
 
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);

@@ -58,7 +58,6 @@ FixFFL::FixFFL(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
                " <group-ID> ffl <tau> <Tstart> <Tstop> <seed>  ");
 
   ecouple_flag = 1;
-  restart_peratom = 1;
   time_integrate = 1;
   scalar_flag = 1;
 

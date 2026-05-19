@@ -51,7 +51,6 @@ FixTTMGrid::FixTTMGrid(LAMMPS *lmp, int narg, char **arg) :
 {
   pergrid_flag = 1;
   pergrid_freq = 1;
-  restart_file = 1;
 
   if (outfile) error->all(FLERR,"Fix ttm/grid does not support outfile option - "
                           "use dump grid command or restart files instead");

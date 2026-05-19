@@ -47,8 +47,6 @@ FixAmoebaPiTorsion::FixAmoebaPiTorsion(LAMMPS *lmp, int narg, char **arg) :
 
   // settings for this fix
 
-  restart_global = 1;
-  restart_peratom = 1;
   energy_global_flag = energy_peratom_flag = 1;
   virial_global_flag = virial_peratom_flag = 1;
   thermo_energy = thermo_virial = 1;

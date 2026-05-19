@@ -74,7 +74,6 @@ FixPIMDLangevin::FixPIMDLangevin(LAMMPS *lmp, int narg, char **arg) :
     _omega_k(nullptr), Lan_s(nullptr), Lan_c(nullptr), random(nullptr), xc(nullptr), xcall(nullptr),
     x_unwrap(nullptr), id_pe(nullptr), id_press(nullptr), c_pe(nullptr), c_press(nullptr)
 {
-  restart_global = 1;
   time_integrate = 1;
 
   ntotal = 0;

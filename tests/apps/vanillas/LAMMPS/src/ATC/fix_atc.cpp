@@ -477,7 +477,6 @@ FixATC::FixATC(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
   lmp->atom->add_callback(Atom::GROW);
 
   // we write our own restart file
-  restart_global = 0;
 
   // Set output computation data based on transfer info
   scalar_flag = atc_->scalar_flag();

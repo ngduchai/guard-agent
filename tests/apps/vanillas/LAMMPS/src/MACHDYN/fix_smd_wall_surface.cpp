@@ -40,8 +40,6 @@ using namespace std;
 FixSMDWallSurface::FixSMDWallSurface(LAMMPS *lmp, int narg, char **arg) :
                 Fix(lmp, narg, arg) {
 
-        restart_global = 0;
-        restart_peratom = 0;
         first = 1;
 
         //atom->add_callback(Atom::GROW);

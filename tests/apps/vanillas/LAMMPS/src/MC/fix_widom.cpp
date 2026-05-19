@@ -70,7 +70,6 @@ FixWidom::FixWidom(LAMMPS *lmp, int narg, char **arg) :
   size_vector = 3;
   global_freq = 1;
   extvector = 0;
-  restart_global = 1;
   time_depend = 1;
 
   // required args

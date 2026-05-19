@@ -529,7 +529,6 @@ FixRigid::FixRigid(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix rigid command");
       delete[] inpfile;
       inpfile = utils::strdup(arg[iarg+1]);
-      restart_file = 1;
       reinitflag = 0;
       iarg += 2;
 

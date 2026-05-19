@@ -284,7 +284,6 @@ FixColvars::FixColvars(LAMMPS *lmp, int narg, char **arg) :
   global_freq = 1;
   nevery = 1;
   extscalar = 1;
-  restart_global = 1;
   energy_global_flag = 1;
 
   me = comm->me;

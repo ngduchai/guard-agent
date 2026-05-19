@@ -55,8 +55,6 @@ FixMesoMove::FixMesoMove (LAMMPS *lmp, int narg, char **arg) :
 
   if (narg < 4) error->all(FLERR,"Illegal fix meso/move command");
 
-  restart_global = 1;
-  restart_peratom = 1;
   peratom_flag = 1;
   size_peratom_cols = 3;
   peratom_freq = 1;

@@ -46,8 +46,6 @@ FixSRP::FixSRP(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
   comm_border = 2;
 
   // restart settings
-  restart_global = 1;
-  restart_peratom = 1;
   restart_pbc = 1;
 
   // per-atom array width 2

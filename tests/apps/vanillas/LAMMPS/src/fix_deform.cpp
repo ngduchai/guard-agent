@@ -50,7 +50,6 @@ irregular(nullptr), set(nullptr)
   if (narg < 4) error->all(FLERR,"Illegal fix deform command");
 
   no_change_box = 1;
-  restart_global = 1;
   pre_exchange_migrate = 1;
 
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);

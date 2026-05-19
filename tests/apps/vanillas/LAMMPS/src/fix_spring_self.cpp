@@ -39,7 +39,6 @@ FixSpringSelf::FixSpringSelf(LAMMPS *lmp, int narg, char **arg) :
   if ((narg < 4) || (narg > 5))
     error->all(FLERR,"Illegal fix spring/self command");
 
-  restart_peratom = 1;
   scalar_flag = 1;
   global_freq = 1;
   extscalar = 1;

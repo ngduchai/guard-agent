@@ -52,7 +52,6 @@ FixSMD::FixSMD(LAMMPS *lmp, int narg, char **arg) :
   xn = yn = zn = 1.0;
   pmf = r_old = r_now = r0 = 0.0;
 
-  restart_global = 1;
   vector_flag = 1;
   size_vector = 7;
   global_freq = 1;

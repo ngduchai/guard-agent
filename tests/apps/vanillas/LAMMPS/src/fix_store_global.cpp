@@ -34,7 +34,6 @@ FixStoreGlobal::FixStoreGlobal(LAMMPS *lmp, int narg, char **arg) :
 
   vecflag = arrayflag = 0;
 
-  restart_global = 1;
   n1 = utils::inumeric(FLERR, arg[3], false, lmp);
   n2 = utils::inumeric(FLERR, arg[4], false, lmp);
   if (n1 <= 0 || n2 <= 0)

@@ -58,7 +58,6 @@ FixWallBodyPolyhedron::FixWallBodyPolyhedron(LAMMPS *lmp, int narg, char **arg) 
     error->all(FLERR,"Fix wall/body/polyhedron requires "
                "atom style body/rounded/polyhedron");
 
-  restart_peratom = 1;
   create_attribute = 1;
   wallstyle = -1;
 

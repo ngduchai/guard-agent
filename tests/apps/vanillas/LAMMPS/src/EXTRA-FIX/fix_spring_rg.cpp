@@ -44,9 +44,7 @@ FixSpringRG::FixSpringRG(LAMMPS *lmp, int narg, char **arg) :
   if (strcmp(arg[4],"NULL") == 0) rg0_flag = 1;
   else rg0 = utils::numeric(FLERR,arg[4],false,lmp);
 
-  restart_global = 1;
   scalar_flag = 1;
-  restart_global = 1;
   dynamic_group_allow = 1;
   respa_level_support = 1;
   ilevel_respa = 0;

@@ -61,7 +61,6 @@ FixTGNHDrude::FixTGNHDrude(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg < 4) error->all(FLERR,"Illegal fix nvt/npt/nph command");
 
-  restart_global = 1;
   dynamic_group_allow = 0;
   time_integrate = 1;
   scalar_flag = 1;

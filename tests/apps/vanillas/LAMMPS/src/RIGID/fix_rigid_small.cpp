@@ -220,7 +220,6 @@ FixRigidSmall::FixRigidSmall(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+2 > narg) error->all(FLERR,"Illegal fix rigid/small command");
       delete[] inpfile;
       inpfile = utils::strdup(arg[iarg+1]);
-      restart_file = 1;
       reinitflag = 0;
       iarg += 2;
 
@@ -235,7 +234,6 @@ FixRigidSmall::FixRigidSmall(LAMMPS *lmp, int narg, char **arg) :
       if (imol == -1) error->all(FLERR,"Molecule template ID for fix rigid/small does not exist");
       onemols = &atom->molecules[imol];
       nmol = onemols[0]->nset;
-      restart_file = 1;
       iarg += 2;
 
     } else if (strcmp(arg[iarg],"temp") == 0) {

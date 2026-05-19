@@ -42,7 +42,6 @@ FixWallGranRegion::FixWallGranRegion(LAMMPS *lmp, int narg, char **arg) :
     FixWallGran(lmp, narg, arg), region(nullptr), ncontact(nullptr), walls(nullptr),
     history_many(nullptr), c2r(nullptr)
 {
-  restart_global = 1;
   motion_resetflag = 0;
 
   region = domain->get_region_by_id(idregion);

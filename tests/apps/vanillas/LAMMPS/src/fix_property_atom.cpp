@@ -32,7 +32,6 @@ FixPropertyAtom::FixPropertyAtom(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg < 4) error->all(FLERR, "Illegal fix property/atom command");
 
-  restart_peratom = 1;
   wd_section = 1;    // can be overwitten using optional arguments
 
   int iarg = 3;

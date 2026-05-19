@@ -33,7 +33,6 @@ FixRigidNPHSmall::FixRigidNPHSmall(LAMMPS *lmp, int narg, char **arg) :
   // other setting are made by parent
 
   scalar_flag = 1;
-  restart_global = 1;
   extscalar = 1;
 
   // error checks

@@ -53,7 +53,6 @@ Fix::Fix(LAMMPS *lmp, int /*narg*/, char **arg) :
 
   style = utils::strdup(arg[2]);
 
-  restart_global = restart_peratom = restart_file = 0;
   force_reneighbor = 0;
   box_change = NO_BOX_CHANGE;
   thermo_energy = 0;
@@ -87,7 +86,6 @@ Fix::Fix(LAMMPS *lmp, int /*narg*/, char **arg) :
   size_vector_variable = size_array_rows_variable = 0;
 
   comm_forward = comm_reverse = comm_border = 0;
-  restart_reset = 0;
 
   // reasonable defaults
   // however, each fix that uses these values should explicitly set them

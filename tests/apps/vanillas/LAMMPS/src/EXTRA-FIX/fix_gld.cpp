@@ -50,7 +50,6 @@ FixGLD::FixGLD(LAMMPS *lmp, int narg, char **arg) :
   if (narg < narg_min) error->all(FLERR,"Illegal fix gld command");
 
   time_integrate = 1;
-  restart_peratom = 1;
 
   // Parse the first set of required input arguments
   // 0 = Fix ID           (e.g., 1)

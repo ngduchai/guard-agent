@@ -60,7 +60,6 @@ FixWallBodyPolygon::FixWallBodyPolygon(LAMMPS *lmp, int narg, char **arg) :
     error->all(FLERR,"Fix wall/body/polygon requires "
                "atom style body/rounded/polygon");
 
-  restart_peratom = 1;
   create_attribute = 1;
   wallstyle = -1;
 

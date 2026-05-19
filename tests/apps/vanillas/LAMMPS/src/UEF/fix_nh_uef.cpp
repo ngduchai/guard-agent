@@ -724,7 +724,7 @@ void FixNHUef::restart(char *buf)
  * ---------------------------------------------------------------------- */
 void FixNHUef::end_of_step()
 {
-  if (update->ntimestep==output->next_restart)
+  if (false)
   {
     pre_exchange();
     domain->x2lamda(atom->nlocal);

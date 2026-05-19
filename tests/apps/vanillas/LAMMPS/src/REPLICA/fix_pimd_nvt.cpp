@@ -121,7 +121,6 @@ FixPIMDNVT::FixPIMDNVT(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
   nhc_size_one_1 = sizeof(double) * nhc_offset_one_1;
   nhc_size_one_2 = sizeof(double) * nhc_offset_one_2;
 
-  restart_peratom = 1;
   peratom_flag = 1;
   peratom_freq = 1;
 

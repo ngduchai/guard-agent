@@ -37,8 +37,6 @@ FixNeighHistory::FixNeighHistory(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg != 4) error->all(FLERR, "Illegal fix NEIGH_HISTORY command");
 
-  restart_peratom = 1;
-  restart_global = 1;
 
   create_attribute = 1;
   maxexchange_dynamic = 1;

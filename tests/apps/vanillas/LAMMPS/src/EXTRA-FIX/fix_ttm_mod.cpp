@@ -88,8 +88,6 @@ FixTTMMod::FixTTMMod(LAMMPS *lmp, int narg, char **arg) :
   global_freq = 1;
   extvector = 1;
   nevery = 1;
-  restart_peratom = 1;
-  restart_global = 1;
 
   seed = utils::inumeric(FLERR,arg[3],false,lmp);
 

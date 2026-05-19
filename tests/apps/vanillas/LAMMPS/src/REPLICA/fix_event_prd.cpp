@@ -31,7 +31,6 @@ FixEventPRD::FixEventPRD(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg != 3) error->all(FLERR,"Illegal fix event command");
 
-  restart_global = 1;
 
   event_number = 0;
   event_timestep = update->ntimestep;

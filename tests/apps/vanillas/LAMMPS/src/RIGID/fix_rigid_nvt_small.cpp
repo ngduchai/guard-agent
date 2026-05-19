@@ -32,7 +32,6 @@ FixRigidNVTSmall::FixRigidNVTSmall(LAMMPS *lmp, int narg, char **arg) :
   // other settings are made by parent
 
   scalar_flag = 1;
-  restart_global = 1;
   extscalar = 1;
 
   // error checking

@@ -36,7 +36,6 @@ FixUpdateSpecialBonds::FixUpdateSpecialBonds(LAMMPS *lmp, int narg, char **arg) 
 {
   if (narg != 3) error->all(FLERR, "Illegal fix update/special/bonds command");
 
-  restart_global = 1;
 }
 
 /* ---------------------------------------------------------------------- */

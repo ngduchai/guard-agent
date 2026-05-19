@@ -73,7 +73,6 @@ FixAveCorrelateLong::FixAveCorrelateLong(LAMMPS *lmp, int narg, char **arg) :
   nevery = utils::inumeric(FLERR, arg[3], false, lmp);
   nfreq = utils::inumeric(FLERR, arg[4], false, lmp);
 
-  restart_global = 1;
   global_freq = nfreq;
   time_depend = 1;
 

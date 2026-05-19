@@ -77,7 +77,6 @@ FixNPTCauchy::FixNPTCauchy(LAMMPS *lmp, int narg, char **arg) :
   alpha=0.001;
   initRUN = 0;
   restartPK = 0;
-  restart_global = 1;
 
   // default values
 

@@ -27,9 +27,6 @@ class Fix : protected Pointers {
   char *id, *style;
   int igroup, groupbit;
 
-  int restart_global;      // 1 if Fix saves global state, 0 if not
-  int restart_peratom;     // 1 if Fix saves peratom state, 0 if not
-  int restart_file;        // 1 if Fix writes own restart file, 0 if not
   int force_reneighbor;    // 1 if Fix forces reneighboring, 0 if not
 
   int box_change;    // >0 if Fix changes box size, shape, or sub-domains, 0 if not
@@ -166,8 +163,6 @@ class Fix : protected Pointers {
   virtual void fused_integrate(int) {}
   virtual void end_of_step() {}
   virtual void post_run() {}
-  virtual void write_restart_file(const char *) {}
-  virtual void restart(char *) {}
 
   virtual void grow_arrays(int) {}
   virtual void copy_arrays(int, int, int) {}

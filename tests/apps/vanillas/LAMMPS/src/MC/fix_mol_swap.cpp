@@ -51,7 +51,6 @@ FixMolSwap::FixMolSwap(LAMMPS *lmp, int narg, char **arg) :
   size_vector = 2;
   global_freq = 1;
   extvector = 0;
-  restart_global = 1;
   time_depend = 1;
 
   // parse args

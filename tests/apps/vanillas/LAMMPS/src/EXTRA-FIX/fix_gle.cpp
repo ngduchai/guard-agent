@@ -198,7 +198,6 @@ FixGLE::FixGLE(LAMMPS *lmp, int narg, char **arg) :
                " <group-ID> gle <ns> <Tstart> <Tstop> <seed> <Amatrix>");
 
   ecouple_flag = 1;
-  restart_peratom = 1;
   time_integrate = 1;
 
   // number of additional momenta

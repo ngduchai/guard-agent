@@ -45,7 +45,6 @@ FixTempRescale::FixTempRescale(LAMMPS *lmp, int narg, char **arg) :
   nevery = utils::inumeric(FLERR,arg[3],false,lmp);
   if (nevery <= 0) error->all(FLERR, "Invalid fix temp/rescale every argument: {}", nevery);
 
-  restart_global = 1;
   scalar_flag = 1;
   global_freq = nevery;
   extscalar = 1;

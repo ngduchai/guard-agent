@@ -123,7 +123,6 @@ FixBondReact::FixBondReact(LAMMPS *lmp, int narg, char **arg) :
 
   newton_bond = force->newton_bond;
 
-  restart_global = 1;
   attempted_rxn = 0;
   force_reneighbor = 1;
   next_reneighbor = -1;

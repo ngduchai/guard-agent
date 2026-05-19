@@ -44,7 +44,6 @@ FixBondHistory::FixBondHistory(LAMMPS *lmp, int narg, char **arg) :
   if (nbond == 0) error->all(FLERR, "Cannot store bond variables without any bonds");
 
   stored_flag = false;
-  restart_global = 1;
   create_attribute = 1;
 
   // Flag whether bond arrays are updated such that data may need to be

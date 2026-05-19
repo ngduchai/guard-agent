@@ -49,8 +49,6 @@ FixPeriNeigh::FixPeriNeigh(LAMMPS *lmp,int narg, char **arg) :
   if (force->pair_match("peri/ves",1)) isVES = 1;
   if (force->pair_match("peri/eps",1)) isEPS = 1;
 
-  restart_global = 1;
-  restart_peratom = 1;
   first = 1;
 
   // perform initial allocation of atom-based arrays

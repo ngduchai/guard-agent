@@ -62,7 +62,6 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg < 4) utils::missing_cmd_args(FLERR, std::string("fix ") + style, error);
 
-  restart_global = 1;
   dynamic_group_allow = 1;
   time_integrate = 1;
   scalar_flag = 1;

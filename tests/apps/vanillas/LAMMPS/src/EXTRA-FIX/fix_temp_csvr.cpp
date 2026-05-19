@@ -51,7 +51,6 @@ FixTempCSVR::FixTempCSVR(LAMMPS *lmp, int narg, char **arg) :
 
   // CSVR thermostat should be applied every step
 
-  restart_global = 1;
   nevery = 1;
   scalar_flag = 1;
   ecouple_flag = 1;

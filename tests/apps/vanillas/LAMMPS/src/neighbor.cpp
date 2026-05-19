@@ -496,9 +496,6 @@ void Neighbor::init()
 
   // fixchecklist = other classes that can induce reneighboring in decide()
 
-  restart_check = 0;
-  if (output->restart_flag) restart_check = 1;
-
   delete[] fixchecklist;
   fixchecklist = nullptr;
   fixchecklist = new int[modify->nfix];
@@ -509,7 +506,7 @@ void Neighbor::init()
       fixchecklist[fix_check++] = i;
 
   must_check = 0;
-  if (restart_check || fix_check) must_check = 1;
+  if (fix_check) must_check = 1;
 
   // set special_flag for 1-2, 1-3, 1-4 neighbors
   // flag[0] is not used, flag[1] = 1-2, flag[2] = 1-3, flag[3] = 1-4
@@ -2294,7 +2291,6 @@ int Neighbor::decide()
 {
   if (must_check) {
     bigint n = update->ntimestep;
-    if (restart_check && n == output->next_restart) return 1;
     for (int i = 0; i < fix_check; i++)
       if (n == modify->fix[fixchecklist[i]]->next_reneighbor) return 1;
   }

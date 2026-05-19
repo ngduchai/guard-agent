@@ -40,7 +40,6 @@ FixSpringChunk::FixSpringChunk(LAMMPS *lmp, int narg, char **arg) :
 {
   if (narg != 6) utils::missing_cmd_args(FLERR, "fix spring/chunk", error);
 
-  restart_global = 1;
   scalar_flag = 1;
   global_freq = 1;
   extscalar = 1;
