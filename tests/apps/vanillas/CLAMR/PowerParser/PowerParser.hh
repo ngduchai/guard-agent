@@ -50,7 +50,6 @@
 #include <fstream>
 #include "Word.hh"
 #include "Cmd.hh"
-#include "Restartblock.hh"
 #include "Whenthen.hh"
 
 /****************************************************************//**
@@ -549,32 +548,6 @@ public:
     void process_error_global(int &return_value);
 
 
-    void rb_check(vector<string> &code_varnames,
-                  vector<string> &code_values,
-                  vector<int> &vv_active, int *rbci,
-                  int *rb_ntriggered, int *rb_triggered_indices);
-    int  get_rb_num_varnames();
-    void get_rb_varnames(vector<string> &rb_varnames_vstr);
-    void get_num_rb(int *rbnum) { *rbnum = (int)restartblocks.size(); }
-    void set_num_rb(int rbnum)  { nrb_on_dump = rbnum; }
-    void get_rb_names(vector<string> &rb_names_vstr);
-    void set_rb_names(vector<string> &rb_names_vstr);
-    void get_rb_aflags(int *rb_aflags);
-    void set_rb_aflags(int *rb_aflags, int rb_num);
-    void get_rb_satsize(int *rb_satsize);
-    void set_rb_satsize(int rb_satsize);
-    void get_rb_satprb(int *rb_satprb);
-    void set_rb_satprb(int *rb_satprb, int rb_num);
-    void get_rb_sat(int *rb_sat);
-    void set_rb_sat(int *rb_sat, int rb_satsize);
-    void list_rb();
-    void list_rb_start();
-    void list_rb_ss(stringstream &ssc);
-    void list_rb1_start(int *rb);
-    void list_rb1_ss(stringstream &ssc, int *rbp);
-    void list_one_rb_ss(stringstream &ssc, int rb);
-
-
     void get_num_whenthen(int *wtnum) { *wtnum = (int)whenthens.size(); }
     void wt_check(int wtn, vector<string> &code_varnames,
                   vector<string> &code_values,
@@ -694,15 +667,6 @@ private:
 
     // The when ... then objects.
     deque<Whenthen> whenthens;
-
-    // Restart blocks.
-    deque<Restartblock> restartblocks;
-    int nrb_on_dump;
-    deque<string> bnames_on_dump;
-    deque<bool> baflags_on_dump;
-    int satsize_on_dump;
-    deque<bool> rbsat_on_dump;
-    deque<int> rbsatprb_on_dump;
 
     // Flag for whether duplicate array values will be none, fatal, or
     // a warning, determined by the duplicate_array_values command.

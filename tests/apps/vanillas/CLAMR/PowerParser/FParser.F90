@@ -153,12 +153,8 @@
     interface FParser_sizeb
        module procedure FParser_sizeb_2   ! 2d array
     end interface
- 
-    ! restart_block subroutines.
-    public FParser_rb_check           ! Do the restart blocks check
-    public FParser_echo_rb_info       ! Echo restart block info for one block
- 
- 
+
+
     ! When...then subroutines.
     public FParser_whenthen_num       ! Get number of when...thens
     public FParser_whenthen_check     ! Do the whenthen check
@@ -1887,22 +1883,7 @@
  
       write(kw, '(a)')     "********** End of echo final when...then parser buffers."
       write(kw, '(a,/,/)') "********************************************************************************"
- 
- 
-      write(kw, '(/,a)') "********************************************************************************"
-      write(kw, '(a)')   "********** Echo restart block information."
- 
-      call echo_rb_info
-      nchar = 256
-      do
-         call get_output_line(fline, nchar, bint)
-         if (bint .eq. 0) exit;
-         write(kw,'(a)') trim(fline)
-      enddo
- 
-      write(kw, '(a)')     "********** End of echo restart block information."
-      write(kw, '(a,/,/)') "********************************************************************************"
- 
+
     end subroutine FParser_echo_fbuffer
  
 ! ******************************************************************************
@@ -1971,94 +1952,6 @@
       endif
        
       end subroutine shorten_string
- 
-! ******************************************************************************
-! ******************************************************************************
-! Handle restart_block commands.
-! ******************************************************************************
-! ******************************************************************************
- 
-    ! ==========================================================================
-    ! Do the restart_block checks
-    ! ==========================================================================
-    subroutine FParser_rb_check(code_varnames, code_values, code_vv_active, &
-                               nchar, nvv, rb_check, rb_ntriggered, &
-                               rb_num, rb_triggered_indices)
- 
-      integer,                             intent(in)    :: nchar, nvv, rb_num
-      character(nchar), dimension(nvv),    intent(in)    :: code_varnames, code_values
-      integer,          dimension(nvv),    intent(in)    :: code_vv_active
-      logical,                             intent(  out) :: rb_check
-      integer,                             intent(inout) :: rb_ntriggered
-      integer,          dimension(rb_num), intent(inout) :: rb_triggered_indices
- 
-      character :: val_array(nchar*nvv), varname_array(nchar*nvv)
-      integer :: i,c,i1d, rbci
- 
-      rb_check = .false.
-      rb_ntriggered = 0
- 
-      if(.not.FParser_initialized)return
- 
-      ! We pack all the fortran strings into one long character array, this
-      ! makes it easier to send to C++.
-      i1d = 1
-      do i = 1,nvv
-         do c = 1,nchar
-            val_array(i1d) = code_values(i)(c:c)
-            varname_array(i1d) = code_varnames(i)(c:c)
-            i1d = i1d+1
-         enddo
-      enddo
- 
-      call parser_rb_check(varname_array, val_array, code_vv_active, &
-                           nchar, nvv, rbci, &
-                           rb_ntriggered, rb_triggered_indices)
- 
-      if (rbci .eq. 1) rb_check = .true.
- 
-    end subroutine FParser_rb_check
- 
- 
-    ! ==========================================================================
-    ! Echo restart block data to a file.
-    !     kw = unit number for the file to write to
-    !     rb = index of the restart block to write. Note that this is an index
-    !          which starts from 0
-    ! ==========================================================================
-    subroutine FParser_echo_rb_info(kw, rb)
- 
-      integer, intent(in) :: kw, rb
-      character(256) :: fline
-      integer :: nchar, bint
- 
-      if (mype .ne. iope) return
- 
-      if(.not.FParser_initialized)then
-         write(kw, '(/,a)') "THE INPUT DECK HAS NOT BEEN OPENED, SO"
-         write(kw, '(/,a)') "A PARSED LIST OF ITS CONTENTS CANNOT BE PRINTED OUT"
-         return
-      endif
- 
-      ! C++ function which echos the restart block info to a stringstream
-      ! internal to the Parser package.
-      call echo_rb1_info(rb)
- 
-      ! Go through every line in the internal stringstream, copy the line
-      ! to a fortran string, and write the fortran string to the file.
-      nchar = 256
-      do
-         call get_output_line(fline, nchar, bint)
-         if (bint .eq. 0) exit;
-         if (kw .eq. 6) then
-            write(*,'(a)') trim(fline)
-         else
-            write(kw,'(a)') trim(fline)
-         endif
-      enddo
- 
-    end subroutine FParser_echo_rb_info
- 
  
 ! ******************************************************************************
 ! ******************************************************************************

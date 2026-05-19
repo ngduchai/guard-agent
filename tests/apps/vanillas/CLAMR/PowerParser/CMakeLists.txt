@@ -97,10 +97,10 @@ if(NOT KOKKOS_ENABLE)
 endif(NOT KOKKOS_ENABLE)
 
 set(H_SRCS   Cmd.hh   Function.hh    Parser_utils.hh  Variable.hh      Word.hh
-             Comm.hh  PowerParser.hh Parser_math.hh   Restartblock.hh  Whenthen.hh)
+             Comm.hh  PowerParser.hh Parser_math.hh   Whenthen.hh)
 
 set(CXX_SRCS Cmd.cc   Function.cc    Parser_utils.cc  Variable.cc      Word.cc
-             Comm.cc  PowerParser.cc Parser_math.cc   Restartblock.cc  Whenthen.cc)
+             Comm.cc  PowerParser.cc Parser_math.cc   Whenthen.cc)
 
 #if(DEFINED ENV{FC})
    set(H_SRCS ${H_SRCS} parser_iface.hh)

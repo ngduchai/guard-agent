@@ -84,7 +84,6 @@ PowerParser::PowerParser()
     comm = new Comm();
 
     init();                     // Init vars, setup functions, ...
-    nrb_on_dump = 0;
     coutbuf = NULL;
 }
 
@@ -93,7 +92,6 @@ PowerParser::PowerParser(string filename)
     comm = new Comm();
 
     init();                     // Init vars, setup functions, ...
-    nrb_on_dump = 0;
     parse_file(filename);       // Parse the file.
     coutbuf = NULL;
 }
@@ -105,7 +103,6 @@ PowerParser::PowerParser(const char *filename)
     string fstring(filename);
 
     init();                     // Init vars, setup functions, ...
-    nrb_on_dump = 0;
     parse_file(fstring);        // Parse the file.
     coutbuf = NULL;
 }
@@ -125,7 +122,6 @@ PowerParser::~PowerParser()
     cmds.clear();
     cmdsf.clear();
     whenthens.clear();
-    restartblocks.clear();
     pre_defined_varss.str("");
 }
 
@@ -346,12 +342,7 @@ void PowerParser::clear_and_init()
     cmds.clear();
     cmdsf.clear();
     whenthens.clear();
-    restartblocks.clear();
     pre_defined_varss.str("");
-
-    // Do not clear out the restart block info from the dump since the whole
-    // point of doing this function is to be able to reset the parser with
-    // the restart block info from the dump.
 
     //for (int i=0; i<(int)bnames_on_dump.size(); i++) {
     //    cout << "&&&&&cw PowerParser.cc, clear_and_init, bnames_on_dump = " <<
@@ -542,9 +533,6 @@ void PowerParser::compile_buffer(int &return_value)
     int nwhen = 0;
     int when_level = 0;
     bool single_line_when = false;
-    int nrb = 0;                       // Number of restart blocks
-    bool single_line_rb = false;       // Flag for single line restart blocks
-    bool skiprb = false;               // Flag for skipping cmds in restart block
     for (int i=0; i<(int)cmds.size(); i++) {
         // Work with cmdi, so that cmds will be available for do loops.
         Cmd cmdi = cmds[i];
@@ -570,41 +558,6 @@ void PowerParser::compile_buffer(int &return_value)
 
             continue;
         }
-
-        // Handle restart_block commands.
-        if (cmdi.get_string(0) == "restart_block") {
-            Restartblock rb(nrb, cmdi, skiprb, single_line_rb, 
-                            bnames_on_dump, baflags_on_dump,
-                            rbsatprb_on_dump, rbsat_on_dump,
-                            serr, ierr);
-            restartblocks.push_back(rb);
-
-            for (int rbi=0; rbi<(int)restartblocks.size(); rbi++) {
-                string rbi_name = restartblocks[rbi].get_name();
-                for (int rbj=rbi+1; rbj<(int)restartblocks.size(); rbj++) {
-                    if (rbi_name == restartblocks[rbj].get_name()) {
-                        cmdi.fatal_error(0, serr, ierr);
-                        serr << "Restart block names must be unique." << endl;
-                        serr << "Non unique name = " << rbi_name << endl;
-                        ierr = 2;
-                    }
-                }
-            }
-
-            if (single_line_rb && skiprb) {
-                skiprb = false;
-                continue;
-            }
-            bool cflag = true;
-            if (single_line_rb && !skiprb) cflag = false;
-            if (cflag) continue;
-        }
-        if (cmdi.get_string(0) == "end_restart_block") {
-            skiprb = false;
-            continue;
-        }
-        if (skiprb) continue;
-
 
         if (skip_sub) {
             if (cmdi.get_string(0) == "endsubroutine") {
@@ -863,13 +816,6 @@ void PowerParser::compile_buffer(int &return_value)
                  << "********** set internal code variables when processing when...then commands." << endl;
             list_wt_cmdsf();
             cout << "********** End of echo final when...then parser buffers.\n"
-                 << "********************************************************************************\n\n" 
-                 << endl;
-
-            cout << "********************************************************************************\n"
-                 << "********** Echo restart block information." << endl;
-            list_rb();
-            cout << "********** End of echo restart block information.\n"
                  << "********************************************************************************\n\n"
                  << endl;
         }
@@ -2448,260 +2394,6 @@ void PowerParser::wt_setseq(int wtn, int wtseq)
     whenthens[wtn-1].setseq(wtseq);
 }
 
-
-
-
-//+***************************************************************************
-// ***************************************************************************
-// restart_block commands
-// ***************************************************************************
-// ***************************************************************************
-
-// ===========================================================================
-// Check if a restart block condition is satisfied.
-// ===========================================================================
-void PowerParser::rb_check(vector<string> &code_varnames,
-                     vector<string> &code_values,
-                     vector<int> &vv_active, int *rbci,
-                     int *rb_ntriggered, int *rb_triggered_indices)
-{
-    stringstream serr;
-    int ierr = 0;
-    *rbci = 0;
-    *rb_ntriggered = 0;
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        int ri = 0;
-        restartblocks[i].check_rb(code_varnames, code_values, vv_active, &ri,
-                                  serr, ierr);
-        if (ri == 1) {
-            *rbci = 1;
-            rb_triggered_indices[*rb_ntriggered] = i;
-            *rb_ntriggered += 1;
-        }
-    }
-    process_error(serr, ierr);
-}
-
-
-// ===========================================================================
-// Get/set the restart block names
-// ===========================================================================
-void PowerParser::get_rb_names(vector<string> &rb_names_vstr)
-{
-    rb_names_vstr.clear();
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        rb_names_vstr.push_back(restartblocks[i].get_name());
-    }
-}
-void PowerParser::set_rb_names(vector<string> &rb_names_vstr)
-{
-    bnames_on_dump.clear();
-    for (int i=0; i<(int)rb_names_vstr.size(); i++) {
-        bnames_on_dump.push_back(rb_names_vstr[i]);
-    }
-}
-
-
-// ===========================================================================
-// Get/set the restart block activity flags.
-// ===========================================================================
-void PowerParser::get_rb_aflags(int *rb_aflags)
-{
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        rb_aflags[i] = restartblocks[i].get_aflag();
-    }
-}
-void PowerParser::set_rb_aflags(int *rb_aflags, int rb_num)
-{
-    baflags_on_dump.clear();
-    for (int j=0; j<rb_num; j++) {
-        baflags_on_dump.push_back(rb_aflags[j]);
-    }
-}
-
-
-// ===========================================================================
-// Get/set the restart block satsize.
-// satsize is defined as the total number of sub-conditions over all restart
-// blocks.
-// ===========================================================================
-void PowerParser::get_rb_satsize(int *rb_satsize)
-{
-    int rb_sum = 0;
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        rb_sum += restartblocks[i].get_satsize();
-    }
-    *rb_satsize = rb_sum;
-}
-
-void PowerParser::set_rb_satsize(int rb_satsize)
-{
-    satsize_on_dump = rb_satsize;
-}
-
-
-// ===========================================================================
-// Get/set the number of sub-conditions per restart block
-// ===========================================================================
-void PowerParser::get_rb_satprb(int *rb_satprb)
-{
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        rb_satprb[i] = restartblocks[i].get_satsize();
-    }
-}
-
-void PowerParser::set_rb_satprb(int *rb_satprb, int rb_num)
-{
-    rbsatprb_on_dump.clear();
-    for (int i=0; i<rb_num; i++) {
-        rbsatprb_on_dump.push_back(rb_satprb[i]);
-    }
-}
-
-
-// ===========================================================================
-// Get/set the satisfied flag for each sub-condition for each restart block
-// ===========================================================================
-void PowerParser::get_rb_sat(int *rb_sat)
-{
-    int k = 0;
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        for (int j=0; j<(int)restartblocks[i].get_satsize(); j++) {
-            rb_sat[k] = restartblocks[i].get_sat(j);
-            k++;
-        }
-    }
-}
-
-
-void PowerParser::set_rb_sat(int *rb_sat, int rb_satsize)
-{
-    rbsat_on_dump.clear();
-    for (int i=0; i<rb_satsize; i++) {
-        bool b = false;
-        if (rb_sat[i] == 1) b = true;
-        rbsat_on_dump.push_back(b);
-    }
-}
-
-
-// ===========================================================================
-// Get a combined list of the restart block variable names. Note that there
-// might be more than one variable name per restart block depending on how
-// complicated the condition is.
-// ===========================================================================
-int PowerParser::get_rb_num_varnames()
-{
-    int numv = 0;
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        numv += restartblocks[i].get_num_varnames();
-    }
-    for (int i=0; i<(int)whenthens.size(); i++) {
-        numv += whenthens[i].get_num_varnames();
-    }
-    return numv;
-}
-void PowerParser::get_rb_varnames(vector<string> &rb_varnames_vstr)
-{
-    rb_varnames_vstr.clear();
-    for (int i=0; i<(int)restartblocks.size(); i++) {
-        int numv = restartblocks[i].get_num_varnames();
-        for (int j=0; j<numv; j++) {
-            rb_varnames_vstr.push_back(restartblocks[i].get_varname(j));
-        }
-    }
-    for (int i=0; i<(int)whenthens.size(); i++) {
-        int numv = whenthens[i].get_num_varnames();
-        for (int j=0; j<numv; j++) {
-            rb_varnames_vstr.push_back(whenthens[i].get_varname(j));
-        }
-    }
-}
-
-
-// ===========================================================================
-// Print info about restart blocks.
-// ===========================================================================
-void PowerParser::list_rb()
-{
-    stringstream ssc;
-    list_rb_ss(ssc);
-    if (comm->isIOProc()) {
-        cout << ssc.str();
-    }
-}
-
-void PowerParser::list_rb_start()
-{
-    ssfout.str("");
-    list_rb_ss(ssfout);
-    ssfout_current_pos = 0;
-}
-
-void PowerParser::list_rb_ss(stringstream &ssc)
-{
-    int rblen = (int)restartblocks.size();
-    if (rblen <= 0) {
-        ssc << endl << "No restart blocks have been specified."
-            << endl << endl;
-        return;
-    }
-
-    for (int rb=0; rb<rblen; rb++) {
-        list_one_rb_ss(ssc, rb);
-    }
-}
-
-void PowerParser::list_rb1_start(int *rb)
-{
-    ssfout.str("");
-    list_rb1_ss(ssfout, rb);
-    ssfout_current_pos = 0;
-}
-
-void PowerParser::list_rb1_ss(stringstream &ssc, int *rbp)
-{
-    int rb = *rbp;
-    int rblen = (int)restartblocks.size();
-    if (rb < 0) {
-        ssc << endl << "List restart block error: rb<0"
-            << endl << endl;
-        return;
-    }
-    if (rb >= rblen) {
-        ssc << endl << "List restart block error: rb>=rblen"
-            << endl << endl;
-        return;
-    }
-
-    list_one_rb_ss(ssc, rb);
-}
-
-
-// ===========================================================================
-// List info for one restart block, index=rb
-// ===========================================================================
-void PowerParser::list_one_rb_ss(stringstream &ssc, int rb)
-{
-    ssc << endl;
-    ssc << "** Echo restart block info, restart block name = "
-        << restartblocks[rb].get_name() << endl;
-    string s = "false";
-    if (restartblocks[rb].get_aflag() == 1) s = "true";
-    ssc << "    Active flag = " << s << endl;
-    ssc << "    Condition for this restart block =" << endl;
-    restartblocks[rb].list_condition("        ", "        ", ssc);
-    ssc << endl;
-    ssc << "    Number of sub-conditions = " <<
-        restartblocks[rb].get_satsize() << endl;
-    for (int i=0; i<restartblocks[rb].get_satsize(); i++) {
-        string t = "false";
-        if (restartblocks[rb].get_sat(i) == 1) t = "true";
-        ssc << "        For sub-condition " << i+1 <<
-            ", satisfied flag = " << t << endl;
-    }
-    ssc << endl;
-}
 
 //+***************************************************************************
 // ***************************************************************************

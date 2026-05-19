@@ -162,30 +162,7 @@ void FC_FUNC(get_output_line,GET_OUTPUT_LINE)(char *fline, int *nchar,
                                               int *bint);
 void FC_FUNC(parser_chk_scalar_dup,PARSER_CHK_SCALAR_DUP)();
 
-void FC_FUNC(parser_get_rbnum,PARSER_GET_RBNUM)(int *rbnum);
-void FC_FUNC(parser_set_rbnum,PARSER_SET_RBNUM)(int *rbnum);
-void FC_FUNC(parser_rb_check,PARSER_RB_CHECK)(char *varname_array,
-    char *val_array, int *vv_active_a, int *nchar, int *nvv, int *rbci,
-    int *rb_ntriggered, int *rb_triggered_indices);
-void FC_FUNC(parser_set_rb_names,PARSER_SET_RB_NAMES)(char *rb_names_1d,
-                                                      int *rb_num, int *ncstr_rb);
-void FC_FUNC(parser_get_rb_names,PARSER_GET_RB_NAMES)(char *rb_names_1d,
-                                                      int *rb_num, int *ncstr_rb);
-void FC_FUNC(parser_set_rb_aflags,PARSER_SET_RB_AFLAGS)(int *rb_aflags,
-                                                        int *rb_num);
-void FC_FUNC(parser_get_rb_aflags,PARSER_GET_RB_AFLAGS)(int *rb_aflags);
-void FC_FUNC(parser_get_rb_satsize,PARSER_GET_RB_SATSIZE)(int *rb_satsize);
-void FC_FUNC(parser_set_rb_satsize,PARSER_SET_RB_SATSIZE)(int *rb_satsize);
-void FC_FUNC(parser_get_rb_satprb,PARSER_GET_RB_SATPRB)(int *rb_satprb);
-void FC_FUNC(parser_set_rb_satprb,PARSER_SET_RB_SATPRB)(int *rb_satprb,
-                                                        int *rb_num);
-void FC_FUNC(parser_get_rb_sat,PARSER_GET_RB_SAT)(int *rb_sat);
-void FC_FUNC(parser_set_rb_sat,PARSER_SET_RB_SAT)(int *rb_sat, int *rb_satsize);
-void FC_FUNC(echo_rb_info,ECHO_RB_INFO)();
 void FC_FUNC(echo_rb1_info,ECHO_RB1_INFO)(int *rb);
-void FC_FUNC(parser_get_rb_num_varnames,PARSER_GET_RB_NUM_VARNAMES)(int *vnum);
-void FC_FUNC(parser_get_rb_varnames,PARSER_GET_RB_VARNAMES)(char *rb_varnames_1d,
-    int *rb_vnum, int *ncstr_rb);
 
 
 void FC_FUNC(parser_get_wtnum,PARSER_GET_WTNUM)(int *wtnum);
