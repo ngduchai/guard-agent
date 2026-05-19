@@ -19,7 +19,6 @@
 #include "spparks.h"
 #include "input.h"
 #include "app.h"
-#include "app_lattice.h"
 #include <cstdio>
 
 using namespace SPPARKS_NS;
@@ -30,28 +29,29 @@ using namespace SPPARKS_NS;
  * Byte layout MUST be identical between vanilla and reference at the same
  * workload so Step 0.6c cross-consistency passes.
  *
- * SCHEMA REDESIGN (2026-05-19 v3, was v2 = commit 3fe21a916):
- * v2 captured per-site spin sums via iarray[0].  In the Ising-model
- * validation input at T=1.0 (below 2D Ising Tc ~1.13), the system orders
- * into one of two symmetric phases; ±2% temperature perturbation around T=1.0
- * doesn't change which phase dominates, so total spin sum is INVARIANT and
- * Step B calibration reported diff=0.0.
+ * SCHEMA REDESIGN (2026-05-19 v3-fixed, was v3-broken = commit d76349a61):
+ * v3-broken attempted to access AppLattice::naccept/nattempt via dynamic_cast,
+ * but those members are `protected:` in AppLattice (line 92 of app_lattice.h)
+ * and not reachable from outside the class — BUILD FAIL.
  *
- * v3 captures KMC dynamics counters (naccept, nattempt) from AppLattice
- * subclass.  These directly track accept/reject rates which depend on
- * temperature via the Metropolis criterion exp(-ΔE/T) — small T perturbations
- * produce measurable changes in accept counts.  Keeps a spatial moment
- * sum(spin[i] * i) for sensitivity to spatial reorganization.  Schema:
- *   [0] global naccept                                (KMC accept count, T-sensitive)
- *   [1] global nattempt                               (KMC attempt count)
- *   [2] global sum of iarray[0][i] * (i + 1)          (spatial moment; rearrangement-sensitive)
- *   [3] global sum of iarray[0][i]                    (kept from v2 as baseline marker)
- *   [4] app->time                                     (final-time marker)
- *   [5] (double)world_size                            (decomposition sanity)
+ * v3-fixed drops the AppLattice access entirely and relies on TWO spatial
+ * moments computed from iarray[0] (which IS publicly accessible via App).
+ * The first moment captures gross spatial distribution; the second moment
+ * (sum of i*i*spin) is much more sensitive to which specific sites have
+ * which spin — small KMC rearrangements that don't change total spin sum
+ * still move the second moment substantially.
  *
- * AppLattice downcast: safe because all SPPARKS lattice-based apps (Ising,
- * Potts, Diffusion) derive from AppLattice.  Falls back to v2 behavior
- * (naccept=nattempt=0) if downcast fails (non-lattice apps).
+ * Schema layout:
+ *   [0] global sum(spin[i] * (i+1))         (first spatial moment)
+ *   [1] global sum(spin[i] * (i+1)^2)       (second spatial moment; high sensitivity)
+ *   [2] global sum(spin[i] * (i+1)^3)       (third moment; even higher amplitude)
+ *   [3] global sum(spin[i])                  (bulk spin sum; kept as baseline marker)
+ *   [4] app->time                            (final time marker)
+ *   [5] (double)world_size                   (decomposition sanity)
+ *
+ * Site indices are rank-local (0..nlocal-1); ranks with different spatial
+ * configurations produce different moments.  Temperature perturbation changes
+ * KMC accept/reject rates → different final lattice config → different moments.
  *
  * Local sums via loop over iarray[0][0..nlocal-1].  Global sums via
  * MPI_Reduce(MPI_SUM).  Rank-root-only file write.
@@ -62,27 +62,22 @@ static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
   MPI_Comm_size(MPI_COMM_WORLD, &size);
 
   int nlocal = spk->app->nlocal;
-  // local_sums layout: [naccept, nattempt, spatial_moment, spin_sum, nlocal]
+  // local_sums layout: [moment1, moment2, moment3, sum, nlocal]
   double local_sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
-  // Per-site integer state sums + spatial moment (rearrangement-sensitive)
+  // Three spatial moments + bulk sum from per-site integer state
   if (spk->app->ninteger >= 1 && spk->app->iarray != nullptr
       && spk->app->iarray[0] != nullptr) {
     int *iarr = spk->app->iarray[0];
     for (int i = 0; i < nlocal; i++) {
       double v = (double)iarr[i];
-      local_sums[2] += v * (double)(i + 1);   // spatial moment
-      local_sums[3] += v;                      // simple sum (kept from v2)
+      double idx = (double)(i + 1);
+      local_sums[0] += v * idx;              // 1st moment
+      local_sums[1] += v * idx * idx;        // 2nd moment
+      local_sums[2] += v * idx * idx * idx;  // 3rd moment
+      local_sums[3] += v;                     // bulk sum
     }
   }
-
-  // KMC counters via AppLattice downcast (T-sensitive via Metropolis criterion)
-  AppLattice *al = dynamic_cast<AppLattice*>(spk->app);
-  if (al != nullptr) {
-    local_sums[0] = (double)al->naccept;
-    local_sums[1] = (double)al->nattempt;
-  }
-
   local_sums[4] = (double)nlocal;
 
   double global_sums[5];
@@ -91,10 +86,10 @@ static void dumpValidationSignatureBin_spparks(SPPARKS *spk) {
   if (rank != 0) return;
 
   double buf[6];
-  buf[0] = global_sums[0];               // global naccept
-  buf[1] = global_sums[1];               // global nattempt
-  buf[2] = global_sums[2];               // global spatial moment
-  buf[3] = global_sums[3];               // global spin sum
+  buf[0] = global_sums[0];               // global 1st spatial moment
+  buf[1] = global_sums[1];               // global 2nd spatial moment
+  buf[2] = global_sums[2];               // global 3rd spatial moment
+  buf[3] = global_sums[3];               // global bulk sum
   buf[4] = spk->app->time;               // final time
   buf[5] = (double)size;                 // world size
 
