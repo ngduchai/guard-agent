@@ -116,10 +116,7 @@ void PairLubricateU::compute(int eflag, int vflag)
   ev_init(eflag,vflag);
 
   // skip compute() if called from integrate::setup()
-  // this is b/c do not want compute() to update velocities twice on a restart
   // when restarting, call compute on step N (last step of prev run),
-  // again on step N (setup of restart run),
-  // then on step N+1 (first step of restart)
   // so this is one extra time which leads to bad dynamics
 
   if (update->setupflag) return;

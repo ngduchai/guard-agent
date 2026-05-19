@@ -29,7 +29,6 @@ class FixWallGranRegion : public FixWallGran {
   FixWallGranRegion(class LAMMPS *, int, char **);
   ~FixWallGranRegion() override;
   void post_force(int) override;
-  void restart(char *) override;
   void init() override;
 
   double memory_usage() override;
@@ -38,11 +37,6 @@ class FixWallGranRegion : public FixWallGran {
   void set_arrays(int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
-
  private:
   class Region *region;
   int nregion;
@@ -56,7 +50,7 @@ class FixWallGranRegion : public FixWallGran {
   int *c2r;                  // contact to region mapping
                              // c2r[i] = index of Ith contact in
                              //   region-contact[] list of contacts
-  int motion_resetflag;      // used by restart to indicate that region
+  int motion_resetflag;
                              //    vel info is to be reset
 
   void update_contacts(int, int);

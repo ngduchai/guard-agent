@@ -44,7 +44,7 @@ using namespace MathConst;
 PairCoulStreitz::PairCoulStreitz(LAMMPS *lmp) : Pair(lmp)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   nmax = 0;
 

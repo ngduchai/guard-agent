@@ -31,9 +31,7 @@ class FixNPHug : public FixNH {
   void init() override;
   void setup(int) override;
   int modify_param(int, char **) override;
-  int pack_restart_data(double *) override;    // pack restart data
-  void restart(char *) override;
-
+  int pack_state_data(double *) override;
  private:
   class Compute *pe;    // PE compute pointer
 

@@ -89,7 +89,6 @@ void FixWallGranRegion::init()
   if (!newregion) error->all(FLERR, "Region {} for fix wall/gran/region does not exist", idregion);
 
   // check if region properties changed between runs
-  // reset if restart info was inconsistent
 
   if (newregion != region) {
     region = newregion;
@@ -108,7 +107,7 @@ void FixWallGranRegion::init()
   if (motion_resetflag) {
     if (comm->me == 0)
       error->warning(FLERR,
-                     "Region properties for region {} are inconsistent with restart file, "
+                     "Region properties for region {} are inconsistent with prior state, "
                      "resetting its motion",
                      idregion);
     region->reset_vel();
@@ -449,83 +448,4 @@ int FixWallGranRegion::unpack_exchange(int nlocal, double *buf)
   }
 
   return n;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixWallGranRegion::pack_restart(int i, double *buf)
-{
-  int m;
-
-  if (!use_history) return 0;
-
-  int n = 1;
-  int count = ncontact[i];
-
-  buf[n++] = ubuf(count).d;
-  for (int iwall = 0; iwall < count; iwall++) {
-    buf[n++] = ubuf(walls[i][iwall]).d;
-    for (m = 0; m < size_history; m++) buf[n++] = history_many[i][iwall][m];
-  }
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = n;
-  return n;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixWallGranRegion::unpack_restart(int nlocal, int nth)
-{
-  int k;
-
-  if (!use_history) return;
-
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  int count = ncontact[nlocal] = (int) ubuf(extra[nlocal][m++]).i;
-  for (int iwall = 0; iwall < count; iwall++) {
-    walls[nlocal][iwall] = (int) ubuf(extra[nlocal][m++]).i;
-    for (k = 0; k < size_history; k++) history_many[nlocal][iwall][k] = extra[nlocal][m++];
-  }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixWallGranRegion::maxsize_restart()
-{
-  if (!use_history) return 0;
-  return 2 + tmax * (size_history + 1);
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixWallGranRegion::size_restart(int nlocal)
-{
-  if (!use_history) return 0;
-  return 2 + ncontact[nlocal] * (size_history + 1);
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixWallGranRegion::restart(char *buf)
-{
-  int n = 0;
-  if (!region->restart(buf, n)) motion_resetflag = 1;
 }

@@ -36,7 +36,7 @@ PairSMATBSingle::PairSMATBSingle(LAMMPS *_lmp) :
     cutOffEnd(0), cutOffEnd2(0), a3(0), a4(0), a5(0), x3(0), x4(0), x5(0)
 {
   single_enable = 0;              // 1 if single() routine exists
-  restartinfo = 1;                // 1 if pair style writes restart info
+  data_writes_state = 1;
   respa_enable = 0;               // 1 if inner/middle/outer rRESPA routines
   one_coeff = 0;                  // 1 if allows only one coeff * * call
   manybody_flag = 1;              // 1 if a manybody potential

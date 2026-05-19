@@ -42,11 +42,6 @@ class FixTTMMod : public Fix {
   void post_force_respa_setup(int, int, int);
   void end_of_step() override;
   void reset_dt() override;
-  void restart(char *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
   double memory_usage() override;
   void grow_arrays(int) override;
   double compute_vector(int) override;

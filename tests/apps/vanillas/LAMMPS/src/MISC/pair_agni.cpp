@@ -57,7 +57,7 @@ PairAGNI::PairAGNI(LAMMPS *lmp) : Pair(lmp)
   if (lmp->citeme) lmp->citeme->add(cite_pair_agni);
 
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   manybody_flag = 1;
   atomic_feature_version = 0;

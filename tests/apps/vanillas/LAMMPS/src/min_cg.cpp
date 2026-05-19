@@ -179,7 +179,6 @@ int MinCG::iterate(int maxiter)
         for (i = 0; i < nextra_global; i++) hextra[i] = gextra[i];
     }
 
-    // output for thermo, dump, restart files
 
     if (output->next == ntimestep) {
       timer->stamp();

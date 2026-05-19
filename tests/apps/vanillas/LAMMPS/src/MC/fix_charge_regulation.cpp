@@ -1241,34 +1241,6 @@ double FixChargeRegulation::compute_vector(int n) {
 }
 
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixChargeRegulation::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int> (list[n++]);
-  random_equal->reset(seed);
-
-  seed = static_cast<int> (list[n++]);
-  random_unequal->reset(seed);
-
-  nacid_attempts  = list[n++];
-  nacid_successes = list[n++];
-  nbase_attempts  = list[n++];
-  nbase_successes = list[n++];
-  nsalt_attempts  = list[n++];
-  nsalt_successes = list[n++];
-
-  next_reneighbor = (bigint) ubuf(list[n++]).i;
-  bigint ntimestep_restart = (bigint) ubuf(list[n++]).i;
-  if (ntimestep_restart != update->ntimestep)
-    error->all(FLERR,"Must not reset timestep when restarting fix gcmc");
-}
-
 /* ---------------------------------------------------------------------- */
 
 void FixChargeRegulation::setThermoTemperaturePointer() {

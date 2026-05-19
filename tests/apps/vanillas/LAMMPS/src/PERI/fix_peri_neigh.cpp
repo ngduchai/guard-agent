@@ -69,7 +69,7 @@ FixPeriNeigh::FixPeriNeigh(LAMMPS *lmp,int narg, char **arg) :
   grow_arrays(atom->nmax);
   memset(wvolume,0,atom->nmax*sizeof(double));
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // initialize npartner to 0 so atom migration is OK the 1st time
 
@@ -88,7 +88,7 @@ FixPeriNeigh::~FixPeriNeigh()
   // unregister this fix so atom class doesn't invoke it any more
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   // delete locally stored arrays
 
@@ -531,101 +531,4 @@ void FixPeriNeigh::unpack_forward_comm(int n, int first, double *buf)
   last = first + n;
   for (i = first; i < last; i++)
     wvolume[i] = buf[m++];
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixPeriNeigh::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  first = static_cast<int> (list[n++]);
-  maxpartner = static_cast<int> (list[n++]);
-
-  // grow 2D arrays now, cannot change size of 2nd array index later
-
-  grow_arrays(atom->nmax);
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixPeriNeigh::pack_restart(int i, double *buf)
-{
-  int m = 0;
-  // pack buf[0] this way b/c other fixes unpack it
-  if (isVES) buf[m++] = 4*npartner[i] + 4;
-  else if (isEPS) buf[m++] = 3*npartner[i] + 5;
-  else buf[m++] = 2*npartner[i] + 4;
-  buf[m++] = npartner[i];
-  for (int n = 0; n < npartner[i]; n++) {
-    buf[m++] = partner[i][n];
-    if (isVES) {
-      buf[m++] = deviatorextention[i][n];
-      buf[m++] = deviatorBackextention[i][n];
-    }
-    if (isEPS) buf[m++] = deviatorPlasticextension[i][n];
-    buf[m++] = r0[i][n];
-  }
-  if (isEPS) buf[m++] = lambdaValue[i];
-  buf[m++] = vinter[i];
-  buf[m++] = wvolume[i];
-  return m;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixPeriNeigh::unpack_restart(int nlocal, int nth)
-{
-
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way b/c other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int> (extra[nlocal][m]);
-  m++;
-
-  npartner[nlocal] = static_cast<int> (extra[nlocal][m++]);
-  for (int n = 0; n < npartner[nlocal]; n++) {
-    partner[nlocal][n] = static_cast<tagint> (extra[nlocal][m++]);
-    if (isVES) {
-      deviatorextention[nlocal][n] = extra[nlocal][m++];
-      deviatorBackextention[nlocal][n] = extra[nlocal][m++];
-    }
-    if (isEPS) deviatorPlasticextension[nlocal][n] = extra[nlocal][m++];
-    r0[nlocal][n] = extra[nlocal][m++];
-  }
-  if (isEPS) lambdaValue[nlocal] = extra[nlocal][m++];
-  vinter[nlocal] = extra[nlocal][m++];
-  wvolume[nlocal] = extra[nlocal][m++];
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixPeriNeigh::maxsize_restart()
-{
-  if (isVES) return 4*maxpartner + 4;
-  if (isEPS) return 3*maxpartner + 5;
-  return 2*maxpartner + 4;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixPeriNeigh::size_restart(int nlocal)
-{
-  if (isVES) return 4*npartner[nlocal] + 4;
-  if (isEPS) return 3*npartner[nlocal] + 5;
-  return 2*npartner[nlocal] + 4;
 }

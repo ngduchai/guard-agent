@@ -37,7 +37,7 @@ using namespace LAMMPS_NS;
 
 PairADP::PairADP(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
 
   nmax = 0;
   rho = nullptr;

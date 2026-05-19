@@ -40,8 +40,7 @@ class FixNPTCauchy : public Fix {
   void pre_exchange() override;
   double compute_scalar() override;
   double compute_vector(int) override;
-  virtual int pack_restart_data(double *);    // pack restart data
-  void restart(char *) override;
+  virtual int pack_state_data(double *);
   int modify_param(int, char **) override;
   void reset_target(double) override;
   void reset_dt() override;
@@ -160,7 +159,6 @@ class FixNPTCauchy : public Fix {
                                        // stress converges)
   double alpha;                        // integration parameter for the cauchystat
   int initPK;                          // 1 if setPK needs to be initialized either
-                                       // from cauchy or restart, else 0
   int restartPK;                       // Read PK stress from the previous run
   int initRUN;                         // 0 if run not initialized
                                        // (pressure->vector not computed yet),

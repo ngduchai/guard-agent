@@ -35,8 +35,6 @@ class RegIntersect : public Region {
   void shape_update() override;
   void pretransform() override;
   void set_velocity() override;
-  void length_restart_string(int &) override;
-  int restart(char *, int &) override;
   void reset_vel() override;
 
  private:

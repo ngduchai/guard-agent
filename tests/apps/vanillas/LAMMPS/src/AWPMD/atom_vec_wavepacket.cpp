@@ -57,19 +57,6 @@ AtomVecWavepacket::AtomVecWavepacket(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecWavepacket::grow_pointers()
-{
-  q = atom->q;
-  spin = atom->spin;
-  eradius = atom->eradius;
-  ervel = atom->ervel;
-  erforce = atom->erforce;
-}
-
 /* ----------------------------------------------------------------------
    clear extra forces starting at atom N
    nbytes = # of bytes to clear for a per-atom vector

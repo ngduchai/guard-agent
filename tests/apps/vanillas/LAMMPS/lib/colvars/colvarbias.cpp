@@ -471,7 +471,7 @@ int colvarbias::set_state_params(std::string const &conf)
                           std::string(""), colvarparse::parse_silent);
 
   if (check_name.size() == 0) {
-    cvm::error("Error: \""+bias_type+"\" block within the restart file "
+    cvm::error("Error: \""+bias_type+"\" block within the resume file "
                "has no identifiers.\n", COLVARS_INPUT_ERROR);
   }
 
@@ -554,7 +554,7 @@ std::istream & colvarbias::read_state(std::istream &is)
 
   is >> brace;
   if (brace != "}") {
-    cvm::error("Error: corrupt restart information for \""+bias_type+"\" bias \""+
+    cvm::error("Error: corrupt resume information for \""+bias_type+"\" bias \""+
                this->name+"\": no matching brace at position "+
                cvm::to_str(static_cast<size_t>(is.tellg()))+
                " in stream.\n");
@@ -641,7 +641,7 @@ std::istream & colvarbias::read_state_data_key(std::istream &is, char const *key
   std::string key_in;
   if ( !(is >> key_in) ||
        !(to_lower_cppstr(key_in) == to_lower_cppstr(std::string(key))) ) {
-    cvm::error("Error: in reading restart configuration for "+
+    cvm::error("Error: in reading resume configuration for "+
                bias_type+" bias \""+this->name+"\" at position "+
                cvm::to_str(static_cast<size_t>(is.tellg()))+
                " in stream.\n", COLVARS_INPUT_ERROR);

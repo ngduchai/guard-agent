@@ -65,7 +65,6 @@ Fix::Fix(LAMMPS *lmp, int /*narg*/, char **arg) :
   time_integrate = 0;
   time_depend = 0;
   create_attribute = 0;
-  restart_pbc = 0;
   wd_header = wd_section = 0;
   dynamic_group_allow = 0;
   dynamic = 0;

@@ -29,7 +29,7 @@ using namespace LAMMPS_NS;
 
 PairSPHRhoSum::PairSPHRhoSum(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
 
   // set comm size needed by this Pair
 

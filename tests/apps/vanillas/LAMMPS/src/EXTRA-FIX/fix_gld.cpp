@@ -94,7 +94,7 @@ FixGLD::FixGLD(LAMMPS *lmp, int narg, char **arg) :
   FixGLD::grow_arrays(atom->nmax);
   // add callbacks to enable restarts
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // read in the Prony series coefficients
   int iarg = narg_min;
@@ -169,7 +169,7 @@ FixGLD::~FixGLD()
 
   // remove callbacks to fix, so atom class stops calling it
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 }
 
 /* ----------------------------------------------------------------------
@@ -527,69 +527,6 @@ int FixGLD::unpack_exchange(int nlocal, double *buf)
   return m;
 }
 
-
-/* ----------------------------------------------------------------------
-   Pack extended variables assoc. w/ atom i into buffer for
-   writing to a restart file
-------------------------------------------------------------------------- */
-
-int FixGLD::pack_restart(int i, double *buf)
-{
-  int m = 0;
-  // pack buf[0] this way because other fixes unpack it
-  buf[m++] = 3*prony_terms + 1;
-  for (int k = 0; k < 3*prony_terms; k=k+3)
-  {
-    buf[m++] = s_gld[i][k];
-    buf[m++] = s_gld[i][k+1];
-    buf[m++] = s_gld[i][k+2];
-  }
-  return m;
-}
-
-/* ----------------------------------------------------------------------
-   Unpack extended variables to restart the fix from a restart file
-------------------------------------------------------------------------- */
-
-void FixGLD::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to the nth set of extended variables
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i< nth; i++) m += static_cast<int> (extra[nlocal][m]);
-  m++;
-
-  for (int k = 0; k < 3*prony_terms; k=k+3)
-  {
-    s_gld[nlocal][k] = extra[nlocal][m++];
-    s_gld[nlocal][k+1] = extra[nlocal][m++];
-    s_gld[nlocal][k+2] = extra[nlocal][m++];
-  }
-}
-
-/* ----------------------------------------------------------------------
-   Returns the number of items in atomic restart data associated with
-   local atom nlocal.  Used in determining the total extra data stored by
-   fixes on a given processor.
-------------------------------------------------------------------------- */
-
-int FixGLD::size_restart(int /*nlocal*/)
-{
-  return 3*prony_terms+1;
-}
-
-/* ----------------------------------------------------------------------
-   Returns the maximum number of items in atomic restart data
-   Called in Modify::restart for peratom restart.
-------------------------------------------------------------------------- */
-
-int FixGLD::maxsize_restart()
-{
-  return 3*prony_terms+1;
-}
 
 /* ----------------------------------------------------------------------
    Initializes the extended variables to equilibrium distribution

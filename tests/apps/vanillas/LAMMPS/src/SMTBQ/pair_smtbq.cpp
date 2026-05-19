@@ -86,7 +86,7 @@ PairSMTBQ::PairSMTBQ(LAMMPS *lmp) : Pair(lmp)
   MPI_Comm_size(world,&nproc);
 
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
 
   nmax = 0;

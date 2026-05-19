@@ -291,22 +291,6 @@ double FixTempCSLD::compute_scalar()
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTempCSLD::restart(char *buf)
-{
-  auto list = (double *) buf;
-
-  energy = list[0];
-  int nprocs = (int) list[1];
-  if (nprocs != comm->nprocs) {
-    if (comm->me == 0)
-      error->warning(FLERR,"Different number of procs. Cannot restore RNG state.");
-  } else random->set_state(list+2+comm->me*103);
-}
-
-/* ----------------------------------------------------------------------
    extract thermostat properties
 ------------------------------------------------------------------------- */
 

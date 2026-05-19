@@ -351,7 +351,7 @@ void LabelMap::write_data(FILE *fp)
 char *LabelMap::read_string(FILE *fp)
 {
   int n = read_int(fp);
-  if (n < 0) error->all(FLERR, "Illegal size string or corrupt restart");
+  if (n < 0) error->all(FLERR, "Illegal size string or corrupt input");
   char *value = new char[n];
   if (comm->me == 0) utils::sfread(FLERR, value, sizeof(char), n, fp, nullptr, error);
   MPI_Bcast(value, n, MPI_CHAR, 0, world);
@@ -360,7 +360,7 @@ char *LabelMap::read_string(FILE *fp)
 
 /* ----------------------------------------------------------------------
    write a flag and a C-style char string (including the terminating null
-   byte) into the restart file
+   byte) into the data stream
 ------------------------------------------------------------------------- */
 
 void LabelMap::write_string(const std::string &str, FILE *fp)
@@ -372,7 +372,7 @@ void LabelMap::write_string(const std::string &str, FILE *fp)
 }
 
 /* ----------------------------------------------------------------------
-   read an int from restart file and bcast it
+   read an int from input stream and bcast it
 ------------------------------------------------------------------------- */
 
 int LabelMap::read_int(FILE *fp)

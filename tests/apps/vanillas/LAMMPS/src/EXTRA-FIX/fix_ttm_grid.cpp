@@ -53,7 +53,7 @@ FixTTMGrid::FixTTMGrid(LAMMPS *lmp, int narg, char **arg) :
   pergrid_freq = 1;
 
   if (outfile) error->all(FLERR,"Fix ttm/grid does not support outfile option - "
-                          "use dump grid command or restart files instead");
+                          "use dump grid command instead");
 
   skin_original = neighbor->skin;
 }
@@ -350,64 +350,6 @@ int FixTTMGrid::unpack_read_grid(int /*nlines*/, char *buffer)
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTTMGrid::restart(char *buf)
-{
-  auto rlist = (double *) buf;
-
-  // check that restart grid size is same as current grid size
-
-  int nxgrid_old = static_cast<int> (rlist[0]);
-  int nygrid_old = static_cast<int> (rlist[1]);
-  int nzgrid_old = static_cast<int> (rlist[2]);
-
-  if (nxgrid_old != nxgrid || nygrid_old != nygrid || nzgrid_old != nzgrid)
-    error->all(FLERR,"Must restart fix ttm with same grid size");
-
-  // change RN seed from initial seed, to avoid same Langevin factors
-  // just increment by 1, since for RanMars that is a new RN stream
-
-  seed = static_cast<int> (rlist[3]) + 1;
-  delete random;
-  random = new RanMars(lmp,seed+comm->me);
-}
-
-/* ----------------------------------------------------------------------
-   write electron temperatures on grid to file
-   identical format to infile option, so info can be read in when restarting
-   each proc contributes info for its portion of grid
-------------------------------------------------------------------------- */
-
-void FixTTMGrid::write_restart_file(const char *file)
-{
-  // proc 0 opens file and writes header
-
-  if (comm->me == 0) {
-    auto outfile = std::string(file) + ".ttm";
-    fpout = fopen(outfile.c_str(),"w");
-    if (fpout == nullptr)
-      error->one(FLERR,"Cannot open fix ttm/grid restart file {}: {}",outfile,utils::getsyserror());
-
-    fmt::print(fpout,"# DATE: {} UNITS: {} COMMENT: "
-               "Electron temperature on {}x{}x{} grid at step {} - "
-               "created by fix {}\n",
-               utils::current_date(),update->unit_style,
-               nxgrid,nygrid,nzgrid,update->ntimestep,style);
-  }
-
-  // write file
-  // Grid3d::write_file() calls back to pack_write_grid() and unpack_write_grid()
-
-  grid->write_file(Grid3d::FIX,this,0,1,sizeof(double), MPI_DOUBLE);
-
-  // close file
-
-  if (comm->me == 0) fclose(fpout);
-}
-
-/* ----------------------------------------------------------------------
    pack values from local grid into buf
 ------------------------------------------------------------------------- */
 
@@ -425,7 +367,7 @@ void FixTTMGrid::pack_write_grid(int /*which*/, void *vbuf)
 }
 
 /* ----------------------------------------------------------------------
-   unpack values from buf and write them to restart file
+   unpack values from buf and write them to state file
 ------------------------------------------------------------------------- */
 
 void FixTTMGrid::unpack_write_grid(int /*which*/, void *vbuf, int *bounds)

@@ -63,19 +63,6 @@ void AtomVecEDPD::init()
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecEDPD::grow_pointers()
-{
-  edpd_cv = atom->edpd_cv;
-  edpd_temp = atom->edpd_temp;
-  edpd_flux = atom->edpd_flux;
-  vest = atom->vest;
-  vest_temp = atom->vest_temp;
-}
-
 /* ----------------------------------------------------------------------
    clear extra forces starting at atom N
    nbytes = # of bytes to clear for a per-atom vector

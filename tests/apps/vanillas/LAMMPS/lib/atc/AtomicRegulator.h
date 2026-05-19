@@ -119,7 +119,7 @@ namespace ATC {
     /** prior to exchanges */
     virtual void pre_exchange();
 
-    /** pack fields for restart */
+    /** pack fields for resume */
     virtual void pack_fields(RESTART_LIST & data);
 
     /** thermo output */
@@ -338,7 +338,7 @@ namespace ATC {
     /** final work at the end of a run */
     virtual void finish(){};
 
-    /** pack fields for restart */
+    /** pack fields for resume */
     virtual void pack_fields(RESTART_LIST & /* data */){};
 
   protected:

@@ -775,31 +775,6 @@ double FixAtomSwap::memory_usage()
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixAtomSwap::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int>(list[n++]);
-  random_equal->reset(seed);
-
-  seed = static_cast<int>(list[n++]);
-  random_unequal->reset(seed);
-
-  next_reneighbor = (bigint) ubuf(list[n++]).i;
-
-  nswap_attempts = static_cast<int>(list[n++]);
-  nswap_successes = static_cast<int>(list[n++]);
-
-  bigint ntimestep_restart = (bigint) ubuf(list[n++]).i;
-  if (ntimestep_restart != update->ntimestep)
-    error->all(FLERR, "Must not reset timestep when restarting fix atom/swap");
-}
-
-/* ----------------------------------------------------------------------
    extract variable which stores whether MC is active or not
      active = MC moves are taking place
      not active = normal MD is taking place

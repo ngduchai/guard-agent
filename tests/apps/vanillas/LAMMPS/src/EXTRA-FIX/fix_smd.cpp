@@ -427,18 +427,6 @@ void FixSMD::smd_couple()
 
 /* ---------------------------------------------------------------------- */
 
-void FixSMD::restart(char *buf)
-{
-  auto list = (double *)buf;
-  r_old = list[0];
-  xn=list[1];
-  yn=list[2];
-  zn=list[3];
-  pmf=list[4];
-}
-
-/* ---------------------------------------------------------------------- */
-
 void FixSMD::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 {
   if (ilevel == ilevel_respa) post_force(vflag);

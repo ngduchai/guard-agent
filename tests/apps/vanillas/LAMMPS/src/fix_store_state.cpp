@@ -330,7 +330,7 @@ FixStoreState::FixStoreState(LAMMPS *lmp, int narg, char **arg) :
   avalues = nullptr;
   FixStoreState::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // zero the array since dump may access it on timestep 0
   // zero the array since a variable may access it before first run
@@ -355,7 +355,7 @@ FixStoreState::~FixStoreState()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   memory->destroy(avalues);
 }
@@ -580,54 +580,6 @@ int FixStoreState::unpack_exchange(int nlocal, double *buf)
 {
   for (std::size_t m = 0; m < values.size(); m++) avalues[nlocal][m] = buf[m];
   return values.size();
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixStoreState::pack_restart(int i, double *buf)
-{
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = values.size()+1;
-  for (std::size_t m = 0; m < values.size(); m++) buf[m+1] = avalues[i][m];
-  return values.size()+1;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixStoreState::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  for (std::size_t i = 0; i < values.size(); i++) avalues[nlocal][i] = extra[nlocal][m++];
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixStoreState::maxsize_restart()
-{
-  return values.size()+1;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixStoreState::size_restart(int /*nlocal*/)
-{
-  return values.size()+1;
 }
 
 /* ----------------------------------------------------------------------

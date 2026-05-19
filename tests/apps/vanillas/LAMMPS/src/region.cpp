@@ -521,43 +521,6 @@ void Region::velocity_contact(double *vwall, double *x, int ic)
 }
 
 /* ----------------------------------------------------------------------
-   increment length of restart buffer based on region info
-   used by restart of fix/wall/gran/region
-------------------------------------------------------------------------- */
-
-void Region::length_restart_string(int &n)
-{
-  n += sizeof(int) + strlen(id) + 1 + sizeof(int) + strlen(style) + 1 + sizeof(int) +
-      size_restart * sizeof(double);
-}
-
-/* ----------------------------------------------------------------------
-   region reads style, id, number of sub-regions from restart file
-   if they match current region, also read previous position/angle
-   needed by fix/wall/gran/region to compute velocity by differencing scheme
-------------------------------------------------------------------------- */
-
-int Region::restart(char *buf, int &n)
-{
-  int size = *((int *) (&buf[n]));
-  n += sizeof(int);
-  if ((size <= 0) || (strcmp(&buf[n], id) != 0)) return 0;
-  n += size;
-
-  size = *((int *) (&buf[n]));
-  n += sizeof(int);
-  if ((size <= 0) || (strcmp(&buf[n], style) != 0)) return 0;
-  n += size;
-
-  int restart_nreg = *((int *) (&buf[n]));
-  n += sizeof(int);
-  if (restart_nreg != nregion) return 0;
-
-  memcpy(prev, &buf[n], size_restart * sizeof(double));
-  return 1;
-}
-
-/* ----------------------------------------------------------------------
    set prev vector to zero
 ------------------------------------------------------------------------- */
 

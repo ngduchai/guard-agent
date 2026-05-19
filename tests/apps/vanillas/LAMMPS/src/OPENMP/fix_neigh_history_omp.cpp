@@ -43,7 +43,7 @@ FixNeighHistoryOMP::FixNeighHistoryOMP(class LAMMPS *lmp, int narg, char **argv)
    e.g. when atoms migrate to new procs, new neigh list built, or between runs
      when atoms may be added or deleted (NDS becomes out-of-date)
    the next post_neighbor() will put this info back into new NDS
-   called during run before atom exchanges, including for restart files
+   called during run before atom exchanges
    called at end of run via post_run()
    do not call during setup of run (setup_pre_exchange)
      b/c there is no guarantee of a current NDS (even on continued run)

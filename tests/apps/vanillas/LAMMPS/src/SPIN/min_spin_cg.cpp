@@ -283,7 +283,6 @@ int MinSpinCG::iterate(int maxiter)
       }
     }
 
-    // output for thermo, dump, restart files
 
     if (output->next == ntimestep) {
       timer->stamp();

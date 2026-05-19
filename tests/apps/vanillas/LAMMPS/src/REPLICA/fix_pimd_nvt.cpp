@@ -131,7 +131,7 @@ FixPIMDNVT::FixPIMDNVT(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
   comm_forward = 3;
 
   atom->add_callback(Atom::GROW);       // Call LAMMPS to allocate memory for per-atom array
-  atom->add_callback(Atom::RESTART);    // Call LAMMPS to re-assign restart-data for per-atom array
+  atom->add_callback(Atom::RESERVED_CB);
 
   grow_arrays(atom->nmax);
 
@@ -146,7 +146,7 @@ FixPIMDNVT::~FixPIMDNVT()
 {
   delete[] mass;
   atom->delete_callback(id, Atom::GROW);
-  atom->delete_callback(id, Atom::RESTART);
+  atom->delete_callback(id, Atom::RESERVED_CB);
 
   memory->destroy(M_x2xp);
   memory->destroy(M_xp2x);
@@ -816,68 +816,6 @@ int FixPIMDNVT::unpack_exchange(int nlocal, double *buf)
   offset += nhc_offset_one_1;
 
   return size_peratom_cols;
-}
-
-/* ---------------------------------------------------------------------- */
-
-int FixPIMDNVT::pack_restart(int i, double *buf)
-{
-  int offset = 0;
-  int pos = i * 3;
-  // pack buf[0] this way because other fixes unpack it
-  buf[offset++] = size_peratom_cols + 1;
-
-  memcpy(buf + offset, nhc_eta[pos], nhc_size_one_1);
-  offset += nhc_offset_one_1;
-  memcpy(buf + offset, nhc_eta_dot[pos], nhc_size_one_2);
-  offset += nhc_offset_one_2;
-  memcpy(buf + offset, nhc_eta_dotdot[pos], nhc_size_one_1);
-  offset += nhc_offset_one_1;
-  memcpy(buf + offset, nhc_eta_mass[pos], nhc_size_one_1);
-  offset += nhc_offset_one_1;
-
-  return size_peratom_cols + 1;
-}
-
-/* ---------------------------------------------------------------------- */
-
-void FixPIMDNVT::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  int pos = nlocal * 3;
-
-  memcpy(nhc_eta[pos], extra[nlocal] + m, nhc_size_one_1);
-  m += nhc_offset_one_1;
-  memcpy(nhc_eta_dot[pos], extra[nlocal] + m, nhc_size_one_2);
-  m += nhc_offset_one_2;
-  memcpy(nhc_eta_dotdot[pos], extra[nlocal] + m, nhc_size_one_1);
-  m += nhc_offset_one_1;
-  memcpy(nhc_eta_mass[pos], extra[nlocal] + m, nhc_size_one_1);
-  m += nhc_offset_one_1;
-
-  nhc_ready = true;
-}
-
-/* ---------------------------------------------------------------------- */
-
-int FixPIMDNVT::maxsize_restart()
-{
-  return size_peratom_cols + 1;
-}
-
-/* ---------------------------------------------------------------------- */
-
-int FixPIMDNVT::size_restart(int /*nlocal*/)
-{
-  return size_peratom_cols + 1;
 }
 
 /* ---------------------------------------------------------------------- */

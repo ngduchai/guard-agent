@@ -31,7 +31,7 @@ class Atom : protected Pointers {
   char *atom_style;
   AtomVec *avec;
   enum { DOUBLE, INT, BIGINT };
-  enum { GROW = 0, RESTART = 1, BORDER = 2 };
+  enum { GROW = 0, RESERVED_CB = 1, BORDER = 2 };
   enum { ATOMIC = 0, MOLECULAR = 1, TEMPLATE = 2 };
   enum { ATOM = 0, BOND = 1, ANGLE = 2, DIHEDRAL = 3, IMPROPER = 4 };
   enum { NUMERIC = 0, LABELS = 1 };
@@ -255,7 +255,6 @@ class Atom : protected Pointers {
 
   class LabelMap *lmap;
 
-  // extra peratom info in restart file destined for fix & diag
 
   double **extra;
 
@@ -266,9 +265,9 @@ class Atom : protected Pointers {
 
   // callback ptrs for atom arrays managed by fix classes
 
-  int nextra_grow, nextra_restart, nextra_border;    // # of callbacks of each type
-  int *extra_grow, *extra_restart, *extra_border;    // index of fix to callback to
-  int nextra_grow_max, nextra_restart_max;           // size of callback lists
+  int nextra_grow, nextra_extra, nextra_border;    // # of callbacks of each type
+  int *extra_grow, *extra_reserved, *extra_border;    // index of fix to callback to
+  int nextra_grow_max, nextra_extra_max;           // size of callback lists
   int nextra_border_max;
   int nextra_store;
 

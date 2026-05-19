@@ -71,7 +71,7 @@ Pair::Pair(LAMMPS *lmp) :
   single_enable = 1;
   born_matrix_enable = 0;
   single_hessian_enable = 0;
-  restartinfo = 1;
+  data_writes_state = 1;
   respa_enable = 0;
   one_coeff = 0;
   no_virial_fdotr_compute = 0;

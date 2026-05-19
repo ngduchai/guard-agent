@@ -808,8 +808,6 @@ int Input::execute_command()
   else if (mycmd == "processors") processors();
   else if (mycmd == "region") region();
   else if (mycmd == "reset_timestep") reset_timestep();
-  // The `restart` command (periodic restart-file writer) has been removed
-  // in this vanilla build along with the rest of native checkpoint code.
   else if (mycmd == "run_style") run_style();
   else if (mycmd == "special_bonds") special_bonds();
   else if (mycmd == "suffix") suffix();
@@ -1821,8 +1819,6 @@ void Input::reset_timestep()
 
 /* ---------------------------------------------------------------------- */
 
-// Input::restart() has been removed in this vanilla build along with the
-// rest of native checkpoint/restart support.
 
 /* ---------------------------------------------------------------------- */
 

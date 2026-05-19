@@ -129,31 +129,6 @@ void AtomVecDielectric::init()
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecDielectric::grow_pointers()
-{
-  num_bond = atom->num_bond;
-  bond_type = atom->bond_type;
-  num_angle = atom->num_angle;
-  angle_type = atom->angle_type;
-  num_dihedral = atom->num_dihedral;
-  dihedral_type = atom->dihedral_type;
-  num_improper = atom->num_improper;
-  improper_type = atom->improper_type;
-  nspecial = atom->nspecial;
-
-  mu = atom->mu;
-  area = atom->area;
-  ed = atom->ed;
-  em = atom->em;
-  epsilon = atom->epsilon;
-  curvature = atom->curvature;
-  q_scaled = atom->q_scaled;
-}
-
 /* ----------------------------------------------------------------------
    initialize non-zero atom quantities
 ------------------------------------------------------------------------- */
@@ -188,16 +163,6 @@ void AtomVecDielectric::data_atom_post(int ilocal)
 }
 
 /* ----------------------------------------------------------------------
-   initialize other atom quantities after AtomVec::unpack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecDielectric::unpack_restart_init(int ilocal)
-{
-  nspecial[ilocal][0] = 0;
-  nspecial[ilocal][1] = 0;
-  nspecial[ilocal][2] = 0;
-}
-
 /* ----------------------------------------------------------------------
    assign an index to named atom property and return index
    return -1 if name is unknown to this atom style

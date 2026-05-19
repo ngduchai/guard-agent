@@ -39,7 +39,7 @@ PairPython::PairPython(LAMMPS *lmp) : Pair(lmp) {
   respa_enable = 0;
   single_enable = 1;
   writedata = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   reinitflag = 0;
   cut_global = 0.0;

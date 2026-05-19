@@ -1085,23 +1085,6 @@ double FixWidom::memory_usage()
   return bytes;
 }
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixWidom::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int> (list[n++]);
-  random_equal->reset(seed);
-
-  seed = static_cast<int> (list[n++]);
-
-  next_reneighbor = static_cast<int> (list[n++]);
-}
-
 void FixWidom::grow_molecule_arrays(int nmolatoms) {
     nmaxmolatoms = nmolatoms;
     molcoords = memory->grow(molcoords,nmaxmolatoms,3,"widom:molcoords");

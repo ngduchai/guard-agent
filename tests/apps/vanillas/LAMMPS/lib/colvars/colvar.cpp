@@ -1027,7 +1027,7 @@ int colvar::parse_analysis(std::string const &conf)
     get_keyval(conf, "runAveStride", runave_stride, 1);
 
     if ((cvm::restart_out_freq % runave_stride) != 0) {
-      cvm::error("Error: runAveStride must be commensurate with the restart frequency.\n", COLVARS_INPUT_ERROR);
+      cvm::error("Error: runAveStride must be commensurate with the resume frequency.\n", COLVARS_INPUT_ERROR);
     }
 
     get_keyval(conf, "runAveOutputFile", runave_outfile, runave_outfile);
@@ -1073,7 +1073,7 @@ int colvar::parse_analysis(std::string const &conf)
     get_keyval(conf, "corrFuncStride", acf_stride, 1);
 
     if ((cvm::restart_out_freq % acf_stride) != 0) {
-      cvm::error("Error: corrFuncStride must be commensurate with the restart frequency.\n", COLVARS_INPUT_ERROR);
+      cvm::error("Error: corrFuncStride must be commensurate with the resume frequency.\n", COLVARS_INPUT_ERROR);
     }
 
     get_keyval(conf, "corrFuncNormalize", acf_normalize, true);
@@ -1745,7 +1745,6 @@ int colvar::calc_colvar_properties()
     ft_reported = ft;
   }
 
-  // At the end of the first update after a restart, we can reset the flag
   after_restart = false;
   return COLVARS_OK;
 }
@@ -2272,7 +2271,7 @@ std::istream & colvar::read_state(std::istream &is)
                std::string(""), colvarparse::parse_silent);
     if (check_name.size() == 0) {
       cvm::error("Error: Collective variable in the "
-                 "restart file without any identifier.\n", COLVARS_INPUT_ERROR);
+                 "resume file without any identifier.\n", COLVARS_INPUT_ERROR);
       is.clear();
       is.seekg(start_pos, std::ios::beg);
       is.setstate(std::ios::failbit);
@@ -2290,7 +2289,7 @@ std::istream & colvar::read_state(std::istream &is)
   }
 
   if ( !(get_keyval(conf, "x", x, x, colvarparse::parse_silent)) ) {
-    cvm::log("Error: restart file does not contain "
+    cvm::log("Error: resume file does not contain "
              "the value of the colvar \""+
              name+"\" .\n");
   } else {
@@ -2305,7 +2304,7 @@ std::istream & colvar::read_state(std::istream &is)
                       colvarvalue(x.type()), colvarparse::parse_silent)) ||
          !(get_keyval(conf, "extended_v", v_ext,
                       colvarvalue(x.type()), colvarparse::parse_silent)) ) {
-      cvm::log("Error: restart file does not contain "
+      cvm::log("Error: resume file does not contain "
                "\"extended_x\" or \"extended_v\" for the colvar \""+
                name+"\", but you requested \"extendedLagrangian\".\n");
     }
@@ -2318,7 +2317,7 @@ std::istream & colvar::read_state(std::istream &is)
 
     if ( !(get_keyval(conf, "v", v_fdiff,
                       colvarvalue(x.type()), colvarparse::parse_silent)) ) {
-      cvm::log("Error: restart file does not contain "
+      cvm::log("Error: resume file does not contain "
                "the velocity for the colvar \""+
                name+"\", but you requested \"outputVelocity\".\n");
     }

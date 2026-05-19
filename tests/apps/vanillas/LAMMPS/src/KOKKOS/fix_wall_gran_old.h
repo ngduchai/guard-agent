@@ -43,10 +43,6 @@ class FixWallGranOld : public Fix {
   void set_arrays(int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
   void reset_dt() override;
 
   void hooke(double, double, double, double, double *, double *, double *, double *, double *,

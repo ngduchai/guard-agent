@@ -57,7 +57,7 @@ PairHDNNP::PairHDNNP(LAMMPS *lmp) : Pair(lmp)
   if (lmp->citeme) lmp->citeme->add(cite_user_hdnnp_package);
 
   single_enable = 0;    // 1 if single() routine exists
-  restartinfo = 0;      // 1 if pair style writes restart info
+  data_writes_state = 0;
   one_coeff = 1;        // 1 if allows only one coeff * * call
   manybody_flag = 1;    // 1 if a manybody potential
   unit_convert_flag =

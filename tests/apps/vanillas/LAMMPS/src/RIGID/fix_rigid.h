@@ -36,7 +36,6 @@ class FixRigid : public Fix {
   void final_integrate() override;
   void initial_integrate_respa(int, int, int) override;
   void final_integrate_respa(int, int) override;
-  void write_restart_file(const char *) override;
   double compute_scalar() override;
 
   double memory_usage() override;

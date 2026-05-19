@@ -67,7 +67,6 @@ ComputeMSD::ComputeMSD(LAMMPS *lmp, int narg, char **arg) : Compute(lmp, narg, a
       modify->add_fix(fmt::format("{} {} STORE/ATOM 3 0 0 1", id_fix, group->names[igroup])));
 
   // calculate xu,yu,zu for fix store array
-  // skip if reset from restart file
 
   if (fix->restart_reset)
     fix->restart_reset = 0;

@@ -43,7 +43,7 @@ FixSMDWallSurface::FixSMDWallSurface(LAMMPS *lmp, int narg, char **arg) :
         first = 1;
 
         //atom->add_callback(Atom::GROW);
-        //atom->add_callback(Atom::RESTART);
+        //atom->add_callback(Atom::RESERVED_CB);
 
         if (narg != 6)
                 error->all(FLERR, "Illegal number of arguments for fix smd/wall_surface");
@@ -72,7 +72,7 @@ FixSMDWallSurface::~FixSMDWallSurface() {
         // unregister this fix so atom class doesn't invoke it any more
 
         //atom->delete_callback(id,Atom::GROW);
-        //atom->delete_callback(id,Atom::RESTART);
+        //atom->delete_callback(id,Atom::RESERVED_CB);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -184,7 +184,7 @@ void FixSMDWallSurface::setup(int /*vflag*/) {
 }
 
 /* ----------------------------------------------------------------------
- size of atom nlocal's restart data
+   size of atom nlocal's state data
  ------------------------------------------------------------------------- */
 
 void FixSMDWallSurface::read_triangles(int pass) {

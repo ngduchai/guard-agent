@@ -48,20 +48,3 @@ void FixEventHyper::store_event_hyper(bigint ntimestep, int delta_clock)
   clock += delta_clock;
   event_number++;
 }
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixEventHyper::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  event_number = (int) ubuf(list[n++]).i;
-  event_timestep = (bigint) ubuf(list[n++]).i;
-  clock = (bigint) ubuf(list[n++]).i;
-  replica_number = (int) ubuf(list[n++]).i;
-  correlated_event = (int) ubuf(list[n++]).i;
-  ncoincident = (int) ubuf(list[n++]).i;
-}

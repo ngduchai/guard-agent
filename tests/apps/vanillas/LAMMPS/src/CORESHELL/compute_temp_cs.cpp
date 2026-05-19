@@ -72,7 +72,6 @@ ComputeTempCS::ComputeTempCS(LAMMPS *lmp, int narg, char **arg) :
 
   // set fix store values = 0 for now
   // fill them in via setup() once Comm::borders() has been called
-  // skip if resetting from restart file
 
   if (fix->restart_reset) {
     fix->restart_reset = 0;

@@ -35,7 +35,7 @@ class LAMMPS {
   class Force *force;              // inter-particle forces
   class Modify *modify;            // fixes and computes
   class Group *group;              // groups of atoms
-  class Output *output;            // thermo/dump/restart
+  class Output *output;
   class Timer *timer;              // CPU timing info
                                    //
   class KokkosLMP *kokkos;         // KOKKOS accelerator class
@@ -49,9 +49,6 @@ class LAMMPS {
                           // that is constructed so that will be greater
                           // for newer versions in numeric or string
                           // value comparisons
-  int restart_ver;        // -1 or numeric version id of LAMMPS version in restart
-                          // file, in case LAMMPS was initialized from a restart
-                          //
   MPI_Comm world;         // MPI communicator
   FILE *infile;           // infile
   FILE *screen;           // screen output

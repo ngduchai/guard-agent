@@ -188,7 +188,7 @@ FixTTMMod::FixTTMMod(LAMMPS *lmp, int narg, char **arg) :
   }
 
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // initialize electron temperatures on grid
 
@@ -902,90 +902,4 @@ double FixTTMMod::compute_vector(int n)
   if (n == 0) return e_energy;
   if (n == 1) return transfer_energy;
   return 0.0;
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTTMMod::restart(char *buf)
-{
-  int n = 0;
-  auto rlist = (double *) buf;
-
-  // check that restart grid size is same as current grid size
-
-  int nxgrid_old = static_cast<int> (rlist[n++]);
-  int nygrid_old = static_cast<int> (rlist[n++]);
-  int nzgrid_old = static_cast<int> (rlist[n++]);
-
-  if (nxgrid_old != nxgrid || nygrid_old != nygrid || nzgrid_old != nzgrid)
-    error->all(FLERR,"Must restart fix ttm with same grid size");
-
-  // change RN seed from initial seed, to avoid same Langevin factors
-  // just increment by 1, since for RanMars that is a new RN stream
-
-  seed = static_cast<int> (rlist[n++]) + 1;
-  delete random;
-  random = new RanMars(lmp,seed+comm->me);
-
-  // restore global frid values
-
-  for (int iz = 0; iz < nzgrid; iz++)
-    for (int iy = 0; iy < nygrid; iy++)
-      for (int ix = 0; ix < nxgrid; ix++)
-        T_electron[iz][iy][ix] = rlist[n++];
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixTTMMod::pack_restart(int i, double *buf)
-{
-  // pack buf[0] this way because other fixes unpack it
-
-  buf[0] = 4;
-  buf[1] = flangevin[i][0];
-  buf[2] = flangevin[i][1];
-  buf[3] = flangevin[i][2];
-  return 4;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixTTMMod::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int> (extra[nlocal][m]);
-  m++;
-
-  flangevin[nlocal][0] = extra[nlocal][m++];
-  flangevin[nlocal][1] = extra[nlocal][m++];
-  flangevin[nlocal][2] = extra[nlocal][m++];
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixTTMMod::maxsize_restart()
-{
-  return 4;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixTTMMod::size_restart(int /*nlocal*/)
-{
-  return 4;
 }

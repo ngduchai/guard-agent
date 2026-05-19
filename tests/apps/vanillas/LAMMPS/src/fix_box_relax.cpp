@@ -220,7 +220,6 @@ FixBoxRelax::FixBoxRelax(LAMMPS *lmp, int narg, char **arg) :
   if (p_flag[4]) box_change |= BOX_CHANGE_XZ;
   if (p_flag[5]) box_change |= BOX_CHANGE_XY;
 
-  if (allremap == 0) restart_pbc = 1;
 
   // error checks
 

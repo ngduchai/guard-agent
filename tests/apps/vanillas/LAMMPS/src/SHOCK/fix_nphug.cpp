@@ -355,10 +355,10 @@ double FixNPHug::compute_vector(int n)
 }
 
 /* ----------------------------------------------------------------------
-   pack restart data
+   pack state data
 ------------------------------------------------------------------------- */
 
-int FixNPHug::pack_restart_data(double *list)
+int FixNPHug::pack_state_data(double *list)
 {
   int n = 0;
 
@@ -368,7 +368,7 @@ int FixNPHug::pack_restart_data(double *list)
 
   // call the base class function
 
-  n += FixNH::pack_restart_data(list+n);
+  n += FixNH::pack_state_data(list+n);
 
   return n;
 }
@@ -386,29 +386,6 @@ int FixNPHug::size_restart_global()
   nsize += FixNH::size_restart_global();
 
   return nsize;
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixNPHug::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  e0 = list[n++];
-  v0 = list[n++];
-  p0 = list[n++];
-
-  e0_set = 1;
-  v0_set = 1;
-  p0_set = 1;
-
-  // call the base class function
-
-  buf += n*sizeof(double);
-  FixNH::restart(buf);
-
 }
 
 /* ---------------------------------------------------------------------- */

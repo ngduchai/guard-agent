@@ -5492,7 +5492,7 @@ the library interface functions will "catch" them and the
 error status can then be checked by calling
 :cpp:func:`lammps_has_error` and the most recent error message
 can be retrieved via :cpp:func:`lammps_get_last_error_message`.
-This can allow to restart a calculation or delete and recreate
+This can allow to resume a calculation or delete and recreate
 the LAMMPS instance when C++ exceptions are enabled.  One application
 of using exceptions this way is the :ref:`lammps_shell`.  If C++
 exceptions are disabled and an error happens during a call to

@@ -460,9 +460,7 @@ public:
   /// Write a label to the trajectory file (comment line)
   std::ostream & write_traj_label(std::ostream &os);
 
-  /// Read the collective variable from a restart file
   std::istream & read_state(std::istream &is);
-  /// Write the collective variable to a restart file
   std::ostream & write_state(std::ostream &os);
 
   /// Write output files (if defined, e.g. in analysis mode)

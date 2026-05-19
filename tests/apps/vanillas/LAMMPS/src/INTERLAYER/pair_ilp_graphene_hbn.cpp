@@ -64,7 +64,7 @@ static std::map<int, std::string> variant_map = {
 
 PairILPGrapheneHBN::PairILPGrapheneHBN(LAMMPS *lmp) : Pair(lmp), variant(ILP_GrhBN)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;

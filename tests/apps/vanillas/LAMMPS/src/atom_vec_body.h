@@ -52,9 +52,6 @@ class AtomVecBody : public AtomVec {
   int unpack_border_bonus(int, int, double *) override;
   int pack_exchange_bonus(int, double *) override;
   int unpack_exchange_bonus(int, double *) override;
-  int size_restart_bonus() override;
-  int pack_restart_bonus(int, double *) override;
-  int unpack_restart_bonus(int, double *) override;
   void data_body(int, int, int, int *, double *) override;
   double memory_usage_bonus() override;
 

@@ -35,8 +35,6 @@ class FixEventHyper : public FixEvent {
 
   FixEventHyper(class LAMMPS *, int, char **);
 
-  void restart(char *) override;
-
   // methods specific to FixEventHyper, invoked by hyper
 
   void store_event_hyper(bigint, int);

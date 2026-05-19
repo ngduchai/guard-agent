@@ -35,7 +35,6 @@ class FixDeform : public Fix {
   void init() override;
   void pre_exchange() override;
   void end_of_step() override;
-  void restart(char *buf) override;
   double memory_usage() override;
 
  protected:

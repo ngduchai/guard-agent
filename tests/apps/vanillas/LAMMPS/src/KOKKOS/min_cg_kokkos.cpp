@@ -191,7 +191,6 @@ int MinCGKokkos::iterate(int maxiter)
         for (int i = 0; i < nextra_global; i++) hextra[i] = gextra[i];
     }
 
-    // output for thermo, dump, restart files
 
     if (output->next == ntimestep) {
       atomKK->sync(Host,ALL_MASK);

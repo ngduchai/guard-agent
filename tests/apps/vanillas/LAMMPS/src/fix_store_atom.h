@@ -41,11 +41,6 @@ class FixStoreAtom : public Fix {
   int unpack_border(int, int, double *) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
-
   double memory_usage() override;
 
  private:
@@ -53,7 +48,7 @@ class FixStoreAtom : public Fix {
   int arrayflag;     // 1 if a 2d array (vector per atom)
   int tensorflag;    // 1 if a 3d array (array per atom)
   int ghostflag;     // 0/1 to communicate values with ghost atoms
-  int restartflag;   // 0/1 to store values in restart files
+  int stateflag;
 
   int n1, n2;     // size of 3d dims of per-atom data struct
   int nvalues;    // number of per-atom values

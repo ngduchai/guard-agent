@@ -67,7 +67,7 @@ typedef struct {
 PairList::PairList(LAMMPS *lmp) : Pair(lmp)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   respa_enable = 0;
   cut_global = 0.0;
   params = nullptr;

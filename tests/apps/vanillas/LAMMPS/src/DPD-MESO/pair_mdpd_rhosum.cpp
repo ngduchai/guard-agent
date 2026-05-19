@@ -37,7 +37,7 @@ using namespace LAMMPS_NS;
 
 PairMDPDRhoSum::PairMDPDRhoSum(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
 
   // set comm size needed by this Pair
 

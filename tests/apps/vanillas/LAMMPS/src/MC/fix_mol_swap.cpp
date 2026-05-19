@@ -458,25 +458,3 @@ double FixMolSwap::compute_vector(int n)
   if (n == 1) return nswap_accept;
   return 0.0;
 }
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixMolSwap::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int> (list[n++]);
-  random->reset(seed);
-
-  next_reneighbor = (bigint) ubuf(list[n++]).i;
-
-  nswap_attempt = static_cast<int>(list[n++]);
-  nswap_accept = static_cast<int>(list[n++]);
-
-  bigint ntimestep_restart = (bigint) ubuf(list[n++]).i;
-  if (ntimestep_restart != update->ntimestep)
-    error->all(FLERR,"Must not reset timestep when restarting fix mol/swap");
-}

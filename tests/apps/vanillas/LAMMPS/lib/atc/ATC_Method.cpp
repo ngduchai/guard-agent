@@ -1045,10 +1045,10 @@ pecified
       \section examples
       <TT> fix_modify AtC read_restart ATC_state </TT> \n
       \section description
-      Reads the current state of the fields from a named text-based restart
+      Reads the current state of the fields from a named text-based resume
       file.
       \section restrictions
-      The restart file only contains fields and their time derivatives.
+      The resume file only contains fields and their time derivatives.
       The reference positions of the atoms and the commands that initialize
       the fix are not saved e.g. an identical mesh containing the same atoms
       will have to be recreated.
@@ -1068,13 +1068,13 @@ pecified
       \section syntax
       fix_modify AtC write_restart [file_name]  \n
       \section examples
-      <TT> fix_modify AtC write_restart restart.mydata </TT> \n
+      <TT> fix_modify AtC write_restart resume.mydata </TT> \n
       \section description
-      Dumps the current state of the fields to a named text-based restart file.
+      Dumps the current state of the fields to a named text-based resume file.
       This done when the command is invoked and not repeated, unlike the
       similar lammps command.
       \section restrictions
-      The restart file only contains fields and their time derivatives.
+      The resume file only contains fields and their time derivatives.
       The reference positions of the atoms and the commands that initialize
       the fix are not saved e.g. an identical mesh containing the same atoms
       will have to be recreated.

@@ -81,7 +81,7 @@ PairEDIPMulti::PairEDIPMulti(LAMMPS *lmp) : Pair(lmp), preForceCoord(nullptr)
   if (lmp->citeme) lmp->citeme->add(cite_pair_edip);
 
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;

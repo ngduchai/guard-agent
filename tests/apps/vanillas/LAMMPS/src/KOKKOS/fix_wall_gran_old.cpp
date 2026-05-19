@@ -441,7 +441,7 @@ FixWallGranOld::FixWallGranOld(LAMMPS *lmp, int narg, char **arg) :
   history_one = nullptr;
   FixWallGranOld::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   nmax = 0;
   mass_rigid = nullptr;
@@ -472,7 +472,7 @@ FixWallGranOld::~FixWallGranOld()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   // delete local storage
 
@@ -1629,63 +1629,6 @@ int FixWallGranOld::unpack_exchange(int nlocal, double *buf)
       array_atom[nlocal][m] = buf[n++];
   }
   return n;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixWallGranOld::pack_restart(int i, double *buf)
-{
-  if (!use_history) return 0;
-
-  int n = 0;
-  // pack buf[0] this way because other fixes unpack it
-  buf[n++] = size_history + 1;
-  for (int m = 0; m < size_history; m++)
-    buf[n++] = history_one[i][m];
-  return n;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixWallGranOld::unpack_restart(int nlocal, int nth)
-{
-  if (!use_history) return;
-
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int> (extra[nlocal][m]);
-  m++;
-
-  for (int i = 0; i < size_history; i++)
-    history_one[nlocal][i] = extra[nlocal][m++];
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixWallGranOld::maxsize_restart()
-{
-  if (!use_history) return 0;
-  return 1 + size_history;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixWallGranOld::size_restart(int /*nlocal*/)
-{
-  if (!use_history) return 0;
-  return 1 + size_history;
 }
 
 /* ---------------------------------------------------------------------- */

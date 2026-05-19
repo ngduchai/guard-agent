@@ -93,9 +93,6 @@ namespace ATC {
     void write_data(double time, FIELDS &soln, OUTPUT_LIST *data=nullptr);
     void write_data(double time, OUTPUT_LIST *data);
 
-    void write_restart_file(std::string fileName, RESTART_LIST *data)
-    { outputManager_.write_restart_file(fileName,data); }
-
     void read_restart_file(std::string fileName, RESTART_LIST *data)
     { outputManager_.read_restart_file(fileName,data); }
 

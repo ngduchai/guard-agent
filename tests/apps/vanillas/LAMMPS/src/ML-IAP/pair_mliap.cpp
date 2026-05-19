@@ -46,7 +46,7 @@ PairMLIAP::PairMLIAP(LAMMPS *lmp) :
     Pair(lmp), map(nullptr), model(nullptr), descriptor(nullptr), data(nullptr)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   manybody_flag = 1;
   is_child = false;

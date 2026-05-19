@@ -80,7 +80,7 @@ FixAmoebaPiTorsion::FixAmoebaPiTorsion(LAMMPS *lmp, int narg, char **arg) :
   nmax_previous = 0;
   grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // list of all pitorsions to compute on this proc
 
@@ -104,7 +104,7 @@ FixAmoebaPiTorsion::~FixAmoebaPiTorsion()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   // per-atom data
 
@@ -907,85 +907,8 @@ void FixAmoebaPiTorsion::write_data_section(int mth, FILE *fp,
 
 // ----------------------------------------------------------------------
 // ----------------------------------------------------------------------
-// methods for restart and communication
 // ----------------------------------------------------------------------
 // ----------------------------------------------------------------------
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixAmoebaPiTorsion::restart(char *buf)
-{
-  npitorsions = *((bigint *) buf);
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixAmoebaPiTorsion::pack_restart(int i, double *buf)
-{
-  int n = 1;
-  for (int m = 0; m < num_pitorsion[i]; m++) {
-    buf[n++] = ubuf(MAX(pitorsion_type[i][m],-pitorsion_type[i][m])).d;
-    buf[n++] = ubuf(pitorsion_atom1[i][m]).d;
-    buf[n++] = ubuf(pitorsion_atom2[i][m]).d;
-    buf[n++] = ubuf(pitorsion_atom3[i][m]).d;
-    buf[n++] = ubuf(pitorsion_atom4[i][m]).d;
-    buf[n++] = ubuf(pitorsion_atom5[i][m]).d;
-    buf[n++] = ubuf(pitorsion_atom6[i][m]).d;
-  }
-  buf[0] = n;
-
-  return n;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixAmoebaPiTorsion::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-   int n = 0;
-   for (int i = 0; i < nth; i++) n += static_cast<int> (extra[nlocal][n]);
-
-   int count = static_cast<int> (extra[nlocal][n++]);
-   num_pitorsion[nlocal] = (count-1)/7;
-
-   for (int m = 0; m < num_pitorsion[nlocal]; m++) {
-     pitorsion_type[nlocal][m] = (int) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom1[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom2[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom3[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom4[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom5[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     pitorsion_atom6[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-   }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixAmoebaPiTorsion::maxsize_restart()
-{
-  return 1 + PITORSIONMAX*6;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixAmoebaPiTorsion::size_restart(int nlocal)
-{
-  return 1 + num_pitorsion[nlocal]*7;
-}
 
 /* ----------------------------------------------------------------------
    allocate atom-based arrays

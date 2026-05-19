@@ -820,24 +820,6 @@ void FixQBMSST::remap(int flag)
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-void FixQBMSST::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  omega[direction] = list[n++];
-  e0 = list[n++];
-  v0 = list[n++];
-  p0 = list[n++];
-  t_current = list[n++];
-  e0_set = 1;
-  v0_set = 1;
-  p0_set = 1;
-  qtb_set = 1;
-}
-
-/* ----------------------------------------------------------------------
    modify parameters
 ------------------------------------------------------------------------- */
 int FixQBMSST::modify_param(int narg, char **arg)

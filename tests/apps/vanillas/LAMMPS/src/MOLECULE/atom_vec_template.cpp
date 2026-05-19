@@ -84,16 +84,6 @@ void AtomVecTemplate::process_args(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecTemplate::grow_pointers()
-{
-  molindex = atom->molindex;
-  molatom = atom->molatom;
-}
-
 /* ----------------------------------------------------------------------
    initialize non-zero atom quantities
 ------------------------------------------------------------------------- */

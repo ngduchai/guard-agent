@@ -39,7 +39,7 @@ using namespace LAMMPS_NS;
 
 PairEAM::PairEAM(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
   manybody_flag = 1;
   embedstep = -1;
   unit_convert_flag = utils::get_supported_conversions(utils::ENERGY);

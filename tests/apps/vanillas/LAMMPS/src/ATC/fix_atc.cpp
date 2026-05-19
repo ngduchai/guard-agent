@@ -476,7 +476,6 @@ FixATC::FixATC(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
 
   lmp->atom->add_callback(Atom::GROW);
 
-  // we write our own restart file
 
   // Set output computation data based on transfer info
   scalar_flag = atc_->scalar_flag();
@@ -656,56 +655,6 @@ void FixATC::unpack_forward_comm(int n, int first, double *buf)
   atc_->unpack_comm(n, first, buf);
 }
 
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-   ------------------------------------------------------------------------- */
-
-int FixATC::pack_restart(int /* i */, double * /* buf */) {
-  return 0;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-   ------------------------------------------------------------------------- */
-
-void FixATC::unpack_restart(int /* nlocal */, int /* nth */) {
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-   ------------------------------------------------------------------------- */
-
-int FixATC::maxsize_restart() {
-  return 0;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-   ------------------------------------------------------------------------- */
-
-int FixATC::size_restart(int /* nlocal */) {
-  return 0;
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-   ------------------------------------------------------------------------- */
-
-void FixATC::restart(char * /* buf */) {
-
-  char *args[2];
-  args[0] = utils::strdup("read_restart");
-  args[1] = utils::strdup("ATC.restart");
-
-  // Then call all objects I own to write their data
-  if (comm->me == 0) {
-    atc_->modify(2,args);
-  }
-
-  delete[] args[0];
-  delete[] args[1];
-}
 
 /* ----------------------------------------------------------------------
    allow for both per-type and per-atom mass

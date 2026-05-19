@@ -113,14 +113,6 @@ class FixATC : public Fix {
   /** modify atc parameters (parser) */
   int modify_param(int narg, char **arg) override;
 
-  /** calls ATC_Method to handle restarting/checkpointing */
-  /** these four methods are for writing per-atom quantities */
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
-  void restart(char *) override;
-
   /** accessor function for ATC_Method class pointer */
   const ATC::ATC_Method *atc() { return atc_; }
 

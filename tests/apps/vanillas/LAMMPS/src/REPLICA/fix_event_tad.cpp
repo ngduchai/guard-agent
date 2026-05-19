@@ -49,18 +49,3 @@ void FixEventTAD::store_event_tad(bigint ntimestep)
   store_event();
   event_timestep = ntimestep;
 }
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixEventTAD::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  event_number = static_cast<int> (list[n++]);
-  event_timestep = static_cast<int> (list[n++]);
-  tlo = list[n++];
-  ebarrier = list[n++];
-}

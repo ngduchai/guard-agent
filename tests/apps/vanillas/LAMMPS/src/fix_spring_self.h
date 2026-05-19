@@ -42,11 +42,6 @@ class FixSpringSelf : public Fix {
   void copy_arrays(int, int, int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
-
  private:
   double k, espring;
   double **xoriginal;    // original coords of atoms

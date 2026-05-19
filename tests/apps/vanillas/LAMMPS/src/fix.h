@@ -62,8 +62,6 @@ class Fix : protected Pointers {
   int time_depend;             // 1 if requires continuous timestepping
   int create_attribute;        // 1 if fix stores attributes that need
                                //      setting when a new atom is created
-  int restart_pbc;             // 1 if fix moves atoms (except integrate)
-                               //      so write_restart must remap to PBC
   int wd_header;               // # of header values fix writes to data file
   int wd_section;              // # of sections fix writes to data file
   int dynamic_group_allow;     // 1 if can be used with dynamic group, else 0
@@ -123,8 +121,6 @@ class Fix : protected Pointers {
                              // CENTROID_AVAIL = different and implemented
                              // CENTROID_NOTAVAIL = different, not yet implemented
 
-  int restart_reset;    // 1 if restart just re-initialized fix
-
   // KOKKOS flags and variables
 
   int kokkosable;             // 1 if Kokkos fix
@@ -175,10 +171,6 @@ class Fix : protected Pointers {
   virtual int unpack_border(int, int, double *) { return 0; }
   virtual int pack_exchange(int, double *) { return 0; }
   virtual int unpack_exchange(int, double *) { return 0; }
-  virtual int pack_restart(int, double *) { return 0; }
-  virtual void unpack_restart(int, int) {}
-  virtual int size_restart(int) { return 0; }
-  virtual int maxsize_restart() { return 0; }
 
   virtual void setup_pre_force_respa(int, int) {}
   virtual void initial_integrate_respa(int, int, int) {}

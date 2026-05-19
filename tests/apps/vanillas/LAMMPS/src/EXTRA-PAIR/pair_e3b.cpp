@@ -45,7 +45,7 @@ using namespace LAMMPS_NS;
 PairE3B::PairE3B(LAMMPS *lmp) : Pair(lmp), pairPerAtom(10)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   nextra = 4;    //store and tally pot energy terms eA, eB, eC, and e2
   pvector = new double[nextra];

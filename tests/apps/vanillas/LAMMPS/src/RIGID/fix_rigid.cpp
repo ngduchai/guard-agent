@@ -2281,7 +2281,6 @@ void FixRigid::readfile(int which, double *vec, double **array1, double **array2
   }
   MPI_Bcast(&nlines,1,MPI_INT,0,world);
 
-  // empty file with 0 lines is needed to trigger initial restart file
   // generation when no infile was previously used.
 
   if (nlines == 0) return;
@@ -2365,54 +2364,6 @@ void FixRigid::readfile(int which, double *vec, double **array1, double **array2
 
   if (me == 0) fclose(fp);
   delete[] buffer;
-}
-
-/* ----------------------------------------------------------------------
-   write out restart info for mass, COM, inertia tensor, image flags to file
-   identical format to inpfile option, so info can be read in when restarting
-   only proc 0 writes list of global bodies to file
-------------------------------------------------------------------------- */
-
-void FixRigid::write_restart_file(const char *file)
-{
-  if (comm->me) return;
-
-  auto outfile = std::string(file) + ".rigid";
-  FILE *fp = fopen(outfile.c_str(),"w");
-  if (fp == nullptr)
-    error->one(FLERR,"Cannot open fix rigid restart file {}: {}",outfile,utils::getsyserror());
-
-  fmt::print(fp,"# fix rigid mass, COM, inertia tensor info for {} bodies on timestep {}\n\n",nbody,update->ntimestep);
-  fmt::print(fp,"{}\n",nbody);
-
-  // compute I tensor against xyz axes from diagonalized I and current quat
-  // Ispace = P Idiag P_transpose
-  // P is stored column-wise in exyz_space
-
-  int xbox,ybox,zbox;
-  double p[3][3],pdiag[3][3],ispace[3][3];
-
-  int id;
-  for (int i = 0; i < nbody; i++) {
-    if (rstyle == SINGLE || rstyle == GROUP) id = i+1;
-    else id = body2mol[i];
-
-    MathExtra::col2mat(ex_space[i],ey_space[i],ez_space[i],p);
-    MathExtra::times3_diag(p,inertia[i],pdiag);
-    MathExtra::times3_transpose(pdiag,p,ispace);
-
-    xbox = (imagebody[i] & IMGMASK) - IMGMAX;
-    ybox = (imagebody[i] >> IMGBITS & IMGMASK) - IMGMAX;
-    zbox = (imagebody[i] >> IMG2BITS) - IMGMAX;
-
-    fprintf(fp,"%d %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e "
-            "%-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %d %d %d\n",
-            id,masstotal[i],xcm[i][0],xcm[i][1],xcm[i][2],ispace[0][0],ispace[1][1],ispace[2][2],
-            ispace[0][1],ispace[0][2],ispace[1][2],vcm[i][0],vcm[i][1],vcm[i][2],
-            angmom[i][0],angmom[i][1],angmom[i][2],xbox,ybox,zbox);
-  }
-
-  fclose(fp);
 }
 
 /* ----------------------------------------------------------------------

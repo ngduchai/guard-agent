@@ -277,7 +277,7 @@ int colvarbias_abf::init(std::string const &conf)
                                          UI_krestr,                // force constant in eABF
                                          output_prefix,              // the prefix of output files
                                          cvm::restart_out_freq,
-                                         UI_restart,                    // whether restart from a .count and a .grad file
+                                         UI_restart,                    // whether resume from a .count and a .grad file
                                          input_prefix,   // the prefixes of input files
                                          proxy->target_temperature());
     }
@@ -787,7 +787,6 @@ std::istream & colvarbias_abf::read_state_data(std::istream& is)
     return is;
   }
   if (b_integrate) {
-    // Update divergence to account for restart data
     pmf->set_div();
   }
 

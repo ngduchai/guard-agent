@@ -105,7 +105,6 @@ int MinSD::iterate(int maxiter)
     if (nextra_global)
       for (i = 0; i < nextra_global; i++) hextra[i] = fextra[i];
 
-    // output for thermo, dump, restart files
 
     if (output->next == ntimestep) {
       timer->stamp();

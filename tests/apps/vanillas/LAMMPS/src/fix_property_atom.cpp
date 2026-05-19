@@ -203,7 +203,7 @@ FixPropertyAtom::FixPropertyAtom(LAMMPS *lmp, int narg, char **arg) :
   nmax_old = 0;
   if (!lmp->kokkos) FixPropertyAtom::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
   if (border) atom->add_callback(Atom::BORDER);
 }
 
@@ -214,7 +214,7 @@ FixPropertyAtom::~FixPropertyAtom()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id, Atom::GROW);
-  atom->delete_callback(id, Atom::RESTART);
+  atom->delete_callback(id, Atom::RESERVED_CB);
   if (border) atom->delete_callback(id, Atom::BORDER);
 
   // deallocate per-atom vectors in Atom class
@@ -838,104 +838,4 @@ int FixPropertyAtom::unpack_exchange(int nlocal, double *buf)
   }
 
   return m;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixPropertyAtom::pack_restart(int i, double *buf)
-{
-  int k, ncol;
-
-  // pack buf[0] this way because other fixes unpack it
-
-  buf[0] = values_peratom + 1;
-
-  int m = 1;
-  for (int nv = 0; nv < nvalue; nv++) {
-    if (styles[nv] == MOLECULE)
-      buf[m++] = ubuf(atom->molecule[i]).d;
-    else if (styles[nv] == CHARGE)
-      buf[m++] = atom->q[i];
-    else if (styles[nv] == RMASS)
-      buf[m++] = atom->rmass[i];
-    else if (styles[nv] == TEMPERATURE)
-      buf[m++] = atom->temperature[i];
-    else if (styles[nv] == HEATFLOW)
-      buf[m++] = atom->heatflow[i];
-    else if (styles[nv] == IVEC)
-      buf[m++] = ubuf(atom->ivector[index[nv]][i]).d;
-    else if (styles[nv] == DVEC)
-      buf[m++] = atom->dvector[index[nv]][i];
-    else if (styles[nv] == IARRAY) {
-      ncol = cols[nv];
-      for (k = 0; k < ncol; k++) buf[m++] = ubuf(atom->iarray[index[nv]][i][k]).d;
-    } else if (styles[nv] == DARRAY) {
-      ncol = cols[nv];
-      for (k = 0; k < ncol; k++) buf[m++] = atom->darray[index[nv]][i][k];
-    }
-  }
-
-  return values_peratom + 1;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixPropertyAtom::unpack_restart(int nlocal, int nth)
-{
-  int k, ncol;
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  for (int nv = 0; nv < nvalue; nv++) {
-    if (styles[nv] == MOLECULE)
-      atom->molecule[nlocal] = (tagint) ubuf(extra[nlocal][m++]).i;
-    else if (styles[nv] == CHARGE)
-      atom->q[nlocal] = extra[nlocal][m++];
-    else if (styles[nv] == RMASS)
-      atom->rmass[nlocal] = extra[nlocal][m++];
-    else if (styles[nv] == TEMPERATURE)
-      atom->temperature[nlocal] = extra[nlocal][m++];
-    else if (styles[nv] == HEATFLOW)
-      atom->heatflow[nlocal] = extra[nlocal][m++];
-    else if (styles[nv] == IVEC)
-      atom->ivector[index[nv]][nlocal] = (int) ubuf(extra[nlocal][m++]).i;
-    else if (styles[nv] == DVEC)
-      atom->dvector[index[nv]][nlocal] = extra[nlocal][m++];
-    else if (styles[nv] == IARRAY) {
-      ncol = cols[nv];
-      for (k = 0; k < ncol; k++)
-        atom->iarray[index[nv]][nlocal][k] = (int) ubuf(extra[nlocal][m++]).i;
-    } else if (styles[nv] == DARRAY) {
-      ncol = cols[nv];
-      for (k = 0; k < ncol; k++) atom->darray[index[nv]][nlocal][k] = extra[nlocal][m++];
-    }
-  }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixPropertyAtom::maxsize_restart()
-{
-  return values_peratom + 1;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixPropertyAtom::size_restart(int /*nlocal*/)
-{
-  return values_peratom + 1;
 }

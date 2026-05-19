@@ -29,7 +29,7 @@ using namespace LAMMPS_NS;
 
 PairSPHTaitwaterMorris::PairSPHTaitwaterMorris(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
   first = 1;
   single_enable = 0;
 }

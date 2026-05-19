@@ -58,12 +58,10 @@ class FixColvars : public Fix {
   double compute_scalar() override;
   double memory_usage() override;
 
-  void restart(char *) override;
-
  protected:
   colvarproxy_lammps *proxy;    // pointer to the colvars proxy class
   char *conf_file;              // name of colvars config file
-  char *inp_name;               // name/prefix of colvars restart file
+  char *inp_name;
   char *out_name;               // prefix string for all output files
   char *tmp_name;               // name of thermostat fix.
   int rng_seed;                 // seed to initialize random number generator

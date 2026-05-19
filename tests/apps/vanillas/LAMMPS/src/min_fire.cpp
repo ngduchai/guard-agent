@@ -606,7 +606,6 @@ template <int INTEGRATOR, bool ABCFLAG> int MinFire::run_iterate(int maxiter)
       }
     }
 
-    // output for thermo, dump, restart files
 
     if (output->next == ntimestep) {
       timer->stamp();

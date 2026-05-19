@@ -45,7 +45,7 @@ typedef struct {
   int role;                     /* role of this rank */
   int steps;                    /* number of MD steps */
   int nmm;                      /* tasks reserved for MD (master and slave) */
-  char *restart;                /* name of (MM) restart file */
+  char *resume;                /* name of (MM) resume file */
   char *handle;                 /* handle for SHEMEM communication */
   int my_comm, qm_comm, mm_comm; /* MPI communicators, Fortran-style */
 } qmmm_config_t;

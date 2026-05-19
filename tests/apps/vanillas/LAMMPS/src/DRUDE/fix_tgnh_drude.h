@@ -33,8 +33,7 @@ class FixTGNHDrude : public Fix {
   void pre_exchange() override;
   double compute_scalar() override;
   double compute_vector(int) override;
-  virtual int pack_restart_data(double *);    // pack restart data
-  void restart(char *) override;
+  virtual int pack_state_data(double *);
   int modify_param(int, char **) override;
   void reset_target(double) override;
   void reset_dt() override;

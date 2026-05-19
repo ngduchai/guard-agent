@@ -110,11 +110,11 @@ int read_qmmm_config(const char *file, qmmm_config_t *cfg)
             if (cfg->handle) free(cfg->handle);
             cfg->handle = strdup(ptr);
 
-        } else if (strncmp(ptr,"restart",7) == 0) {
+        } else if (strncmp(ptr,"resume",7) == 0) {
             ptr = skip_whitespace(ptr+7);
             trim_whitespace(ptr);
-            if (cfg->restart) free(cfg->restart);
-            cfg->restart = strdup(ptr);
+            if (cfg->resume) free(cfg->resume);
+            cfg->resume = strdup(ptr);
 
         } else if (strncmp(ptr,"qmdir",5) == 0) {
             ptr = skip_whitespace(ptr+5);
@@ -273,7 +273,7 @@ int write_qmmm_config(const char *file, qmmm_config_t *cfg)
         fputs("mode electrostatic\n",fp);
     } else fputs("mode unknown\n",fp);
 
-    if (cfg->restart) fprintf(fp,"restart %s\n",cfg->restart);
+    if (cfg->resume) fprintf(fp,"resume %s\n",cfg->resume);
     if (cfg->handle)  fprintf(fp,"handle %s\n", cfg->handle);
     fprintf(fp,"steps %d\n",cfg->steps);
     fprintf(fp,"verbose %d\n",cfg->verbose);

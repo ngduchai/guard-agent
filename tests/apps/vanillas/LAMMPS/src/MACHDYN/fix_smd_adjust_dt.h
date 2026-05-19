@@ -45,8 +45,6 @@ class FixSMDTlsphDtReset : public Fix {
   void initial_integrate(int) override;
   void end_of_step() override;
   double compute_scalar() override;
-  void restart(char *) override;
-
  private:
   double safety_factor;
   double dt, t_elapsed;

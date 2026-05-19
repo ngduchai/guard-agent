@@ -306,7 +306,6 @@ void TAD::command(int narg, char **arg)
       lmp->init();
       update->integrate->setup(1);
 
-    // write restart file of hot coords
 
       if (restart_flag) {
         timer->barrier_start();

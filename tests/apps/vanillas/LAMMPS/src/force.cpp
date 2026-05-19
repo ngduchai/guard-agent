@@ -74,7 +74,7 @@ Force::Force(LAMMPS *lmp) : Pointers(lmp)
   improper_style = utils::strdup("none");
   kspace_style = utils::strdup("none");
 
-  pair_restart = nullptr;
+  _unused_pair_init_str = nullptr;
   create_factories();
 }
 
@@ -142,7 +142,7 @@ Force::~Force()
   delete[] improper_style;
   delete[] kspace_style;
 
-  delete[] pair_restart;
+  delete[] _unused_pair_init_str;
 
   if (pair) delete pair;
   if (bond) delete bond;
@@ -172,11 +172,10 @@ void Force::init()
 {
   qqrd2e = qqr2e / dielectric;
 
-  // check if pair style must be specified after restart
-  if (pair_restart) {
+  if (_unused_pair_init_str) {
     if (!pair)
-      error->all(FLERR, "Must re-specify non-restarted pair style ({}) after read_restart",
-                 pair_restart);
+      error->all(FLERR, "Must re-specify previous pair style ({})",
+                 _unused_pair_init_str);
   }
 
   if (kspace) kspace->init();    // kspace must come before pair
@@ -217,17 +216,17 @@ void Force::setup()
 }
 
 /* ----------------------------------------------------------------------
-   create a pair style, called from input script or restart file
+   create a pair style, called from input script
 ------------------------------------------------------------------------- */
 
 void Force::create_pair(const std::string &style, int trysuffix)
 {
   delete[] pair_style;
   if (pair) delete pair;
-  delete[] pair_restart;
+  delete[] _unused_pair_init_str;
   pair_style = nullptr;
   pair = nullptr;
-  pair_restart = nullptr;
+  _unused_pair_init_str = nullptr;
 
   int sflag;
   pair = new_pair(style, trysuffix, sflag);
@@ -325,7 +324,7 @@ char *Force::pair_match_ptr(Pair *ptr)
 }
 
 /* ----------------------------------------------------------------------
-   create a bond style, called from input script or restart file
+   create a bond style, called from input script
 ------------------------------------------------------------------------- */
 
 void Force::create_bond(const std::string &style, int trysuffix)
@@ -393,7 +392,7 @@ Bond *Force::bond_match(const std::string &style)
 }
 
 /* ----------------------------------------------------------------------
-   create an angle style, called from input script or restart file
+   create an angle style, called from input script
 ------------------------------------------------------------------------- */
 
 void Force::create_angle(const std::string &style, int trysuffix)
@@ -461,7 +460,7 @@ Angle *Force::angle_match(const std::string &style)
 }
 
 /* ----------------------------------------------------------------------
-   create a dihedral style, called from input script or restart file
+   create a dihedral style, called from input script
 ------------------------------------------------------------------------- */
 
 void Force::create_dihedral(const std::string &style, int trysuffix)
@@ -529,7 +528,7 @@ Dihedral *Force::dihedral_match(const std::string &style)
 }
 
 /* ----------------------------------------------------------------------
-   create an improper style, called from input script or restart file
+   create an improper style, called from input script
 ------------------------------------------------------------------------- */
 
 void Force::create_improper(const std::string &style, int trysuffix)

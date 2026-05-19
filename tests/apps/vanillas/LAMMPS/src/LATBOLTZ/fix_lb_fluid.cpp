@@ -93,8 +93,6 @@ FixLbFluid::FixLbFluid(LAMMPS *lmp, int narg, char **arg) :
   //                                                  n_stencil = 2 is trilinear stencil
   //                                                  n_stencil = 3 is 3-point standard IBM stencil
   //                                                  n_stencil = 4 is 4-point Keys' interpolation stencil
-  //  "read_restart" restart_file:                   restart a fluid run from restart_file.
-  //  "write_restart" N:                             write a fluid restart file every N timesteps.
   //  "zwall_velocity" velocity_bottom velocity_top: assign velocities to the z-walls
   //                                                  in the system.
   //  "pressurebcx" pgradav:                         pressure boundary conditions in x-direction. The
@@ -797,11 +795,9 @@ void FixLbFluid::init()
 void FixLbFluid::setup(int /* vflag */)
 {
   //--------------------------------------------------------------------------
-  // We could calculate the force on the fluid for a restart run here but that
   // would not match the original continuation.  In fact, the recalcuated
   // forces would actually be zero if the algorithm were exact whereas the
   // original forces would be nonzero.  As such, seems better to just leave
-  // the hydro forces as zero for the first 1/2 step on restart.
   //--------------------------------------------------------------------------
 }
 
@@ -1002,9 +998,9 @@ void FixLbFluid::InitializeFirstRun()
   } else {
     step = 1;
 
-    read_restartfile();    // get f_lb from restart file
+    read_state_file();
   }
-  parametercalc_full();    // necessary after restart, consistently fill arrays for regular init
+  parametercalc_full();
 
   // When we calculate feq in initial_integrate we will need forces, as hydro forces are
   // velocity dependent and use the 1/2 step velocities which are not saved, we leave forces
@@ -2438,10 +2434,9 @@ void FixLbFluid::dump(const bigint step)
 }
 
 //==========================================================================
-// read in a fluid restart file.  This is only used to restart the
 // fluid portion of a LAMMPS simulation.
 //==========================================================================
-void FixLbFluid::read_restartfile()
+void FixLbFluid::read_state_file()
 {
   MPI_Status status;
   MPI_Datatype realtype;
@@ -2473,15 +2468,12 @@ void FixLbFluid::read_restartfile()
 }
 
 //==========================================================================
-// write a fluid restart file.
 //==========================================================================
 void FixLbFluid::write_restartfile()
 {
   // We first create the distribution with the correct momentum on the full step instead
   // of the 1/2 step that is used in the algorithm.  The main difference is the velocity
-  // shift from a 1/2 collision.  As the restart will have zero forces for first 1/2 step
   // we only take 1/2 force here.  We can use fnew as it will be overwritten in initial_integrate.
-  // This ensures total momentum is conserved after a restart.
 
   std::vector<double> etacov;
   etacov.resize(numvel);

@@ -382,7 +382,6 @@ T* DiagonalMatrix<T>::ptr()                                           const
   return _data->ptr();
 }
 //-----------------------------------------------------------------------------
-// writes the diagonal to a binary data restart file
 //-----------------------------------------------------------------------------
 template<typename T>
 void DiagonalMatrix<T>::write_restart(FILE *f)                            const

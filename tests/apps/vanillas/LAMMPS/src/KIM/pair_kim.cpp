@@ -128,7 +128,7 @@ PairKIM::PairKIM(LAMMPS *lmp) :
 {
   // Initialize Pair data members to appropriate values
   single_enable = 0;  // We do not provide the Single() function
-  restartinfo = 0;    // We do not write any restart info
+  data_writes_state = 0;
   one_coeff = 1;      // We only allow one coeff * * call
   // set to 1, regardless use of fdotr, to avoid ev_set()'s futzing with
   // vflag_global

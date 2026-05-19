@@ -113,7 +113,6 @@ public:
           if (node->position() != kNodePositionDidOnBefore) {
             // Call and Reg are complicated as they may insert some surrounding code around them. The simplest
             // approach is to get the previous node, call the `onBefore()` handlers and then check whether
-            // anything changed and restart if so. By restart we mean that the current `node` would go back to
             // the first possible inserted node by `onBeforeInvoke()` or `onBeforeRet()`.
             BaseNode* prev = node->prev();
 

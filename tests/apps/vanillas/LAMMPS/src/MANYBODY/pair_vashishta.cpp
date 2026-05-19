@@ -40,7 +40,7 @@ using namespace LAMMPS_NS;
 PairVashishta::PairVashishta(LAMMPS *lmp) : Pair(lmp)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;

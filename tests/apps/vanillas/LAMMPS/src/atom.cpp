@@ -248,11 +248,10 @@ Atom::Atom(LAMMPS *_lmp) : Pointers(_lmp)
   mass = nullptr;
   mass_setflag = nullptr;
 
-  // callback lists & extra restart info
 
-  nextra_grow = nextra_restart = nextra_border = 0;
-  extra_grow = extra_restart = extra_border = nullptr;
-  nextra_grow_max = nextra_restart_max = nextra_border_max = 0;
+  nextra_grow = nextra_extra = nextra_border = 0;
+  extra_grow = extra_reserved = extra_border = nullptr;
+  nextra_grow_max = nextra_extra_max = nextra_border_max = 0;
   nextra_store = 0;
   extra = nullptr;
 
@@ -354,7 +353,7 @@ Atom::~Atom()
   // delete extra arrays
 
   memory->destroy(extra_grow);
-  memory->destroy(extra_restart);
+  memory->destroy(extra_reserved);
   memory->destroy(extra_border);
   memory->destroy(extra);
 
@@ -646,7 +645,7 @@ void Atom::set_atomflag_defaults()
 
 /* ----------------------------------------------------------------------
    create an AtomVec style
-   called from lammps.cpp, input script, restart file, replicate
+   called from lammps.cpp, input script, replicate
 ------------------------------------------------------------------------- */
 
 void Atom::create_avec(const std::string &style, int narg, char **arg, int trysuffix)
@@ -1963,7 +1962,7 @@ void Atom::set_mass(const char *file, int line, int /*narg*/, char **arg)
 
 /* ----------------------------------------------------------------------
    set all masses
-   called from reading of restart file, also from ServerMD
+   called from reading by ServerMD
 ------------------------------------------------------------------------- */
 
 void Atom::set_mass(double *values)
@@ -2493,7 +2492,7 @@ void Atom::setup_sort_bins()
 /* ----------------------------------------------------------------------
    register a callback to a fix so it can manage atom-based arrays
    happens when fix is created
-   flag = Atom::GROW for grow, Atom::RESTART for restart, Atom::BORDER for border comm
+   flag = Atom::GROW for grow, Atom::RESERVED_CB for reserved, Atom::BORDER for border comm
 ------------------------------------------------------------------------- */
 
 void Atom::add_callback(int flag)
@@ -2522,14 +2521,14 @@ void Atom::add_callback(int flag)
     extra_grow[nextra_grow] = ifix;
     nextra_grow++;
     std::sort(extra_grow, extra_grow + nextra_grow);
-  } else if (flag == RESTART) {
-    if (nextra_restart == nextra_restart_max) {
-      nextra_restart_max += DELTA;
-      memory->grow(extra_restart,nextra_restart_max,"atom:extra_restart");
+  } else if (flag == RESERVED_CB) {
+    if (nextra_extra == nextra_extra_max) {
+      nextra_extra_max += DELTA;
+      memory->grow(extra_reserved,nextra_extra_max,"atom:extra_reserved");
     }
-    extra_restart[nextra_restart] = ifix;
-    nextra_restart++;
-    std::sort(extra_restart, extra_restart + nextra_restart);
+    extra_reserved[nextra_extra] = ifix;
+    nextra_extra++;
+    std::sort(extra_reserved, extra_reserved + nextra_extra);
   } else if (flag == BORDER) {
     if (nextra_border == nextra_border_max) {
       nextra_border_max += DELTA;
@@ -2544,7 +2543,7 @@ void Atom::add_callback(int flag)
 /* ----------------------------------------------------------------------
    unregister a callback to a fix
    happens when fix is deleted, called by its destructor
-   flag = 0 for grow, 1 for restart
+   flag = 0 for grow, 1 for reserved
 ------------------------------------------------------------------------- */
 
 void Atom::delete_callback(const char *id, int flag)
@@ -2565,15 +2564,14 @@ void Atom::delete_callback(const char *id, int flag)
       extra_grow[i] = extra_grow[i+1];
     nextra_grow--;
 
-  } else if (flag == RESTART) {
+  } else if (flag == RESERVED_CB) {
     int match;
-    for (match = 0; match < nextra_restart; match++)
-      if (extra_restart[match] == ifix) break;
-    if ((nextra_restart == 0) || (match == nextra_restart))
-      error->all(FLERR,"Trying to delete non-existent Atom::restart() callback");
-    for (int i = match; i < nextra_restart-1; i++)
-      extra_restart[i] = extra_restart[i+1];
-    nextra_restart--;
+    for (match = 0; match < nextra_extra; match++)
+      if (extra_reserved[match] == ifix) break;
+    if ((nextra_extra == 0) || (match == nextra_extra))
+    for (int i = match; i < nextra_extra-1; i++)
+      extra_reserved[i] = extra_reserved[i+1];
+    nextra_extra--;
 
   } else if (flag == BORDER) {
     int match;
@@ -2596,8 +2594,8 @@ void Atom::update_callback(int ifix)
 {
   for (int i = 0; i < nextra_grow; i++)
     if (extra_grow[i] > ifix) extra_grow[i]--;
-  for (int i = 0; i < nextra_restart; i++)
-    if (extra_restart[i] > ifix) extra_restart[i]--;
+  for (int i = 0; i < nextra_extra; i++)
+    if (extra_reserved[i] > ifix) extra_reserved[i]--;
   for (int i = 0; i < nextra_border; i++)
     if (extra_border[i] > ifix) extra_border[i]--;
 }

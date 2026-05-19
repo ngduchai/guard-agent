@@ -377,7 +377,6 @@ void PRD::command(int narg, char **arg)
     timer->barrier_stop();
     time_comm += timer->get_wall(Timer::TOTAL);
 
-    // write restart file of hot coords
 
     if (restart_flag) {
       timer->barrier_start();
@@ -668,7 +667,6 @@ void PRD::share_event(int ireplica, int flag, int decrement)
 
   // delta passed to store_event_prd() should make its clock update
   //   be consistent with clock in main PRD loop
-  // don't change the clock or timestep if this is a restart
 
   if (flag == 0 && fix_event->event_number != 0)
     fix_event->store_event_prd(fix_event->event_timestep,0);

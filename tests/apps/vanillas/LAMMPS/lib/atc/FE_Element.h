@@ -285,7 +285,6 @@ namespace ATC {
                   int numFaceNodes,
                   int numNodes1d);
 
-    // Dump state info to disk for later restart (unimplemented)
     void write_restart(FILE *);
 
     ~FE_ElementHex();
@@ -308,7 +307,6 @@ namespace ATC {
   public:
     FE_ElementRect();
 
-    // Dump state info to disk for later restart (unimplemented)
     void write_restart(FILE *);
 
     ~FE_ElementRect();
@@ -336,7 +334,6 @@ namespace ATC {
                   int numFaceNodes,
                   int numNodes1d);
 
-    // Dump state info to disk for later restart (unimplemented)
     void write_restart(FILE *);
 
     ~FE_ElementTet();

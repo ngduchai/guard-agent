@@ -199,13 +199,3 @@ double FixSMDTlsphDtReset::compute_scalar() {
         return t_elapsed;
 }
 
-/* ----------------------------------------------------------------------
- use state info from restart file to restart the Fix
- ------------------------------------------------------------------------- */
-
-void FixSMDTlsphDtReset::restart(char *buf) {
-        int n = 0;
-        auto list = (double *) buf;
-        t_elapsed = list[n++];
-}
-

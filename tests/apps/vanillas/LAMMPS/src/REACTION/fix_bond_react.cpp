@@ -596,7 +596,6 @@ FixBondReact::FixBondReact(LAMMPS *lmp, int narg, char **arg) :
   statted_id = nullptr;
   custom_exclude_flag = 0;
 
-  // used to store restart info
   set = new Set[nreacts];
   memset(set,0,nreacts*sizeof(Set));
 }
@@ -742,7 +741,6 @@ void FixBondReact::post_constructor()
                            " all property/atom i_limit_tags i_react_tags ghost yes");
 
   // create master_group if not already existing
-  // NOTE: limit_tags and react_tags automaticaly intitialized to zero (unless read from restart)
   group->find_or_create(master_group);
   std::string cmd = fmt::format("{} dynamic all property limit_tags",master_group);
   group->assign(cmd);
@@ -777,7 +775,6 @@ void FixBondReact::post_constructor()
 
       // on to statted_tags (system-wide thermostat)
       // initialize per-atom statted_flags to 1
-      // (only if not already initialized by restart)
       if (fix3->restart_reset != 1) {
         int flag,cols;
         int index = atom->find_custom("statted_tags",flag,cols);
@@ -4463,48 +4460,6 @@ void FixBondReact::unpack_reverse_comm(int n, int *list, double *buf)
       } else m += 2;
     }
   }
-}
-
-/* ----------------------------------------------------------------------
-   use selected state info from restart file to restart the Fix
-   bond/react restart revisions numbers added after LAMMPS version 3 Nov 2022
-------------------------------------------------------------------------- */
-
-void FixBondReact::restart(char *buf)
-{
-  int n,revision,r_nreacts,r_max_rate_limit_steps,ibufcount,n2cpy;
-  int **ibuf;
-
-  n = 0;
-  if (lmp->restart_ver > utils::date2num("3 Nov 2022")) revision = buf[n++];
-  else revision = 0;
-
-  Set *set_restart = (Set *) &buf[n*sizeof(int)];
-  r_nreacts = set_restart[0].nreacts;
-
-  n2cpy = 0;
-  if (revision > 0) {
-    r_max_rate_limit_steps = set_restart[0].max_rate_limit_steps;
-    if (r_max_rate_limit_steps > 0) {
-      ibufcount = r_max_rate_limit_steps*r_nreacts;
-      memory->create(ibuf,r_max_rate_limit_steps,r_nreacts,"bond/react:ibuf");
-      memcpy(&ibuf[0][0],&buf[sizeof(int)+r_nreacts*sizeof(Set)],sizeof(int)*ibufcount);
-      n2cpy = r_max_rate_limit_steps;
-    }
-  }
-
-  if (max_rate_limit_steps < n2cpy) n2cpy = max_rate_limit_steps;
-  for (int i = 0; i < r_nreacts; i++) {
-    for (int j = 0; j < nreacts; j++) {
-      if (strcmp(set_restart[i].rxn_name,rxn_name[j]) == 0) {
-        reaction_count_total[j] = set_restart[i].reaction_count_total;
-        // read rate_limit restart information
-        for (int k = 0; k < n2cpy; k++)
-          store_rxn_count[k][j] = ibuf[k][i];
-      }
-    }
-  }
-  if (revision > 0 && r_max_rate_limit_steps > 0) memory->destroy(ibuf);
 }
 
 /* ----------------------------------------------------------------------

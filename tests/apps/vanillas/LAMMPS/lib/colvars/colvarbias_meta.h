@@ -152,10 +152,8 @@ protected:
   /// \brief How often the hills should be projected onto the grids
   size_t     grids_freq;
 
-  /// Keep hills in the restart file (e.g. to accurately rebin later)
   bool       keep_hills;
 
-  /// value of keepHills saved in the most recent restart file
   bool restart_keep_hills;
 
   /// \brief Dump the free energy surface (.pmf file) every restartFrequency
@@ -185,7 +183,6 @@ protected:
   cvm::step_number ebmeta_equil_steps;
 
 
-  /// \brief Try to read the restart information by allocating new
   /// grids before replacing the current ones (used e.g. in
   /// multiple_replicas)
   bool       safely_read_restart;
@@ -241,7 +238,6 @@ protected:
   std::string            replica_list_file;
 
   /// Hills energy and gradients written specifically for other
-  /// replica (in addition to its own restart file)
   std::string            replica_state_file;
   /// Whether a mirror bias has read the latest version of its state file
   bool                   replica_state_file_in_sync;

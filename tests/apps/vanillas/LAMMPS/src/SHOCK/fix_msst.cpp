@@ -784,25 +784,6 @@ void FixMSST::remap(int flag)
   }
 }
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixMSST::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  omega[direction] = list[n++];
-  e0 = list[n++];
-  v0 = list[n++];
-  p0 = list[n++];
-  TS_int = list[n++];
-  tscale = 0.0;           // set tscale to zero for restart
-  p0_set = 1;
-  v0_set = 1;
-  e0_set = 1;
-}
-
 /* ---------------------------------------------------------------------- */
 
 int FixMSST::modify_param(int narg, char **arg)

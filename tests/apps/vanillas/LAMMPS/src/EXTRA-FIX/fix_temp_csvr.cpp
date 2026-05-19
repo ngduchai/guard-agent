@@ -251,7 +251,7 @@ double FixTempCSVR::gamdev(const int ia)
     else
       x = -log(x);
   } else {
-  restart:
+  retry_loop:
     do {
       do {
         do {
@@ -266,7 +266,7 @@ double FixTempCSVR::gamdev(const int ia)
       } while (x <= 0.0);
 
       if (am*log(x/am)-s*y < -700 || v1<0.00001) {
-        goto restart;
+        goto retry_loop;
       }
 
       e=(1.0+y*y)*exp(am*log(x/am)-s*y);
@@ -323,22 +323,6 @@ void FixTempCSVR::reset_target(double t_new)
 double FixTempCSVR::compute_scalar()
 {
   return energy;
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTempCSVR::restart(char *buf)
-{
-  auto list = (double *) buf;
-
-  energy = list[0];
-  int nprocs = (int) list[1];
-  if (nprocs != comm->nprocs) {
-    if (comm->me == 0)
-      error->warning(FLERR,"Different number of procs. Cannot restore RNG state.");
-  } else random->set_state(list+2+comm->me*PRNGSIZE);
 }
 
 /* ----------------------------------------------------------------------

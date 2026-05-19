@@ -133,10 +133,10 @@ class FixLbFluid : public Fix {
   int seed;
   class RanMars *random;
 
-  int readrestart;    // 1 to read in data from a restart file.
+  int readrestart;
   MPI_File pFileRead;
 
-  int printrestart;    // 1 to write data to a restart file.
+  int printrestart;
   MPI_File pFileWrite;
 
   double timeEqb, timeUpdate, timePCalc, timefluidForce, timeCorrectU;
@@ -166,7 +166,7 @@ class FixLbFluid : public Fix {
   void update_full15(void);
   void update_full19(void);
 
-  void read_restartfile(void);
+  void read_state_file(void);
   void write_restartfile(void);
 
   void (FixLbFluid::*interpolate)(int, int);

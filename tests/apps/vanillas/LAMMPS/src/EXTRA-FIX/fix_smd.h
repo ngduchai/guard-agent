@@ -34,8 +34,6 @@ class FixSMD : public Fix {
   void post_force_respa(int, int, int) override;
   double compute_vector(int) override;
 
-  void restart(char *) override;
-
  private:
   double xc, yc, zc, xn, yn, zn, r0;
   double k_smd, f_smd, v_smd;

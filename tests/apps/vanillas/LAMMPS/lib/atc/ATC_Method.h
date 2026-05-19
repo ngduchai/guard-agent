@@ -830,7 +830,7 @@ namespace ATC {
 
 
     //---------------------------------------------------------------
-    /** \name restart procedures */
+    /** \name resume procedures */
     //---------------------------------------------------------------
     bool useRestart_;
     std::string restartFileName_;

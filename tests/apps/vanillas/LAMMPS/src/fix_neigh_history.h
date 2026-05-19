@@ -54,11 +54,6 @@ class FixNeighHistory : public Fix {
   void unpack_reverse_comm(int, int *, double *) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
-
  protected:
   int newton_pair;        // same as force setting
   int dnum, dnumbytes;    // dnum = # of values per neighbor

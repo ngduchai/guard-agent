@@ -64,7 +64,7 @@ FixNeighHistory::FixNeighHistory(LAMMPS *lmp, int narg, char **arg) :
 
   FixNeighHistory::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   pgsize = oneatom = 0;
 
@@ -100,7 +100,7 @@ FixNeighHistory::~FixNeighHistory()
   // unregister this fix so atom class doesn't invoke it any more
 
   atom->delete_callback(id, Atom::GROW);
-  atom->delete_callback(id, Atom::RESTART);
+  atom->delete_callback(id, Atom::RESERVED_CB);
 
   // delete locally stored arrays
 
@@ -213,7 +213,7 @@ void FixNeighHistory::setup_post_neighbor()
    e.g. when atoms migrate to new procs, new neigh list built, or between runs
      when atoms may be added or deleted (NDS becomes out-of-date)
    the next post_neighbor() will put this info back into new NDS
-   called during run before atom exchanges, including for restart files
+   called during run before atom exchanges
    called at end of run via post_run()
    do not call during setup of run (setup_pre_exchange)
      because there is no guarantee of a current NDS (even on continued run)
@@ -856,76 +856,4 @@ int FixNeighHistory::unpack_exchange(int nlocal, double *buf)
     m += dnum;
   }
   return m;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixNeighHistory::pack_restart(int i, double *buf)
-{
-  int m = 1;
-  buf[m++] = npartner[i];
-  for (int n = 0; n < npartner[i]; n++) {
-    buf[m++] = ubuf(partner[i][n]).d;
-    memcpy(&buf[m], &valuepartner[i][dnum * n], dnumbytes);
-    m += dnum;
-  }
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = m;
-  return m;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixNeighHistory::unpack_restart(int nlocal, int nth)
-{
-  // ipage_atom = nullptr if being called from granular pair style init()
-
-  if (ipage_atom == nullptr) allocate_pages();
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  double **extra = atom->extra;
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  // allocate new chunks from ipage_atom,dpage_atom for incoming values
-
-  npartner[nlocal] = static_cast<int>(extra[nlocal][m++]);
-  maxpartner = MAX(maxpartner, npartner[nlocal]);
-  partner[nlocal] = ipage_atom->get(npartner[nlocal]);
-  valuepartner[nlocal] = dpage_atom->get(dnum * npartner[nlocal]);
-  for (int n = 0; n < npartner[nlocal]; n++) {
-    partner[nlocal][n] = static_cast<tagint>(ubuf(extra[nlocal][m++]).i);
-    memcpy(&valuepartner[nlocal][dnum * n], &extra[nlocal][m], dnumbytes);
-    m += dnum;
-  }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixNeighHistory::maxsize_restart()
-{
-  // maxpartner_all = max # of touching partners across all procs
-
-  int maxpartner_all;
-  MPI_Allreduce(&maxpartner, &maxpartner_all, 1, MPI_INT, MPI_MAX, world);
-  return (dnum + 1) * maxpartner_all + 2;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixNeighHistory::size_restart(int nlocal)
-{
-  return (dnum + 1) * npartner[nlocal] + 2;
 }

@@ -33,7 +33,7 @@ class Update : protected Pointers {
   bigint beginstep, endstep;     // 1st and last step of multiple runs
   int first_update;              // 0 before initial update, 1 after
   int max_eval;                  // max force evaluations for minimizer
-  int restrict_output;           // 1 if output should not write dump/restart
+  int restrict_output;
   int setupflag;                 // set when setup() is computing forces
   int multireplica;              // 1 if min across replicas, else 0
   int dt_default;                // 1 if dt is at default value, else 0

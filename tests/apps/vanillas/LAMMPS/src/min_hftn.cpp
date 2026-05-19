@@ -528,7 +528,6 @@ int MinHFTN::execute_hftn_(const bool      bPrintProgress,
       }
     }
 
-    //---- OUTPUT FOR thermo, dump, restart FILES.
     if (output->next == update->ntimestep) {
       //---- IF THE LAST STEP WAS REJECTED, THEN REEVALUATE ENERGY AND
       //---- FORCES AT THE OLD POINT SO THE OUTPUT DOES NOT DISPLAY

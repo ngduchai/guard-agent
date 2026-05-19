@@ -287,7 +287,7 @@ FixMove::FixMove(LAMMPS *lmp, int narg, char **arg) :
 
   FixMove::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   displace = velocity = nullptr;
 
@@ -349,7 +349,6 @@ FixMove::FixMove(LAMMPS *lmp, int narg, char **arg) :
     }
   }
 
-  // nrestart = size of per-atom restart data
   // nrestart = 1 + xorig + torig + qorig
 
   nrestart = 4;
@@ -368,7 +367,7 @@ FixMove::~FixMove()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id, Atom::GROW);
-  atom->delete_callback(id, Atom::RESTART);
+  atom->delete_callback(id, Atom::RESERVED_CB);
 
   // delete locally stored arrays
 
@@ -1193,18 +1192,6 @@ double FixMove::memory_usage()
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixMove::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  time_origin = static_cast<int>(list[n++]);
-}
-
-/* ----------------------------------------------------------------------
    allocate atom-based array
 ------------------------------------------------------------------------- */
 
@@ -1435,73 +1422,6 @@ int FixMove::unpack_exchange(int nlocal, double *buf)
     qoriginal[nlocal][3] = buf[n++];
   }
   return n;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixMove::pack_restart(int i, double *buf)
-{
-  int n = 1;
-  buf[n++] = xoriginal[i][0];
-  buf[n++] = xoriginal[i][1];
-  buf[n++] = xoriginal[i][2];
-  if (theta_flag) buf[n++] = toriginal[i];
-  if (quat_flag) {
-    buf[n++] = qoriginal[i][0];
-    buf[n++] = qoriginal[i][1];
-    buf[n++] = qoriginal[i][2];
-    buf[n++] = qoriginal[i][3];
-  }
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = n;
-  return n;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixMove::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  xoriginal[nlocal][0] = extra[nlocal][m++];
-  xoriginal[nlocal][1] = extra[nlocal][m++];
-  xoriginal[nlocal][2] = extra[nlocal][m++];
-  if (theta_flag) toriginal[nlocal] = extra[nlocal][m++];
-  if (quat_flag) {
-    qoriginal[nlocal][0] = extra[nlocal][m++];
-    qoriginal[nlocal][1] = extra[nlocal][m++];
-    qoriginal[nlocal][2] = extra[nlocal][m++];
-    qoriginal[nlocal][3] = extra[nlocal][m++];
-  }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixMove::maxsize_restart()
-{
-  return nrestart;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixMove::size_restart(int /*nlocal*/)
-{
-  return nrestart;
 }
 
 /* ---------------------------------------------------------------------- */

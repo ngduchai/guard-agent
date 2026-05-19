@@ -1094,47 +1094,6 @@ void FixRigidNH::nh_epsilon_dot()
   mtk_term2 /= g_f;
 }
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixRigidNH::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  int flag = static_cast<int> (list[n++]);
-
-  if (flag) {
-    int m = static_cast<int> (list[n++]);
-    if (tstat_flag && m == t_chain) {
-      for (int i = 0; i < t_chain; i++) {
-        eta_t[i] = list[n++];
-        eta_r[i] = list[n++];
-        eta_dot_t[i] = list[n++];
-        eta_dot_r[i] = list[n++];
-      }
-    } else n += 4*m;
-  }
-
-  flag = static_cast<int> (list[n++]);
-  if (flag) {
-    epsilon[0] = list[n++];
-    epsilon[1] = list[n++];
-    epsilon[2] = list[n++];
-    epsilon_dot[0] = list[n++];
-    epsilon_dot[1] = list[n++];
-    epsilon_dot[2] = list[n++];
-
-    int m = static_cast<int> (list[n++]);
-    if (pstat_flag && m == p_chain) {
-      for (int i = 0; i < p_chain; i++) {
-        eta_b[i] = list[n++];
-        eta_dot_b[i] = list[n++];
-      }
-    } else n += 2*m;
-  }
-}
-
 /* ---------------------------------------------------------------------- */
 
 int FixRigidNH::modify_param(int narg, char **arg)

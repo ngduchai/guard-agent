@@ -59,7 +59,6 @@ public:
   virtual int update();
 
   /// Returns true if the current step represent a valid increment, whose data
-  /// can be recorded (as opposed to e.g. a continuation step from a restart)
   virtual bool can_accumulate_data();
 
   /// Compute the energy of the bias
@@ -156,7 +155,6 @@ public:
   /// Write the bias configuration to a state file or other stream
   std::ostream & write_state(std::ostream &os);
 
-  /// Read the bias configuration from a restart file or other stream
   std::istream & read_state(std::istream &is);
 
   /// Write the bias state to a file with the given prefix

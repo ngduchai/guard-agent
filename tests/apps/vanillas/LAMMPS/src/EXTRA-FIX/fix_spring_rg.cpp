@@ -149,19 +149,6 @@ void FixSpringRG::post_force_respa(int vflag, int ilevel, int /*iloop*/)
   if (ilevel == ilevel_respa) post_force(vflag);
 }
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixSpringRG::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  rg0 = list[n++];
-  rg0_flag = 0;
-}
-
 
 /* ----------------------------------------------------------------------
    return reference radius of gyration

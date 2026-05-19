@@ -933,18 +933,6 @@ void FixColvars::end_of_step()
 
 /* ---------------------------------------------------------------------- */
 
-void FixColvars::restart(char *buf)
-{
-  one_time_init();
-
-  if (me == 0) {
-    std::string rest_text(buf);
-    proxy->deserialize_status(rest_text);
-  }
-}
-
-/* ---------------------------------------------------------------------- */
-
 void FixColvars::post_run()
 {
   if (me == 0) {

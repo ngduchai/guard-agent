@@ -449,16 +449,13 @@ public:
   /// (Re)initialize the output trajectory and state file (does not write it yet)
   int setup_output();
 
-  /// Read a restart file
   std::istream & read_restart(std::istream &is);
 
   /// Read the states of individual objects; allows for changes
   std::istream & read_objects_state(std::istream &is);
 
-  /// If needed (old restart file), print the warning that cannot be ignored
   int print_total_forces_errning(bool warn_total_forces);
 
-  /// Write the output restart file
   std::ostream & write_restart(std::ostream &os);
 
   /// Strips .colvars.state from filename and checks that it is not empty
@@ -476,7 +473,6 @@ public:
   /// Write all trajectory files
   int write_traj_files();
   /// Write a state file useful to resume the simulation
-  int write_restart_file(std::string const &out_name);
   /// Write all other output files
   int write_output_files();
   /// Backup a file before writing it
@@ -751,7 +747,6 @@ public:
 
   /// Frequency for saving output restarts
   static size_t restart_out_freq;
-  /// Output restart file name
   std::string   restart_out_name;
 
   /// Pseudo-random number with Gaussian distribution

@@ -130,7 +130,6 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
 
   version = (const char *) LAMMPS_VERSION;
   num_ver = utils::date2num(version);
-  restart_ver = -1;
 
   // append git descriptor info to update string when compiling development or maintenance version
 
@@ -197,9 +196,6 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
   int partscreenflag = 0;
   int partlogflag = 0;
   int kokkosflag = 0;
-  int restart2data = 0;
-  int restart2dump = 0;
-  int restartremap = 0;
   int citeflag = 1;
   int citescreen = CiteMe::TERSE;
   int citelogfile = CiteMe::VERBOSE;
@@ -214,7 +210,6 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
   else exename = nullptr;
   packargs = nullptr;
   num_package = 0;
-  char *restartfile = nullptr;
   int wfirst,wlast;
   int kkfirst,kklast;
 
@@ -364,50 +359,6 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
         error->universe_all(FLERR,"Cannot use -reorder after -partition");
       universe->reorder(arg[iarg+1],arg[iarg+2]);
       iarg += 3;
-
-    } else if (strcmp(arg[iarg],"-restart2data") == 0 ||
-               strcmp(arg[iarg],"-r2data") == 0) {
-      if (iarg+3 > narg)
-        error->universe_all(FLERR,"Invalid command-line argument");
-      if (restart2dump)
-        error->universe_all(FLERR,
-                            "Cannot use both -restart2data and -restart2dump");
-      restart2data = 1;
-      restartfile = arg[iarg+1];
-      // check for restart remap flag
-      if (strcmp(arg[iarg+2],"remap") == 0) {
-        if (iarg+4 > narg)
-          error->universe_all(FLERR,"Invalid command-line argument");
-        restartremap = 1;
-        iarg++;
-      }
-      iarg += 2;
-      // delimit args for the write_data command
-      wfirst = iarg;
-      while (iarg < narg && arg[iarg][0] != '-') iarg++;
-      wlast = iarg;
-
-    } else if (strcmp(arg[iarg],"-restart2dump") == 0 ||
-               strcmp(arg[iarg],"-r2dump") == 0) {
-      if (iarg+3 > narg)
-        error->universe_all(FLERR,"Invalid command-line argument");
-      if (restart2data)
-        error->universe_all(FLERR,
-                            "Cannot use both -restart2data and -restart2dump");
-      restart2dump = 1;
-      restartfile = arg[iarg+1];
-      // check for restart remap flag
-      if (strcmp(arg[iarg+2],"remap") == 0) {
-        if (iarg+4 > narg)
-          error->universe_all(FLERR,"Invalid command-line argument");
-        restartremap = 1;
-        iarg++;
-      }
-      iarg += 2;
-      // delimit args for the write_dump command
-      wfirst = iarg;
-      while (iarg < narg && arg[iarg][0] != '-') iarg++;
-      wlast = iarg;
 
     } else if (strcmp(arg[iarg],"-screen") == 0 ||
                strcmp(arg[iarg],"-sc") == 0) {
@@ -712,23 +663,6 @@ LAMMPS::LAMMPS(int narg, char **arg, MPI_Comm communicator) :
     post_create();
   }
 
-  // if either restart conversion option was used, invoke 2 commands and quit
-  // add args between wfirst and wlast to write_data or write_data command
-  // add "noinit" to write_data to prevent a system init
-  // write_dump will just give a warning message about no init
-
-  if (restart2data || restart2dump) {
-    std::string cmd = fmt::format("read_restart {}",restartfile);
-    if (restartremap) cmd += " remap\n";
-    input->one(cmd);
-    if (restart2data) cmd = "write_data ";
-    else cmd = "write_dump";
-    for (iarg = wfirst; iarg < wlast; iarg++)
-       cmd += fmt::format(" {}", arg[iarg]);
-    if (restart2data) cmd += " noinit";
-    input->one(cmd);
-    error->done(0);
-  }
 }
 
 /** Shut down a LAMMPS simulation instance
@@ -1003,8 +937,6 @@ void LAMMPS::destroy()
 
   delete python;
   python = nullptr;
-
-  restart_ver = -1;       // reset last restart version id
 }
 
 /* ----------------------------------------------------------------------
@@ -1245,9 +1177,6 @@ void _noopt LAMMPS::help()
           "-partition size1 size2 ...  : assign partition sizes (-p)\n"
           "-plog basename              : basename for partition logs (-pl)\n"
           "-pscreen basename           : basename for partition screens (-ps)\n"
-          "-restart2data rfile dfile ... : convert restart to data file (-r2data)\n"
-          "-restart2dump rfile dgroup dstyle dfile ... \n"
-          "                            : convert restart to dump file (-r2dump)\n"
           "-reorder topology-specs     : processor reordering (-r)\n"
           "-screen none/filename       : where to send screen output (-sc)\n"
           "-skiprun                    : skip loops in run and minimize (-sr)\n"

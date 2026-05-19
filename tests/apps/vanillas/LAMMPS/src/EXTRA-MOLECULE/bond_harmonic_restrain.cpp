@@ -174,8 +174,6 @@ void BondHarmonicRestrain::init_style()
 
   } else {
 
-    // after a restart, natoms is set but initial is a null pointer.
-    // we add the fix, but do not initialize it.  It will pull the data from the restart.
 
     if (!initial) {
       initial = dynamic_cast<FixStoreAtom *>(

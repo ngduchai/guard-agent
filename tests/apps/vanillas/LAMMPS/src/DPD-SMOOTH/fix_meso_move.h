@@ -35,17 +35,11 @@ class FixMesoMove : public Fix {
   void final_integrate() override;
 
   double memory_usage() override;
-  void restart(char *) override;
   void grow_arrays(int) override;
   void copy_arrays(int, int, int) override;
   void set_arrays(int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int maxsize_restart() override;
-  int size_restart(int) override;
-
   void reset_dt() override;
 
  private:

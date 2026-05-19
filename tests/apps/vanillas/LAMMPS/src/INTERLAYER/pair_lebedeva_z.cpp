@@ -47,7 +47,7 @@ using namespace LAMMPS_NS;
 PairLebedevaZ::PairLebedevaZ(LAMMPS *lmp) : Pair(lmp)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;
   unit_convert_flag = utils::get_supported_conversions(utils::ENERGY);

@@ -2489,7 +2489,6 @@ void FixRigidSmall::readfile(int which, double **array, int *inbody)
   }
   MPI_Bcast(&nlines,1,MPI_INT,0,world);
 
-  // empty file with 0 lines is needed to trigger initial restart file
   // generation when no infile was previously used.
 
   if (nlines == 0) return;
@@ -2572,124 +2571,6 @@ void FixRigidSmall::readfile(int which, double **array, int *inbody)
 
   if (me == 0) fclose(fp);
   delete[] buffer;
-}
-
-/* ----------------------------------------------------------------------
-   write out restart info for mass, COM, inertia tensor to file
-   identical format to inpfile option, so info can be read in when restarting
-   each proc contributes info for rigid bodies it owns
-------------------------------------------------------------------------- */
-
-void FixRigidSmall::write_restart_file(const char *file)
-{
-  FILE *fp;
-
-  // do not write file if bodies have not yet been initialized
-
-  if (!setupflag) return;
-
-  // proc 0 opens file and writes header
-
-  if (me == 0) {
-    auto outfile = std::string(file) + ".rigid";
-    fp = fopen(outfile.c_str(),"w");
-    if (fp == nullptr)
-      error->one(FLERR,"Cannot open fix rigid restart file {}: {}",outfile,utils::getsyserror());
-
-    fmt::print(fp,"# fix rigid mass, COM, inertia tensor info for "
-               "{} bodies on timestep {}\n\n",nbody,update->ntimestep);
-    fmt::print(fp,"{}\n",nbody);
-  }
-
-  // communication buffer for all my rigid body info
-  // max_size = largest buffer needed by any proc
-  // ncol = # of values per line in output file
-
-  int ncol = ATTRIBUTE_PERBODY;
-  int sendrow = nlocal_body;
-  int maxrow;
-  MPI_Allreduce(&sendrow,&maxrow,1,MPI_INT,MPI_MAX,world);
-
-  double **buf;
-  if (me == 0) memory->create(buf,MAX(1,maxrow),ncol,"rigid/small:buf");
-  else memory->create(buf,MAX(1,sendrow),ncol,"rigid/small:buf");
-
-  // pack my rigid body info into buf
-  // compute I tensor against xyz axes from diagonalized I and current quat
-  // Ispace = P Idiag P_transpose
-  // P is stored column-wise in exyz_space
-
-  double p[3][3],pdiag[3][3],ispace[3][3];
-
-  for (int i = 0; i < nlocal_body; i++) {
-    MathExtra::col2mat(body[i].ex_space,body[i].ey_space,body[i].ez_space,p);
-    MathExtra::times3_diag(p,body[i].inertia,pdiag);
-    MathExtra::times3_transpose(pdiag,p,ispace);
-
-    buf[i][0] = atom->molecule[body[i].ilocal];
-    buf[i][1] = body[i].mass;
-    buf[i][2] = body[i].xcm[0];
-    buf[i][3] = body[i].xcm[1];
-    buf[i][4] = body[i].xcm[2];
-    buf[i][5] = ispace[0][0];
-    buf[i][6] = ispace[1][1];
-    buf[i][7] = ispace[2][2];
-    buf[i][8] = ispace[0][1];
-    buf[i][9] = ispace[0][2];
-    buf[i][10] = ispace[1][2];
-    buf[i][11] = body[i].vcm[0];
-    buf[i][12] = body[i].vcm[1];
-    buf[i][13] = body[i].vcm[2];
-    buf[i][14] = body[i].angmom[0];
-    buf[i][15] = body[i].angmom[1];
-    buf[i][16] = body[i].angmom[2];
-    buf[i][17] = (body[i].image & IMGMASK) - IMGMAX;
-    buf[i][18] = (body[i].image >> IMGBITS & IMGMASK) - IMGMAX;
-    buf[i][19] = (body[i].image >> IMG2BITS) - IMGMAX;
-  }
-
-  // write one chunk of rigid body info per proc to file
-  // proc 0 pings each proc, receives its chunk, writes to file
-  // all other procs wait for ping, send their chunk to proc 0
-
-  int tmp,recvrow;
-
-  if (me == 0) {
-    MPI_Status status;
-    MPI_Request request;
-    for (int iproc = 0; iproc < nprocs; iproc++) {
-      if (iproc) {
-        MPI_Irecv(&buf[0][0],maxrow*ncol,MPI_DOUBLE,iproc,0,world,&request);
-        MPI_Send(&tmp,0,MPI_INT,iproc,0,world);
-        MPI_Wait(&request,&status);
-        MPI_Get_count(&status,MPI_DOUBLE,&recvrow);
-        recvrow /= ncol;
-      } else recvrow = sendrow;
-
-      for (int i = 0; i < recvrow; i++)
-        fprintf(fp,"%d %-1.16e %-1.16e %-1.16e %-1.16e "
-                "%-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e "
-                "%-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %-1.16e %d %d %d\n",
-                static_cast<int> (buf[i][0]),buf[i][1],
-                buf[i][2],buf[i][3],buf[i][4],
-                buf[i][5],buf[i][6],buf[i][7],
-                buf[i][8],buf[i][9],buf[i][10],
-                buf[i][11],buf[i][12],buf[i][13],
-                buf[i][14],buf[i][15],buf[i][16],
-                static_cast<int> (buf[i][17]),
-                static_cast<int> (buf[i][18]),
-                static_cast<int> (buf[i][19]));
-    }
-
-  } else {
-    MPI_Recv(&tmp,0,MPI_INT,0,0,world,MPI_STATUS_IGNORE);
-    MPI_Rsend(&buf[0][0],sendrow*ncol,MPI_DOUBLE,0,0,world);
-  }
-
-  // clean up and close file
-
-  memory->destroy(buf);
-  if (me == 0) fclose(fp);
 }
 
 /* ----------------------------------------------------------------------

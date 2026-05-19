@@ -208,7 +208,7 @@ FixSMDMoveTriSurf::FixSMDMoveTriSurf(LAMMPS *lmp, int narg, char **arg) :
         comm_forward = 12;
 
         //atom->add_callback(Atom::GROW);
-        //atom->add_callback(Atom::RESTART);
+        //atom->add_callback(Atom::RESERVED_CB);
 
         time_integrate = 1;
 }

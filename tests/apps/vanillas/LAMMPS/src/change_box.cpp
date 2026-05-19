@@ -179,12 +179,10 @@ void ChangeBox::command(int narg, char **arg)
     if (ops[m].style != ORTHO && ops[m].style != TRICLINIC) move_atoms = 1;
   }
 
-  // error if moving atoms and there is stored per-atom restart state
-  // disallowed b/c restart per-atom fix info will not move with atoms
 
   if (move_atoms && modify->nfix_restart_peratom)
     error->all(FLERR,"Change_box parameter not allowed after "
-               "reading restart file with per-atom info");
+               "reading prior state with per-atom info");
 
   // read options from end of input line
 

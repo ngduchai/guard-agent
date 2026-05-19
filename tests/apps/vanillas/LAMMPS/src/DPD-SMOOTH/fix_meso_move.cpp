@@ -224,7 +224,7 @@ FixMesoMove::FixMesoMove (LAMMPS *lmp, int narg, char **arg) :
 
   FixMesoMove::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   displace = velocity = nullptr;
 
@@ -249,7 +249,7 @@ FixMesoMove::~FixMesoMove () {
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   // delete locally stored arrays
 
@@ -795,17 +795,6 @@ double FixMesoMove::memory_usage () {
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixMesoMove::restart (char *buf) {
-  int n = 0;
-  auto list = (double *) buf;
-
-  time_origin = static_cast<int> (list[n++]);
-}
-
-/* ----------------------------------------------------------------------
    allocate atom-based array
 ------------------------------------------------------------------------- */
 
@@ -914,54 +903,6 @@ int FixMesoMove::unpack_exchange (int nlocal, double *buf) {
   xoriginal[nlocal][1] = buf[1];
   xoriginal[nlocal][2] = buf[2];
   return 3;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixMesoMove::pack_restart (int i, double *buf) {
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = 4;
-  buf[1] = xoriginal[i][0];
-  buf[2] = xoriginal[i][1];
-  buf[3] = xoriginal[i][2];
-  return 4;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixMesoMove::unpack_restart (int nlocal, int nth) {
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int> (extra[nlocal][m]);
-  m++;
-
-  xoriginal[nlocal][0] = extra[nlocal][m++];
-  xoriginal[nlocal][1] = extra[nlocal][m++];
-  xoriginal[nlocal][2] = extra[nlocal][m++];
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixMesoMove::maxsize_restart () {
-  return 4;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixMesoMove::size_restart (int /* nlocal */) {
-  return 4;
 }
 
 /* ---------------------------------------------------------------------- */

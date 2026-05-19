@@ -42,7 +42,6 @@ class FixWidom : public Fix {
   double energy_full();
   double compute_vector(int) override;
   double memory_usage() override;
-  void restart(char *) override;
   void grow_molecule_arrays(int);
 
  private:

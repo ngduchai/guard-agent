@@ -35,8 +35,6 @@ class FixStoreGlobal : public Fix {
   int setmask() override;
   void reset_global(int, int);
 
-  void restart(char *) override;
-
   double memory_usage() override;
 
  private:
@@ -44,7 +42,7 @@ class FixStoreGlobal : public Fix {
   int arrayflag;    // 1 if ncol > 1
 
   int n1, n2;      // size of 3d dims of data struct
-  double *rbuf;    // restart buffer for GLOBAL vec/array/tensor
+  double *rbuf;
 };
 
 }    // namespace LAMMPS_NS

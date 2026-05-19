@@ -233,17 +233,6 @@ double FixTempBerendsen::compute_scalar()
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTempBerendsen::restart(char *buf)
-{
-  auto list = (double *) buf;
-
-  energy = list[0];
-}
-
-/* ----------------------------------------------------------------------
    extract thermostat properties
 ------------------------------------------------------------------------- */
 

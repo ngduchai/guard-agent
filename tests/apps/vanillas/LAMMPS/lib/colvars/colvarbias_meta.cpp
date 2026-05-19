@@ -1453,7 +1453,6 @@ std::istream & colvarbias_meta::read_state_data(std::istream& is)
 
     // allocate new grids (based on the new boundaries and widths just
     // read from the configuration file), and project onto them the
-    // grids just read from the restart file
 
     colvar_grid_scalar   *new_hills_energy =
       new colvar_grid_scalar(colvars);
@@ -1478,9 +1477,8 @@ std::istream & colvarbias_meta::read_state_data(std::istream& is)
       cvm::log("rebinning done.\n");
 
     } else {
-      // otherwise, use the grids in the restart file
       cvm::log("Rebinning the energy and forces grids "
-               "from the grids in the restart file.\n");
+               "from the grids in the resume file.\n");
       new_hills_energy->map_grid(*hills_energy);
       new_hills_energy_gradients->map_grid(*hills_energy_gradients);
     }
@@ -1767,7 +1765,6 @@ std::ostream & colvarbias_meta::write_state_data(std::ostream& os)
                   hills_energy,    hills_energy_gradients);
     new_hills_begin = hills.end();
 
-    // write down the grids to the restart file
     os << "  hills_energy\n";
     hills_energy->write_restart(os);
     os << "  hills_energy_gradients\n";

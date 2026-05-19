@@ -109,7 +109,6 @@ void WriteData::command(int narg, char **arg)
   // init entire system since comm->exchange is done
   // comm::init needs neighbor::init needs pair::init needs kspace::init, etc
   // exception is when called by -r command-line switch
-  //   then write_data immediately follows reading of restart file
   //   assume that read_restart initialized necessary values
   //   if don't make exception:
   //     pair->init() can fail due to various unset values:

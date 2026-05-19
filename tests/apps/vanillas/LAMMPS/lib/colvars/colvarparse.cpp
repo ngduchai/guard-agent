@@ -157,7 +157,7 @@ void colvarparse::error_key_required(std::string const &key_str,
   }
   if (parse_mode & parse_restart) {
     cvm::error("Error: keyword \""+key_str+
-               "\" is missing from the restart.\n", COLVARS_INPUT_ERROR);
+               "\" is missing from the resume.\n", COLVARS_INPUT_ERROR);
   } else {
     cvm::error("Error: keyword \""+key_str+
                "\" is required.\n", COLVARS_INPUT_ERROR);

@@ -919,7 +919,7 @@ public:
                                    upper_boundaries[i])) > 1.0E-10) ||
            (cvm::sqrt(cv[i]->dist2(cv[i]->width,
                                    widths[i])) > 1.0E-10) ) {
-        cvm::error("Error: restart information for a grid is "
+        cvm::error("Error: resume information for a grid is "
                    "inconsistent with that of its colvars.\n");
         return;
       }
@@ -951,7 +951,6 @@ public:
   }
 
 
-  /// \brief Read grid entry in restart file
   std::istream & read_restart(std::istream &is)
   {
     std::streampos const start_pos = is.tellg();
@@ -961,14 +960,13 @@ public:
       is >> colvarparse::read_block("grid_parameters", &conf);
       parse_params(conf, colvarparse::parse_silent);
     } else {
-      cvm::log("Grid parameters are missing in the restart file, using those from the configuration.\n");
+      cvm::log("Grid parameters are missing in the resume file, using those from the configuration.\n");
       is.seekg(start_pos, std::ios::beg);
     }
     read_raw(is);
     return is;
   }
 
-  /// \brief Write grid entry in restart file
   std::ostream & write_restart(std::ostream &os)
   {
     write_params(os);

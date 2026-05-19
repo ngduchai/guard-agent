@@ -64,17 +64,6 @@ AtomVecSpin::AtomVecSpin(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecSpin::grow_pointers()
-{
-  sp = atom->sp;
-  fm = atom->fm;
-  fm_long = atom->fm_long;
-}
-
 /* ----------------------------------------------------------------------
    clear extra forces starting at atom N
    nbytes = # of bytes to clear for a per-atom vector

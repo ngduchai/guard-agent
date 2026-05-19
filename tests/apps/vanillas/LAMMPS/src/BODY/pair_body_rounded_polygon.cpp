@@ -66,7 +66,7 @@ PairBodyRoundedPolygon::PairBodyRoundedPolygon(LAMMPS *lmp) : Pair(lmp)
   maxerad = nullptr;
 
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
 
   c_n = 0.1;
   c_t = 0.2;

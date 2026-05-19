@@ -45,9 +45,6 @@ class AtomVecHybrid : virtual public AtomVec {
   int unpack_border_bonus(int, int, double *) override;
   int pack_exchange_bonus(int, double *) override;
   int unpack_exchange_bonus(int, double *) override;
-  int size_restart_bonus() override;
-  int pack_restart_bonus(int, double *) override;
-  int unpack_restart_bonus(int, double *) override;
   double memory_usage_bonus() override;
 
   void pack_restart_pre(int) override;

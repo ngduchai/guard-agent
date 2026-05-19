@@ -40,10 +40,6 @@ class Modify : protected Pointers {
   int n_min_pre_exchange, n_min_pre_neighbor, n_min_post_neighbor;
   int n_min_pre_force, n_min_pre_reverse, n_min_post_force, n_min_energy;
 
-  int restart_pbc_any;         // 1 if any fix sets restart_pbc
-  int nfix_restart_global;     // stored fix global info from restart file
-  int nfix_restart_peratom;    // stored fix peratom info from restart file
-
   int nfix, maxfix;
   Fix **fix;     // list of fixes
   int *fmask;    // bit mask for when each fix is applied
@@ -145,8 +141,6 @@ class Modify : protected Pointers {
   int check_rigid_region_overlap(int, class Region *);
   int check_rigid_list_overlap(int *);
 
-  void restart_deallocate(int);
-
   double memory_usage();
 
  protected:
@@ -173,16 +167,6 @@ class Modify : protected Pointers {
 
   int n_timeflag;    // list of computes that store time invocation
   int *list_timeflag;
-
-  char **id_restart_global;       // stored fix global info
-  char **style_restart_global;    // from read-in restart file
-  char **state_restart_global;
-  int *used_restart_global;
-
-  char **id_restart_peratom;       // stored fix peratom info
-  char **style_restart_peratom;    // from read-in restart file
-  int *index_restart_peratom;
-  int *used_restart_peratom;
 
   int index_permanent;    // fix/compute index returned to library call
 

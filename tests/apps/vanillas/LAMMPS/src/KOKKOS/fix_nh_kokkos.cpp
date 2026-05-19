@@ -96,7 +96,6 @@ void FixNHKokkos<DeviceType>::setup(int /*vflag*/)
     // cannot be done in init() b/c temperature cannot be called there
     // is b/c Modify::init() inits computes after fixes due to dof dependence
     // guesstimate a unit-dependent t0 if actual T = 0.0
-    // if it was read in from a restart file, leave it be
 
     if (t0 == 0.0) {
       atomKK->sync(temperature->execution_space,temperature->datamask_read);

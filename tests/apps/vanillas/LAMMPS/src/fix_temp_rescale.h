@@ -34,7 +34,6 @@ class FixTempRescale : public Fix {
   int modify_param(int, char **) override;
   void reset_target(double) override;
   double compute_scalar() override;
-  void restart(char *buf) override;
   void *extract(const char *, int &) override;
 
  protected:

@@ -38,8 +38,6 @@ class FixRigidSmall : public Fix {
   void final_integrate() override;
   void initial_integrate_respa(int, int, int) override;
   void final_integrate_respa(int, int) override;
-  void write_restart_file(const char *) override;
-
   void grow_arrays(int) override;
   void copy_arrays(int, int, int) override;
   void set_arrays(int) override;

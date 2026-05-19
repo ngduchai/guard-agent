@@ -69,7 +69,7 @@ class Force : protected Pointers {
 
   Pair *pair;
   char *pair_style;
-  char *pair_restart;
+  char *_unused_pair_init_str;
 
   Bond *bond;
   char *bond_style;

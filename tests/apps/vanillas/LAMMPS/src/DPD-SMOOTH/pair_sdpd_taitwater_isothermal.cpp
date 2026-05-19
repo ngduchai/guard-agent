@@ -45,7 +45,7 @@ static const double sqrt_2_inv = std::sqrt(0.5);
 
 PairSDPDTaitwaterIsothermal::PairSDPDTaitwaterIsothermal (LAMMPS *lmp)
 : Pair (lmp), random(nullptr) {
-  restartinfo = 0;
+  data_writes_state = 0;
   single_enable =0;
 }
 

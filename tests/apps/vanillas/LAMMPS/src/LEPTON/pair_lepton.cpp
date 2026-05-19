@@ -40,7 +40,7 @@ PairLepton::PairLepton(LAMMPS *lmp) :
   respa_enable = 0;
   single_enable = 1;
   writedata = 1;
-  restartinfo = 1;
+  data_writes_state = 1;
   reinitflag = 0;
   cut_global = 0.0;
   centroidstressflag = CENTROID_SAME;

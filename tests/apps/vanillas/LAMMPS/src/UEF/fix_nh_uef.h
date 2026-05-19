@@ -32,8 +32,7 @@ class FixNHUef : public FixNH {
   void init() override;
   void setup(int) override;
   void pre_exchange() override;
-  int pack_restart_data(double *) override;
-  void restart(char *) override;
+  int pack_state_data(double *) override;
   void end_of_step() override;
   void initial_integrate(int) override;
   void final_integrate() override;

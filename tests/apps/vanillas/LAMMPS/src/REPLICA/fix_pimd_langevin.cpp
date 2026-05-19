@@ -1414,20 +1414,11 @@ int FixPIMDLangevin::size_restart_global()
 
 /* ---------------------------------------------------------------------- */
 
-int FixPIMDLangevin::pack_restart_data(double *list)
+int FixPIMDLangevin::pack_state_data(double *list)
 {
   int n = 0;
   for (int i = 0; i < 6; i++) list[n++] = vw[i];
   return n;
-}
-
-/* ---------------------------------------------------------------------- */
-
-void FixPIMDLangevin::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  for (int i = 0; i < 6; i++) vw[i] = list[n++];
 }
 
 /* ---------------------------------------------------------------------- */

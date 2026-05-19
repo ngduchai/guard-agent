@@ -195,10 +195,8 @@ irregular(nullptr), set(nullptr)
   }
 
   // read options from end of input line
-  // no x remap effectively moves atoms within box, so set restart_pbc
 
   options(narg-iarg,&arg[iarg]);
-  if (remapflag != Domain::X_REMAP) restart_pbc = 1;
 
   // setup dimflags used by other classes to check for volume-change conflicts
 
@@ -927,30 +925,6 @@ void FixDeform::end_of_step()
   // redo KSpace coeffs since box has changed
 
   if (kspace_flag) force->kspace->setup();
-}
-
-/* ----------------------------------------------------------------------
-   use selected state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixDeform::restart(char *buf)
-{
-  int samestyle = 1;
-  Set *set_restart = (Set *) buf;
-  for (int i=0; i<6; ++i) {
-    // restore data from initial state
-    set[i].lo_initial = set_restart[i].lo_initial;
-    set[i].hi_initial = set_restart[i].hi_initial;
-    set[i].vol_initial = set_restart[i].vol_initial;
-    set[i].tilt_initial = set_restart[i].tilt_initial;
-    // check if style settings are consistent (should do the whole set?)
-    if (set[i].style != set_restart[i].style)
-      samestyle = 0;
-    if (set[i].substyle != set_restart[i].substyle)
-      samestyle = 0;
-  }
-  if (!samestyle)
-    error->all(FLERR,"Fix deform settings not consistent with restart");
 }
 
 /* ---------------------------------------------------------------------- */

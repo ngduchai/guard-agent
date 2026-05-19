@@ -16,7 +16,6 @@
  * First Windows project with the correct directory structure
  *
  * Revision 1.15  2010/10/07 11:20:31  valuev
- * preliminary program restart
  *
  * Revision 1.14  2009/07/24 05:08:46  valuev
  * Sync with FDTD, added molecule setup

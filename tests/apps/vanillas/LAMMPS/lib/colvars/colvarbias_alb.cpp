@@ -262,31 +262,31 @@ int colvarbias_alb::set_state_params(std::string const &conf)
   }
 
   if (!get_keyval(conf, "setCoupling", set_coupling))
-    cvm::error("Error: current setCoupling  is missing from the restart.\n");
+    cvm::error("Error: current setCoupling  is missing from the resume.\n");
 
   if (!get_keyval(conf, "currentCoupling", current_coupling))
-    cvm::error("Error: current setCoupling  is missing from the restart.\n");
+    cvm::error("Error: current setCoupling  is missing from the resume.\n");
 
   if (!get_keyval(conf, "maxCouplingRange", max_coupling_range))
-    cvm::error("Error: maxCouplingRange  is missing from the restart.\n");
+    cvm::error("Error: maxCouplingRange  is missing from the resume.\n");
 
   if (!get_keyval(conf, "couplingRate", coupling_rate))
-    cvm::error("Error: current setCoupling  is missing from the restart.\n");
+    cvm::error("Error: current setCoupling  is missing from the resume.\n");
 
   if (!get_keyval(conf, "couplingAccum", coupling_accum))
-    cvm::error("Error: couplingAccum is missing from the restart.\n");
+    cvm::error("Error: couplingAccum is missing from the resume.\n");
 
   if (!get_keyval(conf, "mean", means))
-    cvm::error("Error: current mean is missing from the restart.\n");
+    cvm::error("Error: current mean is missing from the resume.\n");
 
   if (!get_keyval(conf, "ssd", ssd))
-    cvm::error("Error: current ssd is missing from the restart.\n");
+    cvm::error("Error: current ssd is missing from the resume.\n");
 
   if (!get_keyval(conf, "updateCalls", update_calls))
-    cvm::error("Error: current updateCalls is missing from the restart.\n");
+    cvm::error("Error: current updateCalls is missing from the resume.\n");
 
   if (!get_keyval(conf, "b_equilibration", b_equilibration))
-    cvm::error("Error: current updateCalls is missing from the restart.\n");
+    cvm::error("Error: current updateCalls is missing from the resume.\n");
 
   return COLVARS_OK;
 }

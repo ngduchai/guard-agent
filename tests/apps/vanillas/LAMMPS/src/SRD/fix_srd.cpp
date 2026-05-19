@@ -90,7 +90,6 @@ FixSRD::FixSRD(LAMMPS *lmp, int narg, char **arg) :
 
   if (narg < 8) error->all(FLERR, "Illegal fix srd command");
 
-  restart_pbc = 1;
   vector_flag = 1;
   size_vector = 12;
   global_freq = 1;

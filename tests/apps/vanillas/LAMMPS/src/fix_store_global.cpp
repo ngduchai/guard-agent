@@ -48,7 +48,6 @@ FixStoreGlobal::FixStoreGlobal(LAMMPS *lmp, int narg, char **arg) :
   vstore = nullptr;
   astore = nullptr;
 
-  // allocate data struct and restart buffer rbuf
 
   if (vecflag)
     memory->create(vstore, n1, "fix/store:vstore");
@@ -110,51 +109,6 @@ void FixStoreGlobal::reset_global(int n1_caller, int n2_caller)
   else if (arrayflag)
     memory->create(astore, n1, n2, "fix/store:astore");
   memory->create(rbuf, n1 * n2 + 2, "fix/store:rbuf");
-}
-
-/* ----------------------------------------------------------------------
-   use global array from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixStoreGlobal::restart(char *buf)
-{
-  // first 2 values in buf are vec/array sizes
-
-  auto *dbuf = (double *) buf;
-  int n1_restart = dbuf[0];
-  int n2_restart = dbuf[1];
-
-  // if size of vec/array has changed,
-  //   means the restart file is setting size of vec or array and doing init
-  //   because caller did not know size at time this fix was instantiated
-  // reallocate vstore or astore accordingly
-
-  if (n1 != n1_restart || n2 != n2_restart) {
-    memory->destroy(vstore);
-    memory->destroy(astore);
-    memory->destroy(rbuf);
-    vstore = nullptr;
-    astore = nullptr;
-
-    vecflag = arrayflag = 0;
-    if (n2_restart == 1)
-      vecflag = 1;
-    else
-      arrayflag = 1;
-    n1 = n1_restart;
-    n2 = n2_restart;
-    if (vecflag)
-      memory->create(vstore, n1, "fix/store:vstore");
-    else if (arrayflag)
-      memory->create(astore, n1, n2, "fix/store:astore");
-    memory->create(rbuf, n1 * n2 + 2, "fix/store:rbuf");
-  }
-
-  int n = n1 * n2;
-  if (vecflag)
-    memcpy(vstore, &dbuf[2], n * sizeof(double));
-  else if (arrayflag)
-    memcpy(&astore[0][0], &dbuf[2], n * sizeof(double));
 }
 
 /* ----------------------------------------------------------------------

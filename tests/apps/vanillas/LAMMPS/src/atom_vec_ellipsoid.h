@@ -45,9 +45,6 @@ class AtomVecEllipsoid : public AtomVec {
   int unpack_border_bonus(int, int, double *) override;
   int pack_exchange_bonus(int, double *) override;
   int unpack_exchange_bonus(int, double *) override;
-  int size_restart_bonus() override;
-  int pack_restart_bonus(int, double *) override;
-  int unpack_restart_bonus(int, double *) override;
   void data_atom_bonus(int, const std::vector<std::string> &) override;
   double memory_usage_bonus() override;
 

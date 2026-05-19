@@ -111,7 +111,7 @@ FixAmoebaBiTorsion::FixAmoebaBiTorsion(LAMMPS *lmp, int narg, char **arg) :
   nmax_previous = 0;
   grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(Atom::RESERVED_CB);
 
   // list of all bitorsions to compute on this proc
 
@@ -131,7 +131,7 @@ FixAmoebaBiTorsion::~FixAmoebaBiTorsion()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
 
   // per-atom data
 
@@ -1605,83 +1605,8 @@ void FixAmoebaBiTorsion::write_data_section(int /*mth*/, FILE *fp,
 
 // ----------------------------------------------------------------------
 // ----------------------------------------------------------------------
-// methods for restart and communication
 // ----------------------------------------------------------------------
 // ----------------------------------------------------------------------
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixAmoebaBiTorsion::restart(char *buf)
-{
-  nbitorsions = *((bigint *) buf);
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixAmoebaBiTorsion::pack_restart(int i, double *buf)
-{
-  int n = 1;
-  for (int m = 0; m < num_bitorsion[i]; m++) {
-    buf[n++] = ubuf(MAX(bitorsion_type[i][m],-bitorsion_type[i][m])).d;
-    buf[n++] = ubuf(bitorsion_atom1[i][m]).d;
-    buf[n++] = ubuf(bitorsion_atom2[i][m]).d;
-    buf[n++] = ubuf(bitorsion_atom3[i][m]).d;
-    buf[n++] = ubuf(bitorsion_atom4[i][m]).d;
-    buf[n++] = ubuf(bitorsion_atom5[i][m]).d;
-  }
-  buf[0] = n;
-
-  return n;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixAmoebaBiTorsion::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-   int n = 0;
-   for (int i = 0; i < nth; i++) n += static_cast<int> (extra[nlocal][n]);
-
-   int count = static_cast<int> (extra[nlocal][n++]);
-   num_bitorsion[nlocal] = (count-1)/6;
-
-   for (int m = 0; m < num_bitorsion[nlocal]; m++) {
-     bitorsion_type[nlocal][m] = (int) ubuf(extra[nlocal][n++]).i;
-     bitorsion_atom1[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     bitorsion_atom2[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     bitorsion_atom3[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     bitorsion_atom4[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-     bitorsion_atom5[nlocal][m] = (tagint) ubuf(extra[nlocal][n++]).i;
-   }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixAmoebaBiTorsion::maxsize_restart()
-{
-  return 1 + BITORSIONMAX*6;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixAmoebaBiTorsion::size_restart(int nlocal)
-{
-  return 1 + num_bitorsion[nlocal]*6;
-}
 
 /* ----------------------------------------------------------------------
    allocate atom-based array

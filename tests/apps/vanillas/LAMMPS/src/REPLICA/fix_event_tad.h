@@ -33,8 +33,6 @@ class FixEventTAD : public FixEvent {
 
   FixEventTAD(class LAMMPS *, int, char **);
 
-  void restart(char *) override;
-
   // methods specific to FixEventTAD, invoked by TAD
 
   void store_event_tad(bigint);

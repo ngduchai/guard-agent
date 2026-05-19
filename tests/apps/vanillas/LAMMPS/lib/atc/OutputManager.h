@@ -40,9 +40,6 @@ namespace ATC {
     /** set output options */
     void set_option(OutputOption option, bool value);
 
-    // Dump text-based field info to disk for later restart
-    void write_restart_file(std::string fileName, RESTART_LIST *data);
-
     // Read text-based field file written from write_restart_file
     void read_restart_file(std::string fileName, RESTART_LIST *data);
 

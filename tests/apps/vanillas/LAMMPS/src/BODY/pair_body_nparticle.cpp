@@ -40,7 +40,7 @@ PairBodyNparticle::PairBodyNparticle(LAMMPS *lmp) : Pair(lmp)
   dnum = dfirst = nullptr;
 
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
 }
 
 /* ---------------------------------------------------------------------- */

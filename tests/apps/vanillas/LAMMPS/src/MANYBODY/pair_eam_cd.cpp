@@ -38,7 +38,7 @@ PairEAMCD::PairEAMCD(LAMMPS *lmp, int _cdeamVersion)
   : PairEAM(lmp), PairEAMAlloy(lmp), cdeamVersion(_cdeamVersion)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   unit_convert_flag = utils::get_supported_conversions(utils::ENERGY);
 
   rhoB = nullptr;

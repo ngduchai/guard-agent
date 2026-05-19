@@ -233,18 +233,6 @@ double FixTempRescale::compute_scalar()
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixTempRescale::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  energy = list[n++];
-}
-
-/* ----------------------------------------------------------------------
    extract thermostat properties
 ------------------------------------------------------------------------- */
 

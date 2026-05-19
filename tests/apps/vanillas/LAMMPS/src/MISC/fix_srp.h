@@ -44,11 +44,6 @@ class FixSRP : public Fix {
   int unpack_border(int, int, double *) override;
   void post_run() override;
 
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int maxsize_restart() override;
-  int size_restart(int) override;
-  void restart(char *) override;
   int modify_param(int, char **) override;
 
   double **array;

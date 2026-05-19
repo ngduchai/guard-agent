@@ -816,27 +816,6 @@ void FixDeposit::options(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixDeposit::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int>(list[n++]);
-  ninserted = static_cast<int>(list[n++]);
-  nfirst = static_cast<bigint>(ubuf(list[n++]).i);
-  next_reneighbor = static_cast<bigint>(ubuf(list[n++]).i);
-
-  bigint ntimestep_restart = static_cast<bigint>(ubuf(list[n++]).i);
-  if (ntimestep_restart != update->ntimestep)
-    error->all(FLERR,"Must not reset timestep when restarting this fix");
-
-  random->reset(seed);
-}
-
-/* ----------------------------------------------------------------------
    extract particle radius for atom type = itype
 ------------------------------------------------------------------------- */
 

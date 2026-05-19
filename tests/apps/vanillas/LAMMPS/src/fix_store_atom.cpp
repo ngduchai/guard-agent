@@ -28,7 +28,6 @@ using namespace FixConst;
 //   N1 > 1, N2 = 0 is per-atom array, N1 values per atom
 //   N1 > 0, N2 > 0 is per-atom tensor, N1xN2 array per atom
 //   gflag = 0/1, no/yes communicate per-atom values with ghost atoms
-//   rflag = 0/1, no/yes store per-atom values in restart file
 
 /* ---------------------------------------------------------------------- */
 
@@ -42,7 +41,7 @@ FixStoreAtom::FixStoreAtom(LAMMPS *lmp, int narg, char **arg) :
   n1 = utils::inumeric(FLERR, arg[3], false, lmp);
   n2 = utils::inumeric(FLERR, arg[4], false, lmp);
   ghostflag = utils::logical(FLERR, arg[5], false, lmp);
-  restartflag = utils::logical(FLERR, arg[6], false, lmp);
+  stateflag = utils::logical(FLERR, arg[6], false, lmp);
 
   vecflag = arrayflag = tensorflag = 0;
   if (n1 == 1 && n2 == 0)
@@ -63,7 +62,7 @@ FixStoreAtom::FixStoreAtom(LAMMPS *lmp, int narg, char **arg) :
   if (ghostflag) comm_border = nvalues;
   maxexchange = nvalues;
 
-  if (restartflag) restart_peratom = 1;
+  if (stateflag) restart_peratom = 1;
 
   // allocate data structs and register with Atom class
 
@@ -73,7 +72,7 @@ FixStoreAtom::FixStoreAtom(LAMMPS *lmp, int narg, char **arg) :
 
   FixStoreAtom::grow_arrays(atom->nmax);
   atom->add_callback(Atom::GROW);
-  if (restartflag) atom->add_callback(Atom::RESTART);
+  if (stateflag) atom->add_callback(Atom::RESERVED_CB);
   if (ghostflag) atom->add_callback(Atom::BORDER);
 
   // zero the storage
@@ -98,7 +97,7 @@ FixStoreAtom::~FixStoreAtom()
   // unregister callbacks to this fix from Atom class
 
   atom->delete_callback(id, Atom::GROW);
-  if (restartflag) atom->delete_callback(id, Atom::RESTART);
+  if (stateflag) atom->delete_callback(id, Atom::RESERVED_CB);
   if (ghostflag) atom->delete_callback(id, Atom::BORDER);
 
   memory->destroy(vstore);
@@ -235,77 +234,6 @@ int FixStoreAtom::unpack_exchange(int nlocal, double *buf)
   }
 
   return nvalues;
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixStoreAtom::pack_restart(int i, double *buf)
-{
-  if (disable) {
-    buf[0] = 0;
-    return 1;
-  }
-
-  // pack buf[0] this way because other fixes unpack it
-  buf[0] = nvalues + 1;
-
-  if (vecflag) {
-    buf[1] = vstore[i];
-  } else if (arrayflag) {
-    for (int m = 0; m < nvalues; m++) buf[m + 1] = astore[i][m];
-  } else if (tensorflag) {
-    memcpy(&buf[1], &tstore[i][0][0], nbytes);
-  }
-
-  return nvalues + 1;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixStoreAtom::unpack_restart(int nlocal, int nth)
-{
-  if (disable) return;
-
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) m += static_cast<int>(extra[nlocal][m]);
-  m++;
-
-  if (vecflag) {
-    vstore[nlocal] = extra[nlocal][m];
-  } else if (arrayflag) {
-    for (int i = 0; i < nvalues; i++) astore[nlocal][i] = extra[nlocal][m++];
-  } else if (tensorflag) {
-    memcpy(&tstore[nlocal][0][0], &extra[nlocal][m], nbytes);
-  }
-}
-
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixStoreAtom::maxsize_restart()
-{
-  if (disable) return 1;
-  return nvalues + 1;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixStoreAtom::size_restart(int /*nlocal*/)
-{
-  if (disable) return 1;
-  return nvalues + 1;
 }
 
 /* ----------------------------------------------------------------------

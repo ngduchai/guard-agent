@@ -185,7 +185,7 @@ class Neighbor : protected Pointers {
   int newton_pair;    // 0 if newton off for pairwise, 1 if on
 
   int must_check;       // 1 if must check other classes to reneigh
-  int restart_check;    // 1 if restart enabled, 0 if no
+  int reserved_check;
   int fix_check;        // # of fixes that induce reneigh
   int *fixchecklist;    // which fixes to check
 

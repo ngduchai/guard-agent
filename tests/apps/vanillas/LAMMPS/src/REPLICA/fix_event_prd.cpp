@@ -51,20 +51,3 @@ void FixEventPRD::store_event_prd(bigint ntimestep, int delta_clock)
   clock += delta_clock;
   event_number++;
 }
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixEventPRD::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  event_number = static_cast<int> (list[n++]);
-  event_timestep = static_cast<bigint> (list[n++]);
-  clock = static_cast<bigint> (list[n++]);
-  replica_number = static_cast<int> (list[n++]);
-  correlated_event = static_cast<int> (list[n++]);
-  ncoincident = static_cast<int> (list[n++]);
-}

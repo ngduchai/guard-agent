@@ -43,10 +43,6 @@ class FixPIMDNVT : public Fix {
   void copy_arrays(int, int, int) override;
   int pack_exchange(int, double *) override;
   int unpack_exchange(int, double *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int maxsize_restart() override;
-  int size_restart(int) override;
   double compute_vector(int) override;
 
   int pack_forward_comm(int, int *, double *, int, int *) override;

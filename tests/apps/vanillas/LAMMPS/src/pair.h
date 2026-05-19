@@ -54,7 +54,7 @@ class Pair : protected Pointers {
   int single_enable;              // 1 if single() routine exists
   int born_matrix_enable;         // 1 if born_matrix() routine exists
   int single_hessian_enable;      // 1 if single_hessian() routine exists
-  int restartinfo;                // 1 if pair style writes restart info
+  int data_writes_state;
   int respa_enable;               // 1 if inner/middle/outer rRESPA routines
   int one_coeff;                  // 1 if allows only one coeff * * call
   int manybody_flag;              // 1 if a manybody potential

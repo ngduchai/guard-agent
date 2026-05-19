@@ -35,7 +35,6 @@ class PairThreebodyTable : public Pair {
 
   static constexpr int NPARAMS_PER_LINE = 8;
 
-  // no write or read from binary restart file
 
   // struct for threebody/table
   struct Table {

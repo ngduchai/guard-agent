@@ -50,7 +50,7 @@ PairATM::PairATM(LAMMPS *lmp) : Pair(lmp)
   if (lmp->citeme) lmp->citeme->add(cite_atm_package);
 
   single_enable = 0;
-  restartinfo = 1;
+  data_writes_state = 1;
   one_coeff = 0;
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;

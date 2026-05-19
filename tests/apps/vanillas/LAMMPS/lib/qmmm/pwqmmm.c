@@ -267,8 +267,8 @@ int main(int argc, char **argv)
         char runcmd[1024];
         sprintf(runcmd,"run %d\n",qmmmcfg.steps);
         lammps_command(lmp,runcmd);
-        if (qmmmcfg.restart != NULL) {
-          sprintf(runcmd,"write_restart %s\n",qmmmcfg.restart);
+        if (qmmmcfg.resume != NULL) {
+          sprintf(runcmd,"write_restart %s\n",qmmmcfg.resume);
           lammps_command(lmp,runcmd);
         }
         lammps_close(lmp);

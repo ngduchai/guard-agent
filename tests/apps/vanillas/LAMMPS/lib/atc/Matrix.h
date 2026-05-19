@@ -92,7 +92,6 @@ public:
   virtual void  reset(INDEX nRows, INDEX nCols=1, bool zero=true)=0;
   //* resizes and copies data
   virtual void copy(const T * ptr, INDEX nRows, INDEX nCols=1)=0;
-  //* create restart file
   virtual void write_restart(FILE *f) const=0;
   //* writes a matlab command to recreate this in a variable named s
   virtual void matlab(std::ostream &o, const std::string &s="M") const;

@@ -28,7 +28,7 @@ using namespace LAMMPS_NS;
 
 PairSPHIdealGas::PairSPHIdealGas(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
 }
 
 /* ---------------------------------------------------------------------- */

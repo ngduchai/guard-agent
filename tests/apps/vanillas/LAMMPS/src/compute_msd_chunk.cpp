@@ -43,7 +43,6 @@ ComputeMSDChunk::ComputeMSDChunk(LAMMPS *lmp, int narg, char **arg) :
   // create a new fix STORE style for reference positions
   // id = compute-ID + COMPUTE_STORE, fix group = compute group
   // do not know size of array at this point, just allocate 1x1 array
-  // fix creation must be done now so that a restart run can
   //   potentially re-populate the fix array (and change it to correct size)
   // otherwise size reset and init will be done in setup()
 
@@ -94,7 +93,6 @@ void ComputeMSDChunk::setup()
   compute_array();
   firstflag = 0;
 
-  // if fix->astore is already correct size, restart file set it up
   // otherwise reset its size now and initialize to current COM
 
   if (fix->nrow == nchunk && fix->ncol == 3) return;

@@ -77,13 +77,11 @@ public:
     return output_prefix_str;
   }
 
-  /// Prefix of the restart (checkpoint) file to be written next
   inline std::string & restart_output_prefix()
   {
     return restart_output_prefix_str;
   }
 
-  /// Default restart frequency (as set by the simulation engine)
   inline int default_restart_frequency() const
   {
     return restart_frequency_engine;
@@ -141,10 +139,8 @@ protected:
   /// Default prefix to be used for all output files (final configuration)
   std::string output_prefix_str;
 
-  /// Prefix of the restart (checkpoint) file to be written next
   std::string restart_output_prefix_str;
 
-  /// How often the simulation engine will write its own restart
   int restart_frequency_engine;
 
   /// Container of input files/channels indexed by path name

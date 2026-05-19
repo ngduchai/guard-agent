@@ -50,7 +50,7 @@ PairAIREBO::PairAIREBO(LAMMPS *lmp)
   : Pair(lmp), variant(AIREBO)
 {
   single_enable = 0;
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   ghostneigh = 1;
   ljflag = torflag = 1;

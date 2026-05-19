@@ -45,8 +45,6 @@ FixSRP::FixSRP(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
   create_attribute = 0;
   comm_border = 2;
 
-  // restart settings
-  restart_pbc = 1;
 
   // per-atom array width 2
   peratom_flag = 1;
@@ -59,7 +57,7 @@ FixSRP::FixSRP(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg)
 
   // extends pack_exchange()
   atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART); // restart
+  atom->add_callback(Atom::RESERVED_CB);
   atom->add_callback(Atom::BORDER);
 
   // initialize to illegal values so we capture
@@ -80,7 +78,7 @@ FixSRP::~FixSRP()
 {
   // unregister callbacks to this fix from Atom class
   atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(id,Atom::RESERVED_CB);
   atom->delete_callback(id,Atom::BORDER);
   memory->destroy(array);
 }
@@ -521,73 +519,6 @@ void FixSRP::post_run()
   comm->borders();
   // change back to box coordinates
   if (domain->triclinic) domain->lamda2x(atom->nlocal+atom->nghost);
-}
-
-/* ----------------------------------------------------------------------
-   pack values in local atom-based arrays for restart file
-------------------------------------------------------------------------- */
-
-int FixSRP::pack_restart(int i, double *buf)
-{
-  int m = 0;
-  // pack buf[0] this way because other fixes unpack it
-  buf[m++] = 3;
-  buf[m++] = array[i][0];
-  buf[m++] = array[i][1];
-  return m;
-}
-
-/* ----------------------------------------------------------------------
-   unpack values from atom->extra array to restart the fix
-------------------------------------------------------------------------- */
-
-void FixSRP::unpack_restart(int nlocal, int nth)
-{
-  double **extra = atom->extra;
-
-  // skip to Nth set of extra values
-  // unpack the Nth first values this way because other fixes pack them
-
-  int m = 0;
-  for (int i = 0; i < nth; i++) {
-    m += static_cast<int> (extra[nlocal][m]);
-  }
-
-  m++;
-  array[nlocal][0] = extra[nlocal][m++];
-  array[nlocal][1] = extra[nlocal][m++];
-
-}
-/* ----------------------------------------------------------------------
-   maxsize of any atom's restart data
-------------------------------------------------------------------------- */
-
-int FixSRP::maxsize_restart()
-{
-  return 3;
-}
-
-/* ----------------------------------------------------------------------
-   size of atom nlocal's restart data
-------------------------------------------------------------------------- */
-
-int FixSRP::size_restart(int /*nlocal*/)
-{
-  return 3;
-}
-
-/* ----------------------------------------------------------------------
-   use info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixSRP::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  comm->cutghostuser = static_cast<double> (list[n++]);
-  btype = static_cast<int> (list[n++]);
-  bptype = static_cast<int> (list[n++]);
 }
 
 /* ----------------------------------------------------------------------

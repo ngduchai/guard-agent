@@ -234,39 +234,6 @@ void FixSpringChunk::min_post_force(int vflag)
 }
 
 /* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixSpringChunk::restart(char *buf)
-{
-  auto list = (double *) buf;
-  int n = list[0];
-
-  memory->destroy(com0);
-  memory->destroy(fcom);
-
-  cchunk = dynamic_cast<ComputeChunkAtom *>(modify->get_compute_by_id(idchunk));
-  if (!cchunk)
-    error->all(FLERR,"Chunk/atom compute {} does not exist or is not chunk/atom style", idchunk);
-
-  nchunk = cchunk->setup_chunks();
-  cchunk->compute_ichunk();
-  memory->create(com0,nchunk,3,"spring/chunk:com0");
-  memory->create(fcom,nchunk,3,"spring/chunk:fcom");
-
-  if (n != nchunk) {
-    if (comm->me == 0)
-      error->warning(FLERR,"Number of chunks changed from {} to {}. Cannot use restart", n, nchunk);
-    memory->destroy(com0);
-    memory->destroy(fcom);
-    nchunk = 1;
-  } else {
-    cchunk->lock(this,update->ntimestep,-1);
-    memcpy(&com0[0][0],list+1,3*n*sizeof(double));
-  }
-}
-
-/* ----------------------------------------------------------------------
    energy of stretched spring
 ------------------------------------------------------------------------- */
 

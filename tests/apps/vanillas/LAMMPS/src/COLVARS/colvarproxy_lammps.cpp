@@ -47,7 +47,6 @@ colvarproxy_lammps::colvarproxy_lammps(LAMMPS_NS::LAMMPS *lmp,
 
   engine_ready_ = false;
 
-  // set input restart name and strip the extension, if present
   input_prefix_str = std::string(inp_name ? inp_name : "");
   if (input_prefix_str.rfind(".colvars.state") != std::string::npos)
     input_prefix_str.erase(input_prefix_str.rfind(".colvars.state"),
@@ -61,10 +60,9 @@ colvarproxy_lammps::colvarproxy_lammps(LAMMPS_NS::LAMMPS *lmp,
   // check if it is possible to save output configuration
   if ((!output_prefix_str.size()) && (!restart_output_prefix_str.size())) {
     error("Error: neither the final output state file or "
-          "the output restart file could be defined, exiting.\n");
+          "the output state file could be defined, exiting.\n");
   }
 
-  // try to extract a restart prefix from a potential restart command.
   LAMMPS_NS::Output *outp = _lmp->output;
   if ((outp->restart_every_single > 0) && (outp->restart1 != nullptr)) {
     restart_frequency_engine = outp->restart_every_single;
@@ -73,7 +71,6 @@ colvarproxy_lammps::colvarproxy_lammps(LAMMPS_NS::LAMMPS *lmp,
     restart_frequency_engine = outp->restart_every_double;
     restart_output_prefix_str = std::string(outp->restart2a);
   }
-  // trim off unwanted stuff from the restart prefix
   if (restart_output_prefix_str.rfind(".*") != std::string::npos)
     restart_output_prefix_str.erase(restart_output_prefix_str.rfind(".*"),2);
 

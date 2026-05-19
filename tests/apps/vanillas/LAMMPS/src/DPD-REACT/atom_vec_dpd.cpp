@@ -53,31 +53,7 @@ AtomVecDPD::AtomVecDPD(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecDPD::grow_pointers()
-{
-  rho = atom->rho;
-  dpdTheta = atom->dpdTheta;
-  uCond = atom->uCond;
-  uMech = atom->uMech;
-  uChem = atom->uChem;
-  uCG = atom->uCG;
-  uCGnew = atom->uCGnew;
-}
-
 /* ----------------------------------------------------------------------
-   initialize other atom quantities after AtomVec::unpack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecDPD::unpack_restart_init(int ilocal)
-{
-  uCG[ilocal] = 0.0;
-  uCGnew[ilocal] = 0.0;
-}
-
 /* ----------------------------------------------------------------------
    modify what AtomVec::data_atom() just unpacked
    or initialize other atom quantities

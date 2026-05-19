@@ -149,7 +149,6 @@ FixPressBerendsen::FixPressBerendsen(LAMMPS *lmp, int narg, char **arg) :
     } else error->all(FLERR,"Illegal fix press/berendsen command");
   }
 
-  if (allremap == 0) restart_pbc = 1;
 
   // error checks
 

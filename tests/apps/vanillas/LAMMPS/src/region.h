@@ -81,8 +81,6 @@ class Region : protected Pointers {
 
   virtual void set_velocity();
   void velocity_contact(double *, double *, int);
-  virtual int restart(char *, int &);
-  virtual void length_restart_string(int &);
   virtual void reset_vel();
 
   // implemented by each region, not called by other classes

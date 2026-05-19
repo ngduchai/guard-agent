@@ -42,7 +42,6 @@ private:
   /// Filename prefix for human-readable gradient/sample count output
   std::string  output_prefix;
 
-  /// Base filename(s) for reading previous gradient data (replaces data from restart file)
   std::vector<std::string> input_prefix;
 
   /// Adapt the bias at each time step (as opposed to keeping it constant)?
@@ -154,7 +153,6 @@ private:
   /// Write human-readable FE gradients and sample count, and DX file in dim > 2
   void write_gradients_samples(const std::string &prefix, bool close = true);
 
-  /// Read human-readable FE gradients and sample count (if not using restart)
   int read_gradients_samples();
 
   /// Template used in write_gradient_samples()

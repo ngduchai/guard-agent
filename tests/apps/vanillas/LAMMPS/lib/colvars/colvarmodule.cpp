@@ -789,15 +789,11 @@ int colvarmodule::calc()
     error_code |= write_traj_files();
   }
 
-  // write restart files and similar data
   if (restart_out_freq && (cvm::step_relative() > 0) &&
       ((cvm::step_absolute() % restart_out_freq) == 0) ) {
 
     if (restart_out_name.size()) {
-      // Write restart file, if different from main output
-      error_code |= write_restart_file(restart_out_name);
     } else {
-      error_code |= write_restart_file(output_prefix()+".colvars.state");
     }
 
     cvm::increase_depth();
@@ -1077,28 +1073,13 @@ int colvarmodule::calc_scripted_forces()
 }
 
 
-int colvarmodule::write_restart_file(std::string const &out_name)
-{
-  cvm::log("Saving collective variables state to \""+out_name+"\".\n");
-  std::ostream &restart_out_os = proxy->output_stream(out_name, "state file");
-  if (!restart_out_os) return COLVARS_FILE_ERROR;
-  if (!write_restart(restart_out_os)) {
-    return cvm::error("Error: in writing restart file.\n", COLVARS_FILE_ERROR);
-  }
-  proxy->close_output_stream(out_name);
-
-  // Take the opportunity to flush colvars.traj
-
-  return (cvm::get_error() ? COLVARS_ERROR : COLVARS_OK);
-}
-
 
 int colvarmodule::write_restart_string(std::string &output)
 {
   cvm::log("Saving state to output buffer.\n");
   std::ostringstream os;
   if (!write_restart(os)) {
-    return cvm::error("Error: in writing restart to buffer.\n", COLVARS_FILE_ERROR);
+    return cvm::error("Error: in writing resume to buffer.\n", COLVARS_FILE_ERROR);
   }
   output = os.str();
   return COLVARS_OK;
@@ -1285,13 +1266,13 @@ int colvarmodule::setup_input()
     std::string restart_in_name(proxy->input_prefix()+
                                 std::string(".colvars.state"));
     std::istream *input_is = &(proxy->input_stream(restart_in_name,
-                                                   "restart file/channel",
+                                                   "resume file/channel",
                                                    false));
     if (!*input_is) {
       // Try without the suffix ".colvars.state"
       restart_in_name = proxy->input_prefix();
       input_is = &(proxy->input_stream(restart_in_name,
-                                       "restart file/channel"));
+                                       "resume file/channel"));
       if (!*input_is) {
         return COLVARS_FILE_ERROR;
       }
@@ -1339,13 +1320,12 @@ int colvarmodule::setup_output()
 {
   int error_code = COLVARS_OK;
 
-  // output state file (restart)
   restart_out_name = proxy->restart_output_prefix().size() ?
     std::string(proxy->restart_output_prefix()+".colvars.state") :
     std::string("");
 
   if (restart_out_name.size()) {
-    cvm::log("The restart output state file will be \""+
+    cvm::log("The resume output state file will be \""+
              restart_out_name+"\".\n");
   }
 
@@ -1396,7 +1376,6 @@ std::istream & colvarmodule::read_restart(std::istream &is)
   bool warn_total_forces = false;
 
   {
-    // read global restart information
     std::string restart_conf;
     if (is >> colvarparse::read_block("configuration", &restart_conf)) {
 
@@ -1411,7 +1390,6 @@ std::istream & colvarmodule::read_restart(std::istream &is)
                         restart_version_str, std::string(""),
                         colvarparse::parse_restart);
       if (restart_version_str.size()) {
-        // Initialize integer version number of this restart file
         restart_version_int =
           proxy->get_version_from_string(restart_version_str.c_str());
       }
@@ -1477,7 +1455,7 @@ std::istream & colvarmodule::read_objects_state(std::istream &is)
           if ( !((*cvi)->read_state(is)) ) {
             // Here an error signals that the variable is a match, but the
             // state is corrupt; otherwise, the variable rewinds is silently
-            cvm::error("Error: in reading restart configuration for "
+            cvm::error("Error: in reading resume configuration for "
                        "collective variable \""+(*cvi)->name+"\".\n",
                        COLVARS_INPUT_ERROR);
           }
@@ -1498,7 +1476,7 @@ std::istream & colvarmodule::read_objects_state(std::istream &is)
           }
           if (!((*bi)->read_state(is))) {
             // Same as above, an error means a match but the state is incorrect
-            cvm::error("Error: in reading restart configuration for bias \""+
+            cvm::error("Error: in reading resume configuration for bias \""+
                        (*bi)->name+"\".\n",
                        COLVARS_INPUT_ERROR);
           }
@@ -1536,7 +1514,6 @@ to:\n\
 \""+proxy->input_prefix()+".colvars.state\"\n\
 and load it to continue this simulation.\n");
     output_prefix() = output_prefix()+".tmp";
-    write_restart_file(output_prefix()+".colvars.state");
     return cvm::error("Exiting with error until issue is addressed.\n",
                       COLVARS_INPUT_ERROR);
   }

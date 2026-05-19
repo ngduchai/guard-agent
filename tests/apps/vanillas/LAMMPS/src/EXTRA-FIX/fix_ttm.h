@@ -39,11 +39,6 @@ class FixTTM : public Fix {
   void end_of_step() override;
   void reset_dt() override;
   void grow_arrays(int) override;
-  void restart(char *) override;
-  int pack_restart(int, double *) override;
-  void unpack_restart(int, int) override;
-  int size_restart(int) override;
-  int maxsize_restart() override;
   double compute_vector(int) override;
   double memory_usage() override;
 

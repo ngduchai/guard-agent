@@ -73,7 +73,6 @@ public:
   void zero();
   //* TODO implement copy (or maybe not necessary)
   void copy(const T* ptr, INDEX nRows, INDEX nCols=1);
-  //* Writes a restart file (TODO implement this if needed/wanted).
   void write_restart(FILE *F) const;
   //* Adds SparseVector x, scaled by s to this one.  Can be different sparcity.
   void add_scaled(SparseVector<T>& x, const T& s);

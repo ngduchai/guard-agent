@@ -463,7 +463,6 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
   if (tstat_flag && p_temp_flag)
     error->all(FLERR,"Thermostat in fix {} is incompatible with ptemp command", style);
 
-  // set pstat_flag and box change and restart_pbc variables
 
   pre_exchange_flag = 0;
   pstat_flag = 0;
@@ -480,7 +479,6 @@ FixNH::FixNH(LAMMPS *lmp, int narg, char **arg) :
     if (p_flag[4]) box_change |= BOX_CHANGE_XZ;
     if (p_flag[5]) box_change |= BOX_CHANGE_XY;
     no_change_box = 1;
-    if (allremap == 0) restart_pbc = 1;
 
     // pstyle = TRICLINIC if any off-diagonal term is controlled -> 6 dof
     // else pstyle = ISO if XYZ coupling or XY coupling in 2d -> 1 dof
@@ -757,7 +755,6 @@ void FixNH::setup(int /*vflag*/)
     // cannot be done in init() b/c temperature cannot be called there
     // is b/c Modify::init() inits computes after fixes due to dof dependence
     // error if T less than 1e-6
-    // if it was read in from a restart file, leave it be
 
     if (t0 == 0.0) {
       if (p_temp_flag) {
@@ -1258,10 +1255,10 @@ int FixNH::size_restart_global()
 }
 
 /* ----------------------------------------------------------------------
-   pack restart data
+   pack state data
 ------------------------------------------------------------------------- */
 
-int FixNH::pack_restart_data(double *list)
+int FixNH::pack_state_data(double *list)
 {
   int n = 0;
 
@@ -1310,59 +1307,6 @@ int FixNH::pack_restart_data(double *list)
   }
 
   return n;
-}
-
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixNH::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  int flag = static_cast<int> (list[n++]);
-  if (flag) {
-    int m = static_cast<int> (list[n++]);
-    if (tstat_flag && m == mtchain) {
-      for (int ich = 0; ich < mtchain; ich++)
-        eta[ich] = list[n++];
-      for (int ich = 0; ich < mtchain; ich++)
-        eta_dot[ich] = list[n++];
-    } else n += 2*m;
-  }
-  flag = static_cast<int> (list[n++]);
-  if (flag) {
-    omega[0] = list[n++];
-    omega[1] = list[n++];
-    omega[2] = list[n++];
-    omega[3] = list[n++];
-    omega[4] = list[n++];
-    omega[5] = list[n++];
-    omega_dot[0] = list[n++];
-    omega_dot[1] = list[n++];
-    omega_dot[2] = list[n++];
-    omega_dot[3] = list[n++];
-    omega_dot[4] = list[n++];
-    omega_dot[5] = list[n++];
-    vol0 = list[n++];
-    t0 = list[n++];
-    int m = static_cast<int> (list[n++]);
-    if (pstat_flag && m == mpchain) {
-      for (int ich = 0; ich < mpchain; ich++)
-        etap[ich] = list[n++];
-      for (int ich = 0; ich < mpchain; ich++)
-        etap_dot[ich] = list[n++];
-    } else n+=2*m;
-    flag = static_cast<int> (list[n++]);
-    if (flag) {
-      h0_inv[0] = list[n++];
-      h0_inv[1] = list[n++];
-      h0_inv[2] = list[n++];
-      h0_inv[3] = list[n++];
-      h0_inv[4] = list[n++];
-      h0_inv[5] = list[n++];
-    }
-  }
 }
 
 /* ---------------------------------------------------------------------- */

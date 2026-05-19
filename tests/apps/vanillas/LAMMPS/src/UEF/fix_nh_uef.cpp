@@ -685,7 +685,6 @@ void FixNHUef::inv_rotate_f(double r[3][3])
 }
 
 /* ----------------------------------------------------------------------
- * Increase the size of the restart list to add in the strains
  * ---------------------------------------------------------------------- */
 int FixNHUef::size_restart_global()
 {
@@ -695,30 +694,15 @@ int FixNHUef::size_restart_global()
 /* ----------------------------------------------------------------------
  * Pack the strains after packing the default FixNH values
  * ---------------------------------------------------------------------- */
-int FixNHUef::pack_restart_data(double *list)
+int FixNHUef::pack_state_data(double *list)
 {
-  int n = FixNH::pack_restart_data(list);
+  int n = FixNH::pack_state_data(list);
   list[n++] = strain[0];
   list[n++] = strain[1];
   return n;
 }
 
 /* ----------------------------------------------------------------------
- * read and set the strains after the default FixNH values
- * ---------------------------------------------------------------------- */
-void FixNHUef::restart(char *buf)
-{
-  int n = size_restart_global();
-  FixNH::restart(buf);
-  auto list = (double *) buf;
-  strain[0] = list[n-2];
-  strain[1] = list[n-1];
-  uefbox->set_strain(strain[0],strain[1]);
-}
-
-/* ----------------------------------------------------------------------
- * If the step writes a restart, reduce the box beforehand. This makes sure
- * the unique box shape can be found once the restart is read and that
  * all of the atoms lie within the box.
  * This may only be necessary for RESPA runs, but I'm leaving it in anyway.
  * ---------------------------------------------------------------------- */

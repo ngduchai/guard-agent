@@ -129,23 +129,6 @@ void OutputManager::print_custom_names() {
 //-----------------------------------------------------------------------------
 //*
 //-----------------------------------------------------------------------------
-// Dump text-based fields to disk for later restart
-void OutputManager::write_restart_file(string fileName, RESTART_LIST *data)
-{
-  FILE * fp=nullptr;
-  fp=fopen(fileName.c_str(),"wb"); // open
-  RESTART_LIST::iterator iter;
-  for (iter = data->begin(); iter != data->end(); iter++) {
-    const MATRIX* field_data = iter->second;
-    for (int i = 0; i < field_data->nRows(); ++i) {
-      for (int j = 0; j < field_data->nCols(); ++j) {
-        double x = (*field_data)(i,j);
-        fwrite(&x,sizeof(double),1,fp);
-      }
-    }
-  }
-  fclose(fp);
-}
 //-----------------------------------------------------------------------------
 //*
 //-----------------------------------------------------------------------------

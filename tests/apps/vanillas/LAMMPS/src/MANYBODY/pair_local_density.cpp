@@ -57,7 +57,7 @@ static const char cite_pair_local_density[] =
 
 PairLocalDensity::PairLocalDensity(LAMMPS *lmp) : Pair(lmp)
 {
-  restartinfo = 0;
+  data_writes_state = 0;
   one_coeff = 1;
   single_enable = 1;
 

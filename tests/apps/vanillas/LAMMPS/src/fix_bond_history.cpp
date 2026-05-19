@@ -255,15 +255,6 @@ double FixBondHistory::memory_usage()
   return (double) maxbond * ndata * sizeof(double);
 }
 
-/* ---------------------------------------------------------------------- */
-
-void FixBondHistory::restart(char *buf)
-{
-  int n = 0;
-  double *list = (double *) buf;
-  stored_flag = static_cast<int>(list[n++]);
-}
-
 /* ----------------------------------------------------------------------
    initialize bond values to zero, called when atom is created
 ------------------------------------------------------------------------- */

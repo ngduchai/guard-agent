@@ -2537,37 +2537,6 @@ double FixGCMC::memory_usage()
   return bytes;
 }
 
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixGCMC::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-
-  seed = static_cast<int> (list[n++]);
-  random_equal->reset(seed);
-
-  seed = static_cast<int> (list[n++]);
-  random_unequal->reset(seed);
-
-  next_reneighbor = (bigint) ubuf(list[n++]).i;
-
-  ntranslation_attempts  = list[n++];
-  ntranslation_successes = list[n++];
-  nrotation_attempts     = list[n++];
-  nrotation_successes    = list[n++];
-  ndeletion_attempts     = list[n++];
-  ndeletion_successes    = list[n++];
-  ninsertion_attempts    = list[n++];
-  ninsertion_successes   = list[n++];
-
-  bigint ntimestep_restart = (bigint) ubuf(list[n++]).i;
-  if (ntimestep_restart != update->ntimestep)
-    error->all(FLERR,"Must not reset timestep when restarting fix gcmc");
-}
-
 void FixGCMC::grow_molecule_arrays(int nmolatoms) {
     nmaxmolatoms = nmolatoms;
     molcoords = memory->grow(molcoords,nmaxmolatoms,3,"gcmc:molcoords");

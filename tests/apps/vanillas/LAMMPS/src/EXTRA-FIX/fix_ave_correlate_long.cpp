@@ -721,39 +721,6 @@ double FixAveCorrelateLong::memory_usage() {
 }
 
 /* ----------------------------------------------------------------------
-   Write Restart data to restart file
+   Write state data to data file
 ------------------------------------------------------------------------- */
 // Save everything except t and f
-/* ----------------------------------------------------------------------
-   use state info from restart file to restart the Fix
-------------------------------------------------------------------------- */
-void FixAveCorrelateLong::restart(char *buf)
-{
-  int n = 0;
-  auto list = (double *) buf;
-  int npairin = static_cast<int>(list[n++]);
-  int numcorrelatorsin = static_cast<int> (list[n++]);
-  int pin = static_cast<int>(list[n++]);
-  int min = static_cast<int>(list[n++]);
-  last_accumulated_step = static_cast<int>(list[n++]);
-
-  if ((npairin!=npair) || (numcorrelatorsin!=numcorrelators) || (pin!=(int)p) || (min!=(int)m))
-    error->all(FLERR, "Fix ave/correlate/long: restart and input data are different");
-
-  for (int i=0; i < npair; i++)
-    for (int j=0; j < numcorrelators; j++) {
-      for (unsigned int k=0;k<p;k++) {
-        shift[i][j][k] = list[n++];
-        shift2[i][j][k] = list[n++];
-        correlation[i][j][k] = list[n++];
-      }
-      accumulator[i][j] = list[n++];
-      accumulator2[i][j] = list[n++];
-    }
-  for (int i=0; i < numcorrelators; i++) {
-    for (unsigned int j=0; j < p; j++)
-      ncorrelation[i][j] = static_cast<unsigned long int>(list[n++]);
-    naccumulator[i] = static_cast<unsigned int>(list[n++]);
-    insertindex[i] = static_cast<unsigned int>(list[n++]);
-  }
-}

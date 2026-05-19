@@ -224,7 +224,7 @@ namespace UIestimator {
             const std::vector<double> & krestr_input,                // force constant in eABF
             const std::string & output_filename_input,              // the prefix of output files
             const int output_freq_input,
-            const bool restart_input,                              // whether restart from a .count and a .grad file
+            const bool restart_input,                              // whether resume from a .count and a .grad file
             const std::vector<std::string> & input_filename_input,   // the prefixes of input files
             const double temperature_input) {
 
@@ -235,7 +235,7 @@ namespace UIestimator {
             this->krestr = krestr_input;
             this->output_filename = output_filename_input;
             this->output_freq = output_freq_input;
-            this->restart = restart_input;
+            this->resume = restart_input;
             this->input_filename = input_filename_input;
             this->temperature = temperature_input;
 
@@ -266,7 +266,7 @@ namespace UIestimator {
                 oneD_pmf = n_vector<double>(lowerboundary, upperboundary_temp, width, 1, 0.0);
             }
 
-            if (restart == true) {
+            if (resume == true) {
                 input_grad = n_vector<std::vector<double> >(lowerboundary, upperboundary, width, 1, std::vector<double>(dimension, 0.0));
                 input_count = n_vector<int>(lowerboundary, upperboundary, width, 1, 0);
 
@@ -359,7 +359,7 @@ namespace UIestimator {
         std::vector<double> krestr;
         std::string output_filename;
         int output_freq;
-        bool restart;
+        bool resume;
         std::vector<std::string> input_filename;
         double temperature;
 
@@ -493,7 +493,7 @@ namespace UIestimator {
             last_position = lowerboundary;
             for (i = lowerboundary[0] + width[0]; i < upperboundary[0] + EPSILON; i += width[0]) {
                 position[0] = i + EPSILON;
-                if (restart == false || input_count.get_value(last_position) == 0) {
+                if (resume == false || input_count.get_value(last_position) == 0) {
                     dG = oneD_pmf.get_value(last_position) + grad.get_value(last_position)[0] * width[0];
                 }
                 else {
@@ -630,7 +630,7 @@ namespace UIestimator {
                     ofile_count << loop_flag[j] + 0.5 * width[j] << " ";
                 }
 
-                if (restart == false) {
+                if (resume == false) {
                     for (j = 0; j < dimension; j++) {
                         ofile << grad.get_value(loop_flag)[j] << " ";
                         ofile_hist << grad.get_value(loop_flag)[j] << " ";

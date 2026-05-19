@@ -186,7 +186,6 @@ FixAdapt::FixAdapt(LAMMPS *lmp, int narg, char **arg) :
   }
 
   // if scaleflag set with diameter or charge adaptation,
-  // then previous step scale factors are written to restart file
   // initialize them here in case one is used and other is never defined
 
   if (scaleflag && (diam_flag || chgflag)) restart_global = 1;
@@ -753,16 +752,4 @@ void FixAdapt::set_arrays(int i)
 {
   if (fix_diam) fix_diam->vstore[i] = atom->radius[i];
   if (fix_chg) fix_chg->vstore[i] = atom->q[i];
-}
-
-/* ----------------------------------------------------------------------
-   use scale factors from restart file to restart the Fix
-------------------------------------------------------------------------- */
-
-void FixAdapt::restart(char *buf)
-{
-  auto dbuf = (double *) buf;
-
-  previous_diam_scale = dbuf[0];
-  previous_chg_scale = dbuf[1];
 }

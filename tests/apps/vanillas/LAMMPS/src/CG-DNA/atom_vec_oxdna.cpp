@@ -48,15 +48,6 @@ AtomVecOxdna::AtomVecOxdna(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
-   set local copies of all grow ptrs used by this class, except defaults
-   needed in replicate when 2 atom classes exist and it calls pack_restart()
-------------------------------------------------------------------------- */
-
-void AtomVecOxdna::grow_pointers()
-{
-  id5p = atom->id5p;
-}
-
 /* ----------------------------------------------------------------------
    initialize atom quantity 5' partner
 ------------------------------------------------------------------------- */
