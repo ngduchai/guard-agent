@@ -1119,15 +1119,15 @@ void tw_scheduler_sequential_rollback_check(tw_pe * me) {
         }
     }
     tw_event *cev;
-    crv_lpstate_checkpoint_internal prev, cur;
+    crv_lpstate_snapshot_internal prev, cur;
     prev.state = malloc(largest_lp_size);
     cur.state = malloc(largest_lp_size);
     if (prev.state == NULL || cur.state == NULL) {
         tw_error(TW_LOC, "Failed to allocate memory to save state");
     }
-    size_t const largest_lp_checkpoint = crv_init_checkpoints();
-    if (largest_lp_checkpoint > largest_lp_size) {
-        largest_lp_size = largest_lp_checkpoint;
+    size_t const largest_lp_snapshot = crv_init_snapshots();
+    if (largest_lp_snapshot > largest_lp_size) {
+        largest_lp_size = largest_lp_snapshot;
     }
 
     printf("*** START SEQUENTIAL ROLLBACK TEST SIMULATION ***\n\n");

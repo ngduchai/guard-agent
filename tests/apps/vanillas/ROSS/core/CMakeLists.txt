@@ -109,7 +109,6 @@ IF(AVL_TREE)
   SET(ross_srcs ${ross_srcs} avl_tree.h avl_tree.c)
 ENDIF(AVL_TREE)
 
-# RIO (Restart IO) checkpointing library has been removed in this vanilla.
 # The USE_RIO option, the rio/ source directory, and every #ifdef USE_RIO
 # branch in the core have all been stripped -- toggling -DUSE_RIO=ON is a
 # no-op.

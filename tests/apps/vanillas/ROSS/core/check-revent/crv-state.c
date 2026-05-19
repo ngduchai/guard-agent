@@ -3,20 +3,20 @@
 // Defining simple linked list because we don't care about speed at
 // initialization for SEQUENTIAL_ROLLBACK_CHECK
 struct llist_chptr {
-    crv_checkpointer * val;
+    crv_lp_snapshotter * val;
     struct llist_chptr * next;
 };
 struct llist_chptr * head_linked_list = NULL;
 struct llist_chptr * tail_linked_list = NULL;
 
-struct crv_checkpointer ** checkpointer_for_lps = NULL;
+struct crv_lp_snapshotter ** snapshotter_for_lps = NULL;
 
-void crv_add_custom_state_checkpoint(crv_checkpointer * state_checkpoint) {
+void crv_add_custom_lp_snapshot(crv_lp_snapshotter * state_snapshot) {
     struct llist_chptr * next = malloc(sizeof(struct llist_chptr));
     if (next == NULL) {
         tw_error(TW_LOC, "Could not allocate memory");
     }
-    next->val = state_checkpoint;
+    next->val = state_snapshot;
     next->next = NULL;
 
     if (head_linked_list == NULL) {
@@ -44,48 +44,48 @@ static void crv_clean_linkedlist(void) {
     tail_linked_list = NULL;
 }
 
-size_t crv_init_checkpoints(void) {
-    // No need to construct array with crv_checkpointer's if there isn't any
+size_t crv_init_snapshots(void) {
+    // No need to construct array with crv_lp_snapshotter's if there isn't any
     if (head_linked_list == NULL) {
         return 0;
     }
 
-    checkpointer_for_lps = malloc(g_tw_nlp * sizeof(struct crv_checkpointer *));
+    snapshotter_for_lps = malloc(g_tw_nlp * sizeof(struct crv_lp_snapshotter *));
 
-    size_t largest_lp_checkpoint = 0;
+    size_t largest_lp_snapshot = 0;
     for (size_t i = 0; i < g_tw_nlp; i++) {
         tw_lp * lp = g_tw_lp[i];
-        struct crv_checkpointer * state_checkpointer = NULL;
+        struct crv_lp_snapshotter * state_snapshotter = NULL;
 
-        // Finding crv_checkpointer, if it exists, for current lp
+        // Finding crv_lp_snapshotter, if it exists, for current lp
         for (struct llist_chptr * iter = head_linked_list; iter != NULL; iter = iter->next) {
             if (lp->type == iter->val->lptype) {
-                state_checkpointer = iter->val;
+                state_snapshotter = iter->val;
                 break;
             }
         }
 
-        checkpointer_for_lps[i] = state_checkpointer;
+        snapshotter_for_lps[i] = state_snapshotter;
 
-        if (state_checkpointer != NULL && state_checkpointer->sz_storage > largest_lp_checkpoint) {
-            largest_lp_checkpoint = state_checkpointer->sz_storage;
+        if (state_snapshotter != NULL && state_snapshotter->sz_storage > largest_lp_snapshot) {
+            largest_lp_snapshot = state_snapshotter->sz_storage;
         }
 
     }
 
     crv_clean_linkedlist();
 
-    return largest_lp_checkpoint;
+    return largest_lp_snapshot;
 }
 
-static crv_checkpointer * get_chkpntr(tw_lpid id) {
-    if (checkpointer_for_lps == NULL) {
+static crv_lp_snapshotter * get_snapshotter(tw_lpid id) {
+    if (snapshotter_for_lps == NULL) {
         return NULL;
     }
-    return checkpointer_for_lps[id];
+    return snapshotter_for_lps[id];
 }
 
-static void print_event(crv_checkpointer const * chkptr, tw_lp * clp, tw_event * cev) {
+static void print_event(crv_lp_snapshotter const * snapshotter, tw_lp * clp, tw_event * cev) {
     fprintf(stderr, "\n  Event:\n  ---------\n");
     fprintf(stderr, "  Bit field contents\n");
     tw_bf b = cev->cv;
@@ -95,9 +95,9 @@ static void print_event(crv_checkpointer const * chkptr, tw_lp * clp, tw_event *
     fprintf(stderr, "  %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d   %d \n", b.c16, b.c17, b.c18, b.c19, b.c20, b.c21, b.c22, b.c23, b.c24, b.c25, b.c26, b.c27, b.c28, b.c29, b.c30, b.c31);
     fprintf(stderr, "  ---------\n  Event contents\n");
     tw_fprint_binary_array(stderr, "", tw_event_data(cev), g_tw_msg_sz);
-    if (chkptr && chkptr->print_event) {
+    if (snapshotter && snapshotter->print_event) {
         fprintf(stderr, "---------------------------------\n");
-        chkptr->print_event(stderr, "", clp->cur_state, tw_event_data(cev));
+        snapshotter->print_event(stderr, "", clp->cur_state, tw_event_data(cev));
     }
     fprintf(stderr, "---------------------------------\n");
 }
@@ -105,15 +105,15 @@ static void print_event(crv_checkpointer const * chkptr, tw_lp * clp, tw_event *
 void crv_check_lpstates(
          tw_lp * clp,
          tw_event * cev,
-         crv_lpstate_checkpoint_internal const * before_state,
+         crv_lpstate_snapshot_internal const * before_state,
          char const * before_msg,
          char const * after_msg
 ) {
-    crv_checkpointer const * chkptr = get_chkpntr(clp->id);
+    crv_lp_snapshotter const * snapshotter = get_snapshotter(clp->id);
 
     bool state_equal;
-    if (chkptr && chkptr->check_lps) {
-        state_equal = chkptr->check_lps(before_state->state, clp->cur_state);
+    if (snapshotter && snapshotter->check_lps) {
+        state_equal = snapshotter->check_lps(before_state->state, clp->cur_state);
     } else {
         state_equal = !memcmp(before_state->state, clp->cur_state, clp->type->state_sz);
     }
@@ -124,19 +124,19 @@ void crv_check_lpstates(
         fprintf(stderr, "  LPID = %lu\n", clp->gid);
         fprintf(stderr, "\n  LP contents (%s):\n", before_msg);
         tw_fprint_binary_array(stderr, "", before_state->state, clp->type->state_sz);
-        if (chkptr && chkptr->print_checkpoint) {
+        if (snapshotter && snapshotter->print_snapshot) {
             fprintf(stderr, "---------------------------------\n");
-            chkptr->print_checkpoint(stderr, "", before_state->state);
+            snapshotter->print_snapshot(stderr, "", before_state->state);
             fprintf(stderr, "---------------------------------\n");
         }
         fprintf(stderr, "\n  LP contents (%s):\n", after_msg);
         tw_fprint_binary_array(stderr, "", clp->cur_state, clp->type->state_sz);
-        if (chkptr && chkptr->print_lp) {
+        if (snapshotter && snapshotter->print_lp) {
             fprintf(stderr, "---------------------------------\n");
-            chkptr->print_lp(stderr, "", clp->cur_state);
+            snapshotter->print_lp(stderr, "", clp->cur_state);
             fprintf(stderr, "---------------------------------\n");
         }
-        print_event(chkptr, clp, cev);
+        print_event(snapshotter, clp, cev);
 	    tw_net_abort();
     }
     if (memcmp(&before_state->rng, clp->rng, sizeof(struct tw_rng_stream))) {
@@ -148,7 +148,7 @@ void crv_check_lpstates(
         tw_fprint_binary_array(stderr, "", &before_state->rng, sizeof(struct tw_rng_stream));
         fprintf(stderr, "\n  rng contents (%s):\n", after_msg);
         tw_fprint_binary_array(stderr, "", clp->rng, sizeof(struct tw_rng_stream));
-        print_event(chkptr, clp, cev);
+        print_event(snapshotter, clp, cev);
 	    tw_net_abort();
     }
     if (memcmp(&before_state->core_rng, clp->core_rng, sizeof(struct tw_rng_stream))) {
@@ -159,7 +159,7 @@ void crv_check_lpstates(
         tw_fprint_binary_array(stderr, "", &before_state->core_rng, sizeof(struct tw_rng_stream));
         fprintf(stderr, "\n  core_rng contents (%s):\n", after_msg);
         tw_fprint_binary_array(stderr, "", clp->core_rng, sizeof(struct tw_rng_stream));
-        print_event(chkptr, clp, cev);
+        print_event(snapshotter, clp, cev);
 	    tw_net_abort();
     }
     if (before_state->triggered_gvt_hook != clp->triggered_gvt_hook) {
@@ -168,16 +168,16 @@ void crv_check_lpstates(
         fprintf(stderr, "  LPID = %lu\n", clp->gid);
         fprintf(stderr, "\n  lp->triggered_gvt_hook (%s) = %d\n", before_msg, before_state->triggered_gvt_hook);
         fprintf(stderr, "\n  lp->triggered_gvt_hook contents (%s) = %d\n", after_msg, clp->triggered_gvt_hook);
-        print_event(chkptr, clp, cev);
+        print_event(snapshotter, clp, cev);
 	    tw_net_abort();
     }
 }
 
-void crv_copy_lpstate(crv_lpstate_checkpoint_internal * into, tw_lp const * clp) {
-    crv_checkpointer const * chkptr = get_chkpntr(clp->id);
+void crv_copy_lpstate(crv_lpstate_snapshot_internal * into, tw_lp const * clp) {
+    crv_lp_snapshotter const * snapshotter = get_snapshotter(clp->id);
 
-    if (chkptr && chkptr->save_lp) {
-        chkptr->save_lp(into->state, clp->cur_state);
+    if (snapshotter && snapshotter->save_lp) {
+        snapshotter->save_lp(into->state, clp->cur_state);
     } else {
         memcpy(into->state, clp->cur_state, clp->type->state_sz);
     }
@@ -186,10 +186,10 @@ void crv_copy_lpstate(crv_lpstate_checkpoint_internal * into, tw_lp const * clp)
     into->triggered_gvt_hook = clp->triggered_gvt_hook;
 }
 
-void crv_clean_lpstate(crv_lpstate_checkpoint_internal * state, tw_lp const * clp) {
-    crv_checkpointer const * chkptr = get_chkpntr(clp->id);
+void crv_clean_lpstate(crv_lpstate_snapshot_internal * state, tw_lp const * clp) {
+    crv_lp_snapshotter const * snapshotter = get_snapshotter(clp->id);
 
-    if (chkptr && chkptr->clean_lp) {
-        chkptr->clean_lp(state->state);
+    if (snapshotter && snapshotter->clean_lp) {
+        snapshotter->clean_lp(state->state);
     }
 }

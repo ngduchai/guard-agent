@@ -113,7 +113,6 @@ tw_init_lps(tw_pe * me)
 				tw_error(TW_LOC, "ran out of events during init");
 		}
 	}
-	/* RIO read-checkpoint / RIO-staged init blocks removed in this vanilla. */
 }
 
 void tw_pre_run_lps (tw_pe * me) {
