@@ -685,13 +685,6 @@ void FixNHUef::inv_rotate_f(double r[3][3])
 }
 
 /* ----------------------------------------------------------------------
- * ---------------------------------------------------------------------- */
-int FixNHUef::size_restart_global()
-{
-  return FixNH::size_restart_global() +2;
-}
-
-/* ----------------------------------------------------------------------
  * Pack the strains after packing the default FixNH values
  * ---------------------------------------------------------------------- */
 int FixNHUef::pack_state_data(double *list)

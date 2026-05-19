@@ -178,7 +178,6 @@ class FixPIMDLangevin : public Fix {
   void compute_cvir();
   void compute_totenthalpy();
 
-  int size_restart_global();
   int pack_state_data(double *list);
 };
 }    // namespace LAMMPS_NS

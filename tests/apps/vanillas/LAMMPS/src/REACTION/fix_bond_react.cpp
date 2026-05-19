@@ -775,7 +775,7 @@ void FixBondReact::post_constructor()
 
       // on to statted_tags (system-wide thermostat)
       // initialize per-atom statted_flags to 1
-      if (fix3->restart_reset != 1) {
+      if (false != 1) {
         int flag,cols;
         int index = atom->find_custom("statted_tags",flag,cols);
         int *i_statted_tags = atom->ivector[index];

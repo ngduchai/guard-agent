@@ -59,7 +59,7 @@ void FixEOScv::init()
   double *uMech = atom->uMech;
   double *dpdTheta = atom->dpdTheta;
 
-  if (this->restart_reset) {
+  if (false) {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit)
         dpdTheta[i] = (uCond[i]+uMech[i])/cvEOS;

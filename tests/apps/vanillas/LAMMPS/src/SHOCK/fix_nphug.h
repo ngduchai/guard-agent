@@ -50,7 +50,6 @@ class FixNPHug : public FixNH {
   int idir;
   int uniaxial;
 
-  int size_restart_global() override;
 };
 
 }    // namespace LAMMPS_NS

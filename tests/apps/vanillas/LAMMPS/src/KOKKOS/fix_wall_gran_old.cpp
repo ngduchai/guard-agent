@@ -83,8 +83,8 @@ FixWallGranOld::FixWallGranOld(LAMMPS *lmp, int narg, char **arg) :
   else if (strcmp(arg[3],"granular") == 0) pairstyle = GRANULAR;
   else error->all(FLERR,"Invalid fix wall/gran interaction style");
 
-  use_history = restart_peratom = 1;
-  if (pairstyle == HOOKE) use_history = restart_peratom = 0;
+  use_history = 1;
+  if (pairstyle == HOOKE) use_history = 0;
   tangential_history = roll_history = twist_history = 0;
   normal_model = NORMAL_NONE;
   tangential_model = TANGENTIAL_NONE;

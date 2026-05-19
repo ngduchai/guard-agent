@@ -99,7 +99,7 @@ void FixRxKokkos<DeviceType>::post_constructor()
   FixRX::post_constructor();
 
   // Need a copy of this
-  this->my_restartFlag = fix_species->restart_reset;
+  this->my_restartFlag = false;
 }
 
 /* ---------------------------------------------------------------------- */

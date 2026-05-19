@@ -73,10 +73,7 @@ ComputeTempCS::ComputeTempCS(LAMMPS *lmp, int narg, char **arg) :
   // set fix store values = 0 for now
   // fill them in via setup() once Comm::borders() has been called
 
-  if (fix->restart_reset) {
-    fix->restart_reset = 0;
-    firstflag = 0;
-  } else {
+  {
     double *partner = fix->vstore;
     int nlocal = atom->nlocal;
     for (int i = 0; i < nlocal; i++) partner[i] = ubuf(0).d;

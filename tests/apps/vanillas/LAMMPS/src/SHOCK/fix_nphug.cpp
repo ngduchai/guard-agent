@@ -373,21 +373,6 @@ int FixNPHug::pack_state_data(double *list)
   return n;
 }
 
-/* ----------------------------------------------------------------------
-   calculate the number of data to be packed
-------------------------------------------------------------------------- */
-
-int FixNPHug::size_restart_global()
-{
-  int nsize = 3;
-
-  // call the base class function
-
-  nsize += FixNH::size_restart_global();
-
-  return nsize;
-}
-
 /* ---------------------------------------------------------------------- */
 
 int FixNPHug::modify_param(int narg, char **arg)

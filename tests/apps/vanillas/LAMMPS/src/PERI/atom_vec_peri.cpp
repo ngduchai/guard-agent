@@ -70,6 +70,18 @@ AtomVecPeri::AtomVecPeri(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecPeri::grow_pointers()
+{
+  rmass = atom->rmass;
+  vfrac = atom->vfrac;
+  s0 = atom->s0;
+  x0 = atom->x0;
+}
+
 /* ----------------------------------------------------------------------
    initialize non-zero atom quantities
 ------------------------------------------------------------------------- */

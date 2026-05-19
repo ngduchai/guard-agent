@@ -45,7 +45,6 @@ class FixNHUef : public FixNH {
 
  protected:
   void remap() override;
-  int size_restart_global() override;
   void nve_x() override;
   void nve_v() override;
   void rotate_x(double[3][3]);

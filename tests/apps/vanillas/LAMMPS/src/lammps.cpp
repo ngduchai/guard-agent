@@ -877,7 +877,6 @@ void LAMMPS::init()
   domain->init();
   atom->init();          // atom must come after force and domain
                          //   atom deletes extra array
-                         //   used by fix shear_history::unpack_restart()
                          //     when force->pair->gran_history creates fix
                          //   atom_vec init uses deform_vremap
   modify->init();        // modify must come after update, force, atom, domain

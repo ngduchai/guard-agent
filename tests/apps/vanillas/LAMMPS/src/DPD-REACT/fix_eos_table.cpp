@@ -112,7 +112,7 @@ void FixEOStable::init()
   double *dpdTheta = atom->dpdTheta;
   double tmp;
 
-  if (this->restart_reset) {
+  if (false) {
     for (int i = 0; i < nlocal; i++)
       if (mask[i] & groupbit)
         temperature_lookup(uCond[i]+uMech[i],dpdTheta[i]);

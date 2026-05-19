@@ -62,8 +62,6 @@ FixStoreAtom::FixStoreAtom(LAMMPS *lmp, int narg, char **arg) :
   if (ghostflag) comm_border = nvalues;
   maxexchange = nvalues;
 
-  if (stateflag) restart_peratom = 1;
-
   // allocate data structs and register with Atom class
 
   vstore = nullptr;

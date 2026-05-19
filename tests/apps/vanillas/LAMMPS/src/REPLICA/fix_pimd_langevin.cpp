@@ -1405,15 +1405,6 @@ void FixPIMDLangevin::compute_totenthalpy()
 
 /* ---------------------------------------------------------------------- */
 
-int FixPIMDLangevin::size_restart_global()
-{
-  int nsize = 6;
-
-  return nsize;
-}
-
-/* ---------------------------------------------------------------------- */
-
 int FixPIMDLangevin::pack_state_data(double *list)
 {
   int n = 0;

@@ -188,7 +188,6 @@ FixAdapt::FixAdapt(LAMMPS *lmp, int narg, char **arg) :
   // if scaleflag set with diameter or charge adaptation,
   // initialize them here in case one is used and other is never defined
 
-  if (scaleflag && (diam_flag || chgflag)) restart_global = 1;
   previous_diam_scale = previous_chg_scale = 1.0;
 
   // allocate pair style arrays
@@ -270,8 +269,8 @@ void FixAdapt::post_constructor()
     id_fix_diam = utils::strdup(id + std::string("_FIX_STORE_DIAM"));
     fix_diam = dynamic_cast<FixStoreAtom *>(
       modify->add_fix(fmt::format("{} {} STORE/ATOM 1 0 0 1", id_fix_diam,group->names[igroup])));
-    if (fix_diam->restart_reset) fix_diam->restart_reset = 0;
-    else {
+
+    {
       double *vec = fix_diam->vstore;
       double *radius = atom->radius;
       int *mask = atom->mask;
@@ -288,8 +287,8 @@ void FixAdapt::post_constructor()
     id_fix_chg = utils::strdup(id + std::string("_FIX_STORE_CHG"));
     fix_chg = dynamic_cast<FixStoreAtom *>(
       modify->add_fix(fmt::format("{} {} STORE/ATOM 1 0 0 1",id_fix_chg,group->names[igroup])));
-    if (fix_chg->restart_reset) fix_chg->restart_reset = 0;
-    else {
+
+    {
       double *vec = fix_chg->vstore;
       double *q = atom->q;
       int *mask = atom->mask;
@@ -447,17 +446,15 @@ void FixAdapt::init()
           error->all(FLERR,"Fix adapt requires atom attribute mass");
         if (discflag && domain->dimension != 2)
           error->all(FLERR,"Fix adapt requires 2d simulation");
-        if (!restart_reset) previous_diam_scale = 1.0;
+        previous_diam_scale = 1.0;
       }
       if (ad->atomparam == CHARGE) {
         if (!atom->q_flag)
           error->all(FLERR,"Fix adapt requires atom attribute charge");
-        if (!restart_reset) previous_chg_scale = 1.0;
+        previous_chg_scale = 1.0;
       }
     }
   }
-
-  if (restart_reset) restart_reset = 0;
 
   // make copy of original pair/bond/angle array values
 

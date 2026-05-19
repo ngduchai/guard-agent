@@ -76,6 +76,17 @@ AtomVecEllipsoid::~AtomVecEllipsoid()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecEllipsoid::grow_pointers()
+{
+  ellipsoid = atom->ellipsoid;
+  rmass = atom->rmass;
+  angmom = atom->angmom;
+}
+
 /* ----------------------------------------------------------------------
    grow bonus data structure
 ------------------------------------------------------------------------- */
@@ -272,6 +283,80 @@ int AtomVecEllipsoid::unpack_exchange_bonus(int ilocal, double *buf)
   int m = 0;
 
   if (ubuf(buf[m++]).i == 0)
+    ellipsoid[ilocal] = -1;
+  else {
+    if (nlocal_bonus == nmax_bonus) grow_bonus();
+    double *shape = bonus[nlocal_bonus].shape;
+    double *quat = bonus[nlocal_bonus].quat;
+    shape[0] = buf[m++];
+    shape[1] = buf[m++];
+    shape[2] = buf[m++];
+    quat[0] = buf[m++];
+    quat[1] = buf[m++];
+    quat[2] = buf[m++];
+    quat[3] = buf[m++];
+    bonus[nlocal_bonus].ilocal = ilocal;
+    ellipsoid[ilocal] = nlocal_bonus++;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+   include extra data stored by fixes
+------------------------------------------------------------------------- */
+
+int AtomVecEllipsoid::size_restart_bonus()
+{
+  int i;
+
+  int n = 0;
+  int nlocal = atom->nlocal;
+  for (i = 0; i < nlocal; i++) {
+    if (ellipsoid[i] >= 0)
+      n += size_restart_bonus_one;
+    else
+      n++;
+  }
+
+  return n;
+}
+
+/* ----------------------------------------------------------------------
+   xyz must be 1st 3 values, so that read_restart can test on them
+   molecular types may be negative, but write as positive
+------------------------------------------------------------------------- */
+
+int AtomVecEllipsoid::pack_restart_bonus(int i, double *buf)
+{
+  int m = 0;
+
+  if (ellipsoid[i] < 0)
+    buf[m++] = ubuf(0).d;
+  else {
+    buf[m++] = ubuf(1).d;
+    int j = ellipsoid[i];
+    buf[m++] = bonus[j].shape[0];
+    buf[m++] = bonus[j].shape[1];
+    buf[m++] = bonus[j].shape[2];
+    buf[m++] = bonus[j].quat[0];
+    buf[m++] = bonus[j].quat[1];
+    buf[m++] = bonus[j].quat[2];
+    buf[m++] = bonus[j].quat[3];
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecEllipsoid::unpack_restart_bonus(int ilocal, double *buf)
+{
+  int m = 0;
+
+  ellipsoid[ilocal] = (int) ubuf(buf[m++]).i;
+  if (ellipsoid[ilocal] == 0)
     ellipsoid[ilocal] = -1;
   else {
     if (nlocal_bonus == nmax_bonus) grow_bonus();

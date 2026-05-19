@@ -81,6 +81,16 @@ void AtomVecTDPD::init()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecTDPD::grow_pointers()
+{
+  cc_flux = atom->cc_flux;
+  vest = atom->vest;
+}
+
 /* ----------------------------------------------------------------------
    clear extra forces starting at atom N
    nbytes = # of bytes to clear for a per-atom vector

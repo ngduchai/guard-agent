@@ -94,6 +94,29 @@ AtomVecSMD::AtomVecSMD(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecSMD::grow_pointers()
+{
+  esph = atom->esph;
+  desph = atom->desph;
+  vfrac = atom->vfrac;
+  rmass = atom->rmass;
+  x0 = atom->x0;
+  x = atom->x;
+  radius = atom->radius;
+  contact_radius = atom->contact_radius;
+  molecule = atom->molecule;
+  smd_data_9 = atom->smd_data_9;
+  vest = atom->vest;
+  smd_stress = atom->smd_stress;
+  eff_plastic_strain = atom->eff_plastic_strain;
+  eff_plastic_strain_rate = atom->eff_plastic_strain_rate;
+  damage = atom->damage;
+}
+
 /* ----------------------------------------------------------------------
    clear extra forces starting at atom N
    nbytes = # of bytes to clear for a per-atom vector

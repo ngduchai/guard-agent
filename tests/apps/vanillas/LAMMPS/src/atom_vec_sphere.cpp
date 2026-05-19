@@ -97,6 +97,17 @@ void AtomVecSphere::init()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecSphere::grow_pointers()
+{
+  radius = atom->radius;
+  rmass = atom->rmass;
+  omega = atom->omega;
+}
+
 /* ----------------------------------------------------------------------
    initialize non-zero atom quantities
 ------------------------------------------------------------------------- */

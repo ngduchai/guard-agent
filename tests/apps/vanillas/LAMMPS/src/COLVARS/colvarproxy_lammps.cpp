@@ -242,7 +242,7 @@ double colvarproxy_lammps::compute()
 void colvarproxy_lammps::serialize_status(std::string &rst)
 {
   std::ostringstream os;
-  colvars->write_restart(os);
+  colvars->write_resume(os);
   rst = os.str();
 }
 
@@ -252,7 +252,7 @@ bool colvarproxy_lammps::deserialize_status(std::string &rst)
   std::istringstream is;
   is.str(rst);
 
-  if (!colvars->read_restart(is)) {
+  if (!colvars->read_resume(is)) {
     return false;
   } else {
     return true;

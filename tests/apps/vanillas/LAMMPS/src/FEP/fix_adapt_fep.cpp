@@ -212,8 +212,8 @@ void FixAdaptFEP::post_constructor()
     id_fix_diam = utils::strdup(id + std::string("_FIX_STORE_DIAM"));
     fix_diam = dynamic_cast<FixStoreAtom *>(
       modify->add_fix(fmt::format("{} {} STORE/ATOM 1 0 0 1", id_fix_diam,group->names[igroup])));
-    if (fix_diam->restart_reset) fix_diam->restart_reset = 0;
-    else {
+
+    {
       double *vec = fix_diam->vstore;
       double *radius = atom->radius;
       int *mask = atom->mask;
@@ -230,8 +230,8 @@ void FixAdaptFEP::post_constructor()
     id_fix_chg = utils::strdup(id + std::string("_FIX_STORE_CHG"));
     fix_chg = dynamic_cast<FixStoreAtom *>(
       modify->add_fix(fmt::format("{} {} STORE/ATOM 1 0 0 1",id_fix_chg,group->names[igroup])));
-    if (fix_chg->restart_reset) fix_chg->restart_reset = 0;
-    else {
+
+    {
       double *vec = fix_chg->vstore;
       double *q = atom->q;
       int *mask = atom->mask;

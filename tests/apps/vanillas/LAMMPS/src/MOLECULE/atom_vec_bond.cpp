@@ -55,9 +55,69 @@ AtomVecBond::~AtomVecBond()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecBond::grow_pointers()
+{
+  num_bond = atom->num_bond;
+  bond_type = atom->bond_type;
+  nspecial = atom->nspecial;
+}
+
 /* ----------------------------------------------------------------------
+   modify values for AtomVec::pack_restart() to pack
+------------------------------------------------------------------------- */
+
+void AtomVecBond::pack_restart_pre(int ilocal)
+{
+  // ensure bond_negative vector is needed length
+
+  if (bond_per_atom < atom->bond_per_atom) {
+    delete[] bond_negative;
+    bond_per_atom = atom->bond_per_atom;
+    bond_negative = new int[bond_per_atom];
+  }
+
+  // flip any negative types to positive and flag which ones
+
+  any_bond_negative = 0;
+  for (int m = 0; m < num_bond[ilocal]; m++) {
+    if (bond_type[ilocal][m] < 0) {
+      bond_negative[m] = 1;
+      bond_type[ilocal][m] = -bond_type[ilocal][m];
+      any_bond_negative = 1;
+    } else
+      bond_negative[m] = 0;
+  }
+}
+
 /* ----------------------------------------------------------------------
+   unmodify values packed by AtomVec::pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecBond::pack_restart_post(int ilocal)
+{
+  // restore the flagged types to their negative values
+
+  if (any_bond_negative) {
+    for (int m = 0; m < num_bond[ilocal]; m++)
+      if (bond_negative[m]) bond_type[ilocal][m] = -bond_type[ilocal][m];
+  }
+}
+
 /* ----------------------------------------------------------------------
+   initialize other atom quantities after AtomVec::unpack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecBond::unpack_restart_init(int ilocal)
+{
+  nspecial[ilocal][0] = 0;
+  nspecial[ilocal][1] = 0;
+  nspecial[ilocal][2] = 0;
+}
+
 /* ----------------------------------------------------------------------
    modify what AtomVec::data_atom() just unpacked
    or initialize other atom quantities

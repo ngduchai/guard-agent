@@ -154,8 +154,6 @@ class FixBocs : public Fix {
   virtual void nh_v_press();
   virtual void nh_v_temp();
   virtual void compute_temp_target();
-  virtual int size_restart_global();
-
   void compute_sigma();
   void compute_deviatoric();
   double compute_strain_energy();

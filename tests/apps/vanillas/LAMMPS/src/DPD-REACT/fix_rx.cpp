@@ -318,7 +318,7 @@ void FixRX::post_constructor()
   newcmd2 += " ghost yes";
 
   fix_species = dynamic_cast<FixPropertyAtom *>(modify->add_fix(newcmd1));
-  restartFlag = fix_species->restart_reset;
+  restartFlag = false;
   fix_species_old = dynamic_cast<FixPropertyAtom *>(modify->add_fix(newcmd2));
 
   if (nspecies==0) error->all(FLERR,"There are no rx species specified.");

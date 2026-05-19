@@ -237,9 +237,7 @@ void BondBPM::settings(int narg, char **arg)
       delete[] y_ref_id;
       delete[] z_ref_id;
 
-      if (ifix->restart_reset) {
-        ifix->restart_reset = 0;
-      } else {
+      {
         double *x_ref = atom->dvector[index_x_ref];
         double *y_ref = atom->dvector[index_y_ref];
         double *z_ref = atom->dvector[index_z_ref];
@@ -263,7 +261,7 @@ double BondBPM::equilibrium_distance(int /*i*/)
 {
   // Ghost atoms may not yet be communicated, this may only be an estimate
   if (r0_max_estimate == 0) {
-    if (!fix_bond_history->restart_reset) {
+    if (true) {
       int type, j;
       double delx, dely, delz, r;
       double **x = atom->x;

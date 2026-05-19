@@ -65,9 +65,6 @@ void DisplaceAtoms::command(int narg, char **arg)
   if (domain->box_exist == 0)
     error->all(FLERR,"Displace_atoms command before simulation box is defined");
   if (narg < 2) error->all(FLERR,"Illegal displace_atoms command");
-  if (modify->nfix_restart_peratom)
-    error->all(FLERR,"Cannot displace_atoms after "
-               "reading prior state with per-atom info");
 
   if (comm->me == 0) utils::logmesg(lmp,"Displacing atoms ...\n");
 

@@ -43,9 +43,7 @@ ComputeVACF::ComputeVACF(LAMMPS *lmp, int narg, char **arg) :
 
   // store current velocities in fix store array
 
-  if (fix->restart_reset)
-    fix->restart_reset = 0;
-  else {
+  {
     double **voriginal = fix->astore;
 
     double **v = atom->v;

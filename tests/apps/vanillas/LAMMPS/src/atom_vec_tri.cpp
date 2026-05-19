@@ -90,6 +90,19 @@ void AtomVecTri::init()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecTri::grow_pointers()
+{
+  tri = atom->tri;
+  radius = atom->radius;
+  rmass = atom->rmass;
+  omega = atom->omega;
+  angmom = atom->angmom;
+}
+
 /* ----------------------------------------------------------------------
    grow bonus data structure
 ------------------------------------------------------------------------- */
@@ -320,6 +333,104 @@ int AtomVecTri::pack_exchange_bonus(int i, double *buf)
 /* ---------------------------------------------------------------------- */
 
 int AtomVecTri::unpack_exchange_bonus(int ilocal, double *buf)
+{
+  int m = 0;
+
+  tri[ilocal] = (int) ubuf(buf[m++]).i;
+  if (tri[ilocal] == 0)
+    tri[ilocal] = -1;
+  else {
+    if (nlocal_bonus == nmax_bonus) grow_bonus();
+    double *quat = bonus[nlocal_bonus].quat;
+    double *c1 = bonus[nlocal_bonus].c1;
+    double *c2 = bonus[nlocal_bonus].c2;
+    double *c3 = bonus[nlocal_bonus].c3;
+    double *inertia = bonus[nlocal_bonus].inertia;
+    quat[0] = buf[m++];
+    quat[1] = buf[m++];
+    quat[2] = buf[m++];
+    quat[3] = buf[m++];
+    c1[0] = buf[m++];
+    c1[1] = buf[m++];
+    c1[2] = buf[m++];
+    c2[0] = buf[m++];
+    c2[1] = buf[m++];
+    c2[2] = buf[m++];
+    c3[0] = buf[m++];
+    c3[1] = buf[m++];
+    c3[2] = buf[m++];
+    inertia[0] = buf[m++];
+    inertia[1] = buf[m++];
+    inertia[2] = buf[m++];
+    bonus[nlocal_bonus].ilocal = ilocal;
+    tri[ilocal] = nlocal_bonus++;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+   include extra data stored by fixes
+------------------------------------------------------------------------- */
+
+int AtomVecTri::size_restart_bonus()
+{
+  int i;
+
+  int n = 0;
+  int nlocal = atom->nlocal;
+  for (i = 0; i < nlocal; i++) {
+    if (tri[i] >= 0)
+      n += size_restart_bonus_one;
+    else
+      n++;
+  }
+
+  return n;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecTri::pack_restart_bonus(int i, double *buf)
+{
+  int m = 0;
+
+  if (tri[i] < 0)
+    buf[m++] = ubuf(0).d;
+  else {
+    buf[m++] = ubuf(1).d;
+    int j = tri[i];
+    double *quat = bonus[j].quat;
+    double *c1 = bonus[j].c1;
+    double *c2 = bonus[j].c2;
+    double *c3 = bonus[j].c3;
+    double *inertia = bonus[j].inertia;
+    buf[m++] = quat[0];
+    buf[m++] = quat[1];
+    buf[m++] = quat[2];
+    buf[m++] = quat[3];
+    buf[m++] = c1[0];
+    buf[m++] = c1[1];
+    buf[m++] = c1[2];
+    buf[m++] = c2[0];
+    buf[m++] = c2[1];
+    buf[m++] = c2[2];
+    buf[m++] = c3[0];
+    buf[m++] = c3[1];
+    buf[m++] = c3[2];
+    buf[m++] = inertia[0];
+    buf[m++] = inertia[1];
+    buf[m++] = inertia[2];
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecTri::unpack_restart_bonus(int ilocal, double *buf)
 {
   int m = 0;
 

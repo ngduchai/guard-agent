@@ -49,6 +49,15 @@ AtomVecDipole::AtomVecDipole(LAMMPS *lmp) : AtomVec(lmp)
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecDipole::grow_pointers()
+{
+  mu = atom->mu;
+}
+
 /* ----------------------------------------------------------------------
    modify what AtomVec::data_atom() just unpacked
    or initialize other atom quantities

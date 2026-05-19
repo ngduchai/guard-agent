@@ -378,13 +378,6 @@ void PRD::command(int narg, char **arg)
     time_comm += timer->get_wall(Timer::TOTAL);
 
 
-    if (restart_flag) {
-      timer->barrier_start();
-      output->write_restart(update->ntimestep);
-      timer->barrier_stop();
-      time_output += timer->get_wall(Timer::TOTAL);
-    }
-
     if (stepmode == 0) istep = update->ntimestep - update->beginstep;
     else istep = clock;
   }

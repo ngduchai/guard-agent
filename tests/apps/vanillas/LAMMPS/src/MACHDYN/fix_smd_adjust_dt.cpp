@@ -54,7 +54,6 @@ FixSMDTlsphDtReset::FixSMDTlsphDtReset(LAMMPS *lmp, int narg, char **arg) :
         global_freq = 1;
         extscalar = 0;
         extvector = 0;
-        restart_global = 1; // this fix stores global (i.e., not per-atom) info: elaspsed time
 
         safety_factor = utils::numeric(FLERR,arg[3],false,lmp);
 

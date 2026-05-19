@@ -122,8 +122,8 @@ FixWallGran::FixWallGran(LAMMPS *lmp, int narg, char **arg) :
 
   size_history = model->size_history;
   if (model->beyond_contact) size_history += 1; //Need to track if particle is touching
-  if (size_history == 0) use_history = restart_peratom = 0;
-  else use_history = restart_peratom = 1;
+  if (size_history == 0) use_history = 0;
+  else use_history = 1;
 
   // wallstyle args
 

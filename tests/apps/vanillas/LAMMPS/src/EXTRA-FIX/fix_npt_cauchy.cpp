@@ -1270,22 +1270,6 @@ void FixNPTCauchy::remap()
 }
 
 /* ----------------------------------------------------------------------
-    calculate the number of data to be packed
-------------------------------------------------------------------------- */
-
-int FixNPTCauchy::size_restart_global()
-{
-  int nsize = 2;
-  if (tstat_flag) nsize += 1 + 2*mtchain;
-  if (pstat_flag) {
-    nsize += 16 + 2*mpchain;
-    if (deviatoric_flag) nsize += 6;
-  }
-
-  return nsize;
-}
-
-/* ----------------------------------------------------------------------
    pack state data
 ------------------------------------------------------------------------- */
 

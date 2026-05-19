@@ -234,19 +234,11 @@ void FixTuneKspace::update_pair_style(const std::string &new_pair_style,
   // check to see if we need to change pair styles
   if (new_pair_style == force->pair_style) return;
 
-  // create a temporary file to store current pair settings
-  FILE *p_pair_settings_file;
-  p_pair_settings_file = tmpfile();
-  force->pair->write_restart(p_pair_settings_file);
-  rewind(p_pair_settings_file);
   if (comm->me == 0)
     utils::logmesg(lmp,"Creating new pair style: {}\n",new_pair_style);
 
   // delete old pair style and create new one
   force->create_pair(new_pair_style,1);
-
-  // restore current pair settings from temporary file
-  force->pair->read_restart(p_pair_settings_file);
 
   auto pcutoff = (double *) force->pair->extract("cut_coul",itmp);
   double current_cutoff = *pcutoff;

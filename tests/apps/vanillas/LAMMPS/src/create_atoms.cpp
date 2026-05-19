@@ -71,8 +71,6 @@ void CreateAtoms::command(int narg, char **arg)
 {
   if (domain->box_exist == 0)
     error->all(FLERR, "Create_atoms command before simulation box is defined");
-  if (modify->nfix_restart_peratom)
-    error->all(FLERR, "Cannot create_atoms after reading prior state with per-atom info");
 
   // check for compatible lattice
 

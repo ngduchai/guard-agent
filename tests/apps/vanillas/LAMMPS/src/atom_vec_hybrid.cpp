@@ -287,6 +287,33 @@ int AtomVecHybrid::unpack_exchange_bonus(int ilocal, double *buf)
 
 /* ---------------------------------------------------------------------- */
 
+int AtomVecHybrid::size_restart_bonus()
+{
+  int n = 0;
+  for (int k = 0; k < nstyles_bonus; k++) n += styles_bonus[k]->size_restart_bonus();
+  return n;
+}
+
+/* ---------------------------------------------------------------------- */
+
+int AtomVecHybrid::pack_restart_bonus(int i, double *buf)
+{
+  int m = 0;
+  for (int k = 0; k < nstyles_bonus; k++) m += styles_bonus[k]->pack_restart_bonus(i, buf);
+  return m;
+}
+
+/* ---------------------------------------------------------------------- */
+
+int AtomVecHybrid::unpack_restart_bonus(int ilocal, double *buf)
+{
+  int m = 0;
+  for (int k = 0; k < nstyles_bonus; k++) m += styles_bonus[k]->unpack_restart_bonus(ilocal, buf);
+  return m;
+}
+
+/* ---------------------------------------------------------------------- */
+
 double AtomVecHybrid::memory_usage_bonus()
 {
   double bytes = 0;
@@ -295,8 +322,32 @@ double AtomVecHybrid::memory_usage_bonus()
 }
 
 /* ----------------------------------------------------------------------
+   modify values for AtomVec::pack_restart() to pack
+------------------------------------------------------------------------- */
+
+void AtomVecHybrid::pack_restart_pre(int ilocal)
+{
+  for (int k = 0; k < nstyles; k++) styles[k]->pack_restart_pre(ilocal);
+}
+
 /* ----------------------------------------------------------------------
+   unmodify values packed by AtomVec::pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecHybrid::pack_restart_post(int ilocal)
+{
+  for (int k = 0; k < nstyles; k++) styles[k]->pack_restart_post(ilocal);
+}
+
 /* ----------------------------------------------------------------------
+   initialize other atom quantities after AtomVec::unpack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecHybrid::unpack_restart_init(int ilocal)
+{
+  for (int k = 0; k < nstyles; k++) styles[k]->unpack_restart_init(ilocal);
+}
+
 /* ----------------------------------------------------------------------
    initialize non-zero atom quantities
 ------------------------------------------------------------------------- */

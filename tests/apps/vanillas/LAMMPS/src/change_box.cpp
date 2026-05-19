@@ -180,10 +180,6 @@ void ChangeBox::command(int narg, char **arg)
   }
 
 
-  if (move_atoms && modify->nfix_restart_peratom)
-    error->all(FLERR,"Change_box parameter not allowed after "
-               "reading prior state with per-atom info");
-
   // read options from end of input line
 
   options(narg-iarg,&arg[iarg]);

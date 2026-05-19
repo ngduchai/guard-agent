@@ -87,6 +87,18 @@ void AtomVecLine::init()
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecLine::grow_pointers()
+{
+  line = atom->line;
+  radius = atom->radius;
+  rmass = atom->rmass;
+  omega = atom->omega;
+}
+
 /* ----------------------------------------------------------------------
    grow bonus data structure
 ------------------------------------------------------------------------- */
@@ -243,6 +255,68 @@ int AtomVecLine::pack_exchange_bonus(int i, double *buf)
 /* ---------------------------------------------------------------------- */
 
 int AtomVecLine::unpack_exchange_bonus(int ilocal, double *buf)
+{
+  int m = 0;
+
+  line[ilocal] = (int) ubuf(buf[m++]).i;
+  if (line[ilocal] == 0)
+    line[ilocal] = -1;
+  else {
+    if (nlocal_bonus == nmax_bonus) grow_bonus();
+    bonus[nlocal_bonus].length = buf[m++];
+    bonus[nlocal_bonus].theta = buf[m++];
+    bonus[nlocal_bonus].ilocal = ilocal;
+    line[ilocal] = nlocal_bonus++;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+   include extra data stored by fixes
+------------------------------------------------------------------------- */
+
+int AtomVecLine::size_restart_bonus()
+{
+  int i;
+
+  int n = 0;
+  int nlocal = atom->nlocal;
+  for (i = 0; i < nlocal; i++) {
+    if (line[i] >= 0)
+      n += size_restart_bonus_one;
+    else
+      n++;
+  }
+
+  return n;
+}
+
+/* ----------------------------------------------------------------------
+   xyz must be 1st 3 values, so that read_restart can test on them
+   molecular types may be negative, but write as positive
+------------------------------------------------------------------------- */
+
+int AtomVecLine::pack_restart_bonus(int i, double *buf)
+{
+  int m = 0;
+
+  if (line[i] < 0)
+    buf[m++] = ubuf(0).d;
+  else {
+    buf[m++] = ubuf(1).d;
+    int j = line[i];
+    buf[m++] = bonus[j].length;
+    buf[m++] = bonus[j].theta;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecLine::unpack_restart_bonus(int ilocal, double *buf)
 {
   int m = 0;
 

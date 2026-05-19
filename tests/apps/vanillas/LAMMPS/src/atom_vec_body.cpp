@@ -137,6 +137,18 @@ void AtomVecBody::process_args(int narg, char **arg)
 }
 
 /* ----------------------------------------------------------------------
+   set local copies of all grow ptrs used by this class, except defaults
+   needed in replicate when 2 atom classes exist and it calls pack_restart()
+------------------------------------------------------------------------- */
+
+void AtomVecBody::grow_pointers()
+{
+  body = atom->body;
+  rmass = atom->rmass;
+  radius = atom->radius;
+  angmom = atom->angmom;
+}
+
 /* ----------------------------------------------------------------------
    grow bonus data structure
 ------------------------------------------------------------------------- */
@@ -389,6 +401,106 @@ int AtomVecBody::unpack_exchange_bonus(int ilocal, double *buf)
     memcpy(bonus[nlocal_bonus].dvalue, &buf[m], bonus[nlocal_bonus].ndouble * sizeof(double));
     m += bonus[nlocal_bonus].ndouble;
 
+    bonus[nlocal_bonus].ilocal = ilocal;
+    body[ilocal] = nlocal_bonus++;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecBody::size_restart_bonus()
+{
+  int i;
+
+  int n = 0;
+  int nlocal = atom->nlocal;
+  for (i = 0; i < nlocal; i++) {
+    if (body[i] >= 0) {
+      n += size_restart_bonus_one;
+      if (intdoubleratio == 1)
+        n += bonus[body[i]].ninteger;
+      else
+        n += (bonus[body[i]].ninteger + 1) / 2;
+      n += bonus[body[i]].ndouble;
+    } else
+      n++;
+  }
+
+  return n;
+}
+
+/* ----------------------------------------------------------------------
+   xyz must be 1st 3 values, so that read_restart can test on them
+   molecular types may be negative, but write as positive
+------------------------------------------------------------------------- */
+
+int AtomVecBody::pack_restart_bonus(int i, double *buf)
+{
+  int m = 0;
+
+  if (body[i] < 0)
+    buf[m++] = ubuf(0).d;
+  else {
+    buf[m++] = ubuf(1).d;
+    int j = body[i];
+    double *quat = bonus[j].quat;
+    double *inertia = bonus[j].inertia;
+    buf[m++] = quat[0];
+    buf[m++] = quat[1];
+    buf[m++] = quat[2];
+    buf[m++] = quat[3];
+    buf[m++] = inertia[0];
+    buf[m++] = inertia[1];
+    buf[m++] = inertia[2];
+    buf[m++] = ubuf(bonus[j].ninteger).d;
+    buf[m++] = ubuf(bonus[j].ndouble).d;
+    memcpy(&buf[m], bonus[j].ivalue, bonus[j].ninteger * sizeof(int));
+    if (intdoubleratio == 1)
+      m += bonus[j].ninteger;
+    else
+      m += (bonus[j].ninteger + 1) / 2;
+    memcpy(&buf[m], bonus[j].dvalue, bonus[j].ndouble * sizeof(double));
+    m += bonus[j].ndouble;
+  }
+
+  return m;
+}
+
+/* ----------------------------------------------------------------------
+------------------------------------------------------------------------- */
+
+int AtomVecBody::unpack_restart_bonus(int ilocal, double *buf)
+{
+  int m = 0;
+
+  body[ilocal] = (int) ubuf(buf[m++]).i;
+  if (body[ilocal] == 0)
+    body[ilocal] = -1;
+  else {
+    if (nlocal_bonus == nmax_bonus) grow_bonus();
+    double *quat = bonus[nlocal_bonus].quat;
+    double *inertia = bonus[nlocal_bonus].inertia;
+    quat[0] = buf[m++];
+    quat[1] = buf[m++];
+    quat[2] = buf[m++];
+    quat[3] = buf[m++];
+    inertia[0] = buf[m++];
+    inertia[1] = buf[m++];
+    inertia[2] = buf[m++];
+    bonus[nlocal_bonus].ninteger = (int) ubuf(buf[m++]).i;
+    bonus[nlocal_bonus].ndouble = (int) ubuf(buf[m++]).i;
+    bonus[nlocal_bonus].ivalue = icp->get(bonus[nlocal_bonus].ninteger, bonus[nlocal_bonus].iindex);
+    bonus[nlocal_bonus].dvalue = dcp->get(bonus[nlocal_bonus].ndouble, bonus[nlocal_bonus].dindex);
+    memcpy(bonus[nlocal_bonus].ivalue, &buf[m], bonus[nlocal_bonus].ninteger * sizeof(int));
+    if (intdoubleratio == 1)
+      m += bonus[nlocal_bonus].ninteger;
+    else
+      m += (bonus[nlocal_bonus].ninteger + 1) / 2;
+    memcpy(bonus[nlocal_bonus].dvalue, &buf[m], bonus[nlocal_bonus].ndouble * sizeof(double));
+    m += bonus[nlocal_bonus].ndouble;
     bonus[nlocal_bonus].ilocal = ilocal;
     body[ilocal] = nlocal_bonus++;
   }

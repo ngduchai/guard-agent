@@ -45,7 +45,7 @@ class AtomVec : protected Pointers {
   int bonus_flag;                // 1 if stores bonus data
   int size_forward_bonus;        // # in forward bonus comm
   int size_border_bonus;         // # in border bonus comm
-  int size_restart_bonus_one;
+  int size_restart_bonus_one;    // # in restart bonus comm
   int size_data_bonus;           // number of values in Bonus line
 
   class Molecule **onemols;    // list of molecules for style template
@@ -54,7 +54,7 @@ class AtomVec : protected Pointers {
   int kokkosable;    // 1 if atom style is KOKKOS-enabled
 
   int nargcopy;      // copy of command-line args for atom_style command
-  char **argcopy;
+  char **argcopy;    // used when AtomVec is realloced (restart,replicate)
 
   // additional list of peratom fields operated on by different methods
   // set or created by child styles
@@ -108,9 +108,17 @@ class AtomVec : protected Pointers {
   virtual int pack_exchange_bonus(int, double *) { return 0; }
   virtual int unpack_exchange_bonus(int, double *) { return 0; }
 
+  virtual int size_restart();
+  virtual int pack_restart(int, double *);
+  virtual int unpack_restart(double *);
+
   virtual void pack_restart_pre(int) {}
   virtual void pack_restart_post(int) {}
   virtual void unpack_restart_init(int) {}
+
+  virtual int size_restart_bonus() { return 0; }
+  virtual int pack_restart_bonus(int, double *) { return 0; }
+  virtual int unpack_restart_bonus(int, double *) { return 0; }
 
   virtual void create_atom(int, double *);
   virtual void create_atom_post(int) {}

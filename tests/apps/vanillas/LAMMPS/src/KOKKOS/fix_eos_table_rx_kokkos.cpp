@@ -117,7 +117,7 @@ void FixEOStableRXKokkos<DeviceType>::setup(int /*vflag*/)
   uCGnew = atomKK->k_uCGnew.view<DeviceType>();
   dvector = atomKK->k_dvector.view<DeviceType>();
 
-  if (!this->restart_reset) {
+  if (true) {
     atomKK->sync(execution_space,MASK_MASK | UCHEM_MASK | UCG_MASK | UCGNEW_MASK);
     Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixEOStableRXSetup>(0,nlocal),*this);
     atomKK->modified(execution_space,UCHEM_MASK | UCG_MASK | UCGNEW_MASK);
@@ -174,7 +174,7 @@ void FixEOStableRXKokkos<DeviceType>::init()
   dpdTheta= atomKK->k_dpdTheta.view<DeviceType>();
   dvector = atomKK->k_dvector.view<DeviceType>();
 
-  if (this->restart_reset) {
+  if (false) {
     atomKK->sync(execution_space,MASK_MASK | UCOND_MASK | UMECH_MASK | UCHEM_MASK | DPDTHETA_MASK | DVECTOR_MASK);
     Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixEOStableRXTemperatureLookup>(0,nlocal),*this);
     atomKK->modified(execution_space,DPDTHETA_MASK);

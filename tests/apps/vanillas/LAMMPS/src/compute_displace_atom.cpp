@@ -79,8 +79,7 @@ ComputeDisplaceAtom::ComputeDisplaceAtom(LAMMPS *lmp, int narg, char **arg) :
 
   // calculate xu,yu,zu for fix store array
 
-  if (fix->restart_reset) fix->restart_reset = 0;
-  else {
+  {
     double **xoriginal = fix->astore;
 
     double **x = atom->x;
