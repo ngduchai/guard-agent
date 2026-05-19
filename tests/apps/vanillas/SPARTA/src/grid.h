@@ -208,14 +208,6 @@ class Grid : protected Pointers {
   ParentLevel *plevels;       // list of parent levels, level = root = simulation box
   ParentCell *pcells;         // list of parent cell neighbors
 
-  // restart buffers, filled by read_restart
-
-  int nlocal_restart;
-  cellint *id_restart;
-  int *level_restart,*nsplit_restart;
-  int *mask_restart;
-  char *cvalues_restart;
-
   // methods
 
   Grid(class SPARTA *);
@@ -298,7 +290,6 @@ class Grid : protected Pointers {
   void surf2grid_one(int, int, int, int, class Cut3d *, class Cut2d *);
   void clear_surf();
   void clear_surf_implicit();
-  void clear_surf_restart();
   void combine_split_cell_particles(int, int);
   void assign_split_cell_particles(int);
   int point_outside_surfs(int, double *);

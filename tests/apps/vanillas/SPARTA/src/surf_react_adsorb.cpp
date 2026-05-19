@@ -420,7 +420,7 @@ void SurfReactAdsorb::create_per_face_state()
 void SurfReactAdsorb::create_per_surf_state()
 {
   // check if 4 custom attributes already exist
-  //   due to multiple instances of SRA or restart file
+  //   due to multiple instances of SRA
   // else create per-surf vectors and array
   // error if only some of them exist
   // add_custom() initializes all state data to zero

@@ -192,8 +192,8 @@ A collision style must be specified first.
 
 E: Dimension command after simulation box is defined
 
-The dimension command cannot be used after a read_data,
-read_restart, or create_box command.
+The dimension command cannot be used after a read_data
+or create_box command.
 
 E: Invalid react style
 
@@ -201,7 +201,7 @@ The choice of reaction style is unknown.
 
 E: Units command after simulation box is defined
 
-The units command cannot be used after a read_data, read_restart, or
+The units command cannot be used after a read_data or
 create_box command.
 
 */

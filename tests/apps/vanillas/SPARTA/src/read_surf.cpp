@@ -2322,7 +2322,7 @@ void ReadSurf::file_search(char *infile, char *outfile)
   struct dirent *ep;
   DIR *dp = opendir(dirname);
   if (dp == NULL)
-    error->one(FLERR,"Cannot open dir to search for restart file");
+    error->one(FLERR,"Cannot open dir to search for surf file");
   while ((ep = readdir(dp))) {
     if (strstr(ep->d_name,begin) != ep->d_name) continue;
     if ((ptr = strstr(&ep->d_name[nbegin],end)) == NULL) continue;
@@ -2334,7 +2334,7 @@ void ReadSurf::file_search(char *infile, char *outfile)
     }
   }
   closedir(dp);
-  if (maxnum < 0) error->one(FLERR,"Found no restart file matching pattern");
+  if (maxnum < 0) error->one(FLERR,"Found no surf file matching pattern");
 
   // create outfile with maxint substituted for "*"
   // use original infile, not pattern, since need to retain "%" in filename

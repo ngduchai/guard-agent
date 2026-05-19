@@ -38,7 +38,7 @@ class SPARTA {
   class Surf *surf;              // surface elements
   class Collide *collide;        // collisions and chemistry
   class React *react;            // chemistry reactions
-  class Output *output;          // stats/dump/restart
+  class Output *output;          // stats/dump
   class Timer *timer;            // CPU timing info
 
   class KokkosSPARTA *kokkos;    // KOKKOS accelerator class

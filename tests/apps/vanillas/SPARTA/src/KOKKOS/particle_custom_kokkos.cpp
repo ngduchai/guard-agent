@@ -30,7 +30,6 @@ enum{INT,DOUBLE};                      // several files
 
 /* ----------------------------------------------------------------------
    add a custom attribute with name
-   assumes name does not already exist, except in case of restart
    type = 0/1 for int/double
    size = 0 for vector, size > 0 for array with size columns
    allocate the vector or array to current maxlocal via grow_custom()
@@ -56,8 +55,7 @@ int ParticleKokkos::add_custom(char *name, int type, int size)
   int index;
 
   // if name already exists
-  // just return index if a restart script and re-defining the name
-  // else error
+  // error
 
   index = find_custom(name);
   if (index >= 0)

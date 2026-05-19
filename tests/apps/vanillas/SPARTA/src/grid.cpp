@@ -1972,7 +1972,7 @@ void Grid::type_check(int outflag)
    set static cellwise fnum weights based on uncut volumes
    for volume, use volume of cell, whether axisymmetric or not
    for radius, use radius of cell centroid from axisymmetric axis
-   weight() called from input script and read_restart (with narg = -1)
+   weight() called from input script (narg > 0)
    weight_one() is called only for adapted cells from grid_adapt
 ------------------------------------------------------------------------- */
 
@@ -1982,8 +1982,6 @@ void Grid::weight(int narg, char **arg)
 
   if (!exist) error->all(FLERR,"Cannot weight cells before grid is defined");
   if (narg > 0 && narg != 1) error->all(FLERR,"Illegal weight command");
-
-  // if called from read_restart with narg = -1, cellweightflag is already set
 
   if (narg == 1) {
     if (strcmp(arg[0],"none") == 0) cellweightflag = NOWEIGHT;

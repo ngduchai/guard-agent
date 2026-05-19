@@ -380,7 +380,7 @@ void BalanceGrid::command(int narg, char **arg, int outflag)
   // invoke init() so all grid cell info, including collide & fixes,
   //   is ready to migrate
   // for init, do not require surfs be assigned collision models
-  //   this allows balance call early in script, e.g. from ReadRestart
+  //   this allows balance call early in script
   // migrate grid cells and their particles to new owners
   // invoke grid methods to complete grid setup
 
@@ -448,7 +448,7 @@ void BalanceGrid::command(int narg, char **arg, int outflag)
 
   // stats on balance operation
   // only print if outflag = 1
-  // some callers suppress output, e.g. ReadRestart
+  // some callers suppress output
 
   bigint count = nmigrate;
   bigint nmigrate_all;

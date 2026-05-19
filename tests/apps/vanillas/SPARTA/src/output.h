@@ -80,19 +80,7 @@ E: Variable for dump every is invalid style
 
 Only equal-style variables can be used.
 
-E: Variable name for restart does not exist
-
-Self-explanatory.
-
-E: Variable for restart is invalid style
-
-It must be an equal-style variable.
-
 E: Dump every variable returned a bad timestep
-
-The variable must return a timestep greater than the current timestep.
-
-E: Restart variable returned a bad timestep
 
 The variable must return a timestep greater than the current timestep.
 
@@ -129,9 +117,5 @@ Self-explanatory.
 E: Could not find undump ID
 
 A dump ID used in the undump command does not exist.
-
-E: Both restart files must use % or neither
-
-Self-explanatory.
 
 */

@@ -66,7 +66,7 @@ FixAmbipolar::FixAmbipolar(SPARTA *sparta, int narg, char **arg) :
   double seed = update->ranmaster->uniform();
   random->reset(seed,comm->me,100);
 
-  // check if 2 custom attributes already exist, due to restart file
+  // check if 2 custom attributes already exist
   // else create per-particle vector and array
   // error if one exists and other doesn't
 

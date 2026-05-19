@@ -96,8 +96,8 @@ lo value must be less than the hi value for all 3 dimensions.
 
 E: Boundary command after simulation box is defined
 
-The boundary command cannot be used after a read_data, read_restart,
-or create_box command.
+The boundary command cannot be used after a read_data or
+create_box command.
 
 E: Illegal ... command
 

@@ -62,7 +62,7 @@ enum{SOUTSIDE,SINSIDE,ONSURF2OUT,ONSURF2IN};  // several files (changed 2 words)
    for distributed surfs, have to use surf alg
    PERAUTO option chooses based on total nsurfs vs nprocs
    see info on subflag, outflag options with surf2grid_split()
-   called from ReadSurf, MoveSurf, RemoveSurf, ReadRestart, and FixMoveSurf
+   called from ReadSurf, MoveSurf, RemoveSurf, and FixMoveSurf
 ------------------------------------------------------------------------- */
 
 void Grid::surf2grid(int subflag, int outflag)
@@ -235,7 +235,7 @@ void Grid::surf2grid_cell_algorithm(int outflag)
 
   // compute overlap of all surfs with each cell I own
   // info stored in nsurf,csurfs
-  // skip if nsplit <= 0 b/c split cells could exist if restarting
+  // skip if nsplit <= 0 b/c split cells may already exist
 
   Surf::Line *lines = surf->lines;
   Surf::Tri *tris = surf->tris;
@@ -731,7 +731,7 @@ void Grid::surf2grid_surf_algorithm(int outflag)
       cells[icell].nsurf++;
     }
 
-    // skip sub cells since may exist in a restart
+    // skip sub cells since they may already exist
 
     for (icell = 0; icell < nlocal; icell++) {
       if (cells[icell].level != level) continue;
@@ -983,7 +983,6 @@ void Grid::surf2grid_surf_algorithm(int outflag)
    if subflag = 1, create new owned split and sub cells as needed
      called from ReadSurf, RemoveSurf, MoveSurf, FixAblate
    if subflag = 0, split/sub cells already exist
-     called from ReadRestart, only for explicit surfs
    outflag = 1 for timing and statistics info
    in cells: set nsplit, isplit
    in cinfo: set corner, volume
@@ -1010,7 +1009,7 @@ void Grid::surf2grid_split(int subflag, int outflag)
   // compute cut volume and possible split of each grid cell by surfs
   // decrement nunsplitlocal if convert an unsplit cell to split cell
   // if nsplitone > 1, create new split cell sinfo and sub-cells
-  // skip if nsplit <= 0 b/c split cells could exist if restarting
+  // skip if nsplit <= 0 b/c split cells may already exist
 
   int max = 0;
   int ncurrent = nlocal;
@@ -1076,7 +1075,7 @@ void Grid::surf2grid_split(int subflag, int outflag)
         printf("BAD %d " CELLINT_FORMAT ": %d %d\n",icell,cells[icell].id,
                nsplitone,cells[icell].nsplit);
         error->one(FLERR,
-                   "Inconsistent surface to grid mapping in read_restart");
+                   "Inconsistent surface to grid mapping");
       }
 
       s = &sinfo[cells[icell].isplit];
@@ -1627,8 +1626,6 @@ void Grid::clear_surf()
    remove sub-cells from grid list and set all cells to unsplit
    reassign particles in sub-cells to parent split cell
    allows a subsequent read_isurf command to work correctly
-   called by read_restart after reading restart file for simulation
-     which used implicit surfs and thus may have had split cells
 ------------------------------------------------------------------------- */
 
 void Grid::clear_surf_implicit()
@@ -1708,39 +1705,6 @@ void Grid::clear_surf_implicit()
   memory->destroy(cellIDs);
   hash->clear();
   hashfilled = 0;
-}
-
-/* ----------------------------------------------------------------------
-   remove all surf info from owned grid cells and reset cell volumes
-   do NOT remove sub cells by compressing grid cells list
-   called from read_restart before reassigning surfs to grid cells
-   sub cells already exist from restart file
-------------------------------------------------------------------------- */
-
-void Grid::clear_surf_restart()
-{
-  // reset current grid cells as if no surfs existed
-  // just skip sub cells
-  // set values in cells/cinfo as if no surfaces, including volume
-
-  int dimension = domain->dimension;
-  int ncorner = 8;
-  if (dimension == 2) ncorner = 4;
-  double *lo,*hi;
-
-  for (int icell = 0; icell < nlocal; icell++) {
-    if (cells[icell].nsplit <= 0) continue;
-    cinfo[icell].type = UNKNOWN;
-    for (int m = 0; m < ncorner; m++) cinfo[icell].corner[m] = UNKNOWN;
-    lo = cells[icell].lo;
-    hi = cells[icell].hi;
-    if (dimension == 3)
-      cinfo[icell].volume = (hi[0]-lo[0]) * (hi[1]-lo[1]) * (hi[2]-lo[2]);
-    else if (domain->axisymmetric)
-      cinfo[icell].volume = MY_PI * (hi[1]*hi[1]-lo[1]*lo[1]) * (hi[0]-lo[0]);
-    else
-      cinfo[icell].volume = (hi[0]-lo[0]) * (hi[1]-lo[1]);
-  }
 }
 
 /* ----------------------------------------------------------------------
@@ -2092,7 +2056,6 @@ void Grid::allocate_surf_arrays()
 
 /* ----------------------------------------------------------------------
    request N-length vector from csubs
-   called by ReadRestart
 ------------------------------------------------------------------------- */
 
 int *Grid::csubs_request(int n)

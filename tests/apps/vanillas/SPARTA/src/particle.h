@@ -80,18 +80,6 @@ class Particle : protected Pointers {
     double weight;          // particle or cell weight, if weighting enabled
   };
 
-  struct OnePartRestart {
-    int id;                 // particle ID
-    int ispecies;           // particle species index
-    cellint icell;          // cell ID the particle is in
-    int nsplit;             // 1 for unsplit cell
-                            // else neg of sub cell index (0 to Nsplit-1)
-    double x[3];            // particle position
-    double v[3];            // particle velocity
-    double erot;            // rotational energy
-    double evib;            // vibrational energy
-  };
-
   bigint nglobal;           // global # of particles
   int nlocal;               // # of particles I own
   int maxlocal;             // max # particles list can hold
@@ -120,11 +108,6 @@ class Particle : protected Pointers {
   int ***eiarray;           // pointer to each integer array
   double **edvec;           // pointer to each double vector
   double ***edarray;        // pointer to each double array
-
-  // restart buffers, filled by read_restart
-
-  int nlocal_restart;
-  char *particle_restart;
 
   // Kokkos settings
 

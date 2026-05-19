@@ -99,7 +99,7 @@ class Modify : protected Pointers {
 
 E: Fix command before simulation box is defined
 
-The fix command cannot be used before a read_data, read_restart, or
+The fix command cannot be used before a read_data or
 create_box command.
 
 E: Illegal ... command

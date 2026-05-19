@@ -46,7 +46,7 @@ enum{INT,DOUBLE};                      // several files
    cvalues = custom values for each surf in same order as newlines/newtris
      1st value is surf ID, remaining values are for nc vecs/arrays
    nsurf_new, nsurf_old = global #
-   called from add_surfs() via ReadSurf or RemoveSurf or ReadRestart
+   called from add_surfs() via ReadSurf or RemoveSurf
 ------------------------------------------------------------------------- */
 
 void Surf::redistribute_surfs(int n, Line *newlines, Tri *newtris,

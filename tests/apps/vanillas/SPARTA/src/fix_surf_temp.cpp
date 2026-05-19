@@ -128,7 +128,7 @@ FixSurfTemp::FixSurfTemp(SPARTA *sparta, int narg, char **arg) :
   char *id_custom = new char[n];
   strcpy(id_custom,arg[7]);
 
-  // check if custom attribute already exists, due to restart file
+  // check if custom attribute already exists
   // else create per-surf temperature vector
 
   tindex = surf->find_custom(id_custom);
