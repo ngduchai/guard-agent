@@ -24,7 +24,6 @@
 #include "SAMRAI/algs/HyperbolicPatchStrategy.h"
 #include "SAMRAI/hier/IntVector.h"
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -58,7 +57,6 @@
 using namespace SAMRAI;
 
 class LinAdv:
-   public tbox::Serializable,
    public algs::HyperbolicPatchStrategy,
    public appu::VisDerivedDataStrategy
 {

@@ -13,7 +13,6 @@
 
 #include "SAMRAI/SAMRAI_config.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Statistic.h"
 
 #include <string>
@@ -22,7 +21,6 @@
 namespace SAMRAI {
 namespace tbox {
 
-class StatisticRestartDatabase;
 
 /**
  * Class Statistician is a Singleton class that manages a simple
@@ -63,7 +61,6 @@ class StatisticRestartDatabase;
 
 class Statistician
 {
-   friend class StatisticRestartDatabase;
 public:
    /**
     * Create the singleton instance of the statistic manager and return
@@ -961,13 +958,6 @@ private:
    makeStatisticianInstance(
       bool read_from_restart = true);
 
-   /*
-    * Create and initialize state of restart database.
-    */
-   void
-   initRestartDatabase(
-      bool read_from_restart);
-
    /**
     * Allocate the Statistician instance.
     *
@@ -992,11 +982,6 @@ private:
    static void
    finalizeCallback();
 
-   /*
-    * Internal database class for statistician restart capabilities.  See
-    * class declaration below.
-    */
-   StatisticRestartDatabase* d_restart_database_instance;
 
    /*
     * Count of statistics registered with the statistician and vectors of
@@ -1079,87 +1064,6 @@ private:
    static const int DEFAULT_NUMBER_OF_TIMERS_INCREMENT;
 
    static StartupShutdownManager::Handler s_finalize_handler;
-};
-
-/*
- * Class StatisticRestartDatabase is a separate class used by the
- * statistician to provide restart capabilities. Each restartable
- * class must be derived from Serializable.  Since Statistician
- * is a Singleton, its destructor is protected.  StatisticRestartDatabase
- * has a publically accessible destructor.  To avoid improper use of this
- * class, it is privately derived from Serializable, and make it a
- * friend of Statistician.  In this way, its methods can only
- * be accessed via Serializable and Statistician.
- */
-
-class StatisticRestartDatabase:private Serializable
-{
-   friend class Statistician;
-public:
-   /*
-    * The StatisticRestartDatabase constructor caches a copy of the
-    * database object name and registers the object with the restart
-    * manager for subsequent restart files.  If the run is started from
-    * a restart file and the boolean argument is true, we initialize
-    * the statistics from restart.
-    *
-    * @pre !object_name.empty()
-    */
-   StatisticRestartDatabase(
-      const std::string& object_name,
-      bool read_from_restart);
-
-   /*
-    * The destructor for StatisticRestartDatabase unregisters
-    * the database object with the restart manager.
-    */
-   virtual ~StatisticRestartDatabase();
-
-   /*
-    * Put all statistics and their state in the given restart database.
-    * This function is inherited from Serializable.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<Database>& restart_db) const;
-
-   /*
-    * Construct those statistics saved in the restart database.
-    */
-   void
-   getFromRestart();
-
-   /**
-    * Return string name identifier for statistic object.
-    */
-   const std::string&
-   getObjectName() const
-   {
-      return d_object_name;
-   }
-
-private:
-   // Unimplemented default constructor.
-   StatisticRestartDatabase();
-
-   // Unimplemented default constructor.
-   StatisticRestartDatabase(
-      const StatisticRestartDatabase& other);
-
-   // Unimplemented assignment operator.
-   StatisticRestartDatabase&
-   operator = (
-      const StatisticRestartDatabase& rhs);
-
-   std::string d_object_name;
-
-   /*
-    * Static integer constant describing this class's version number.
-    */
-   static const int TBOX_STATISTICRESTARTDATABASE_VERSION;
-
 };
 
 }

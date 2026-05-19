@@ -15,7 +15,6 @@
 
 #include "SAMRAI/tbox/Database.h"
 #include "SAMRAI/tbox/PIO.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Timer.h"
 
 #include <iostream>

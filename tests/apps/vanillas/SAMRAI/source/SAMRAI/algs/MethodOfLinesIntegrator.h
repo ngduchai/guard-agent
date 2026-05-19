@@ -23,7 +23,6 @@
 #include "SAMRAI/hier/PatchLevel.h"
 #include "SAMRAI/xfer/RefineAlgorithm.h"
 #include "SAMRAI/xfer/RefineSchedule.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/mesh/StandardTagAndInitStrategy.h"
 #include "SAMRAI/hier/BaseGridGeometry.h"
 #include "SAMRAI/hier/Variable.h"
@@ -127,7 +126,6 @@ namespace algs {
  */
 
 class MethodOfLinesIntegrator:
-   public tbox::Serializable,
    public mesh::StandardTagAndInitStrategy
 {
 public:

@@ -59,7 +59,6 @@
 #include "SAMRAI/hier/ComponentSelector.h"
 #include "SAMRAI/hier/VariableContext.h"
 #include "SAMRAI/hier/Box.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/MessageStream.h"
 #include "SAMRAI/tbox/Database.h"
 
@@ -91,8 +90,7 @@ class ModifiedBratuProblem:
    public solv::SNESAbstractFunctions,
    public solv::KINSOLAbstractFunctions,
    public RefinePatchStrategy,
-   public CoarsenPatchStrategy,
-   public tbox::Serializable
+   public CoarsenPatchStrategy
 {
 public:
    /**

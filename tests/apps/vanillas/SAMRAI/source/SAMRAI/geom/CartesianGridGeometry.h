@@ -19,7 +19,6 @@
 #include "SAMRAI/hier/Patch.h"
 #include "SAMRAI/hier/PatchLevel.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 
 #include <string>
 #include <memory>

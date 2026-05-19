@@ -24,7 +24,6 @@
 #include "SAMRAI/algs/MethodOfLinesIntegrator.h"
 #include "SAMRAI/algs/MethodOfLinesPatchStrategy.h"
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include <string>
 #define included_String
 #include "SAMRAI/hier/VariableContext.h"
@@ -58,7 +57,6 @@
 using namespace SAMRAI;
 
 class ConvDiff:
-   public tbox::Serializable,
    public algs::MethodOfLinesPatchStrategy,
    public appu::BoundaryUtilityStrategy
 {

@@ -49,7 +49,6 @@ set ( tbox_headers
   SAMRAIManager.h
   Schedule.h
   ScheduleOpsStrategy.h
-  Serializable.h
   SiloDatabase.h
   SiloDatabaseFactory.h
   StagedKernelFusers.h
@@ -110,7 +109,6 @@ set (tbox_sources
   Scanner.cpp
   Schedule.cpp
   ScheduleOpsStrategy.cpp
-  Serializable.cpp
   SiloDatabase.cpp
   SiloDatabaseFactory.cpp
   StagedKernelFusers.cpp

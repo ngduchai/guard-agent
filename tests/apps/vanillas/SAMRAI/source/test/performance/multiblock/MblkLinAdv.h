@@ -13,7 +13,6 @@
 
 #include "SAMRAI/SAMRAI_config.h"
 
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/hier/Box.h"
 #include "SAMRAI/hier/BoundaryBox.h"
 #include "SAMRAI/xfer/RefineSchedule.h"
@@ -62,7 +61,6 @@
 using namespace SAMRAI;
 
 class MblkLinAdv:
-   public tbox::Serializable,
    public MblkHyperbolicPatchStrategy,
    public xfer::SingularityPatchStrategy,
    public appu::BoundaryUtilityStrategy

@@ -123,8 +123,7 @@ using namespace SAMRAI;
 
 class MblkHyperbolicLevelIntegrator:
    public algs::TimeRefinementLevelStrategy,
-   public mesh::StandardTagAndInitStrategy,
-   public tbox::Serializable
+   public mesh::StandardTagAndInitStrategy
 {
 public:
    /**

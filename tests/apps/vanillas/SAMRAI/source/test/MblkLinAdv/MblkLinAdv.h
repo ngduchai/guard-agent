@@ -56,7 +56,6 @@
 using namespace SAMRAI;
 
 class MblkLinAdv:
-   public tbox::Serializable,
    public MblkHyperbolicPatchStrategy,
    public xfer::SingularityPatchStrategy,
    public appu::BoundaryUtilityStrategy

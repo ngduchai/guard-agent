@@ -13,7 +13,6 @@
 #include <string>
 
 #define included_String
-#include "SAMRAI/tbox/Serializable.h"
 
 using namespace SAMRAI;
 

@@ -24,7 +24,6 @@ namespace SAMRAI {
 namespace tbox {
 
 const int Statistician::DEFAULT_NUMBER_OF_TIMERS_INCREMENT = 128;
-const int StatisticRestartDatabase::TBOX_STATISTICRESTARTDATABASE_VERSION = 1;
 
 Statistician * Statistician::s_statistician_instance = 0;
 
@@ -72,12 +71,6 @@ Statistician::initializeCallback()
 void
 Statistician::shutdownCallback()
 {
-   if (s_statistician_instance) {
-      if (s_statistician_instance->d_restart_database_instance) {
-         delete s_statistician_instance->d_restart_database_instance;
-      }
-      s_statistician_instance->d_restart_database_instance = 0;
-   }
 }
 
 void
@@ -113,8 +106,6 @@ Statistician::registerSingletonSubclassInstance(
 Statistician::Statistician():
    d_has_gathered_stats(false)
 {
-   d_restart_database_instance = 0;
-
    d_must_call_finalize = true;
 
    setMaximumNumberOfStatistics(DEFAULT_NUMBER_OF_TIMERS_INCREMENT);
@@ -126,8 +117,6 @@ Statistician::Statistician():
 
 Statistician::~Statistician()
 {
-   if (d_restart_database_instance) delete d_restart_database_instance;
-
    d_proc_statistics.resize(0);
    d_patch_statistics.resize(0);
 
@@ -157,17 +146,7 @@ Statistician::makeStatisticianInstance(
 
    if (!s_statistician_instance) {
       s_statistician_instance = new Statistician();
-      s_statistician_instance->initRestartDatabase(read_from_restart);
    }
-}
-
-void
-Statistician::initRestartDatabase(
-   bool read_from_restart)
-{
-   d_restart_database_instance =
-      new StatisticRestartDatabase("StatisticRestartDatabase",
-         read_from_restart);
 }
 
 /*
@@ -2544,42 +2523,6 @@ Statistician::printSpreadSheetOutputForProcessor(
 
    }
 
-}
-
-/*
- *************************************************************************
- *
- * Implementation of StatisticRestartDatabase class.
- *
- *************************************************************************
- */
-
-StatisticRestartDatabase::StatisticRestartDatabase(
-   const std::string& object_name,
-   bool read_from_restart):
-   d_object_name(object_name)
-{
-   TBOX_ASSERT(!object_name.empty());
-
-   bool is_from_restart = false;
-   if (is_from_restart && read_from_restart) {
-      getFromRestart();
-   }
-}
-
-StatisticRestartDatabase::~StatisticRestartDatabase()
-{
-   }
-
-void StatisticRestartDatabase::putToRestart(
-   const std::shared_ptr<Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-void StatisticRestartDatabase::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 }

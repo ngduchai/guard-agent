@@ -28,7 +28,6 @@
 #include "SAMRAI/algs/HyperbolicPatchStrategy.h"
 #include "SAMRAI/hier/IntVector.h"
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Database.h"
 #include "SAMRAI/tbox/MessageStream.h"
 
@@ -56,7 +55,6 @@
 using namespace SAMRAI;
 
 class Euler:
-   public tbox::Serializable,
    public algs::HyperbolicPatchStrategy,
    public appu::BoundaryUtilityStrategy,
    public appu::VisDerivedDataStrategy

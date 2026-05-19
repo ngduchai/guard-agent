@@ -17,7 +17,6 @@
 #include "SAMRAI/pdat/CellData.h"
 #include "SAMRAI/tbox/Database.h"
 #include "SAMRAI/hier/Patch.h"
-#include "SAMRAI/tbox/Serializable.h"
 
 #include <memory>
 

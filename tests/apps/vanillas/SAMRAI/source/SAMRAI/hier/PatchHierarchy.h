@@ -25,7 +25,6 @@
 #include "SAMRAI/hier/PersistentOverlapConnectors.h"
 #include "SAMRAI/hier/UncoveredBoxIterator.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Utilities.h"
 
 #include <string>
@@ -219,7 +218,7 @@ namespace hier {
  * @see PatchDescriptor
  */
 
-class PatchHierarchy:public tbox::Serializable
+class PatchHierarchy
 {
 public:
    /*

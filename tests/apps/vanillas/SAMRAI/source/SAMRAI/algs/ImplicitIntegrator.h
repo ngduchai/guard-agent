@@ -14,13 +14,11 @@
 #include "SAMRAI/SAMRAI_config.h"
 
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/algs/ImplicitEquationStrategy.h"
 #include "SAMRAI/solv/NonlinearSolverStrategy.h"
 #include "SAMRAI/solv/SAMRAIVectorReal.h"
 #include "SAMRAI/hier/PatchHierarchy.h"
 #include "SAMRAI/tbox/InputDatabase.h"
-#include "SAMRAI/tbox/Serializable.h"
 
 #include <string>
 #include <memory>
@@ -100,8 +98,7 @@ namespace algs {
  * @see ImplicitEquationStrategy
  * @see solv::NonlinearSolverStrategy
  */
-class ImplicitIntegrator:
-   public tbox::Serializable
+class ImplicitIntegrator
 {
 public:
    /**

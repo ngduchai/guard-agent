@@ -33,7 +33,6 @@
 using namespace SAMRAI;
 
 class MblkEuler:
-   public tbox::Serializable,
    public MblkHyperbolicPatchStrategy,
    public xfer::SingularityPatchStrategy
 {

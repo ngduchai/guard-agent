@@ -13,7 +13,6 @@
 
 #include "SAMRAI/SAMRAI_config.h"
 
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Timer.h"
 #include "SAMRAI/hier/CoarsenOperator.h"
 #include "SAMRAI/hier/Patch.h"
@@ -59,8 +58,7 @@ class SingularityFinder;
  * @see BoundaryBox
  */
 
-class BaseGridGeometry:
-   public tbox::Serializable
+class BaseGridGeometry
 {
 public:
    typedef  PatchGeometry::TwoDimBool TwoDimBool;

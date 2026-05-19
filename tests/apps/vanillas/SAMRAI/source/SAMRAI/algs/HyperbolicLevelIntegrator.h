@@ -24,7 +24,6 @@
 #include "SAMRAI/mesh/GriddingAlgorithm.h"
 #include "SAMRAI/mesh/StandardTagAndInitStrategy.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/xfer/CoarsenAlgorithm.h"
 #include "SAMRAI/xfer/RefineAlgorithm.h"
 #include "SAMRAI/xfer/RefineSchedule.h"
@@ -165,8 +164,7 @@ namespace algs {
 
 class HyperbolicLevelIntegrator:
    public TimeRefinementLevelStrategy,
-   public mesh::StandardTagAndInitStrategy,
-   public tbox::Serializable
+   public mesh::StandardTagAndInitStrategy
 {
 public:
    /**

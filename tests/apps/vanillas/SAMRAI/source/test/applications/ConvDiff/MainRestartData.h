@@ -13,7 +13,6 @@
 
 #include "SAMRAI/SAMRAI_config.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #ifndef included_String
 #include <string>
 #define included_String
@@ -55,7 +54,7 @@ using namespace SAMRAI;
  *
  */
 
-class MainRestartData:public tbox::Serializable
+class MainRestartData
 {
 public:
    /**

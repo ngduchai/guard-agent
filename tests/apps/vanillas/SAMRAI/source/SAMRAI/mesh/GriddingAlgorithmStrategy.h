@@ -14,7 +14,6 @@
 #include "SAMRAI/SAMRAI_config.h"
 #include "SAMRAI/hier/PatchHierarchy.h"
 #include "SAMRAI/mesh/TagAndInitializeStrategy.h"
-#include "SAMRAI/tbox/Serializable.h"
 
 #include <vector>
 #include <memory>

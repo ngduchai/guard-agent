@@ -34,7 +34,6 @@
 #include "SAMRAI/solv/NonlinearSolverStrategy.h"
 #include "SAMRAI/solv/SNESAbstractFunctions.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Utilities.h"
 
 namespace SAMRAI {
@@ -370,8 +369,7 @@ namespace solv {
  */
 
 class SNES_SAMRAIContext:
-   public NonlinearSolverStrategy,
-   public tbox::Serializable
+   public NonlinearSolverStrategy
 {
 public:
    /*!

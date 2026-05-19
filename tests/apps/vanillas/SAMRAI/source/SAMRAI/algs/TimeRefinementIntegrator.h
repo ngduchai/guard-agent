@@ -18,7 +18,6 @@
 #include "SAMRAI/mesh/GriddingAlgorithmStrategy.h"
 #include "SAMRAI/hier/PatchHierarchy.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 #include "SAMRAI/tbox/Timer.h"
 #include "SAMRAI/tbox/Utilities.h"
 
@@ -190,8 +189,7 @@ namespace algs {
  * @see mesh::GriddingAlgorithmStrategy
  */
 
-class TimeRefinementIntegrator:
-   public tbox::Serializable
+class TimeRefinementIntegrator
 {
 public:
    /**

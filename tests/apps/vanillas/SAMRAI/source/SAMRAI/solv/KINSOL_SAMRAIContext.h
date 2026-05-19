@@ -24,7 +24,6 @@
 #include "SAMRAI/solv/KINSOLSolver.h"
 #include "SAMRAI/solv/KINSOLAbstractFunctions.h"
 #include "SAMRAI/tbox/Database.h"
-#include "SAMRAI/tbox/Serializable.h"
 
 namespace SAMRAI {
 namespace solv {
@@ -313,8 +312,7 @@ namespace solv {
  * @see NonlinearSolverStrategy
  */
 class KINSOL_SAMRAIContext:
-   public NonlinearSolverStrategy,
-   public tbox::Serializable
+   public NonlinearSolverStrategy
 {
 public:
    /**
