@@ -569,7 +569,7 @@ void AppSinter::iterate_rejection(double stoptime)
 /*  app_lattice has functions/methods that app_sinter uses.  However, it need to stop simulation
    *  at the end of each sector, which app_lattice does not.  So, Cristina told app_lattice to expect
    *  this to be added/modified in app_sinter.  And here it is.  Simulations at each processor stops,
-   *  performs annihilations and restarts.
+   *  performs annihilations and re-initializations.
    *
    *  This function actually performs everything - annihilation, pm, gg
    */
