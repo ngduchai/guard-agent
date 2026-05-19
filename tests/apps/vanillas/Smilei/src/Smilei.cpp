@@ -538,14 +538,12 @@ int main( int argc, char *argv[] )
     TITLE( "Open files & initialize diagnostics" );
     vecPatches.initAllDiags( params, &smpi );
 
-    if( !params.restart ) {
-        TITLE( "Running diags at time t = 0" );
-        #pragma omp parallel shared( smpi, params, vecPatches, simWindow )
-        {
-            vecPatches.runAllDiags( params, &smpi, 0, timers, simWindow );
-        }
-        vecPatches.rebootDiagTimers();
+    TITLE( "Running diags at time t = 0" );
+    #pragma omp parallel shared( smpi, params, vecPatches, simWindow )
+    {
+        vecPatches.runAllDiags( params, &smpi, 0, timers, simWindow );
     }
+    vecPatches.rebootDiagTimers();
 
     TITLE( "Species creation summary" );
     vecPatches.printGlobalNumberOfParticlesPerSpecies( &smpi );

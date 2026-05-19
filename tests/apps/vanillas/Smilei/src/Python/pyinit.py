@@ -353,19 +353,6 @@ class MovingWindow(SmileiSingleton):
     additional_shifts_time = 0.
 
 
-class Checkpoints(SmileiSingleton):
-    """Checkpoints parameters"""
-
-    restart_dir = None
-    restart_number = None
-    dump_step = 0
-    dump_minutes = 0.
-    keep_n_dumps = 2
-    dump_deflate = 0
-    exit_after_dump = True
-    file_grouping = 0
-    restart_files = []
-
 class CurrentFilter(SmileiSingleton):
     """Current filtering parameters"""
     model = "binomial"

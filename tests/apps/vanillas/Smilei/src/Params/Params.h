@@ -255,9 +255,6 @@ public:
     unsigned int region_ghost_cells ;
     
     bool initial_rotational_cleaning;
-    
-    //! True if restart requested
-    bool restart;
 
     //! frequency of exchange particles (default = 1, disabled for now, incompatible with sort)
     int exchange_particles_each;

@@ -13,7 +13,7 @@ using namespace std;
 
 DiagnosticTrack::DiagnosticTrack( Params &params, SmileiMPI *smpi, VectorPatch &vecPatches, unsigned int iDiagTrackParticles, unsigned int idiag, OpenPMDparams &oPMD ) :
     DiagnosticParticleList( params, smpi, vecPatches, "DiagTrackParticles", "TrackParticlesDisordered_", iDiagTrackParticles, oPMD ),
-    IDs_done( params.restart )
+    IDs_done( false )
 {
     write_id_ = true;
     

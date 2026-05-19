@@ -447,10 +447,8 @@ public:
                 );
             }
 
-            //Get number of particles. Do not initialize any more if this is a restart.
-            if( !params.restart ) {
-                this_species->n_numpy_particles_ =  PyArray_SHAPE( A )[1];
-            }
+            //Get number of particles.
+            this_species->n_numpy_particles_ =  PyArray_SHAPE( A )[1];
         }
 #endif
         else {
@@ -569,7 +567,7 @@ public:
             }
 
             //Get number of particles
-            if( !params.restart && this_species->n_numpy_particles_ != PyArray_SHAPE( A )[1] ) {
+            if( this_species->n_numpy_particles_ != PyArray_SHAPE( A )[1] ) {
                 ERROR_NAMELIST(
                     "For species '" << species_name
                     << "' momentum_initialization must provide as many particles as position_initialization.",

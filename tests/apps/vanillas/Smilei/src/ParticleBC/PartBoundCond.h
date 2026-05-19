@@ -75,7 +75,7 @@ public:
         }
     }
 
-    ////! Set the condition window if restart (patch position not read)
+    ////! Set the condition window for moving-window updates
     //inline void updateMvWinLimits( double x_moved ) {
     //}
     

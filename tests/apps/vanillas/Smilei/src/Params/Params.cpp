@@ -202,12 +202,6 @@ Params::Params( SmileiMPI *smpi, std::vector<std::string> namelistsFiles ) :
     PyTools::runPyFunction( "_smilei_check" );
     smpi->barrier();
 
-    // Python makes the checkpoint dir tree
-    if( ! smpi->test_mode ) {
-        PyTools::runPyFunction( "_prepare_checkpoint_dir" );
-        smpi->barrier();
-    }
-
     // Call python function _keep_python_running (see pyontrol.py)
     // Return false if we can close the python interpreter
     MESSAGE( 1, "Calling python _keep_python_running() :" );
@@ -222,13 +216,6 @@ Params::Params( SmileiMPI *smpi, std::vector<std::string> namelistsFiles ) :
         // Init of the seed for the C++ random generator
         Rand::gen = std::mt19937( random_seed );
     }
-
-    // --------------
-    // Stop & Restart
-    // --------------
-    // Checkpoint/restart support has been removed from this vanilla; the
-    // `Checkpoints` Python namelist component is no longer parsed.
-    restart = false;
 
     // ---------------------
     // Normalisation & units
@@ -1093,7 +1080,7 @@ Params::Params( SmileiMPI *smpi, std::vector<std::string> namelistsFiles ) :
                 ERROR_NAMELIST( "For LaserOffset #" << n_laser_offset << ": box_side must be `xmin`, `xmax`, `ymin`, `ymax`, `zmin` or `zmax`", LINK_NAMELIST + std::string("#lasers") );
             }
 
-            if( smpi->getRank() < number_of_processes && ! restart ) {
+            if( smpi->getRank() < number_of_processes ) {
                 if( n_laser_offset == 0 ) {
                     TITLE( "Calculate LaserOffset" );
                 }

@@ -56,12 +56,12 @@ public:
     {
         return n_moved;
     }
-    //! Set total length the window has moved (restart case)
+    //! Set total length the window has moved
     void   setXmoved( double new_val )
     {
         x_moved = new_val;
     }
-    //! Set total number of cells the window has moved (restart case)
+    //! Set total number of cells the window has moved
     void   setNmoved( int new_val )
     {
         n_moved = new_val;

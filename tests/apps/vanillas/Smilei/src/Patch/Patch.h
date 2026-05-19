@@ -410,7 +410,7 @@ public:
     //! Given several arrays (x,y,z for instance), return indices of points in patch
     virtual std::vector<unsigned int> indicesInDomain( double **position, unsigned int n_particles ) = 0;
     
-    //! Set geometry data in case of moving window restart
+    //! Set geometry data for moving window
     //! \param x_moved difference on coordinates regarding t0 geometry
     //! \param idx_moved number of displacement of the window
     //inline void updateMvWinLimits(double x_moved, int idx_moved) {

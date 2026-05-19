@@ -481,11 +481,6 @@ void LaserProfileFile::createFields( Params &params, Patch *, ElectroMagn * )
 
 void LaserProfileFile::initFields( Params &params, Patch *patch, ElectroMagn *EMfields )
 {
-    // This is handled in checkpoints when restarting
-    if( params.restart ) {
-        return;
-    }
-    
     std::vector<unsigned int> size( EMfields->size_ );
     std::vector<unsigned int> oversize( EMfields->oversize );
     

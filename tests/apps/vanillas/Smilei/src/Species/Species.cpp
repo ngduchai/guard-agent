@@ -233,8 +233,8 @@ void Species::initParticles( Params &params, Patch *patch, bool with_particles, 
     // Associate the ceator to the current species (this)
     particle_creator.associate(this);
 
-    // If restart from a checkpoint or without particle creation
-    if( params.restart || !with_particles ) {
+    // If particle creation is disabled, skip initialization
+    if( !with_particles ) {
 
         if( like_particles ) {
             particles->initialize( 0, *like_particles );
@@ -274,7 +274,7 @@ void Species::initOperators( Params &params, Patch *patch )
 
     // Assign the Ionization model (if needed) to Ionize
     //  Needs to be placed after ParticleCreator() because requires the knowledge of max_charge_
-    // \todo pay attention to restart
+    
     Ionize = IonizationFactory::create( params, this );
 
     // Create the radiation model
@@ -1978,7 +1978,7 @@ void Species::removeTaggedParticles(
 
 
 // ------------------------------------------------
-// Set position when using restart & moving window
+// Set position when using moving window
 // patch are initialized with t0 position
 // ------------------------------------------------
 //void Species::updateMvWinLimits(double x_moved)

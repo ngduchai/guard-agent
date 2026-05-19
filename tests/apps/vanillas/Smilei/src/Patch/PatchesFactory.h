@@ -56,7 +56,7 @@ public:
     static void createVector( VectorPatch &vecPatches, Params &params, SmileiMPI *smpi, OpenPMDparams &openPMD, RadiationTables * radiation_tables_, unsigned int itime, unsigned int n_moved=0 )
     {
     
-        vecPatches.diag_flag = ( params.restart? false : true );
+        vecPatches.diag_flag = true;
         vecPatches.lastIterationPatchesMoved = itime;
         
         // Compute npatches (1 is std MPI behavior)

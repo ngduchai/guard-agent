@@ -31,7 +31,7 @@ void Timer::init( SmileiMPI *smpi )
     last_start_ = MPI_Wtime();
 }
 
-//! Accumulate time couting from last init/restart
+//! Accumulate time couting from last init/reset
 void Timer::update( bool store )
 {
     #pragma omp barrier
@@ -46,7 +46,7 @@ void Timer::update( bool store )
     }
 }
 
-//! Accumulate time couting from last init/restart in task
+//! Accumulate time couting from last init/reset in task
 void Timer::updateInTask( bool store )
 {
     time_acc_ +=  MPI_Wtime()-last_start_;
@@ -59,7 +59,7 @@ void Timer::updateInTask( bool store )
 
 
 #ifdef __DETAILED_TIMERS
-//!Accumulate time couting from last init/restart using patch detailed timers
+//!Accumulate time couting from last init/reset using patch detailed timers
 void Timer::update( VectorPatch &vecPatches, bool store )
 {
     #pragma omp barrier
@@ -91,7 +91,7 @@ void Timer::update( VectorPatch &vecPatches, bool store )
     }
 }
 
-//! Accumulate time couting from last init/restart using patch detailed timers spreaded between threads
+//! Accumulate time couting from last init/reset using patch detailed timers spreaded between threads
 void Timer::updateThreaded( VectorPatch &vecPatches, bool store )
 {
     #pragma omp barrier

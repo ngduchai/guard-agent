@@ -385,9 +385,7 @@ DiagnosticProbes::DiagnosticProbes( Params &params, SmileiMPI *smpi, VectorPatch
     filename = mystream.str();
     
     // Create points initially
-    if( ! params.restart ) {
-        createPoints( smpi, vecPatches, 0. );
-    }
+    createPoints( smpi, vecPatches, 0. );
     
     // Display info
     MESSAGE( 1, "Probe diagnostic #"<<n_probe<< (time_integral?" (integrated over time)":"") );

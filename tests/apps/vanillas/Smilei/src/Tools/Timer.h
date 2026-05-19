@@ -19,18 +19,18 @@ public:
     ~Timer();
     //! Init t0 of the timer, synchronized through MPI
     void init( SmileiMPI *smpi );
-    //! Accumulate time couting from last init/restart
+    //! Accumulate time couting from last init/reset
     void update( bool store = false );
     
-    //! Accumulate time couting from last init/restart without omp master for tasking
+    //! Accumulate time couting from last init/reset without omp master for tasking
     void updateInTask( bool store = false );
 
     
 #ifdef __DETAILED_TIMERS
-    //! Accumulate time couting from last init/restart using patch detailed timers
+    //! Accumulate time couting from last init/reset using patch detailed timers
     void update( VectorPatch &vecPatches, bool store = false );
     
-    //! Accumulate time couting from last init/restart using patch detailed timers spreaded between threads
+    //! Accumulate time couting from last init/reset using patch detailed timers spreaded between threads
     void updateThreaded( VectorPatch &vecPatches, bool store = false );
 #endif
     

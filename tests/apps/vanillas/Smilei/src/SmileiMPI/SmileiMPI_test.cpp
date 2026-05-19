@@ -107,9 +107,7 @@ void SmileiMPI_test::init( Params &params, DomainDecomposition *domain_decomposi
     remove( "patch_load.txt" );
 
     // Initialize patch distribution
-    if( !params.restart ) {
-        init_patch_count( params, domain_decomposition );
-    }
+    init_patch_count( params, domain_decomposition );
 
     // Initialize buffers for particles push vectorization
     dynamics_Epart.resize( 1 );
