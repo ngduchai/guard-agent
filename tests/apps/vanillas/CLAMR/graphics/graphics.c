@@ -94,7 +94,7 @@ static struct MagickColorTable MagickRainbow[MAGICK_NCOLORS];
 
 #define WINSIZE 800
 
-void DrawSquaresToFile(int graph_num, int ncycle, double simTime, int rollback_img, int rollback_num);
+void DrawSquaresToFile(int graph_num, int ncycle, double simTime);
 
 /*
  * Variables that I added to make everything work for getting graphics
@@ -211,7 +211,7 @@ void set_graphics_outline(int graphics_outline_in){
  * data is writeen out to outline#.lin files.
  * Brian Atkinson
 */
-void DrawSquaresToFile(int graph_num, int ncycle, double simTime, int rollback_img, int rollback_num){
+void DrawSquaresToFile(int graph_num, int ncycle, double simTime){
 #ifdef HAVE_MAGICKWAND
    if (magick_on) {
       draw_wand   = NewDrawingWand();
@@ -374,14 +374,8 @@ void DrawSquaresToFile(int graph_num, int ncycle, double simTime, int rollback_i
       int xloc1, xloc2, yloc1, yloc2;
       char filename[50], filename2[50];
    
-      if(rollback_img){
-         sprintf(filename,"%s/graph%dcp%05d.data", graphics_directory, graph_num, rollback_num);
-         sprintf(filename2,"%s/outline%dcp%05d.lin",graphics_directory, graph_num, rollback_num);
-      }
-      else{
-         sprintf(filename,"%s/graph%05d.data", graphics_directory, graph_num);
-         sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
-      }
+      sprintf(filename,"%s/graph%05d.data", graphics_directory, graph_num);
+      sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
       FILE *fp = fopen(filename,"w");
       FILE *fp2 = fopen(filename2,"w");
       if(fp && fp2){
@@ -449,7 +443,7 @@ void DrawSquaresToFile(int graph_num, int ncycle, double simTime, int rollback_i
  * data is writeen out to outline#.lin files.
  * Brian Atkinson
 */
-void DisplayStateToFile(int graph_num, int ncycle, double simTime, int rollback_img, int rollback_num){
+void DisplayStateToFile(int graph_num, int ncycle, double simTime){
 #ifdef HAVE_MAGICKWAND
    if (magick_on) {
       double scaleMax = 25.0, scaleMin = 0.0;
@@ -577,14 +571,8 @@ void DisplayStateToFile(int graph_num, int ncycle, double simTime, int rollback_
       int color;
       char filename[50], filename2[50];
    
-      if(rollback_img){
-         sprintf(filename,"%s/graph%dcp%05d.data", graphics_directory, graph_num, rollback_num);
-         sprintf(filename2,"%s/outline%dcp%05d.lin",graphics_directory, graph_num, rollback_num);
-      }
-      else{
-         sprintf(filename,"%s/graph%05d.data", graphics_directory, graph_num);
-         sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
-      }
+      sprintf(filename,"%s/graph%05d.data", graphics_directory, graph_num);
+      sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
       FILE *fp = fopen(filename,"w");
       FILE *fp2 = fopen(filename2,"w");
       if(fp && fp2){
@@ -673,14 +661,8 @@ void DisplayStateToFile(int graph_num, int ncycle, double simTime, int rollback_
       int i;
       char filename[50], filename2[50];
    
-      if(rollback_img){
-         sprintf(filename,"%s/graph%dcp%05d.rdata", graphics_directory, graph_num, rollback_num);
-         sprintf(filename2,"%s/outline%dcp%05d.lin",graphics_directory, graph_num, rollback_num);
-      }
-      else{
-         sprintf(filename,"%s/graph%05d.rdata", graphics_directory, graph_num);
-         sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
-      }
+      sprintf(filename,"%s/graph%05d.rdata", graphics_directory, graph_num);
+      sprintf(filename2,"%s/outline%05d.lin",graphics_directory, graph_num);
       FILE *fp = fopen(filename,"w");
       FILE *fp2 = fopen(filename2,"w");
       if(fp && fp2){
@@ -738,11 +720,11 @@ void DisplayStateToFile(int graph_num, int ncycle, double simTime, int rollback_
    }
 }
 
-void write_graphics_info(int graph_num, int ncycle, double simTime, int rollback_img, int rollback_num){
+void write_graphics_info(int graph_num, int ncycle, double simTime){
    if (graphics_view_mode == 0) {
-      DrawSquaresToFile(graph_num, ncycle, simTime, rollback_img, rollback_num);
+      DrawSquaresToFile(graph_num, ncycle, simTime);
    } else {
-      DisplayStateToFile(graph_num, ncycle, simTime, rollback_img, rollback_num);
+      DisplayStateToFile(graph_num, ncycle, simTime);
    }
 }
 

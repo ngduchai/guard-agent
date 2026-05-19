@@ -15,7 +15,6 @@ IF (UNIX)
    *.a
    */*.a
    Makefile
-   crux/Makefile
    ezcl/Makefile
    genmalloc/Makefile
    graphics/Makefile

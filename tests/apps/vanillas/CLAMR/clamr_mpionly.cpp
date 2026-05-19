@@ -374,7 +374,7 @@ int main(int argc, char **argv) {
 
       if (mype == 0) {
          init_graphics_output();
-         write_graphics_info(0,0,0.0,0,0);
+         write_graphics_info(0,0,0.0);
       }
       next_graphics_cycle += graphic_outputInterval;
    }
@@ -653,7 +653,7 @@ extern "C" void do_calc(void)
       set_graphics_cell_proc(&proc_global[0]);
 
       if (mype == 0) {
-         write_graphics_info(0,0,0.0,0,0);
+         write_graphics_info(0,0,0.0);
       }
       next_graphics_cycle += graphic_outputInterval;
    }
@@ -703,7 +703,7 @@ extern "C" void do_calc(void)
 #endif
 
          if (mype == 0) {
-            write_graphics_info(ncycle/graphic_outputInterval,ncycle,simTime,0,0);
+            write_graphics_info(ncycle/graphic_outputInterval,ncycle,simTime);
          }
          next_graphics_cycle += graphic_outputInterval;
 

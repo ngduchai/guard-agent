@@ -78,7 +78,7 @@ int main(int argc, char *argv[])
 
    init_graphics_output();
    set_graphics_cell_proc(proc);
-   //write_graphics_info(0,0,0.0,0,0);
+   //write_graphics_info(0,0,0.0);
 
    init_display(&argc, argv, "Shallow Water");
    draw_scene();

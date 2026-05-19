@@ -8,7 +8,7 @@ include commands such as simple key,value input::
 
    dx = 1.0
 
-as well as array operations, mathematical operations, and restart support.
+as well as array operations and mathematical operations.
 
 Each input line is called a command in the *PowerParser* nomenclature and
 the left hand side of the expression is a key and the right hand side is
@@ -114,7 +114,6 @@ These functions also take two possible optional arguments::
                               default = NULL, means scalar input
 
    bool skip = false -- has to do with skipping assignment to help
-                        handle restarts 
 
 The get_char functions also have an optional variable called single_char that
 can be true or false.

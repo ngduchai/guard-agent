@@ -95,8 +95,7 @@ void set_graphics_cell_coordinates_double(double *x_in, double *dx_in,
                                           double *y_in, double *dy_in);
 void set_graphics_cell_coordinates_float(float *x_in, float *dx_in,
                                          float *y_in, float *dy_in);
-void write_graphics_info(int graph_num, int ncycle, double simTime,
-                         int rollback_img, int rollback_num);
+void write_graphics_info(int graph_num, int ncycle, double simTime);
 
 #ifdef __cplusplus
 }

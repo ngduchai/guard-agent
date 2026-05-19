@@ -4,7 +4,6 @@ EXCLUDES="--exclude */._* --exclude */*/._* --exclude .DS_Store"
 
 tar ${EXCLUDES} -czf ~/Packages/MallocPlus_v2.0.7.tgz MallocPlus
 tar ${EXCLUDES} -czf ~/Packages/PowerParser_v2.0.7.tgz PowerParser
-tar ${EXCLUDES} -czf ~/Packages/crux_v2.0.7.tgz crux
 tar ${EXCLUDES} -czf ~/Packages/ezcl_v2.0.7.tgz ezcl
 tar ${EXCLUDES} -czf ~/Packages/genmalloc_v2.0.7.tgz genmalloc
 tar ${EXCLUDES} -czf ~/Packages/graphics_v2.0.7.tgz graphics
@@ -56,7 +55,6 @@ cd ../; tar -czf ~/Packages/CLAMR_v2.0.7.tgz \
 
 #spack create -f file:/Users/lbrobey/Packages/MallocPlus_v2.0.7.tgz 
 #spack create -f file:/Users/lbrobey/Packages/PowerParser_v2.0.7.tgz 
-#spack create -f file:/Users/lbrobey/Packages/crux_v2.0.7.tgz 
 #spack create -f file:/Users/lbrobey/Packages/ezcl_v2.0.7.tgz 
 #spack create -f file:/Users/lbrobey/Packages/genmalloc_v2.0.7.tgz 
 #spack create -f file:/Users/lbrobey/Packages/graphics_v2.0.7.tgz 

@@ -8596,39 +8596,6 @@ void State::print_failure_log(int iteration, double simTime, double initial_mass
    }
 }
 
-void State::print_rollback_log(int iteration, double simTime, double initial_mass, double iteration_mass, double mass_diff_percentage, int backup_attempt, int num_of_attempts, int error_status){
-   char filename[40];
-   sprintf(filename, "rollback%d.log",backup_attempt);
-   mesh->fp=fopen(filename,"w");
-
-   double mass_diff = iteration_mass - initial_mass;
-   if(error_status == STATUS_NAN){
-      fprintf(mesh->fp,"Rolling back because of nan for H_sum was equal to NAN\n");
-   }
-   else{
-      fprintf(mesh->fp,"Rolling back because mass difference is outside of accepted percentage\n");
-   }
-   fprintf(mesh->fp,"Rollback attempt %d of %d ---> Number of attempts left:%d\n", backup_attempt, num_of_attempts, num_of_attempts - backup_attempt);
-   fprintf(mesh->fp,"Iteration = %d\t\tSimuation Time = %lf\n", iteration, simTime);
-   fprintf(mesh->fp,"mesh->ncells = %lu\t\tmesh->ncells_ghost = %lu\n", mesh->ncells, mesh->ncells_ghost);
-   fprintf(mesh->fp,"Initial Mass: %14.12lg\t\tIteration Mass: %14.12lg\n", initial_mass, iteration_mass);
-   fprintf(mesh->fp,"Mass Difference: %12.6lg\t\tMass Difference Percentage: %12.6lg%%\n", mass_diff, mass_diff_percentage);
-
-   if (mesh->mesh_memory.get_memory_size(mesh->nlft) >= mesh->ncells_ghost){
-      fprintf(mesh->fp,"%d:   index global  i     j     lev   nlft  nrht  nbot  ntop \n",mesh->mype);
-      for (uint ic=0; ic<mesh->ncells; ic++) {
-         fprintf(mesh->fp,"%d: %6d  %6d %4d  %4d   %4d  %4d  %4d  %4d  %4d \n", mesh->mype,ic, ic+mesh->noffset,mesh->i[ic], mesh->j[ic], mesh->level[ic], mesh->nlft[ic], mesh->nrht[ic], mesh->nbot[ic], mesh->ntop[ic]);
-      }
-      for (uint ic=mesh->ncells; ic<mesh->ncells_ghost; ic++) {
-         fprintf(mesh->fp,"%d: %6d  %6d %4d  %4d   %4d  %4d  %4d  %4d  %4d \n", mesh->mype,ic, ic+mesh->noffset,mesh->i[ic], mesh->j[ic], mesh->level[ic], mesh->nlft[ic], mesh->nrht[ic], mesh->nbot[ic], mesh->ntop[ic]);
-      }
-   } else {
-      fprintf(mesh->fp,"%d:  index     H        U         V      i     j     lev\n",mesh->mype);
-      for (uint ic=0; ic<mesh->ncells_ghost; ic++) {
-         fprintf(mesh->fp,"%d: %6d %lf %lf %lf %4d  %4d   %4d  \n", mesh->mype,ic, H[ic], U[ic], V[ic], mesh->i[ic], mesh->j[ic], mesh->level[ic]);
-      }
-   }
-}
 
 Mesh_CLAMR::Mesh_CLAMR(int nx, int ny, int levmx_in, int ndim_in, double deltax_in, double deltay_in, int boundary, int parallel_in, int do_gpu_calc) : Mesh(nx,ny,levmx_in,ndim_in,deltax_in,deltay_in,boundary,parallel_in,do_gpu_calc){};
 

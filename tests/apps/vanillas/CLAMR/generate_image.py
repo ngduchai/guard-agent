@@ -35,7 +35,7 @@ NumImages=0
 Iteration = 0
 Time = 0.0
 font = ImageFont.truetype('FreeSansBold.ttf',20)
-cp_info = [-1,-1,-1] # [Checkpoint Num, Last Graph for Checkpoint Num, Total number of Checkpoint Images for Checkpoint]
+cp_info = [-1,-1,-1] # [phase num, last graph for phase, total images for phase]
 
 if len(sys.argv) == 2:
    GridLines = check_outline_flag(sys.argv[1])

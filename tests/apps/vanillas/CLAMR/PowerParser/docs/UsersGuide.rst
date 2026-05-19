@@ -1726,199 +1726,6 @@ the user input file. Use the "parser_print_fbuffer" command to print the final b
 user input file has been "compiled".
 
 ----------------------
-Restart Blocks
-----------------------
-
-*PowerParser* has a feature called restart blocks which aid the user in doing calculations with
-multiple restarts. A restart block is a set of commands in the user input file delineated by a
-start command and an end command. A user specified condition, such as "time .ge. 50" is
-associated with the restart block (specified in the restart block start command). The restart
-block is initially ignored by the code. As the code runs, when the condition is met, *PowerParser*
-marks the restart block as active, writes a restart dump, and gracefully ends the calculation.
-When the calculation is restarted all the commands in the restart block are parsed and used as
-normal commands. Multiple restart blocks are allowed and a variety of conditions are possible.
-
-Note that some of this functionality is dependent on integration into the restart dump functionality
-of the simulation code. It may also work a little differently if the integration is not as
-assumed here.
-
-Following is an example of a restart block ::
-
-   sizemat(1) = 0.1
-   restart_block air_zoning1 (time .gt. 10) then
-      sizemat(1) = 0.0125
-   end_restart_block
-
-In this example, sizemat for material 2 (air for example) starts at 0.1 cm. The restart_block
-command specifies a unique name for the block, "air_zoning1" in this example, and it specifies
-the condition, "time .gt. 10". When the simulation time gets greater than 10 seconds, the
-"air_zoning1 restart" block will be marked as active, a restart dump will be written, and the
-code will gracefully end. The calculation will subsequently
-be restarted using the run scripts/batch system, or restarted manually, or perhaps
-restarted using any other set of scripts. When restarting, effectively the "restart_block" and
-"end_restart_block" commands for the "air_zoning1" restart block are ignored and the code
-"sees" the following commands::
-
-   sizemat(1) = 0.1
-   sizemat(1) = 0.0125
-
-Thus sizemat for material 2 is set to 0.0125 cm.
-
-Restart blocks trigger anytime the condition changes. This is irrelevant in the above example,
-since once time is greater than 10 and triggers a restart, time will never fall to less than 10
-and thus the above example will not trigger again. Consider, however, the following example::
-
-   shortmodcyc = 5
-   restart_block rb3 (ncycle .gt. 50 .and. ncycle .lt. 70) then
-      shortmodcyc = 1
-   end_restart_block
-
-The condition starts out as false and shortmodcyc is 5. When the simulation reaches cycle 51
-the condition changes to true, and thus triggers a restart and shortmodcyc changes to 1.
-When cycle 70 is reached the condition changes from true to false and another restart is
-triggered. Since the condition is now false, the restart block is marked as inactive and the
-"shortmodcyc=1" command is not processed, thus shortmodcyc goes back to 5.
-
-Any number of commands are allowed between the "restart_block" and "end_restart_block"
-commands. Any number of restart blocks are allowed, but each restart block must have a
-unique name.
-
-When restarting, restart blocks can be added and removed from the user input file.
-
-A single line version of the "restart_block" and "end_restart_block" commands are available,
-for the above example, it would be::
-
-   restart_block air_zoning1 (time .gt. 10) sizemat(2) = 0.0125
-
-The following example shows the use of multiple restart blocks using the cycle number as
-the trigger::
-
-   restart_block my_name1 (ncycle .eq. 10) sizemat(5) = 0.0500
-   restart_block my_name2 (ncycle .eq. 20) sizemat(5) = 0.0250
-   restart_block my_name3 (ncycle .eq. 30) sizemat(5) = 0.0125
-
-The program will restart at cycles 10, 20, and 30, resetting sizemat for material 5 at each restart.
-The restart block information, particularly the active flag, is stored on the restart dump and
-is not known until the restart dump is read. Thus the commands that are processed before
-the dump is read must not appear in restart blocks.
-
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-Restart Block Conditions
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-A simple condition consists of three words and is the following form::
-
-   variable relation value
-
-for example, "time .gt. 1.35e-2". More generally, a condition consists of multiple subconditions
-linked together by logical operators, i.e.
-::
-
-   variable relation value      logical      variable relation value      logical     &
-      variable relation value      logical ...
-
-Any number of subconditions are allowed. Three logical operators are allowed, they are::
-
-   .and., .or., .andthen.
-
-The variable is some code variable that is allowed in the "restart_block" command. For
-example, time and ncycle. The relation is the relation between the variable and the value.
-Valid relations are::
-
-   .eq., .ne., .gt., .ge., .lt., .le.,
-   .hgeq., .hgne., .hggt., .hgge., .hglt., .hgle.
-
-The value is the number to be tested against the variable. At this time, the condition value
-cannot be a parser variable or math expression. It can only be a number (or a logical or a
-string, see below).
-
-The above examples all had floating point or integer conditions. A logical condition works
-the same way::
-
-   restart_block some_name (wttf_c01 .eq. TruE) then
-      wt_cmd01 = true
-      wt_cmd02 = 5.0
-   end_restart_block
-
-Whereas "time" and "ncycle" are valid variables, the "wttf_c01" logical variable is not a valid
-code variable. At this time we have not implemented any logical or character variables, but
-perhaps will in the future.
-
-For logical conditions, the only relations allowed are .eq. and .ne. and the only values allowed
-are true and false (or .true., .false., with any case).
-
-Character conditions are allowed as in the following example::
-
-   restart_block my_name_3 (wttf_c02 .eq. "The Force") then
-      wt_cmd03 = true
-      wt_cmd04 = 6
-   end_restart_block
-
-**hg type relations.** The hg in the hg type relations, such as .hggt., stands for "has gotten".
-For a subcondition that has a hg relation, for example .hggt., this means that when the code
-variable has gotten greater than the specified value, then that subcondition is marked as
-having been satisfied. It will remain marked as satisfied for the duration of the calculation.
-
-For this to work, the subconditions have to be linked together with .andthen., not .and.
-
-For example, suppose the user wants to restart and set the sizemat of material 6 to 0.01 when
-max_density drops below 1, but does not want to start checking for that until max_pressure
-has reached at least 50. This is accomplished with the following "restart_block" command::
-
-   restart_block hg_example (max_pressure .hgge. 50 .andthen. &
-                             max_density .lt. 1) then
-      sizemat(6) = 0.01
-   end_restart_block
-
-The condition in this example consists of two subconditions::
-
-   max_pressure .hgge. 50
-   max_density .lt. 1
-
-connected by the logical .andthen. operator. The first subcondition starts as being marked as
-not satisfied. Assuming the pressure starts at 0 and ramps up, eventually the max_pressure
-reaches 50 and then the first subcondition is marked as satisfied. During this ramp-up period,
-the max_density is checked but it does not matter since the first subcondition has not been
-satisfied.
-
-Once the first subcondition, "max_pressure .hgge. 50" is marked as being satisfied, it will
-remain marked as satisfied even if max_pressure subsequently drops below 50.
-
-Once the first subcondition is satisfied, then the result of the overall condition will be
-determined by the second subcondition "max_density .lt. 1". When max_density drops below 1,
-then the calculation will end and upon restart the sizemat of material 6 will be set to 0.01.
-
-Note that "max_pressure" and "max_density" must be valid restart block condition variables
-in the simulation code for this to work.
-
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Changing Restart Blocks
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Restart blocks can be changed during a calculation, i.e., changed when a restart is done,
-however with certain constraints. How restart blocks can and cannot be changed is detailed
-as follows.
-
-**Deleting Restart Blocks** Restart blocks can be removed from the input file at any time.
-If the restart block has already triggered, then the contents of the restart block will not be
-processed since it is gone from the input file. When the code discovers that a restart block
-exists on the restart dump, but is not in the input file, then it simply ignores the restart
-block on the dump.
-
-**Adding Restart Blocks** Restart blocks can be added to the input file at any time.
-
-**Renaming Restart Blocks** Restart blocks can be renamed at any time, subject to the
-new name being unique. This is equivalent to removing a restart block and adding in a new
-one.
-
-**Changing Restart Block Content** The restart block content can be changed at any time.
-If the restart block has already triggered, the changed content will be used.
-
-**Changing Restart Block Conditions** If the restart block has already triggered then the
-condition cannot be changed. If the restart block has not triggered then the condition can
-be changed, however the number of sub-conditions in the condition cannot be changed.
-
------------------
 When...Then
 -----------------
 
@@ -1931,8 +1738,7 @@ user input file as shown::
 
 The when...then condition is checked every cycle as the calculation runs, when the
 condition is satisfied, the associated commands are executed. The when...then command is
-then tagged as inactive and is not checked again, except when doing a restart where it is
-checked again. See the discussion of when...then restarts below.
+then tagged as inactive and is not checked again.
 
 A related command is the whenever command::
 
@@ -1981,7 +1787,9 @@ relations are::
    .eq., .ne., .gt., .ge., .lt., .le.,
    .hgeq., .hgne., .hggt., .hgge., .hglt., .hgle.
 
-The meaning of the hg type relations, such as .hggt., were discussed earlier in the `Restart Blocks`_ Section.
+The hg type relations (``.hgeq.``, ``.hgne.``, ``.hggt.``, ``.hgge.``, ``.hglt.``, ``.hgle.``)
+behave like the ordinary relations but with hysteresis: once a condition becomes true it
+stays true until the value moves back to the strict opposite, preventing rapid toggling.
 
 The value is the number to be tested against the variable. At this time, the condition value
 cannot be a parser variable or math expression. It can only be a number (or a logical or a
@@ -2017,8 +1825,8 @@ Character conditions are allowed as in the following example::
       wt_cmd04 = 6
    endwhen
 
-**hg type relations.** The hg type relations described in the `Restart Blocks`_ can
-also be used in when...then commands. 
+**hg type relations.** The hg type relations introduced above (``.hgeq.``, ``.hgne.``,
+``.hggt.``, ``.hgge.``, ``.hglt.``, ``.hgle.``) can also be used in when...then commands.
 For example, suppose the user wants to set the shortmodcyc to 10 when max_density drops
 below 1, but does not want to start checking for that until max_pressure has reached at
 least 50. This is accomplished with the following whenthen::
@@ -2044,11 +1852,6 @@ remain marked as satisfied even if max_pressure subsequently drops below 50.
 Once the first subcondition is satisfied, then the result of the overall condition will be
 determined by the second subcondition "max_density .lt. 1". When max_density drops below
 1, then the commands will be executed and shortmodcyc will be set to 10.
-
-**When...then restarts.** Several aspects of the when...then commands are stored on the restart
-dumps, including the when...then active flags. When restarting the when...then commands
-will all be processed again in the order that they were triggered. When restarting, the user
-can remove and/or add when...then commands.
 
 **Allowable when...then conditions and commands.** The allowed condition variables and
 commands are dependent on the integration of *PowerParser* into the application code.
