@@ -2,7 +2,7 @@ project(Sandbox)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${qmcpack_BINARY_DIR}/bin)
 # add apps XYZ.cpp, e.g., qmc_particles.cpp
-set(ESTEST diff_distancetables einspline_spo einspline_spo_nested determinant restart determinant_delayed_update)
+set(ESTEST diff_distancetables einspline_spo einspline_spo_nested determinant determinant_delayed_update)
 
 add_library(sandbox_helper ParticleIOUtility.cpp)
 target_link_libraries(sandbox_helper PUBLIC qmcparticle)
