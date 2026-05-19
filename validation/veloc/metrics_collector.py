@@ -1546,6 +1546,7 @@ def run_benchmark_sweep(
     resilient_priority_source_dirs: list[Path] | None = None,
     skip_original_codebase: bool = False,
     skip_original_inject_scenarios: bool = True,
+    warmup_runs_per_codebase: int = 1,
 ) -> BenchmarkResults:
     """Execute all scenarios for all codebases and collect RunMetrics.
 
@@ -1687,6 +1688,63 @@ def run_benchmark_sweep(
         approach_build_dirs[approach.name] = a_build
 
     total_scenarios = len(scenarios)
+
+    # WARMUP RUNS (2026-05-19, F-19 v3 collection-time fix): run each codebase
+    # warmup_runs_per_codebase times BEFORE any measured runs, discarding the
+    # timings.  This primes the OS file-cache (shared libs, input files,
+    # write buffers) so the first MEASURED run sees the same warm-cache
+    # state as the second and third.  Without this, the first measured run
+    # is ~25% slower than steady-state (OpenLB 2026-05-19: nofail run_1 154s
+    # vs runs 2+3 at 124s; mean ratio fell to 0.931 and tripped F-19 mean
+    # check despite the LLM being honest).
+    if warmup_runs_per_codebase > 0 and scenarios:
+        warmup_scenario = scenarios[0]  # use first scenario's args
+        # Always do nofail warmup for cache-priming regardless of scenario inject setting.
+        from dataclasses import replace as _scenario_replace
+        try:
+            warmup_scen = _scenario_replace(warmup_scenario, inject_failures=False)
+        except TypeError:
+            # Fall back to a plain attribute copy if Scenario isn't a dataclass.
+            warmup_scen = warmup_scenario
+        for codebase_name, src_dir, build_dir, exe_name in [
+            ("original", original_source_dir, original_build_dir, original_executable_name),
+            ("resilient", resilient_source_dir, resilient_build_dir, resilient_executable_name),
+        ]:
+            if codebase_name == "original" and skip_original_codebase:
+                continue
+            for w in range(warmup_runs_per_codebase):
+                print(
+                    f"[metrics] --- WARMUP run {w+1}/{warmup_runs_per_codebase} "
+                    f"for codebase={codebase_name} (timings DISCARDED, primes OS cache) ---",
+                    flush=True,
+                )
+                try:
+                    _run_scenario_once(
+                        scenario=warmup_scen,
+                        codebase=codebase_name,
+                        run_index=-1,  # negative index marks warmup run dir
+                        source_dir=src_dir,
+                        build_dir=build_dir,
+                        output_dir=benchmarks_dir,
+                        executable_name=exe_name,
+                        veloc_config_name=veloc_config_name,
+                        app_input_subdir=app_input_subdir,
+                    )
+                except Exception as exc:
+                    # Warmup failures are non-fatal — proceed to measured runs
+                    # and let them surface the real error.
+                    print(f"[metrics] warmup {codebase_name} #{w+1} raised: {exc!r}; continuing", flush=True)
+                # Clean up the warmup run dir so it doesn't pollute the bench artifacts
+                _warm_dir = benchmarks_dir / codebase_name / warmup_scen.name / "run_-1"
+                if _warm_dir.exists():
+                    import shutil as _shutil
+                    _shutil.rmtree(_warm_dir, ignore_errors=True)
+                _cleanup_checkpoints_post_run(
+                    run_output_dir=_warm_dir,
+                    veloc_cfg_name=veloc_config_name,
+                    veloc_cfg_search_dirs=[src_dir, build_dir],
+                )
+
     for scenario_idx, scenario in enumerate(scenarios, 1):
         print(
             f"\n[metrics] === scenario {scenario_idx}/{total_scenarios}: {scenario.name!r} "
