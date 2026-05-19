@@ -219,12 +219,10 @@ MultiParticleContainer::LoadFromDir (const std::string& dir)
                 pc->AddIntComp(comp_name);
             }
         }
-
-        pc->LoadFromDir(dir, species_names.at(i));
     }
-    for (unsigned i = species_names.size(); i < species_names.size()+lasers_names.size(); ++i) {
-        allcontainers.at(i)->LoadFromDir(dir, lasers_names.at(i-species_names.size()));
-    }
+    // restart-load was removed in the vanilla strip; the body that called
+    // pc->LoadFromDir(...) and allcontainers->LoadFromDir(...) is gone.
+    (void)dir;
 }
 
 void
