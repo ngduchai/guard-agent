@@ -116,7 +116,6 @@ namespace hier {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>max_levels</td>
@@ -124,7 +123,6 @@ namespace hier {
  *     <td>>0</td>
  *     <td>1</td>
  *     <td>opt</td>
- *     <td>May be made smaller by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>ratio_to_coarser</td>
@@ -132,7 +130,6 @@ namespace hier {
  *     <td>all values 1</td>
  *     <td>all values >0</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>smallest_patch_size</td>
@@ -140,7 +137,6 @@ namespace hier {
  *     <td>all values 1</td>
  *     <td>all values >0</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>largest_patch_size</td>
@@ -148,7 +144,6 @@ namespace hier {
  *     <td>all values max int</td>
  *     <td>each value >=0 must be >= corresponding smallest_patch_size value</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>minimum_cell_request</td>
@@ -156,7 +151,6 @@ namespace hier {
  *     <td>all values 1</td>
  *     <td>all values >0</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>proper_nesting_buffer</td>
@@ -164,7 +158,6 @@ namespace hier {
  *     <td>all values 1</td>
  *     <td>all values >=0</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>allow_patches_smaller_than_ghostwidth</td>
@@ -172,7 +165,6 @@ namespace hier {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>allow_patches_smaller_than_minimum_size_to_prevent_overlap</td>
@@ -180,7 +172,6 @@ namespace hier {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -330,7 +321,6 @@ public:
  *
  * The constructor for the PatchHierarchy initializes the number of
  * levels to zero, sets the geometry for the PatchHierarchy, and
- * registers the PatchHierarchy for restart with the specified name.
  *
  * @param[in]  object_name
  * @param[in]  geometry
@@ -1073,7 +1063,6 @@ public:
       const std::string& topology_name) const;
 
    /*!
-    * @brief Read in the entire hierarchy from the restart database.
     *
     * @note
     * <ul>
@@ -1177,7 +1166,6 @@ private:
     * class members.
     *
     * @param[in]  input_db   Input database
-    * @param[in]  is_from_restart   True is being invoked on restart
     */
    void
    getFromInput(

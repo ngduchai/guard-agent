@@ -49,7 +49,6 @@ namespace algs {
  *       during the simulation.
  *
  * All input data items described above, except for initial_time, may be
- * overridden by new input values when continuing from restart.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -59,7 +58,6 @@ namespace algs {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>initial_time</td>
@@ -67,7 +65,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>>=0</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>final_time</td>
@@ -75,7 +72,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>final_time >= initial_time</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_integrator_steps</td>
@@ -83,7 +79,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>>=0</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -106,7 +101,6 @@ public:
     * default state of the integrator.  The integrator is configured with
     * the concrete strategy objects in the argument list that provide
     * operations related to the nonlinear solver and implicit equations
-    * to solve.  Data members are initialized from the input and restart
     * databases.
     *
     * Note that no vectors are created in the constructor.  Vectors are
@@ -292,7 +286,6 @@ private:
 
    /*
     * Read input data from specified database and initialize class members.
-    * If run is from restart, a subset of the restart values may be replaced
     * with those read from input.
     */
    void

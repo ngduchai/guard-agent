@@ -123,9 +123,6 @@ namespace solv {
  *  - @b uses_jac_times_vector
  *     indicates whether an analytic Jacobian-vector product is supplied
  *
- * All values read in from a restart database may be overriden by input
- * database values.  If no new input database value is given, the restart
- * database value is used.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -135,7 +132,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>residual_stop_tolerance</td>
@@ -143,7 +139,6 @@ namespace solv {
  *     <td>-1.0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_nonlinear_iterations</td>
@@ -151,7 +146,6 @@ namespace solv {
  *     <td>200</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_krylov_dimension</td>
@@ -159,7 +153,6 @@ namespace solv {
  *     <td>10</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>global_newton_strategy</td>
@@ -167,7 +160,6 @@ namespace solv {
  *     <td>0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_newton_step</td>
@@ -175,7 +167,6 @@ namespace solv {
  *     <td>-1.0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>nonlinear_step_tolerance</td>
@@ -183,7 +174,6 @@ namespace solv {
  *     <td>-1.0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>relative_function_error</td>
@@ -191,7 +181,6 @@ namespace solv {
  *     <td>-1.0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>linear_convergence_test</td>
@@ -199,7 +188,6 @@ namespace solv {
  *     <td>3</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_subsetup_calls</td>
@@ -207,7 +195,6 @@ namespace solv {
  *     <td>5</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>residual_monitoring_params</td>
@@ -215,7 +202,6 @@ namespace solv {
  *     <td>[0.00001, 0.9]</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>residual_monitoring_constant</td>
@@ -223,7 +209,6 @@ namespace solv {
  *     <td>0.0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>no_min_eps</td>
@@ -231,7 +216,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>eisenstat_walker_params</td>
@@ -239,7 +223,6 @@ namespace solv {
  *     <td>[2.0, 0.9]</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>linear_solver_constant_tolerance</td>
@@ -247,7 +230,6 @@ namespace solv {
  *     <td>0.1</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_solves_no_precond_setup</td>
@@ -255,7 +237,6 @@ namespace solv {
  *     <td>10</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_linear_solve_restarts</td>
@@ -263,7 +244,6 @@ namespace solv {
  *     <td>0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>KINSOL_log_filename</td>
@@ -271,7 +251,6 @@ namespace solv {
  *     <td>""</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>KINSOL_print_flag</td>
@@ -279,7 +258,6 @@ namespace solv {
  *     <td>0</td>
  *     <td>Refer to KINSOL documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>uses_preconditioner</td>
@@ -287,7 +265,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>uses_jac_times_vector</td>
@@ -295,7 +272,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -319,7 +295,6 @@ public:
     * Constructor for algs::KINSOL_SAMRAIContext allocates the KINSOL
     * C++ wrapper object and initializes rudimentary state associated
     * with user-supplied solver components.  Then, it reads solver parameter
-    * from input and restart which may override default values.
     *
     * @pre !object_name.empty()
     * @pre my_functions != 0
@@ -411,7 +386,6 @@ private:
    SundialsAbstractVector* d_solution_vector;
 
    /*
-    * KINSOL state data maintained here for input/restart capabilities.
     */
 
    double d_residual_stop_tolerance;

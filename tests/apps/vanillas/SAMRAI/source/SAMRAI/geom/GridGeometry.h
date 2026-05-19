@@ -69,7 +69,6 @@ namespace geom {
  *       pair of blocks that touch each other in any way.  Like Singularity,
  *       each entry must have a trailing integer beginning with 0.
  *
- * No values read in from a restart database may be overridden by input
  * database values.
  *
  * <b> Details: </b> <br>
@@ -80,7 +79,6 @@ namespace geom {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>num_blocks</td>
@@ -88,7 +86,6 @@ namespace geom {
  *     <td>1</td>
  *     <td>>=1</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>domain_boxes_N</td>
@@ -96,7 +93,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>all Boxes must be non-empty</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>periodic_dimension</td>
@@ -104,7 +100,6 @@ namespace geom {
  *     <td>all values 0</td>
  *     <td>any int</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>Singularity</td>
@@ -112,7 +107,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>see Multiblock.pdf for subentries</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>BlockNeighbors</td>
@@ -120,7 +114,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>see Multiblock.pdf for subentries</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  * </table>
  *
@@ -163,7 +156,6 @@ public:
     * @brief Construct a new GridGeometry object based on arguments.
     *
     * This constructor creates a new GridGeometry object based on the
-    * arguments, rather than relying on input or restart data.
     *
     * @param[in]  object_name
     * @param[in]  domain      Each element of the array describes the index

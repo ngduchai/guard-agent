@@ -59,7 +59,6 @@ namespace geom {
  *       values representing the spatial coordinates of the upper corner of the
  *       physical domain.
  *
- * No values read in from a restart database may be overridden by input
  * database values.
  *
  * <b> Details: </b> <br>
@@ -70,7 +69,6 @@ namespace geom {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>domain_boxes</td>
@@ -78,7 +76,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>all Boxes must be non-empty</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>periodic_dimension</td>
@@ -86,7 +83,6 @@ namespace geom {
  *     <td>all values 0</td>
  *     <td>any int</td>
  *     <td>opt</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>x_lo</td>
@@ -94,7 +90,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>each x_lo < corresponding x_up</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>x_up</td>
@@ -102,7 +97,6 @@ namespace geom {
  *     <td>none</td>
  *     <td>each x_up > corresponding x_lo</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  * </table>
  *
@@ -131,7 +125,6 @@ public:
    /**
     * Constructor for CartesianGridGeometry initializes data
     * members based on parameters read from the specified input database
-    * or from the restart database corresponding to the specified
     * object name.
     *
     * @pre !object_name.empty()
@@ -190,7 +183,6 @@ public:
    /**
     * Destructor for CartesianGridGeometry deallocates
     * data describing grid geometry and unregisters the object with
-    * the restart manager.
     */
    virtual ~CartesianGridGeometry();
 
@@ -297,7 +289,6 @@ private:
 
    /*
     * Reads in domain_boxes, x_lo, and x_up from the input database.
-    * Data is read from input only if the simulation is not from restart.
     * Otherwise, all values specified in the input database are ignored.
     *
     * @pre is_from_restart || input_db

@@ -101,8 +101,6 @@ namespace algs {
  *       indicates whether ghost data must be filled before timestep is
  *       computed on each patch (possible communication optimization)
  *
- * Note that when continuing from restart, the input parameters in the input
- * database override all values read in from the restart database.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -112,7 +110,6 @@ namespace algs {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>cfl</td>
@@ -120,7 +117,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>any double</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>cfl_init</td>
@@ -128,7 +124,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>any double</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>lag_dt_computation</td>
@@ -136,7 +131,6 @@ namespace algs {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>use_ghosts_to_compute_dt</td>
@@ -144,7 +138,6 @@ namespace algs {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -202,7 +195,6 @@ public:
     * Constructor for HyperbolicLevelIntegrator initializes
     * integration parameters to default values and constructs standard
     * communication algorithms.  Other data members are read in from
-    * the specified input database or the restart database corresponding
     * to the specified object_name.  This class is used by
     * the time refinement integrator for refined timestepping when the
     * use_time_refinement argument is true, and for synchronized
@@ -219,7 +211,6 @@ public:
 
    /**
     * The destructor for HyperbolicLevelIntegrator unregisters
-    * the integrator object with the restart manager.
     */
    virtual ~HyperbolicLevelIntegrator();
 
@@ -751,7 +742,6 @@ protected:
    /**
     * Read values, indicated above, from given input database.  The boolean
     * argument is_from_restart should be set to true if the simulation
-    * is beginning from restart.  Otherwise it should be set to false.
     *
     * @pre is_from_restart || input_db
     */
@@ -889,7 +879,6 @@ private:
 
    /*
     * The object name is used as a handle to databases stored in
-    * restart files and for error reporting purposes.
     */
    std::string d_object_name;
    bool d_use_time_refinement;

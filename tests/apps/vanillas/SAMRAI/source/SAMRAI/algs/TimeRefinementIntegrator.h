@@ -113,7 +113,6 @@ namespace algs {
  *       before clustering into boxes.
  *
  * Note that the input values for regrid_interval, end_time, grow_dt,
- * max_integrator_steps, and tag_buffer override values read in from restart.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -123,7 +122,6 @@ namespace algs {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>regrid_interval</td>
@@ -131,7 +129,6 @@ namespace algs {
  *     <td>1</td>
  *     <td>>=1</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>start_time</td>
@@ -139,7 +136,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>start_time >=0</td>
  *     <td>req</td>
- *     <td>May not be modified by input db on restart</td>
  *   </tr>
  *   <tr>
  *     <td>end_time</td>
@@ -147,7 +143,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>end_time >= start_time</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>grow_dt</td>
@@ -155,7 +150,6 @@ namespace algs {
  *     <td>1.0</td>
  *     <td>>0</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>max_integrator_steps</td>
@@ -163,7 +157,6 @@ namespace algs {
  *     <td>none</td>
  *     <td>>=0</td>
  *     <td>req</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>tag_buffer</td>
@@ -171,7 +164,6 @@ namespace algs {
  *     <td>regrid_interval value for corresponding level</td>
  *     <td>all values >= 0</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -196,7 +188,6 @@ public:
     * The constructor for TimeRefinementIntegrator initializes the
     * time stepping parameters needed to integrate the levels in the AMR
     * hierarchy.   Some data is set to default values; others are read
-    * from the specified input database and the restart database
     * corresponding to the specified object_name.  Consult top of
     * this header file for further details.
     *
@@ -217,13 +208,11 @@ public:
 
    /**
     * The destructor for TimeRefinementIntegrator unregisters
-    * the integrator object with the restart manager.
     */
    virtual ~TimeRefinementIntegrator();
 
    /*!
     * Set AMR patch hierarchy configuration and data at start of simulation.
-    * If the run is begun from a restart file, the hierarchy and data
     * are read from the hierarchy database.  Otherwise, the hierarchy
     * and data are initialized by the gridding algorithm data member.
     * In this case, the coarsest level is constructed and initialized.
@@ -616,13 +605,10 @@ private:
    /*
     * Read input data from specified input database and initialize class
     * members.  The argument is_from_restart should be set to true if the
-    * simulation is from restart.  Otherwise, it should be set to false.
     *
-    * If the simulation is not from restart, read in start_time, end_time,
     * grow_dt, max_integrator_step, and possibly tag_buffer
     * from the database.
     *
-    * If the simulation is from restart, then only read in end_time,
     * grow_dt, max_integrator_step and tag_buffer if they are
     * found in the input database.
     */
@@ -633,7 +619,6 @@ private:
 
    /*
     * The object name is used as a handle to databases stored in
-    * restart files and for error reporting purposes.
     */
    std::string d_object_name;
 

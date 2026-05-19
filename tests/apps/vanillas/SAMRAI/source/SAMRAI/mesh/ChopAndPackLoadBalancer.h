@@ -118,7 +118,6 @@ namespace mesh {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>bin_pack_method</td>
@@ -126,7 +125,6 @@ namespace mesh {
  *     <td>"SPATIAL"</td>
  *     <td>"SPATIAL", "GREEDY"</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>max_workload_factor</td>
@@ -134,7 +132,6 @@ namespace mesh {
  *     <td>none</td>
  *     <td>0.0 <= all values</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>workload_tolerance</td>
@@ -142,7 +139,6 @@ namespace mesh {
  *     <td>none</td>
  *     <td>0.0 <= all values < 1.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>ignore_level_box_union_is_single_box</td>
@@ -150,7 +146,6 @@ namespace mesh {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>processor_layout</td>
@@ -158,7 +153,6 @@ namespace mesh {
  *     <td>N/A</td>
  *     <td>N/A</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>tile_size</td>
@@ -166,7 +160,6 @@ namespace mesh {
  *     <td>1</td>
  *     <td>1-</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  * </table>
  *

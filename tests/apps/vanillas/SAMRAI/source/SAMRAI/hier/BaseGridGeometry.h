@@ -94,7 +94,6 @@ public:
     * @brief Construct a new BaseGridGeometry object based on arguments.
     *
     * This constructor creates a new BaseGridGeometry object based on the
-    * arguments, rather than relying on input or restart data.
     *
     * @param[in]  object_name
     * @param[in]  domain      Each element of the array describes the index
@@ -1846,11 +1845,9 @@ private:
    /*!
     * @brief Reads in data from the specified input database.
     *
-    * If the simulation is from restart, these values are taken from restart
     * and newly specified values in the input database are ignored.
     *
     * @param[in] input_db  input database, must not be NULL pointer
-    * @param[in] is_from_restart  set to true if simulation is from restart
     * @param[in] allow_multiblock set to false if called by inherently single
     *            block derived class such as CartesianGridGeometry
     *

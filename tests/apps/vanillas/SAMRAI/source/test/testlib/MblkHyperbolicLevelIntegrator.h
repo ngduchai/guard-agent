@@ -57,8 +57,6 @@
  * coarsenDataForRichardsonExtrapolation().
  *
  * An object of this class requires numerous parameters to be read from
- * input.  Also, data must be written to and read from files for restart.
- * The input and restart data are summarized as follows.
  *
  * Required input keys and data types: NONE
  *
@@ -99,8 +97,6 @@
  *
  *
  *
- * Note that when continuing from restart, the input values in the
- * input file override all values read in from the restart database.
  *
  * A sample input file entry might look like:
  *
@@ -161,7 +157,6 @@ public:
     * Constructor for MblkHyperbolicLevelIntegrator initializes
     * integration parameters to default values and constructs standard
     * communication algorithms.  Other data members are read in from
-    * the specified input database or the restart database corresponding
     * to the specified object_name.  This class is used by
     * the time refinement integrator for refined timestepping when the
     * use_time_refinement argument is true, and for synchronized
@@ -180,7 +175,6 @@ public:
 
    /**
     * The destructor for MblkHyperbolicLevelIntegrator unregisters
-    * the integrator object with the restart manager.
     */
    virtual ~MblkHyperbolicLevelIntegrator();
 
@@ -674,7 +668,6 @@ protected:
    /**
     * Read values, indicated above, from given input database.  The boolean
     * argument is_from_restart should be set to true if the simulation
-    * is beginning from restart.  Otherwise it should be set to false.
     *
     * When assertion checking is active, the database pointer must be non-null.
     */
@@ -762,7 +755,6 @@ private:
 
    /*
     * The object name is used as a handle to databases stored in
-    * restart files and for error reporting purposes.
     */
    std::string d_object_name;
 

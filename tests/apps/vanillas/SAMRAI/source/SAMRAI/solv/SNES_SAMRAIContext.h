@@ -145,9 +145,6 @@ namespace solv {
  *    - \b function_evaluation_error
  *       square root of the estimated relative error in function evaluation
  *
- * All values read in from a restart database may be overriden by input
- * database values.  If no new input database value is given, the restart
- * database value is used.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -157,7 +154,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>maximum_nonliner_iterations</td>
@@ -165,7 +161,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>maximum_function_evals</td>
@@ -173,7 +168,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>uses_preconditioner</td>
@@ -181,7 +175,6 @@ namespace solv {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>uses_explicit_jacobian</td>
@@ -189,7 +182,6 @@ namespace solv {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>absolute_tolerance</td>
@@ -197,7 +189,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>relative_tolerance</td>
@@ -205,7 +196,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>step_tolerance</td>
@@ -213,7 +203,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>forcing_term_strategy</td>
@@ -221,7 +210,6 @@ namespace solv {
  *     <td>"CONSTANT"</td>
  *     <td>"CONSTANT", "EWCHOICE1", "EWCHOICE2"</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>constant_forcing_term</td>
@@ -229,7 +217,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>initial_forcing_term</td>
@@ -237,7 +224,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>maximum_forcing_term</td>
@@ -245,7 +231,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>EW_choice2_alpha</td>
@@ -253,7 +238,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>EW_choice2_gamma</td>
@@ -261,7 +245,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>EW_safeguard_exponent</td>
@@ -269,7 +252,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>EW_safeguard_disable_threshold</td>
@@ -277,7 +259,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>linear_solver_type</td>
@@ -285,7 +266,6 @@ namespace solv {
  *     <td>""</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>linear_solver_absolute_tolerance</td>
@@ -293,7 +273,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>linear_solver_divergence_tolerance</td>
@@ -301,7 +280,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>maximum_linear_iterations</td>
@@ -309,7 +287,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>maximum_gmres_krylov_dimension</td>
@@ -317,7 +294,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>gmres_orthogonalization_algorithm</td>
@@ -325,7 +301,6 @@ namespace solv {
  *     <td>""</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>differencing_parameter_strategy</td>
@@ -333,7 +308,6 @@ namespace solv {
  *     <td>MATMFFD_WP</td>
  *     <td>MATMFFD_WP, MATFFD_DS</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>function_evaluation_error</td>
@@ -341,7 +315,6 @@ namespace solv {
  *     <td>PETSC_DEFAULT</td>
  *     <td>Refer to PETSc documentation</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -358,11 +331,9 @@ namespace solv {
  * Note that input values can also be set using accessor functions.
  * Values that are set via this mechanism will be cached both in the
  * solver context as well as in the corresponding PETSc object.  Thus
- * values changed on-the-fly will be written to restart.  These input
  * values can also be changed by directly accessing the corresponding
  * PETSc object and using native PETSc function calls; however such
  * settings/changes will NOT be cached in the solver context, and so
- * will not be written to restart.
  *
  * @see SNESAbstractFunctions
  * @see NonlinearSolverStrategy
@@ -376,7 +347,6 @@ public:
     * Constructor for SNES_SAMRAIContext allocates the SNES
     * object and initializes rudimentary state associated with
     * user-supplied solver components.  Then, it reads solver parameter
-    * from input and restart which may override default values.
     *
     * @pre !object_name.empty()
     * @pre my_functions != 0
@@ -1126,7 +1096,6 @@ private:
    bool d_uses_explicit_jacobian;
 
    /*
-    * SNES state data maintained here for input/restart capabilities.
     */
 
    // Nonlinear solver parameters:

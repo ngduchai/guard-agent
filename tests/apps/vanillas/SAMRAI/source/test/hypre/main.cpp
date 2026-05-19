@@ -138,7 +138,6 @@ int main(
 
       /*
        * Create major algorithm and data objects which comprise application.
-       * Each object will be initialized either from input data or restart
        * files, or a combination of both.  Refer to each class constructor
        * for details.  For more information on the composition of objects
        * for this application, see comments at top of file.

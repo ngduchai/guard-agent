@@ -67,7 +67,6 @@ class BoxLevel;
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>implicit_connector_creation_rule</td>
@@ -75,7 +74,6 @@ class BoxLevel;
  *     <td>"WARN"</td>
  *     <td>"ERROR", "WARN", "SILENT"</td>
  *     <td>opt</td>
- *     <td>Not read from restart</td>
  *   </tr>
  * </table>
  *

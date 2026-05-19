@@ -55,7 +55,7 @@ int main(
       if (argc != 2) {
          TBOX_ERROR(
             "USAGE:  " << argv[0] << " <input filename> "
-                       << "<restart dir> <restore number> [options]\n"
+                       << "\n"
                        << "  options:\n"
                        << "  none at this time"
                        << std::endl);

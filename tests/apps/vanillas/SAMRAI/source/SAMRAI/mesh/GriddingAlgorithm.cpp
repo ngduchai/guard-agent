@@ -221,7 +221,6 @@ GriddingAlgorithm::GriddingAlgorithm(
    d_to_nesting_complement.resize(d_hierarchy->getMaxNumberOfLevels());
 
    /*
-    * Initialize object with data read from input and restart databases.
     */
    bool is_from_restart = false;
    if (is_from_restart) {
@@ -294,7 +293,6 @@ GriddingAlgorithm::GriddingAlgorithm(
  *************************************************************************
  *
  * Destructor tells the tbox::RestartManager to remove this object from
- * the list of restart items.
  *
  *************************************************************************
  */
@@ -4858,8 +4856,6 @@ GriddingAlgorithm::printClassData(
 /*
  *************************************************************************
  *
- * If simulation is not from restart, read data from input database.
- * Otherwise, override data members initialized from restart with
  * values in the input database.
  *
  *************************************************************************

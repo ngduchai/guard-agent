@@ -68,7 +68,6 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
    d_beta[2] = 2.0 / 3.0;
 
    /*
-    * Initialize object with data read from input and restart databases.
     */
    bool is_from_restart = false;
    if (is_from_restart) {
@@ -82,7 +81,6 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
  *************************************************************************
  *
  * Destructor tells tbox::RestartManager to remove this object from the
- * list of restart items.
  *
  *************************************************************************
  */
@@ -654,7 +652,6 @@ MethodOfLinesIntegrator::applyGradientDetector(
  *************************************************************************
  *
  * Reads in paramemters from the database overriding any values
- * read in from the restart database. Also checks to make sure that
  * number of alpha values specified equals order of Runga-Kutta scheme.
  *
  *************************************************************************

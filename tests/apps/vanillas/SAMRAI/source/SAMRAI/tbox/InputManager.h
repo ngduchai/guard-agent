@@ -27,7 +27,6 @@ namespace tbox {
  * input file, creating the parser, and populating the database with
  * values.  The input manager is simple enough that it did not need
  * to be implemented as a singleton class; however, it was implemented
- * as a singleton to be consistent with the restart manager class.
  *
  * All processors must call the parsing routines.  Any errors are reported
  * to pout and will result in termination of the program.

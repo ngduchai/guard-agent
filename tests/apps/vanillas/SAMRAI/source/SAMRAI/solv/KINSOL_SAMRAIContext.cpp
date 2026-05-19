@@ -24,7 +24,6 @@ const int KINSOL_SAMRAIContext::SOLV_KINSOL_SAMRAI_CONTEXT_VERSION = 1;
  *
  * Constructor and destructor for KINSOL_SAMRAIContext.  The
  * constructor sets default values for data members, then overrides
- * them with values read from input or restart.  The C++ wrapper for
  * KINSOL is also created in the constructor.  The destructor destroys
  * the wrappers for KINSOL and the solution vector.
  *
@@ -66,7 +65,6 @@ KINSOL_SAMRAIContext::KINSOL_SAMRAIContext(
    d_eisenstat_walker_params[1] = 0.9;
 
    /*
-    * Initialize object with data read from the input and restart databases.
     */
    bool is_from_restart = false;
    if (is_from_restart) {
@@ -113,7 +111,6 @@ KINSOL_SAMRAIContext::solve()
  *************************************************************************
  *
  * Initialize KINSOL solver and solve nonlinear system from input.
- * Note that all restart values for parameters may be overridden with
  * input values.
  *
  *************************************************************************

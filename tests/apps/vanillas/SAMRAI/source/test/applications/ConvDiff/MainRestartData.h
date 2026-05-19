@@ -25,9 +25,7 @@ using namespace SAMRAI;
 /**
  * Class MainRestartData is a concrete subclass of tbox::Serializable that is
  * used for storing and accessing the data in main that is necessary for
- * restart.
  *
- * The input and restart data for the main program are summarized as follows:
  *
  * \verbatim
  * Input:
@@ -43,13 +41,11 @@ using namespace SAMRAI;
  *   regrid_step         = 2
  *   tag_buffer          = 2
  *
- * Restart:
  *    Data written: d_max_timesteps, d_start_time, d_end_time, d_regrid_step,
  *                  d_tag_buffer, d_loop_time, d_iteration_number
  *    Data read:    d_max_timesteps, d_start_time, d_end_time, d_regrid_step,
  *                  d_tag_buffer, d_loop_time, d_iteration_number
  *
- *    Input overwrites all restart values.
  * \endverbatim
  *
  */
@@ -131,7 +127,6 @@ private:
     * Reads in max_timesteps, start_time, end_time,
     * regrid_step, tag_buffer from the specified input database.
     * Any values from the input database override values found
-    * in the restart database.
     */
    virtual void
    getFromInput(

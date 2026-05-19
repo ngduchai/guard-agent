@@ -2993,7 +2993,7 @@ are each manageable, or you might want to set more detailed expectations about
 which API calls invoke which mock functions.
 
 A technique you can use is to put the expectations in a sequence and insert
-calls to a dummy "checkpoint" function at specific places. Then you can verify
+calls to a dummy "trace_point" function at specific places. Then you can verify
 that the mock function calls do happen at the right time. For example, if you
 are exercising the code:
 
@@ -3031,7 +3031,7 @@ TEST(FooTest, InvokesBarCorrectly) {
 ```
 
 The expectation spec says that the first `Bar("a")` call must happen before
-checkpoint "1", the second `Bar("a")` call must happen after checkpoint "2", and
+trace_point "1", the second `Bar("a")` call must happen after trace_point "2", and
 nothing should happen between the two checkpoints. The explicit checkpoints make
 it clear which `Bar("a")` is called by which call to `Foo()`.
 

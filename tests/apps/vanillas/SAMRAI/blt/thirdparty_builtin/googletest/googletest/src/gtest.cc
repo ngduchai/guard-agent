@@ -721,7 +721,6 @@ static bool PatternMatchesString(const std::string& name_str,
           break;
         case '*':
           // Match zero or more characters. Start by skipping over the wildcard
-          // and matching zero characters from name. If that fails, restart and
           // match one more character than the last attempt.
           pattern_next = pattern;
           name_next = name + 1;
@@ -729,7 +728,6 @@ static bool PatternMatchesString(const std::string& name_str,
           continue;
       }
     }
-    // Failed to match a character. Restart if possible.
     if (name_begin < name_next && name_next <= name_end) {
       pattern = pattern_next;
       name = name_next;

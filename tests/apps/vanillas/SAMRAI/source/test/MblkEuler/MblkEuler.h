@@ -247,7 +247,6 @@ private:
 
    /*
     * The object name is used for error/warning reporting and also as a
-    * string label for restart database entries.
     */
    std::string d_object_name;
 

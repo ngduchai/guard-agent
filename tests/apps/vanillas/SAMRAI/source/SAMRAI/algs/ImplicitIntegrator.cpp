@@ -26,7 +26,6 @@ const int ImplicitIntegrator::ALGS_IMPLICIT_INTEGRATOR_VERSION = 1;
  *
  * Constructor and destructor for ImplicitIntegrator.  The
  * constructor sets default values for data members, then overrides
- * them with values read from input or restart.  The destructor does
  * nothing interesting.
  *
  *************************************************************************
@@ -57,7 +56,6 @@ ImplicitIntegrator::ImplicitIntegrator(
    TBOX_ASSERT(hierarchy);
 
    /*
-    * Initialize object with data read from input and restart databases.
     */
 
    bool is_from_restart = false;
@@ -251,8 +249,6 @@ ImplicitIntegrator::updateSolution()
 /*
  *************************************************************************
  *
- * If simulation is not from restart, read data from input database.
- * Otherwise, override restart values for a subset of the data members
  * with those found in input.
  *
  *************************************************************************
@@ -294,7 +290,7 @@ ImplicitIntegrator::getFromInput(
             double tmp = input_db->getDouble("initial_time");
             if (tmp != d_initial_time) {
                TBOX_WARNING("ImplicitIntegrator::getFromInput warning...\n"
-                  << "initial_time may not be changed on restart."
+                  << "initial_time may not be changed across re-init."
                   << std::endl);
             }
          }

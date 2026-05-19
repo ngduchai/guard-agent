@@ -399,10 +399,6 @@ public:
 
 private:
    /*
-    * These private member functions read data from input and restart.
-    * When beginning a run from a restart file, all data members are read
-    * from the restart file.   If the boolean flag "is_from_restart"
-    * is true when reading from input, some restart values may be
     * overridden by those in the input file.
     *
     * An assertion results if the database pointer is null.
@@ -447,7 +443,6 @@ private:
 
    /*
     * The object name is used for error/warning reporting and also as a
-    * string label for restart database entries.
     */
    std::string d_object_name;
 

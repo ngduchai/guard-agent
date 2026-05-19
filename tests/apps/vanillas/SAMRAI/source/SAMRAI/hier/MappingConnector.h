@@ -41,13 +41,11 @@ public:
       const tbox::Dimension& dim);
 
    /*!
-    * @brief Creates an MappingConnector which is initialized from a restart
     * database.
     *
     * @param dim The dimension of the head and base BoxLevels that
     * this object will eventually connect.
     *
-    * @param restart_db Restart Database written by a Connector.
     *
     * @see setBase()
     * @see setHead()

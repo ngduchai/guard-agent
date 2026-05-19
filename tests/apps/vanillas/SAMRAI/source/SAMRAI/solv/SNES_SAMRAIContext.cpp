@@ -57,7 +57,6 @@ SNES_SAMRAIContext::SNESJacobianSet(
  *
  * Constructor and destructor for SNES_SAMRAIContext.  The
  * constructor sets default values for data members, then overrides
- * them with values read from input or restart.  The destructor destroys
  * the SNES object.
  *
  *************************************************************************
@@ -104,7 +103,6 @@ SNES_SAMRAIContext::SNES_SAMRAIContext(
    TBOX_ASSERT(my_functions != 0);
 
    /*
-    * Initialize members with data read from the input and restart
     * databases.  Note that PETSc object parameters are set in
     * initialize().
     */

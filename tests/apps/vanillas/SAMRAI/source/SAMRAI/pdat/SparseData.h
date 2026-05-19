@@ -491,7 +491,6 @@ private:
    int d_int_attr_size;
 
    /*
-    * Unique version number for this patch data for restart purposes.
     */
    static const int PDAT_SPARSEDATA_VERSION;
 

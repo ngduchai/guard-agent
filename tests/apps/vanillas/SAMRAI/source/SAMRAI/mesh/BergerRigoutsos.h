@@ -99,7 +99,6 @@ class BergerRigoutsosNode;
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>max_box_size</td>
@@ -107,7 +106,6 @@ class BergerRigoutsosNode;
  *     <td>all values max int</td>
  *     <td>all values > 0</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>sort_output_nodes</td>
@@ -115,7 +113,6 @@ class BergerRigoutsosNode;
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>check_min_box_size</td>
@@ -123,7 +120,6 @@ class BergerRigoutsosNode;
  *     <td>"WARN"</td>
  *     <td>"WARN", "IGNORE", "ERROR"</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>efficiency_tolerance</td>
@@ -131,7 +127,6 @@ class BergerRigoutsosNode;
  *     <td>0.8 for each level</td>
  *     <td>all values > 0.0 && < 1.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>combine_efficiency</td>
@@ -139,7 +134,6 @@ class BergerRigoutsosNode;
  *     <td>0.8 for each level</td>
  *     <td>all values > 0.0 && < 1.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  * </table>
  *

@@ -4,7 +4,6 @@
  * information, see COPYRIGHT and LICENSE.
  *
  * Copyright:     (c) 1997-2026 Lawrence Livermore National Security, LLC
- * Description:   Simple example to demonstrate input/restart of patch data.
  *
  ************************************************************************/
 

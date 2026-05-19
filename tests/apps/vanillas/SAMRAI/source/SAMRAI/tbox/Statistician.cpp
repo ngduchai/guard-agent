@@ -136,9 +136,6 @@ void
 Statistician::makeStatisticianInstance(
    bool read_from_restart)
 {
-   /* If reading from restart then force new instance
-    * to be created from existing state in the
-    * restart file */
    if (read_from_restart) {
       delete s_statistician_instance;
       s_statistician_instance = 0;

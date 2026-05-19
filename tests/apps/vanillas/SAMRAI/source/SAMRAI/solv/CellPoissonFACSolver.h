@@ -100,7 +100,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>enable_logging</td>
@@ -108,7 +107,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  * </table>
  *

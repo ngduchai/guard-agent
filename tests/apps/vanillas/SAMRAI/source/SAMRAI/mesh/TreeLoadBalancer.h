@@ -76,7 +76,6 @@ namespace mesh {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>flexible_load_tolerance</td>
@@ -84,7 +83,6 @@ namespace mesh {
  *     <td>0.05</td>
  *     <td>0-1</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>tile_size</td>
@@ -92,7 +90,6 @@ namespace mesh {
  *     <td>1</td>
  *     <td>1-</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>max_spread_procs</td>
@@ -100,7 +97,6 @@ namespace mesh {
  *     <td>500</td>
  *     <td> > 1</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  * </table>
  *

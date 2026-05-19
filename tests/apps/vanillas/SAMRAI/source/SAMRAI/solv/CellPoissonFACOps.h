@@ -123,7 +123,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>coarse_solver_choice</td>
@@ -131,7 +130,6 @@ namespace solv {
  *     <td>"hypre"</td>
  *     <td>"hypre", "redblack", "jacobi"</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>coarse_solver_tolerance</td>
@@ -139,7 +137,6 @@ namespace solv {
  *     <td>1e-14</td>
  *     <td>>0.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>coarse_solver_max_iterations</td>
@@ -147,7 +144,6 @@ namespace solv {
  *     <td>10</td>
  *     <td>>=1</td>
  *     <td>opt
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>cf_discretization</td>
@@ -155,7 +151,6 @@ namespace solv {
  *     <td>"Ewing"</td>
  *     <td>"Ewing", "CONSTANT_REFINE", "CONSERVATIVE_LINEAR_REFINE", "LINEAR_REFINE"</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>prolongation_method</td>
@@ -163,7 +158,6 @@ namespace solv {
  *     <td>"LINEAR_REFINE"</td>
  *     <td>"CONSTANT_REFINE", "CONSERVATIVE_LINEAR_REFINE", "LINEAR_REFINE"</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>enable_logging</td>
@@ -171,7 +165,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  * </table>
  *

@@ -60,7 +60,6 @@ namespace algs {
  *
  * Initialization of an MethodOfLinesIntegrator object is performed
  * by first setting default values, then reading from input.  All input
- * values may override values read from restart.  Data read from input is
  * summarized as follows:
  *
  * <b> Input Parameters </b>
@@ -73,8 +72,6 @@ namespace algs {
  *       used in the multi-step Strong Stability Preserving (SSP) Runge-Kutta
  *       algorithm.
  *
- * Note that when continuing from restart, the input parameters in the input
- * database override all values read in from the restart database.
  *
  * <b> Details: </b> <br>
  * <table>
@@ -84,7 +81,6 @@ namespace algs {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *      <td>alpha_1</td>
@@ -92,7 +88,6 @@ namespace algs {
  *      <td>[1.0, 0.75, 2.0/3.0]</td>
  *      <td>any doubles but no more than 3 of them</td>
  *      <td>opt</td>
- *      <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *      <td>alpha_2</td>
@@ -100,7 +95,6 @@ namespace algs {
  *      <td>[0.0, 0.25, 2.0/3.0]</td>
  *      <td>any doubles but no more than 3 of them</td>
  *      <td>opt</td>
- *      <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *      <td>beta</td>
@@ -108,7 +102,6 @@ namespace algs {
  *      <td>[1.0, 0.25, 2.0/3.0]</td>
  *      <td>any doubles but no more than 3 of them</td>
  *      <td>opt</td>
- *      <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  * </table>
  *
@@ -150,7 +143,6 @@ public:
     * of lines integration algorithm with the concrete patch strategy object
     * (containing problem-specific numerical routines) and initializes
     * integration algorithm parameters provided in the specified input
-    * database and in the restart database corresponding to the
     * specified object_name.
     *
     * @pre !object_name.empty()
@@ -163,7 +155,6 @@ public:
 
    /*!
     * The destructor for MethodOfLinesIntegrator unregisters
-    * the integrator object with the restart manager.
     */
    virtual ~MethodOfLinesIntegrator();
 
@@ -356,7 +347,6 @@ private:
    /*
     * Reads in parameters from the input database.  All
     * values from the input file take precedence over values from the
-    * restart file.
     */
    void
    getFromInput(
@@ -365,7 +355,6 @@ private:
 
    /*
     * The object name is used as a handle to the database stored in
-    * restart files and for error reporting purposes.
     */
    std::string d_object_name;
 

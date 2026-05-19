@@ -155,7 +155,6 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
 
    /*
     * Initialize this time refinement integration object with data read
-    * from input and restart databases.
     */
    bool is_from_restart = false;
    if (is_from_restart) {
@@ -187,7 +186,6 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
  *************************************************************************
  *
  * Destructor tells tbox::RestartManager to remove this object from the
- * list of restart items.
  *
  *************************************************************************
  */
@@ -1563,7 +1561,6 @@ TimeRefinementIntegrator::printDataForLevel(
 /*
  *************************************************************************
  *
- * If simulation is not from restart, read in all data members from
  * the input database.  Otherwise, only override end_time, grow_dt
  * max_integrator_steps, and tag_buffer from the input database.
  *
@@ -1582,7 +1579,6 @@ TimeRefinementIntegrator::getFromInput(
 
    if (!is_from_restart) {
       /*
-       * If not from restart, read in all data members from input database.
        */
 
       if (!d_use_refined_timestepping) {
@@ -1668,7 +1664,7 @@ TimeRefinementIntegrator::getFromInput(
             double tmp = input_db->getDouble("start_time");
             if (tmp != d_start_time) {
                TBOX_WARNING("TimeRefinementIntegrator::getFromInput warning...\n"
-                  << "start_time may not be changed on restart." << std::endl);
+                  << "start_time may not be changed across re-init." << std::endl);
             }
          }
 

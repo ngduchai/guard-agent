@@ -144,11 +144,9 @@ public:
 
    /*!
     * @brief Construct a new patch level from the specified PatchLevel
-    * restart database.
     *
     * The box, mapping, and ratio to level zero data which are normally
     * passed in during the construction of a new patch level are
-    * retrieved from the specified restart database.
     *
     * @param[in]  restart_database
     * @param[in]  grid_geometry

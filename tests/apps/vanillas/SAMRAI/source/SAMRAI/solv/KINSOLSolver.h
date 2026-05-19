@@ -76,7 +76,6 @@ namespace solv {
  * by a user who opts not to use the vector kernel supplied by the KINSOL
  * package.
  *
- * Note that this class provides no input or restart capabilities and
  * relies on KINSOL for output reporting.  When using KINSOL in an
  * application using SAMRAI, it is straightforward to include this
  * functionality in the entity using this solver class.

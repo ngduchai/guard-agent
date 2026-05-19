@@ -466,8 +466,6 @@ public:
    /**
     * @brief Attach the Database to an existing HDF file.
     *
-    * If an application has an existing HDF file used for restart this
-    * method can be used to write SAMRAI restart information to the
     * existing file instead of SAMRAI creating a distinct file.
     *
     * The group_id should be a hid returned from a H5Gcreate call.

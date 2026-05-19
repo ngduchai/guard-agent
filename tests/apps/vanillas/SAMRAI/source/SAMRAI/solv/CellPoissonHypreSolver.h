@@ -111,7 +111,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>print_solver_info</td>
@@ -119,7 +118,6 @@ namespace solv {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>max_iterations</td>
@@ -127,7 +125,6 @@ namespace solv {
  *     <td>10</td>
  *     <td>>0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>relative_residual_tol</td>
@@ -135,7 +132,6 @@ namespace solv {
  *     <td>1.0e-10</td>
  *     <td>>0.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>num_pre_relax_steps</td>
@@ -143,7 +139,6 @@ namespace solv {
  *     <td>1</td>
  *     <td>>=0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>num_post_relax_steps</td>
@@ -151,7 +146,6 @@ namespace solv {
  *     <td>1</td>
  *     <td>>=0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>use_smg</td>
@@ -159,7 +153,6 @@ namespace solv {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  * </table>
  *

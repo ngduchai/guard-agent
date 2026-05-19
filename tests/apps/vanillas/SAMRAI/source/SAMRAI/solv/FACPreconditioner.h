@@ -78,7 +78,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>max_cycles</td>
@@ -86,7 +85,6 @@ namespace solv {
  *     <td>10</td>
  *     <td>>=1</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>residual_tol</td>
@@ -94,7 +92,6 @@ namespace solv {
  *     <td>1.0e-6</td>
  *     <td>>0.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>relative_residual_tol</td>
@@ -102,7 +99,6 @@ namespace solv {
  *     <td>-1.0</td>
  *     <td>-1.0 or >0.0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>num_pre_sweeps</td>
@@ -110,7 +106,6 @@ namespace solv {
  *     <td>1</td>
  *     <td>>=0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>num_post_sweeps</td>
@@ -118,7 +113,6 @@ namespace solv {
  *     <td>1</td>
  *     <td>>=0</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  * </table>
  *

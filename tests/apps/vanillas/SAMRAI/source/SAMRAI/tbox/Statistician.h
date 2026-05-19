@@ -41,7 +41,6 @@ namespace tbox {
  * `PROC_STAT' is the type of statistic. See discussion for the getStatistic()
  * method below for more information.
  *
- * The statistic state is saved to restart files when restart file generation
  * is active.  This allows users to continue to accumulate timing
  * information when restarting a run.  If desired, all statistics can be
  * reset when restarting by calling the function resetAllStatistics().
@@ -66,9 +65,7 @@ public:
     * Create the singleton instance of the statistic manager and return
     * a pointer to it.  This function is provided so that so that
     * users can control whether statistic information will be written
-    * to/read from restart files.
     *
-    * Statistics that exist in the restart file will be read from restart
     * when a run is restarted and the second argument is true.
     *
     * Generally, this routine should only be called once during program

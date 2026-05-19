@@ -67,7 +67,6 @@ namespace solv {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>boundary_N</td>
@@ -75,7 +74,6 @@ namespace solv {
  *     <td>none</td>
  *     <td>"value", "gval"; "slope", "gval"; "coefficients", "aVal", "bVal"</td>
  *     <td>req</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  * </table>
  *
  */

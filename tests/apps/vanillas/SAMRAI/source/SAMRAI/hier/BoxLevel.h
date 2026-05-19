@@ -105,7 +105,6 @@ public:
 
    /*!
     * @brief Construct a BoxLevel which will be initialized from the supplied
-    * restart database.
     *
     * @param[in] dim
     * @param[in] restart_db

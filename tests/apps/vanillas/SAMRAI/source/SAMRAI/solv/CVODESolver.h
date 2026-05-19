@@ -79,7 +79,6 @@ namespace solv {
  * noted that the vector kernel used by CVODE is the same as the one
  * used by the other packages in the Sundials of solvers).
  *
- * Note that this class provides no input or restart capabilities and
  * relies on CVODE for output reporting.
  *
  * CVODESolver Usage:

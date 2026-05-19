@@ -38,7 +38,6 @@ namespace SAMRAI {
 namespace tbox {
 
 /**
- * @brief Class Database is an abstract base class for the input, restart,
  * and visualization databases.
  *
  * SAMRAI databases store (key,value) pairs in a hierarchical

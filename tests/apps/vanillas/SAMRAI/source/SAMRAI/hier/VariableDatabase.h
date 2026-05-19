@@ -147,7 +147,6 @@ namespace hier {
  *
  * @par
  * The database is also used in SAMRAI to manage the reading/writing of
- * patch data objects to/from restart files.
  *
  * @note
  * <ul>

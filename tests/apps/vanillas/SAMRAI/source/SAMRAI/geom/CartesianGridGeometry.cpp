@@ -543,7 +543,6 @@ CartesianGridGeometry::printClassData(
 /*
  *************************************************************************
  *
- * Data is read from input only if the simulation is not from restart.
  * Otherwise, all values specifed in the input database are ignored.
  * In this method data from the database are read to local
  * variables and the setGeometryData() method is called to
@@ -586,7 +585,7 @@ CartesianGridGeometry::getFromInput(
       if (num_keys > 0 && read_on_restart) {
          TBOX_WARNING(
             "CartesianGridGeometry::getFromInput() warning...\n"
-            << "You want to override restart data with values from\n"
+            << "You want to override prior values with values from\n"
             << "an input database which is not allowed." << std::endl);
       }
    }

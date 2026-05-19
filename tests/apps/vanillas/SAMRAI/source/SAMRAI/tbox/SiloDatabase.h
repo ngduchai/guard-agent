@@ -498,8 +498,6 @@ public:
    /**
     * @brief Attach the Database to an existing Silo file.
     *
-    * If an application has an existing Silo file used for restart this
-    * method can be used to write SAMRAI restart information to the
     * existing file instead of SAMRAI creating a distinct file.
     *
     * SAMRAI data will be written to the directory specified within

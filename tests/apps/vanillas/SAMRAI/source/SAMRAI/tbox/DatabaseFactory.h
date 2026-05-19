@@ -23,7 +23,6 @@ namespace tbox {
  *
  * Used to build database objects.  For example, RestartManager
  * may use a DatabaseFactory to build databases when creating
- * a restart file.
  */
 class DatabaseFactory
 {

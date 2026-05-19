@@ -97,7 +97,6 @@ public:
     * Constructor for ModifiedBratuProblem class creates problem variables
     * to represent the solution and other quantities on the patch hierarchy.
     * It initializes data members to default values and sets others based
-    * on input and/or restart values.  The constructor also sets up algorithms
     * for communicating data between patches on the hierarchy.
     */
    ModifiedBratuProblem(
@@ -483,7 +482,6 @@ private:
 
    /*
     * The object name is used as a handle to databases stored in
-    * restart files and for error reporting purposes.
     */
    std::string d_object_name;
 

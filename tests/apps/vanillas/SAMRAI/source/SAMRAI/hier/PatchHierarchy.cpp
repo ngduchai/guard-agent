@@ -37,7 +37,6 @@ PatchHierarchy::s_finalize_handler(
  *************************************************************************
  *
  * Instantiate the patch hierarchy and set default values.
- * Initialize from restart if necessary.
  *
  *************************************************************************
  */
@@ -102,7 +101,6 @@ PatchHierarchy::PatchHierarchy(
  **************************************************************************
  *
  * The destructor tells the tbox::RestartManager to remove this hierarchy
- * from the list of restart items and automatically deletes all
  * allocated resources through smart pointers and arrays.
  *
  **************************************************************************
@@ -114,8 +112,6 @@ PatchHierarchy::~PatchHierarchy()
 
 /*
  *************************************************************************
- * If simulation is not from restart, read data from input database.
- * Otherwise, override data members initialized from restart with
  * values in the input database.
  *************************************************************************
  */
@@ -357,7 +353,7 @@ PatchHierarchy::getFromInput(
             input_db->getIntegerWithDefault("max_levels", d_max_levels);
          if (new_max_levels > d_max_levels) {
             TBOX_ERROR("PatchHierarchy::getFromInput error...\n"
-               << "max_levels must not increase on restart." << std::endl);
+               << "max_levels must not increase across re-init." << std::endl);
          }
          d_max_levels = new_max_levels;
 
@@ -466,7 +462,7 @@ PatchHierarchy::getFromInput(
                }
                if (val != d_proper_nesting_buffer[ln]) {
                   TBOX_WARNING("PatchHierarchy::getFromInput warning...\n"
-                     << "proper_nesting_buffer may not be changed on restart."
+                     << "proper_nesting_buffer may not be changed across re-init."
                      << std::endl);
                   break;
                }
@@ -478,7 +474,7 @@ PatchHierarchy::getFromInput(
             if (tmp != d_allow_patches_smaller_than_ghostwidth) {
                TBOX_WARNING("PatchHierarchy::getFromInput warning...\n"
                   << "allow_patches_smaller_than_ghostwidth\n"
-                  << "may not be changed on restart." << std::endl);
+                  << "may not be changed across re-init." << std::endl);
             }
          }
 
@@ -2165,7 +2161,6 @@ PatchHierarchy::makeAdjacencySets(
 void
 PatchHierarchy::initializeHierarchy()
 {
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 int

@@ -153,7 +153,6 @@ namespace mesh {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>check_overflow_nesting</td>
@@ -161,7 +160,6 @@ namespace mesh {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>check_proper_nesting</td>
@@ -169,7 +167,6 @@ namespace mesh {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>check_nonrefined_tags</td>
@@ -177,7 +174,6 @@ namespace mesh {
  *     <td>"WARN"</td>
  *     <td>"WARN", "IGNORE", "ERROR"</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>check_overlapping_patches</td>
@@ -185,7 +181,6 @@ namespace mesh {
  *     <td>"IGNORE"</td>
  *     <td>"WARN", "IGNORE", "ERROR"</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>check_nonnesting_user_boxes</td>
@@ -193,7 +188,6 @@ namespace mesh {
  *     <td>"ERROR"</td>
  *     <td>"WARN", "IGNORE", "ERROR"</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>sequentialize_patch_indices</td>
@@ -201,7 +195,6 @@ namespace mesh {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>enforce_proper_nesting</td>
@@ -209,7 +202,6 @@ namespace mesh {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db may be overridden by input db</td>
  *   </tr>
  *   <tr>
  *     <td>save_tag_data</td>
@@ -217,13 +209,9 @@ namespace mesh {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Parameter read from restart db will not be overridden by input db</td>
  *   </tr>
  * </table>
  *
- * All values read in from a restart database may be overriden by input
- * database values.  If no new input database value is given, the restart
- * database value is used.
  *
  * @see TagAndInitializeStrategy
  * @see LoadBalanceStrategy
@@ -269,14 +257,12 @@ public:
     * strategy objects in the argument list.
     *
     * Gridding parameters are initialized from values provided in the
-    * specified input and in the restart database corresponding to the
     * specified object_name argument.
     *
     * @param[in] hierarchy The hierarchy that this GriddingAlgorithm will
     * work on.  The pointer is cached.  All hierarchy operations will
     * be on this hierarchy.
     *
-    * @param[in] object_name For registering the object in the restart
     * database.
     *
     * @param[in] input_db
@@ -1146,7 +1132,6 @@ private:
 
    /*
     * The object name is used for error reporting and accessing
-    * restart file information.
     */
    std::string d_object_name;
 

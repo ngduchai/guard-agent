@@ -78,7 +78,6 @@ namespace mesh {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>tile_size</td>
@@ -86,7 +85,6 @@ namespace mesh {
  *     <td>all values are 8</td>
  *     <td>all values > 0</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>coalesce_boxes</td>
@@ -94,7 +92,6 @@ namespace mesh {
  *     <td>true</td>
  *     <td>false/true</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>coalesce_boxes_from_same_patch</td>
@@ -102,7 +99,6 @@ namespace mesh {
  *     <td>false</td>
  *     <td>false/true</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>allow_remote_tile_extent</td>
@@ -110,7 +106,6 @@ namespace mesh {
  *     <td>true</td>
  *     <td>false/true</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>DEV_debug_checks</td>
@@ -118,7 +113,6 @@ namespace mesh {
  *     <td>false</td>
  *     <td>false/true</td>
  *     <td>opt</td>
- *     <td>Not written to restart. Value in input db used.</td>
  *   </tr>
  * </table>
  *

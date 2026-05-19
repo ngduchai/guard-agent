@@ -189,7 +189,6 @@ std::vector<std::shared_ptr<tbox::Statistic> > HyperbolicLevelIntegrator::s_time
  * This constructor sets the HyperbolicPatchStrategy pointer and
  * initializes integration parameters to default values.  Communication
  * algorithms are created here too.  Other data members are read in
- * from the input database or from the restart database corresponding
  * to the specified object_name.
  *
  *************************************************************************
@@ -224,7 +223,6 @@ HyperbolicLevelIntegrator::HyperbolicLevelIntegrator(
    TBOX_ASSERT(patch_strategy != 0);
 
    /*
-    * Initialize object with data read from the input and restart databases.
     */
    bool from_restart = false;
    if (from_restart) {
@@ -236,7 +234,6 @@ HyperbolicLevelIntegrator::HyperbolicLevelIntegrator(
  *************************************************************************
  *
  * Destructor tells the tbox::RestartManager to remove this object from
- * the list of restart items.
  *
  *************************************************************************
  */
@@ -2686,7 +2683,6 @@ HyperbolicLevelIntegrator::printClassData(
  *
  * Reads in cfl, cfl_init, lag_dt_computation, and
  * use_ghosts_to_compute_dt from the input database.
- * Note all restart values are overriden with values from the input
  * database.
  *
  *************************************************************************

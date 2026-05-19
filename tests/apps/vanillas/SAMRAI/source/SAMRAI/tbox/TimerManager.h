@@ -112,7 +112,6 @@ namespace tbox {
  *     <th>default</th>
  *     <th>range</th>
  *     <th>opt/req</th>
- *     <th>behavior on restart</th>
  *   </tr>
  *   <tr>
  *     <td>print_exclusive</td>
@@ -120,7 +119,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_total</td>
@@ -128,7 +126,6 @@ namespace tbox {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_processor</td>
@@ -136,7 +133,6 @@ namespace tbox {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_max</td>
@@ -144,7 +140,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_summed</td>
@@ -152,7 +147,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_user</td>
@@ -160,7 +154,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_sys</td>
@@ -168,7 +161,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_wall</td>
@@ -176,7 +168,6 @@ namespace tbox {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_percentage</td>
@@ -184,7 +175,6 @@ namespace tbox {
  *     <td>TRUE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_concurrent</td>
@@ -192,7 +182,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_timer_overhead</td>
@@ -200,7 +189,6 @@ namespace tbox {
  *     <td>FALSE</td>
  *     <td>TRUE, FALSE</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>print_threshold</td>
@@ -208,7 +196,6 @@ namespace tbox {
  *     <td>0.25</td>
  *     <td>any double</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  *   <tr>
  *     <td>timer_list</td>
@@ -216,7 +203,6 @@ namespace tbox {
  *     <td>none</td>
  *     <td>N/A</td>
  *     <td>opt</td>
- *     <td>Not written to restart.  Value in input db used.</td>
  *   </tr>
  * </table>
  *

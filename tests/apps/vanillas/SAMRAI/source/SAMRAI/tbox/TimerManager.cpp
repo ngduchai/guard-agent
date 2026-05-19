@@ -1159,7 +1159,6 @@ TimerManager::print(
    delete[] timer_values;
    delete[] max_processor_id;
    /*
-    * Lastly, restart the main_timer that we stopped at the beginning of
     * this routine
     */
    d_main_timer->start();

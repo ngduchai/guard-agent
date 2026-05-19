@@ -1887,7 +1887,6 @@ internal::ByMoveWrapper<R> ByMove(R x) {
 
 // Creates an action that returns an element of `vals`. Calling this action will
 // repeatedly return the next value from `vals` until it reaches the end and
-// will restart from the beginning.
 template <typename T>
 internal::ReturnRoundRobinAction<T> ReturnRoundRobin(std::vector<T> vals) {
   return internal::ReturnRoundRobinAction<T>(std::move(vals));
@@ -1895,7 +1894,6 @@ internal::ReturnRoundRobinAction<T> ReturnRoundRobin(std::vector<T> vals) {
 
 // Creates an action that returns an element of `vals`. Calling this action will
 // repeatedly return the next value from `vals` until it reaches the end and
-// will restart from the beginning.
 template <typename T>
 internal::ReturnRoundRobinAction<T> ReturnRoundRobin(
     std::initializer_list<T> vals) {
