@@ -49,14 +49,6 @@
 //! - athena_hdf5.cpp, ATHDF5Output::WriteOutputFile(): need to allocate space for the new
 //!   OutputData node as an HDF5 "variable" inside an existing HDF5 "dataset"
 //!   (cell-centered vs. face-centered data).
-//! - restart.cpp, RestartOutput::WriteOutputFile(): memcpy array of quantity to pdata
-//!   pointer and increment the pointer. pdata points to an allocated region of
-//!   memory whose "datasize" is inferred from MeshBlock::GetBlockSizeInBytes(), ---->
-//! - mesh/meshblock.cpp, MeshBlock::GetBlockSizeInBytes(): increment std::size_t size by
-//!   the size of the new quantity's array(s)
-//! - mesh/meshblock.cpp, MeshBlock restart constructor: memcpy quantity
-//!   (IN THE SAME ORDER AS THE VARIABLES ARE WRITTEN IN restart.cpp)
-//!   from the loaded .rst file to the MeshBlock's appropriate physics member object
 //!
 //! - history.cpp, HistoryOutput::WriteOutputFile() (3x places):
 //!   1) modify NHISTORY_VARS macro
@@ -69,9 +61,6 @@
 //! treats .vtk velocity output from Athena++. The workaround is to import the
 //! vis/visit/*.xml expressions file, which can pack these HDF5 scalars into a vector.
 //
-// TODO(felker): Replace MeshBlock::GetBlockSizeInBytes() by 2x RegisterMeshBlockData()
-// overloads. Replace "NEW_OUTPUT_TYPES" region of RestartOutput::WriteOutputFile() with
-// automatic loops over registered MeshBlock quantities in pvars_cc, pvars_fc vectors.
 //========================================================================================
 
 // C headers
@@ -1454,7 +1443,7 @@ void OutputType::ClearOutputData() {
 
 void Outputs::MakeOutputs(Mesh *pm, ParameterInput *pin, bool wtflag) {
   // wtflag = only true for making final outputs due to signal or wall-time/cycle/time
-  // limit. Used by restart file output to change suffix to .final
+  // limit.
   bool first=true;
   MeshBlock *pmb;
   bool rad_mom=true;

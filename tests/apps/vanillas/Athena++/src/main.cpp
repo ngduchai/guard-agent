@@ -64,9 +64,8 @@
 
 int main(int argc, char *argv[]) {
   std::string athena_version = "version 24.0 - June 2024";
-  char *input_filename = nullptr, *restart_filename = nullptr;
+  char *input_filename = nullptr;
   char *prundir = nullptr;
-  int res_flag = 0;   // set to 1 if -r        argument is on cmdline
   int narg_flag = 0;  // set to 1 if -n        argument is on cmdline
   int iarg_flag = 0;  // set to 1 if -i <file> argument is on cmdline
   int mesh_flag = 0;  // set to <nproc> if -m <nproc> argument is on cmdline
@@ -152,10 +151,6 @@ int main(int argc, char *argv[]) {
           input_filename = argv[++i];
           iarg_flag = 1;
           break;
-        case 'r':                      // -r <restart_file>
-          res_flag = 1;
-          restart_filename = argv[++i];
-          break;
         case 'd':                      // -d <run_directory>
           prundir = argv[++i];
           break;
@@ -184,7 +179,6 @@ int main(int argc, char *argv[]) {
             std::cout << "Usage: " << argv[0] << " [options] [block/par=value ...]\n";
             std::cout << "Options:" << std::endl;
             std::cout << "  -i <file>       specify input file [athinput]\n";
-            std::cout << "  -r <file>       restart with this file\n";
             std::cout << "  -d <directory>  specify run dir [current dir]\n";
             std::cout << "  -n              parse input file and quit\n";
             std::cout << "  -c              show configuration and quit\n";
@@ -202,10 +196,10 @@ int main(int argc, char *argv[]) {
     } // else if argv[i] not of form "-?" ignore it here (tested in ModifyFromCmdline)
   }
 
-  if (restart_filename == nullptr && input_filename == nullptr) {
+  if (input_filename == nullptr) {
     // no input file is given
     std::cout << "### FATAL ERROR in main" << std::endl
-              << "No input file or restart file is specified." << std::endl;
+              << "No input file is specified." << std::endl;
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
@@ -223,22 +217,12 @@ int main(int argc, char *argv[]) {
   // With MPI, the input is read by every process in parallel using MPI-IO.
 
   ParameterInput *pinput;
-  IOWrapper infile, restartfile;
+  IOWrapper infile;
 #ifdef ENABLE_EXCEPTIONS
   try {
 #endif
     pinput = new ParameterInput;
-    if (res_flag == 1) {
-      restartfile.Open(restart_filename, IOWrapper::FileMode::read);
-      pinput->LoadFromFile(restartfile);
-      // make sure next_time gets corrected in case -i input file or cmdline args change
-      // the output next_time, dt, etc.
-      // This needs to be corrected on the restart file because we need the old dt.
-      pinput->RollbackNextTime();
-      // leave the restart file open for later use
-    }
     if (iarg_flag == 1) {
-      // if both -r and -i are specified, override the parameters using the input file
       infile.Open(input_filename, IOWrapper::FileMode::read);
       pinput->LoadFromFile(infile);
       infile.Close();
@@ -250,7 +234,6 @@ int main(int argc, char *argv[]) {
     std::cout << "### FATAL ERROR in main" << std::endl
               << "memory allocation failed initializing class ParameterInput: "
               << ba.what() << std::endl;
-    if (res_flag == 1) restartfile.Close();
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
@@ -258,7 +241,6 @@ int main(int argc, char *argv[]) {
   }
   catch(std::exception const& ex) {
     std::cout << ex.what() << std::endl;  // prints diagnostic message
-    if (res_flag == 1) restartfile.Close();
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
@@ -273,18 +255,13 @@ int main(int argc, char *argv[]) {
 #ifdef ENABLE_EXCEPTIONS
   try {
 #endif
-    if (res_flag == 0) {
-      pmesh = new Mesh(pinput, mesh_flag);
-    } else {
-      pmesh = new Mesh(pinput, restartfile, mesh_flag);
-    }
+    pmesh = new Mesh(pinput, mesh_flag);
 #ifdef ENABLE_EXCEPTIONS
   }
   catch(std::bad_alloc& ba) {
     std::cout << "### FATAL ERROR in main" << std::endl
               << "memory allocation failed initializing class Mesh: "
               << ba.what() << std::endl;
-    if (res_flag == 1) restartfile.Close();
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
@@ -292,7 +269,6 @@ int main(int argc, char *argv[]) {
   }
   catch(std::exception const& ex) {
     std::cout << ex.what() << std::endl;  // prints diagnostic message
-    if (res_flag == 1) restartfile.Close();
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
@@ -300,24 +276,14 @@ int main(int argc, char *argv[]) {
   }
 #endif // ENABLE_EXCEPTIONS
 
-  // With current mesh time possibly read from restart file, correct next_time for outputs
-  if (res_flag == 1) {
-    // ensure that next_time  >= mesh_time - dt, in case input file or command line
-    // overrides it
-    pinput->ForwardNextTime(pmesh->time);
-  }
-
   // Dump input parameters and quit if code was run with -n option.
   if (narg_flag) {
     if (Globals::my_rank == 0) pinput->ParameterDump(std::cout);
-    if (res_flag == 1) restartfile.Close();
 #ifdef MPI_PARALLEL
     MPI_Finalize();
 #endif
     return(0);
   }
-
-  if (res_flag == 1) restartfile.Close(); // close the restart file here
 
   // Quit if -m was on cmdline.  This option builds and outputs mesh structure.
   if (mesh_flag > 0) {
@@ -387,12 +353,12 @@ int main(int argc, char *argv[]) {
   }
 
   //--- Step 6. --------------------------------------------------------------------------
-  // Set initial conditions by calling problem generator, or reading restart file
+  // Set initial conditions by calling problem generator
 
 #ifdef ENABLE_EXCEPTIONS
   try {
 #endif
-    pmesh->Initialize(res_flag, pinput);
+    pmesh->Initialize(0, pinput);
 #ifdef ENABLE_EXCEPTIONS
   }
   catch(std::bad_alloc& ba) {
@@ -421,7 +387,7 @@ int main(int argc, char *argv[]) {
 #endif
     ChangeRunDir(prundir);
     pouts = new Outputs(pmesh, pinput);
-    if (res_flag == 0) pouts->MakeOutputs(pmesh, pinput);
+    pouts->MakeOutputs(pmesh, pinput);
 #ifdef ENABLE_EXCEPTIONS
   }
   catch(std::bad_alloc& ba) {

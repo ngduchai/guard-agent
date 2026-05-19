@@ -89,7 +89,6 @@ class NRRadiation {
   Real nu_min, nu_max;
   // mininum and maximum frequencies, and number of frequency bins
   int nfreq; // number of frequency bins
-  int restart_from_gray; //
   Real fre_ratio; // ratio between neighboring frequency bins
   // frequency grid, center of each frequency bin
   AthenaArray<Real> nu_grid, nu_cen, delta_nu;

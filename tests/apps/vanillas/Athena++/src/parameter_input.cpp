@@ -181,9 +181,7 @@ void ParameterInput::LoadFromStream(std::istream &is) {
 
 //----------------------------------------------------------------------------------------
 //! \fn  void ParameterInput::LoadFromFile(IOWrapper &input)
-//! \brief Read the parameters from an input file or restarting file.
-//!
-//! Return the position at the end of the header, which is used in restarting
+//! \brief Read the parameters from an input file.
 
 void ParameterInput::LoadFromFile(IOWrapper &input) {
   std::stringstream par, msg;
@@ -856,7 +854,7 @@ void ParameterInput::ParameterDump(std::ostream& os) {
   }
 
   os<< "#------------------------- PAR_DUMP -------------------------" << std::endl;
-  os<< "<par_end>" << std::endl;    // finish with par-end (useful in restart files)
+  os<< "<par_end>" << std::endl;    // finish with par-end
 }
 
 //----------------------------------------------------------------------------------------

@@ -184,7 +184,7 @@ void TurbulenceDriver::Generate() {
 
   // For driven turbulence (turb_flag == 2 or 3),
   // Ornstein-Uhlenbeck (OU) process is implemented.
-  // fv_ are set initially (or in restart) and kept
+  // fv_ are set initially and kept
   // unless tcorr == 0
   if (!initialized_) {
     for (int nv=0; nv<3; nv++) {

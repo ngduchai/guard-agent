@@ -114,7 +114,7 @@ class MeshBlock {
   AthenaArray<Real> user_out_var;
   std::string *user_out_var_names_;
 
-  // user MeshBlock data that can be stored in restart files
+  // user MeshBlock data arrays
   AthenaArray<Real> *ruser_meshblock_data;
   AthenaArray<int> *iuser_meshblock_data;
 
@@ -138,8 +138,6 @@ class MeshBlock {
 
 
   // functions
-  std::size_t GetBlockSizeInBytes();
-  std::size_t GetBlockSizeInBytesGray();
   int GetNumberOfMeshBlockCells() {
     return block_size.nx1*block_size.nx2*block_size.nx3; }
   void SearchAndSetNeighbors(MeshBlockTree &tree, int *ranklist, int *nslist);
@@ -159,7 +157,7 @@ class MeshBlock {
 
   // inform MeshBlock which arrays contained in member Hydro, Field, Particles,
   // ... etc. classes are the "primary" representations of a quantity. when registered,
-  // that data are used for (1) load balancing (2) (future) dumping to restart file
+  // that data are used for load balancing.
   void RegisterMeshBlockData(AthenaArray<Real> &pvar_cc);
   void RegisterMeshBlockData(FaceField &pvar_fc);
 
@@ -235,9 +233,7 @@ class Mesh {
 #endif
 
  public:
-  // 2x function overloads of ctor: normal and restarted simulation
   explicit Mesh(ParameterInput *pin, int test_flag=0);
-  Mesh(ParameterInput *pin, IOWrapper &resfile, int test_flag=0);
   ~Mesh();
 
   // accessors

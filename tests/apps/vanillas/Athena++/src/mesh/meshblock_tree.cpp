@@ -133,7 +133,7 @@ void MeshBlockTree::AddMeshBlock(LogicalLocation rloc, int &nnew) {
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBlockTree::AddMeshBlockWithoutRefine(LogicalLocation rloc)
-//! \brief add a MeshBlock to the tree without refinement, used in restarting.
+//! \brief add a MeshBlock to the tree without refinement.
 //!        MeshBlockTree::CreateRootGrid must be called before this method
 void MeshBlockTree::AddMeshBlockWithoutRefine(LogicalLocation rloc) {
   if (loc_.level == rloc.level) // done
