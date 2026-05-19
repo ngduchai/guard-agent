@@ -205,39 +205,6 @@ std::ostream& operator << (
 }
 
 /*
- * *************************************************************************
- * Write/read for restart
- * *************************************************************************
- */
-void
-IntVector::putToRestart(
-   tbox::Database& restart_db,
-   const std::string& name) const
-{
-   std::shared_ptr<tbox::Database> intvec_db =
-      restart_db.putDatabase(name);
-   intvec_db->putInteger("d_num_blocks", static_cast<int>(d_num_blocks));
-   intvec_db->putIntegerVector("d_vector",
-                               d_vector);
-
-}
-
-void
-IntVector::getFromRestart(
-   tbox::Database& restart_db,
-   const std::string& name)
-{
-   std::shared_ptr<tbox::Database> intvec_db =
-      restart_db.getDatabase(name);
-
-   d_num_blocks = static_cast<size_t>(intvec_db->getInteger("d_num_blocks"));
-   d_vector = intvec_db->getIntegerVector("d_vector"); 
-
-   TBOX_ASSERT(d_num_blocks * d_dim.getValue() == d_vector.size());
-
-}
-
-/*
  *************************************************************************
  * Sort the values of the given IntVector from smallest to largest value.
  *************************************************************************

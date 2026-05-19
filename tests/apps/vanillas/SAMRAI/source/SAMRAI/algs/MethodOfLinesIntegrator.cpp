@@ -72,7 +72,6 @@ MethodOfLinesIntegrator::MethodOfLinesIntegrator(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
 
    getFromInput(input_db, is_from_restart);
@@ -654,22 +653,6 @@ MethodOfLinesIntegrator::applyGradientDetector(
 /*
  *************************************************************************
  *
- * Writes the class version number, order, and
- * alpha array to the restart database.
- *
- *************************************************************************
- */
-
-void
-MethodOfLinesIntegrator::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * Reads in paramemters from the database overriding any values
  * read in from the restart database. Also checks to make sure that
  * number of alpha values specified equals order of Runga-Kutta scheme.
@@ -726,23 +709,6 @@ MethodOfLinesIntegrator::getFromInput(
          d_order = static_cast<int>(d_alpha_1.size());
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Checks that class and restart file version numbers are equal.  If so,
- * reads in d_alpha_1, d_alpha_2, and d_beta from the database.  Also,
- * dooes a consistency check to make sure that the number of alpha values
- * specified equals the order of the Runga-Kutta scheme.
- *
- *************************************************************************
- */
-
-void
-MethodOfLinesIntegrator::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

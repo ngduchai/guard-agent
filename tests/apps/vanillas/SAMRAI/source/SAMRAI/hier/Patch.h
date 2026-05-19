@@ -452,47 +452,6 @@ public:
    }
 
    /*!
-    * @brief Get the patch data items from the restart database.
-    *
-    * Patch state is read in from the database and all patch
-    * data objects specified in the PatchDataRestartManager are created.
-    *
-    * The class version and restart file version must be equal.
-    *
-    * @par Assertions
-    * Checks that data retrieved from the database are of the type
-    * expected, and that the patch_number read in from the database
-    * matches the patch number assigned to this Patch.
-    * @note
-    * A warning will be printed to the log file if some patch data components
-    * that were requested through the PatchDataRestartManager are not found in
-    * the database.
-    *
-    * @param[in]  restart_db
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /*!
-    * @brief Write patch data and other patch information to the restart
-    * database.
-    *
-    * Class version number and the state of the patch object are written.
-    * Patch data objects specified in the PatchDataRestartManager are also
-    * written.
-    *
-    * @param[in]  restart_db
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * @brief Print a patch (for debugging).
     *
     * Depth is kept for consistency with other recursivePrint methods,

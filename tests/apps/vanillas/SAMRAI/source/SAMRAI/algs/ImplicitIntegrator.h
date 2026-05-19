@@ -276,15 +276,6 @@ public:
       std::ostream& os) const;
 
    /**
-    * Write out state of object to given restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * Returns the object name.
     */
    const std::string&
@@ -308,13 +299,6 @@ private:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /*
-    * Read object state from restart database and initialize class members.
-    * Check that class and restart version numbers are the same.
-    */
-   void
-   getFromRestart();
 
    /*
     * String used to identify specific class instantiation.

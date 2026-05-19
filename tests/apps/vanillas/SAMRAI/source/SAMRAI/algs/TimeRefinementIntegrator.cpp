@@ -159,7 +159,6 @@ TimeRefinementIntegrator::TimeRefinementIntegrator(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
    getFromInput(input_db, is_from_restart);
 
@@ -1564,21 +1563,6 @@ TimeRefinementIntegrator::printDataForLevel(
 /*
  *************************************************************************
  *
- * Write the class version number and data members to restart database object.
- *
- *************************************************************************
- */
-
-void
-TimeRefinementIntegrator::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * If simulation is not from restart, read in all data members from
  * the input database.  Otherwise, only override end_time, grow_dt
  * max_integrator_steps, and tag_buffer from the input database.
@@ -1728,28 +1712,6 @@ TimeRefinementIntegrator::getFromInput(
                d_barrier_and_time);
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Gets the database in the restart root database that corresponds to
- * the object name.  This method then checks to make sure that the class
- * version number and the restart version number are the same.  If they
- * are, then reads in the objects data members from the restart
- * database.
- *
- * Data read from restart database: d_start_time, d_end_time, d_grow_dt,
- * d_max_steps_level[0], d_regrid_interval, d_tag_buffer,
- * d_step_level[0], d_dt_max_level, d_dt_actual_level.
- *
- *************************************************************************
- */
-
-void
-TimeRefinementIntegrator::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

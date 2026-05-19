@@ -180,50 +180,6 @@ Patch::setTime(
 /*
  *************************************************************************
  *
- * Checks that class and restart file version numbers are equal.  If so,
- * reads in data from database and have each patch_data item read
- * itself in from the database
- *
- *************************************************************************
- */
-
-void
-Patch::getFromRestart(
-   const std::shared_ptr<tbox::Database>& restart_db)
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
- * Write out the class version number to restart database.  Then,
- * writes out data to restart database and have each patch_data item write
- * itself out to the restart database.  The following data
- * members are written out: d_box, d_patch_number,
- * d_patch_level_number,
- * d_patch_in_hierarchy, d_patch_data[].
- * The database key for all data members is identical to the
- * name of the data member except for the d_patch_data.  These have
- * keys of the form "variable##context" which is the form that they
- * are stored by the patch descriptor.  In addition a list of the
- * patch_data names ("patch_data_namelist") and the number of patch data
- * items saved ("namelist_count") are also written to the database.
- * The PatchDataRestartManager determines which patchdata are written to
- * the database.
- *
- *************************************************************************
- */
-void
-Patch::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * Print information about the patch.
  *
  *************************************************************************

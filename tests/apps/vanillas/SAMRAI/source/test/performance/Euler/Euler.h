@@ -65,10 +65,8 @@ public:
     * the state of the solution.  The constructor also registers this
     * object for restart with the restart manager using the object name.
     *
-    * After default values are set, this routine calls getFromRestart()
-    * if execution from a restart file is specified.  Finally,
     * getFromInput() is called to read values from the given input
-    * database (potentially overriding those found in the restart file).
+    * database.
     */
    Euler(
       const string& object_name,
@@ -300,16 +298,6 @@ public:
    //@}
 
    /**
-    * Write state of Euler object to the given database for restart.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * This routine is a concrete implementation of the virtual function
     * in the base class BoundaryUtilityStrategy.  It reads DIRICHLET
     * boundary state values from the given database with the
@@ -420,9 +408,6 @@ private:
    getFromInput(
       std::shared_ptr<tbox::Database> input_db,
       bool is_from_restart);
-   void
-   getFromRestart();
-
    void
    readStateDataEntry(
       std::shared_ptr<tbox::Database> db,

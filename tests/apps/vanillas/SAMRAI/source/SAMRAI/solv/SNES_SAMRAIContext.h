@@ -961,15 +961,6 @@ public:
       std::ostream& os = tbox::plog) const;
 
    /*!
-    * Write solver parameters to restart database matching object name.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * Print out all members of integrator instance to given output stream.
     */
    virtual void
@@ -1081,12 +1072,6 @@ private:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /*!
-    * Read solver parameters from restart database matching object name.
-    */
-   void
-   getFromRestart();
 
    /*!
     * Internal state parameters:

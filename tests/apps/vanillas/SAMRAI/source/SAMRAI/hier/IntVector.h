@@ -1109,26 +1109,6 @@ public:
    }
 
    /*!
-    * @brief Store the object state to the specified restart database
-    *        with the provided name.
-    *
-    */
-   void
-   putToRestart(
-      tbox::Database& restart_db,
-      const std::string& name) const;
-
-   /*!
-    * @brief Restores the object giving it the provided name and getting its
-    *        state from the specified restart database.
-    *
-    */
-   void
-   getFromRestart(
-      tbox::Database& restart_db,
-      const std::string& name);
-
-   /*!
     * @brief Return the dimension of this object.
     */
    const tbox::Dimension&

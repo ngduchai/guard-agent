@@ -1258,69 +1258,6 @@ void ArrayData<TYPE>::fillSequential(
 }
 
 
-/*
- *************************************************************************
- *
- * Checks to make sure that class and restart file version numbers are
- * equal.  If so, reads in d_depth, d_offset, and d_box from the
- * database.
- *
- *************************************************************************
- */
-
-template <class TYPE>
-void ArrayData<TYPE>::getFromRestart(
-    const std::shared_ptr<tbox::Database>& restart_db)
-{
-   TBOX_ASSERT(restart_db);
-
-   int ver = restart_db->getInteger("PDAT_ARRAYDATA_VERSION");
-   if (ver != PDAT_ARRAYDATA_VERSION) {
-      TBOX_ERROR("ArrayData::getFromRestart error...\n"
-                 << " : Restart file version different than class version" << std::endl);
-   }
-
-   d_depth = restart_db->getInteger("d_depth");
-   d_offset = restart_db->getInteger("d_offset");
-   d_box = restart_db->getDatabaseBox("d_box");
-
-#if defined(HAVE_UMPIRE)
-   std::vector<TYPE> temp;
-   restart_db->getVector("d_array", temp);
-   std::copy(temp.begin(), temp.end(), d_array);
-#else
-   restart_db->getVector("d_array", d_array);
-#endif
-}
-
-/*
- *************************************************************************
- *
- * Write out the class version number, d_depth, d_offset, d_box, and
- * d_array to the restart database.
- *
- *************************************************************************
- */
-
-template <class TYPE>
-void ArrayData<TYPE>::putToRestart(
-    const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("PDAT_ARRAYDATA_VERSION", PDAT_ARRAYDATA_VERSION);
-
-   restart_db->putInteger("d_depth", d_depth);
-   restart_db->putInteger("d_offset", static_cast<int>(d_offset));
-   restart_db->putDatabaseBox("d_box", d_box);
-
-#if defined(HAVE_UMPIRE)
-   restart_db->putVector("d_array", std::vector<TYPE>(d_array, d_array + d_depth * d_offset));
-#else
-   restart_db->putVector("d_array", d_array);
-#endif
-}
-
 template <class TYPE>
 const tbox::Dimension&
 ArrayData<TYPE>::getDim() const

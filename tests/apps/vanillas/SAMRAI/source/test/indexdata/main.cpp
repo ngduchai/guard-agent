@@ -77,17 +77,6 @@ public:
       NULL_USE(offset);
    }
 
-   void putToRestart(
-      std::shared_ptr<tbox::Database> dbase)
-   {
-      NULL_USE(dbase);
-   }
-   void getFromRestart(
-      std::shared_ptr<tbox::Database> dbase)
-   {
-      NULL_USE(dbase);
-   }
-
    double x[NN];
 };
 

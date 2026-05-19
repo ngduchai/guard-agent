@@ -67,10 +67,8 @@ public:
     * the state of the solution.  The constructor also registers this
     * object for restart with the restart manager using the object name.
     *
-    * After default values are set, this routine calls getFromRestart()
-    * if execution from a restart file is specified.  Finally,
     * getFromInput() is called to read values from the given input
-    * database (potentially overriding those found in the restart file).
+    * database.
     */
    LinAdv(
       const std::string& object_name,
@@ -303,16 +301,6 @@ public:
 
    //@}
 
-   /**
-    * Write state of LinAdv object to the given database for restart.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
 #ifdef HAVE_HDF5
    /**
     * Register a VisIt data writer so this class will write
@@ -356,9 +344,6 @@ private:
    getFromInput(
       std::shared_ptr<tbox::Database> input_db,
       bool is_from_restart);
-
-   void
-   getFromRestart();
 
    void
    readStateDataEntry(

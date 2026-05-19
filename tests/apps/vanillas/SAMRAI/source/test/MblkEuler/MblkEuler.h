@@ -200,16 +200,6 @@ public:
    setVolumeOnPatch(
       const hier::Patch& patch);
 
-   /**
-    * Write state of MblkEuler object to the given database for restart.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
    hier::IntVector
    getMultiblockRefineOpStencilWidth() const;
    hier::IntVector
@@ -244,9 +234,6 @@ private:
    getFromInput(
       std::shared_ptr<tbox::Database> input_db,
       bool is_from_restart);
-
-   void
-   getFromRestart();
 
    /*
     * Private member function to check correctness of boundary data.

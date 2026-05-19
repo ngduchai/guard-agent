@@ -2708,20 +2708,6 @@ void ModifiedBratuProblem::getFromInput(
 /*
  *************************************************************************
  *
- * Put class version number and data members in restart database.
- *
- *************************************************************************
- */
-
-void ModifiedBratuProblem::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * Print all class data members to given output stream.
  *
  *************************************************************************

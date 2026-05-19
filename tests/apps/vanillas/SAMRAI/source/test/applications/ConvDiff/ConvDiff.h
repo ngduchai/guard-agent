@@ -65,13 +65,10 @@ public:
     * The constructor for ConvDiff sets default model parameters to
     * initialize the object. It creates variables that represent
     * the state of the solution, and initializes pertinent private
-    * data members.  It also registers the object with the
-    * tbox::RestartManager.
+    * data members.
     *
     * After setting the default values, the routine calls
-    * calls getFromRestart() if this is a restart case.  It next
-    * calls getfromInput() to read values from the input database,
-    * potentially overriding those in the restart file.
+    * getfromInput() to read values from the input database.
     */
    ConvDiff(
       const std::string& object_name,
@@ -245,16 +242,6 @@ public:
    //@}
 
    /**
-    * Writes state of ConvDiff object to the specified restart database.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * This routine is a concrete implementation of the virtual function
     * in the base class BoundaryUtilityStrategy.  It reads DIRICHLET
     * boundary state values from the given database with the
@@ -306,9 +293,6 @@ private:
    getFromInput(
       std::shared_ptr<tbox::Database> input_db,
       bool is_from_restart);
-
-   virtual void
-   getFromRestart();
 
    void
    readStateDataEntry(

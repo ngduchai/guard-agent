@@ -391,15 +391,6 @@ public:
    //@}
 
    /**
-    * Write data members to given database for restart.
-    *
-    * Inherited from tbox::Serializable.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * Write class data to given output stream.
     */
    void

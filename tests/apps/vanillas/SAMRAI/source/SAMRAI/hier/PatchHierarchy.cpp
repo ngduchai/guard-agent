@@ -92,7 +92,6 @@ PatchHierarchy::PatchHierarchy(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
    getFromInput(input_db, is_from_restart);
 
@@ -1036,28 +1035,6 @@ PatchHierarchy::logMetadataStatistics(
                  << "\tL" << ln - 1 << "->L" << ln
                  << " Connector statistics:\n" << from_crse.formatStatistics("\t\t");
    }
-}
-
-/*
- *************************************************************************
- *
- * Writes the class version number and the number of levels in the
- * hierarchy to the restart database.  Each patch_level write itself out
- * to the restart database.  The database keys for the patch levels are
- * given by "level#" where # is the level number for the patch_level.
- * The patchdata that are written to the database are determined by
- * which those bits in the VariableDatabase restart table.
- *
- * Asserts that the restart_db pointer passed in is not NULL.
- *
- *************************************************************************
- */
-
-void
-PatchHierarchy::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 #ifdef SAMRAI_HAVE_CONDUIT
@@ -2183,24 +2160,6 @@ PatchHierarchy::makeAdjacencySets(
          }
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Gets the database in the root database that corresponds to the object
- * name.  This method then checks the class version against restart
- * file version.  If they match, it creates each hierarchy level and
- * reads in the level data.   The number of levels read from restart is
- * the minimum of the argument max levels and the number of levels in
- * the restart file.
- *
- *************************************************************************
- */
-void
-PatchHierarchy::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 void

@@ -103,7 +103,6 @@ Connector::Connector(
    d_transpose(0),
    d_owns_transpose(false)
 {
-   getFromRestart(restart_db);
 }
 
 /*

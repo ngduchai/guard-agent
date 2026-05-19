@@ -126,15 +126,6 @@ public:
    setIterationNumber(
       const int iter_num);
 
-   /**
-    * Writes out d_max_timesteps, d_start_time, d_end_time,
-    * d_regrid_step, d_tag_buffer, d_loop_time, d_iteration_number
-    * to the restart database.
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
 private:
    /**
     * Reads in max_timesteps, start_time, end_time,
@@ -146,14 +137,6 @@ private:
    getFromInput(
       std::shared_ptr<tbox::Database> input_db,
       bool is_from_restart);
-
-   /**
-    * Reads in d_max_timesteps, d_start_time, d_end_time,
-    * d_regrid_step, d_tag_buffer, d_loop_time, d_iteration_number
-    * from the specified restart database.
-    */
-   virtual void
-   getFromRestart();
 
    int d_max_timesteps;
    double d_start_time;

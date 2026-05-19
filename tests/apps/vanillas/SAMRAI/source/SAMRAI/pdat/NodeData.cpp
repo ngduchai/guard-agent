@@ -617,61 +617,6 @@ NodeData<TYPE>::print(
    }
 }
 
-/*
- *************************************************************************
- *
- * Checks to make sure that the class version and restart file
- * version are equal.  If so, reads in d_depth and has d_data
- * retrieve its own data from the restart database.
- *
- *************************************************************************
- */
-
-template<class TYPE>
-void
-NodeData<TYPE>::getFromRestart(
-   const std::shared_ptr<tbox::Database>& restart_db)
-{
-   TBOX_ASSERT(restart_db);
-
-   hier::PatchData::getFromRestart(restart_db);
-
-   int ver = restart_db->getInteger("PDAT_NODEDATA_VERSION");
-   if (ver != PDAT_NODEDATA_VERSION) {
-      TBOX_ERROR("NodeData<TYPE>::getFromRestart error...\n"
-         << " : Restart file version different than class version" << std::endl);
-   }
-
-   d_depth = restart_db->getInteger("d_depth");
-
-   d_data->getFromRestart(restart_db->getDatabase("d_data"));
-}
-
-/*
- *************************************************************************
- *
- * Writes out the class version number and d_depth, Then has d_data
- * write its own data to the restart database.
- *
- *************************************************************************
- */
-
-template<class TYPE>
-void
-NodeData<TYPE>::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   TBOX_ASSERT(restart_db);
-
-   hier::PatchData::putToRestart(restart_db);
-
-   restart_db->putInteger("PDAT_NODEDATA_VERSION", PDAT_NODEDATA_VERSION);
-
-   restart_db->putInteger("d_depth", d_depth);
-
-   d_data->putToRestart(restart_db->putDatabase("d_data"));
-}
-
 #if defined(HAVE_RAJA)
 template<int DIM, typename TYPE, typename... Args>
 typename NodeData<TYPE>::template View<DIM> get_view(NodeData<TYPE>& data, Args&&... args)

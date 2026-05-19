@@ -483,15 +483,6 @@ public:
    printClassData(
       std::ostream& os) const;
 
-   /*!
-    * @brief Write object state out to the given restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
    /*
     * @brief Write out statistics recorded on numbers of cells and patches generated.
     */
@@ -530,24 +521,6 @@ private:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /*!
-    * @brief Read object state from the restart file and initialize
-    * class data members.
-    *
-    * The database from which the restart data is read is determined
-    * by the object_name specified in the constructor.
-    *
-    * Unrecoverable Errors:
-    *
-    *   -The database corresponding to object_name is not found
-    *    in the restart file.
-    *
-    *   -The class version number and restart version number do not
-    *    match.
-    */
-   void
-   getFromRestart();
 
    /*!
     * @brief Recursively regrid the hierarchy level and all finer

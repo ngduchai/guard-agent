@@ -629,25 +629,6 @@ public:
       const hier::Box& box,
       const unsigned int d = 0);
 
-   /*!
-    * Check to make sure that the class version and restart file
-    * version are equal.  If so, read in data from restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /*!
-    * Write out array data object data to restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
    /**
     * Return the dimension of this object.
     */

@@ -119,29 +119,6 @@ void SampleIndexData::unpackStream(
 }
 
 /*
- *************************************************************************
- *
- * The putToRestart() and getFromRestart() methods
- * are required to template SampleIndexData as IndexData type - i.e.
- * IndexData<SampleIndexData>.  They are used to write/read SampleIndexData,
- * data to/from the restart database.
- *
- *************************************************************************
- */
-
-void SampleIndexData::putToRestart(
-   std::shared_ptr<tbox::Database>& restart_db) const
-{
-   NULL_USE(restart_db);
-}
-
-void SampleIndexData::getFromRestart(
-   std::shared_ptr<tbox::Database>& restart_db)
-{
-   NULL_USE(restart_db);
-}
-
-/*
  *****************************************************************
  *
  *  Templates used for SampleIndexData

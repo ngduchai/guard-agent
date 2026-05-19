@@ -1227,18 +1227,6 @@ private:
       std::ostream& stream) const;
 
    /*!
-    * @brief Writes the state of the BaseGridGeometry object to the
-    * restart database.
-    *
-    * @param[in,out]  restart_db The restart database to write/serialize to.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * @brief Class NeighborIterator iterates over the Neighbors of a block.
     *
     * The iterator points to a mutable Neighbor.
@@ -1873,26 +1861,6 @@ private:
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart,
       bool allow_multiblock);
-
-   /*!
-    * @brief Read object state from the restart file and initialize class data
-    * members.
-    *
-    * The database from which the restart data is read is
-    * determined by the object_name specified in the constructor.
-    *
-    * @pre tbox::RestartManager::getManager()->getRootDatabase()->isDatabase(getObjectName()
-    *
-    * Unrecoverable Errors:
-    *
-    *    -The database corresponding to object_name is not found
-    *     in the restart file.
-    *
-    *    -The class version number and restart version number do not
-    *     match.
-    */
-   void
-   getFromRestart();
 
    /*!
     * @brief Initialize static objects and register shutdown routine.

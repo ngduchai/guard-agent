@@ -458,16 +458,6 @@ public:
       std::vector<int>& counters);
 
    /**
-    * Writes state of CVODEModel object to the specified restart database.
-    *
-    * This routine is a concrete implementation of the function
-    * declared in the tbox::Serializable abstract base class.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<Database>& restart_db) const;
-
-   /**
     * This routine is a concrete implementation of the virtual function
     * in the base class BoundaryUtilityStrategy.  It reads DIRICHLET
     * and NEUMANN boundary state values from the given database with the
@@ -508,9 +498,6 @@ private:
    getFromInput(
       std::shared_ptr<Database> input_db,
       bool is_from_restart);
-
-   virtual void
-   getFromRestart();
 
    void
    readStateDataEntry(

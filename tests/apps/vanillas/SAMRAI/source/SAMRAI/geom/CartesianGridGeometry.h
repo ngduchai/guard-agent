@@ -282,16 +282,6 @@ public:
    printClassData(
       std::ostream& os) const;
 
-   /**
-    * Writes the state of the CartesianGridGeometry object to the
-    * restart database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
 protected:
    /*!
     * @brief Build operators appropriate for a CartesianGridGeometry.
@@ -316,23 +306,6 @@ private:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /*
-    * Read object state from the restart file and initialize class data
-    * members.  The database from which the restart data is read is
-    * determined by the object_name specified in the constructor.
-    *
-    * Unrecoverable Errors:
-    *
-    *    -The database corresponding to object_name is not found
-    *     in the restart file.
-    *
-    *    -The class version number and restart version number do not
-    *     match.
-    *
-    */
-   void
-   getFromRestart();
 
    double d_dx[SAMRAI::MAX_DIM_VAL];     // mesh increments for level 0.
    double d_x_lo[SAMRAI::MAX_DIM_VAL];   // spatial coordinates of lower corner

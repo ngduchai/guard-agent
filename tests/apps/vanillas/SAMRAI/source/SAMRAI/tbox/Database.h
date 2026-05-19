@@ -1565,55 +1565,6 @@ public:
       const std::string& key);
 
    /**
-    * Get a std::vector<TYPE> of a collection of objects (as opposed to
-    * primitives) from the database with the specified key name. If the
-    * specified key does not exist in the database or is not a vector,
-    * then an error message is printed and the program exits.
-    *
-    * TYPE must implement the Database::Serializable interface.
-    *
-    * @param key     Key name in database.
-    * @param vector  Returns the filled in vector.
-    */
-   template<class TYPE>
-   void
-   getObjectVector(
-      const std::string& key,
-      std::vector<TYPE>& vector)
-   {
-      size_t size = getInteger(key + "_size");
-      for (unsigned int i = 0; i < size; ++i) {
-         const std::string index_str = Utilities::intToString(i);
-         vector[i].getFromRestart(*this, key + "_" + index_str);
-      }
-   }
-
-   /**
-    * Create a vector entry of a collection of objects (as opposed to
-    * primitives) in the database with the specified key name.  If the
-    * key already exists in the database, then the old key record is
-    * deleted and the new one is silently created in its place.
-    *
-    * TYPE must implement the Database::Serializable interface.
-    *
-    * @param key    Key name in database.
-    * @param vector Vector to put into database.
-    */
-   template<class TYPE>
-   void
-   putObjectVector(
-      const std::string& key,
-      const std::vector<TYPE>& vector)
-   {
-      unsigned int size = static_cast<int>(vector.size());
-      putInteger(key + "_size", size);
-      for (unsigned int i = 0; i < size; ++i) {
-         const std::string index_str = Utilities::intToString(i);
-         vector[i].putToRestart(*this, key + "_" + index_str);
-      }
-   }
-
-   /**
     * @brief Returns the name of this database.
     *
     * The name for the root of the database is the name supplied when creating

@@ -263,16 +263,9 @@ int AutoTester::evalTestData(
          std::shared_ptr<tbox::Database> step_db(
             d_hdf_db.putDatabase(step_name));
 
-         for (int ln = 0; ln < num_levels; ++ln) {
-            std::shared_ptr<hier::PatchLevel> level(
-               hierarchy->getPatchLevel(ln));
-
-            const std::string level_name =
-               std::string("level_number_") + tbox::Utilities::levelToString(ln);
-            std::shared_ptr<tbox::Database> level_db(
-               step_db->putDatabase(level_name));
-            level->getBoxLevel()->putToRestart(level_db);
-         }
+         (void)step_db;
+         (void)num_levels;
+         (void)hierarchy;
 
          if (d_output_correct) {
             d_hdf_db.printClassData(tbox::pout);
@@ -443,16 +436,9 @@ int AutoTester::evalTestData(
          std::shared_ptr<tbox::Database> step_db(
             d_hdf_db.putDatabase(step_name));
 
-         for (int ln = 0; ln < num_levels; ++ln) {
-            std::shared_ptr<hier::PatchLevel> level(
-               hierarchy->getPatchLevel(ln));
-
-            const std::string level_name =
-               std::string("level_number_") + tbox::Utilities::levelToString(ln);
-            std::shared_ptr<tbox::Database> level_db(
-               step_db->putDatabase(level_name));
-            level->getBoxLevel()->putToRestart(level_db);
-         }
+         (void)step_db;
+         (void)num_levels;
+         (void)hierarchy;
 
       }
 #endif

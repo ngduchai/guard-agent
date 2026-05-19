@@ -700,62 +700,6 @@ CellData<TYPE>::print(
    }
 }
 
-/*
- *************************************************************************
- *
- * Checks that class version and restart file version are equal.  If so,
- * reads in the d_depth data member to the restart database.  Then tells
- * d_data to read itself in from the database.
- *
- *************************************************************************
- */
-
-template<class TYPE>
-void
-CellData<TYPE>::getFromRestart(
-   const std::shared_ptr<tbox::Database>& restart_db)
-{
-
-   TBOX_ASSERT(restart_db);
-
-   hier::PatchData::getFromRestart(restart_db);
-
-   int ver = restart_db->getInteger("PDAT_CELLDATA_VERSION");
-   if (ver != PDAT_CELLDATA_VERSION) {
-      TBOX_ERROR("CellData<TYPE>::getFromRestart error...\n"
-         << "Restart file version different than class version" << std::endl);
-   }
-
-   d_depth = restart_db->getInteger("d_depth");
-
-   d_data->getFromRestart(restart_db->getDatabase("d_data"));
-}
-
-/*
- *************************************************************************
- *
- * Write out the class version number, d_depth data member to the
- * restart database.  Then tells d_data to write itself to the database.
- *
- *************************************************************************
- */
-
-template<class TYPE>
-void
-CellData<TYPE>::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   TBOX_ASSERT(restart_db);
-
-   hier::PatchData::putToRestart(restart_db);
-
-   restart_db->putInteger("PDAT_CELLDATA_VERSION", PDAT_CELLDATA_VERSION);
-
-   restart_db->putInteger("d_depth", d_depth);
-
-   d_data->putToRestart(restart_db->putDatabase("d_data"));
-}
-
 #if defined(HAVE_RAJA)
 template<int DIM, typename TYPE, typename... Args>
 typename CellData<TYPE>::template View<DIM> get_view(CellData<TYPE>& data, Args&&... args)

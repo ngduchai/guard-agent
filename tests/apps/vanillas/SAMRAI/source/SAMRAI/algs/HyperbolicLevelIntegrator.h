@@ -660,15 +660,6 @@ public:
       std::ostream& os) const;
 
    /**
-    * Write out object state to the given restart database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * Return pointer to "current" variable context used by integrator.
     * Current data corresponds to state data at the beginning of a
     * timestep, or when a new level is initialized.
@@ -768,32 +759,6 @@ protected:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /**
-    * Read object state from the restart file and initialize class
-    * data members.  The database from which the restart data is read is
-    * determined by the object_name specified in the constructor.
-    *
-    * Unrecoverable Errors:
-    *
-    *
-    *
-    *
-    *    -
-    *        The database corresponding to object_name is not found
-    *        in the restart file.
-    *
-    *    -
-    *        The class version number and restart version number do not
-    *        match.
-    *
-    *
-    *
-    *
-    *
-    */
-   virtual void
-   getFromRestart();
 
    /*
     * Pre-process flux storage before advancing solution on level from

@@ -540,26 +540,6 @@ public:
       int prec = 12) const;
 
    /*!
-    * Check that class version and restart file version are equal.  If so,
-    * read data members from the restart database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /*!
-    * Write out the class version number and other data members to
-    * the restart database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * The edge iterator iterates over the elements on one axis of an edge
     * centered box geometry.  This typedef is a convenience for
     * using the EdgeIterator class.

@@ -1086,41 +1086,6 @@ public:
    }
 
    /*!
-    * @brief Use the PatchLevel restart database to set the state of the
-    * PatchLevel and to create all patches on the local processor.
-    *
-    * @par Assertions
-    * Assertions will check that database is a non-null std::shared_ptr,
-    * that the data being retrieved from the database are of
-    * the type expected.  Also checked is the number of patches is positive,
-    * and the number of patches and size of processor mapping array are the
-    * same, and that the number of patches and the number of boxes on the
-    * level are equal.
-    *
-    * @param[in,out] restart_db
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /*!
-    * @brief Write data to the restart database.
-    *
-    * Writes the data from the PatchLevel to the restart database.
-    * Also tells all local patches to write out their state to
-    * the restart database.
-    *
-    * @param[in,out]  restart_db
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * @brief Print a patch level to varying details.
     *
     * If depth>0, print function will be called for each patch in the level.

@@ -1658,26 +1658,6 @@ private:
     * @name IO--these are only called from the mblktree test.
     */
 
-   /*!
-    * @brief Writes the neighborhood information to the supplied restart
-    * database.
-    *
-    * @param restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
-    * @brief Constructs the neighborhoods from the supplied restart
-    * database.
-    *
-    * @param restart_db
-    */
-   void
-   getFromRestart(
-      tbox::Database& restart_db);
-
    //@}
 };
 

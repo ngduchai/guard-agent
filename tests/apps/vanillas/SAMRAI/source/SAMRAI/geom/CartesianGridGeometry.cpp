@@ -117,7 +117,6 @@ CartesianGridGeometry::CartesianGridGeometry(
 
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
 
    getFromInput(input_db, is_from_restart);
@@ -544,21 +543,6 @@ CartesianGridGeometry::printClassData(
 /*
  *************************************************************************
  *
- * Write class version number and object state to restart database.
- *
- *************************************************************************
- */
-
-void
-CartesianGridGeometry::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * Data is read from input only if the simulation is not from restart.
  * Otherwise, all values specifed in the input database are ignored.
  * In this method data from the database are read to local
@@ -606,23 +590,6 @@ CartesianGridGeometry::getFromInput(
             << "an input database which is not allowed." << std::endl);
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Checks to see if the version number for the class is the same as
- * as the version number of the restart file.
- * If they are equal, then the data from the database are read to local
- * variables and the setGeometryData() method is called to
- * initialize the data members.
- *
- *************************************************************************
- */
-void
-CartesianGridGeometry::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 }

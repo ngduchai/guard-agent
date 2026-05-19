@@ -76,10 +76,6 @@ class IndexIterator;
  *    - \b - Unpack data from message stream; i.e.,
  *             unpackStream(MessageStream\& stream,
  *             const hier::IntVector\& offset)
- *    - \b - Write to restart;
- *             putToRestart(std::shared_ptr<tbox::Database>\& restart_db)
- *    - \b - Retrieve from restart;
- *             getFromRestart(std::shared_ptr<tbox::Database>\& restart_db)
  *
  * The BOX_GEOMETRY template parameter defines the geometry.   BOX_GEOMETRY must
  * have a nested class name Overlap that implements he following methods:
@@ -436,25 +432,6 @@ public:
    TYPE *
    getItem(
       const hier::Index& index) const;
-
-   /**
-    * Check to make sure that the class version number is the same
-    * as the restart file version number.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /**
-    * Write out the class version number to the restart database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
 
 private:
    friend class IndexIterator<TYPE, BOX_GEOMETRY>;

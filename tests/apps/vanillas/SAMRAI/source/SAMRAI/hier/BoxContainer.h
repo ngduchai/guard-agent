@@ -1907,20 +1907,6 @@ private:
    //@{ @name I/O
 
    /*!
-    * @brief Write the BoxContainer to a restart database.
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
-    * @brief Read the BoxContainer from a restart database.
-    */
-   void
-   getFromRestart(
-      tbox::Database& restart_db);
-
-   /*!
     * @brief Conversion from BoxContainer to std::vector<tbox::DatabaseBox>.
     */
    operator std::vector<tbox::DatabaseBox>() const;

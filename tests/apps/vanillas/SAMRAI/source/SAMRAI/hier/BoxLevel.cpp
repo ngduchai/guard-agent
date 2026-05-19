@@ -84,7 +84,6 @@ BoxLevel::BoxLevel(
    d_grid_geometry(),
    d_locked(false)
 {
-   getFromRestart(restart_db, grid_geom);
 }
 
 BoxLevel::BoxLevel(
@@ -1505,93 +1504,6 @@ BoxLevel::getGlobalBoxes(BoxContainer& global_boxes) const
         itr != d_global_boxes.end(); ++itr) {
       global_boxes.pushBack(*itr);
    }
-}
-
-/*
- ***********************************************************************
- * Write the BoxLevel to a restart database.
- *
- * Write only local parts.
- ***********************************************************************
- */
-
-void
-BoxLevel::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   // This appears to be used in the RedistributedRestartUtility.
-   restart_db->putBool("d_is_mapped_box_level", true);
-
-   restart_db->putInteger(
-      "HIER_MAPPED_BOX_LEVEL_VERSION", HIER_BOX_LEVEL_VERSION);
-   restart_db->putInteger("d_nproc", d_mpi.getSize());
-   restart_db->putInteger("d_rank", d_mpi.getRank());
-   restart_db->putInteger("dim", d_ratio.getDim().getValue());
-   const size_t nblocks = d_grid_geometry->getNumberBlocks();
-   for (BlockId::block_t b =0; b < nblocks; ++b) {
-      std::string ratio_name = "d_ratio_" +
-         tbox::Utilities::intToString(static_cast<int>(b)); 
-      std::vector<int> tmp_ratio(d_ratio.getDim().getValue());
-      for (unsigned int d = 0; d < d_ratio.getDim().getValue(); ++d) {
-         tmp_ratio[d] = d_ratio(b,d);
-      }
-      restart_db->putIntegerArray(ratio_name,
-         &(tmp_ratio[0]),
-         d_ratio.getDim().getValue());
-   }
-   getBoxes().putToRestart(restart_db->putDatabase("mapped_boxes"));
-}
-
-/*
- ***********************************************************************
- * Read the BoxLevel from a database.
- ***********************************************************************
- */
-
-void
-BoxLevel::getFromRestart(
-   tbox::Database& restart_db,
-   const std::shared_ptr<const BaseGridGeometry>& grid_geom)
-{
-   TBOX_ASSERT(restart_db.isInteger("dim"));
-   const tbox::Dimension dim(static_cast<unsigned short>(
-                                restart_db.getInteger("dim")));
-   TBOX_ASSERT(getDim() == dim);
-
-   const size_t nblocks = grid_geom->getNumberBlocks();
-
-   IntVector ratio(nblocks, dim);
-   for (BlockId::block_t b = 0; b < nblocks; ++b) {
-      std::string ratio_name = "d_ratio_" +
-         tbox::Utilities::intToString(static_cast<int>(b));
-      std::vector<int> tmp_ratio(dim.getValue());
-      restart_db.getIntegerArray(ratio_name, &tmp_ratio[0], dim.getValue());
-      for (int d = 0; d < dim.getValue(); ++d) {
-         ratio(b,d) = tmp_ratio[d];
-      }
-   }
- 
-#ifdef DEBUG_CHECK_ASSERTIONS
-   const int version = restart_db.getInteger("HIER_MAPPED_BOX_LEVEL_VERSION");
-   const int nproc = restart_db.getInteger("d_nproc");
-   const int rank = restart_db.getInteger("d_rank");
-#endif
-   TBOX_ASSERT(ratio >= IntVector::getOne(dim));
-   TBOX_ASSERT(version <= HIER_BOX_LEVEL_VERSION);
-
-   initialize(BoxContainer(), ratio, grid_geom);
-
-   /*
-    * Failing these asserts means that we don't have a compatible
-    * restart database for the number of processors or we are reading another
-    * processor's data.
-    */
-   TBOX_ASSERT(nproc == d_mpi.getSize());
-   TBOX_ASSERT(rank == d_mpi.getRank());
-
-   d_boxes.getFromRestart(*restart_db.getDatabase("mapped_boxes"));
-   computeLocalRedundantData();
-
 }
 
 /*

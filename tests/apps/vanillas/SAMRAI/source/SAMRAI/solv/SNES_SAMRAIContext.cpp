@@ -110,7 +110,6 @@ SNES_SAMRAIContext::SNES_SAMRAIContext(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
    getFromInput(input_db, is_from_restart);
 
@@ -721,27 +720,6 @@ SNES_SAMRAIContext::getFromInput(
       }
    }
 
-}
-
-/*
- *************************************************************************
- *
- * Routines to read/write from/to restart/database.
- *
- *************************************************************************
- */
-
-void
-SNES_SAMRAIContext::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-void
-SNES_SAMRAIContext::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

@@ -279,33 +279,6 @@ public:
       const hier::BoxOverlap& overlap);
 
    /*!
-    * @brief Obtain the specific information for this SparseData object
-    *        from the restart Database.
-    *
-    * The parent PatchData part of this class will call this function
-    * to get the parts of it specified within this concrete child.  It
-    * will check the version number of this instance to ensure that
-    * it is valid.
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /*!
-    * @brief Write out the specialized data to the restart Database.
-    *
-    * A version number is written out as well, in order to maintain
-    * validity across runs.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /*!
     * @brief Returns the attribute ID associated with the named
     *        attribute.
     *

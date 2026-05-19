@@ -987,25 +987,6 @@ public:
       bool log_fine_connector,
       bool log_coarse_connector) const;
 
-   /*!
-    * @brief Writes the state of the PatchHierarchy object and the PatchLevels
-    * it contains to the restart database.
-    *
-    * @note
-    * Only those patch data which have been registered for restart with
-    * the VariableDatabase will be written to the database.
-    * This method implements the pure virtual method in tbox::Serializable
-    * class which is used by the tbox::RestartManager for writing the
-    * PatchHierarchy to a restart file.
-    *
-    * @param[out]  restart_db
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
 #ifdef SAMRAI_HAVE_CONDUIT
    /*!
     * @brief Make a database holding a description of the hierarchy in the
@@ -1202,21 +1183,6 @@ private:
    getFromInput(
       const std::shared_ptr<tbox::Database>& input_db,
       bool is_from_restart);
-
-   /*!
-    * @brief Read in the entire hierarchy from the restart file.
-    *
-    * The database from which the restart data is read is determined by the
-    * object_name specified in the constructor.
-    *
-    * @par Assertions
-    * When assertion checking is active, @c d_max_levels must be
-    * greater than zero.  An unrecoverable assertion will result if the
-    * database cannot be found in the restart file or the data in the
-    * restart file is erroneous.
-    */
-   void
-   getFromRestart();
 
    /*!
     * @brief Free static timers.

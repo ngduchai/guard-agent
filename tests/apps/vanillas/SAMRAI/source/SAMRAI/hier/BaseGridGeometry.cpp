@@ -83,7 +83,6 @@ BaseGridGeometry::BaseGridGeometry(
 
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
 
    getFromInput(input_db, is_from_restart, allow_multiblock);
@@ -587,21 +586,6 @@ BaseGridGeometry::setGeometryDataOnPatch(
 
 /*
  *************************************************************************
- * Checks to see if the version number for the class is the same as
- * as the version number of the restart file.
- * If they are equal, then the data from the database are read to local
- * variables and the setPhysicalDomain() method is called.
- *
- *************************************************************************
- */
-void
-BaseGridGeometry::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
  *
  * Data is read from input only if the simulation is not from restart.
  * Otherwise, all values specifed in the input database are ignored.
@@ -722,21 +706,6 @@ BaseGridGeometry::getFromInput(
             << "an input database which is not allowed." << std::endl);
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Writes version number and data members for the class to restart database.
- *
- *************************************************************************
- */
-
-void
-BaseGridGeometry::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

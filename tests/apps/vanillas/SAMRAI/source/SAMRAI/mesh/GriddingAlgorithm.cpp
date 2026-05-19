@@ -225,7 +225,6 @@ GriddingAlgorithm::GriddingAlgorithm(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
 
    getFromInput(input_db, is_from_restart);
@@ -4859,21 +4858,6 @@ GriddingAlgorithm::printClassData(
 /*
  *************************************************************************
  *
- * Write out class version number and data members to restart database.
- *
- *************************************************************************
- */
-
-void
-GriddingAlgorithm::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * If simulation is not from restart, read data from input database.
  * Otherwise, override data members initialized from restart with
  * values in the input database.
@@ -5046,24 +5030,6 @@ GriddingAlgorithm::getFromInput(
             input_db->getBoolWithDefault("save_tag_data", false);
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Gets the database in the root database that corresponds to the object
- * name.  This method then checks to make sure that the version number
- * of the class is that same as the version number in the restart file.
- * If these values are equal, the data members are read in from the
- * restart database.
- *
- *************************************************************************
- */
-
-void
-GriddingAlgorithm::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

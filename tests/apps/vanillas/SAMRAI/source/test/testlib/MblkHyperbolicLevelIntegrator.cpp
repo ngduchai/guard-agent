@@ -217,7 +217,6 @@ MblkHyperbolicLevelIntegrator::MblkHyperbolicLevelIntegrator(
 
    bool from_restart = false;
    if (from_restart) {
-      getFromRestart();
    }
    getFromInput(input_db, from_restart);
 }
@@ -2321,21 +2320,6 @@ void MblkHyperbolicLevelIntegrator::printClassData(
 /*
  *************************************************************************
  *
- * Writes out the class version number, d_cfl, d_cfl_init,
- * d_lag_dt_computation, and d_use_ghosts_for_dt to the restart database.
- *
- *************************************************************************
- */
-
-void MblkHyperbolicLevelIntegrator::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
  * Reads in cfl, cfl_init, lag_dt_computation, and
  * use_ghosts_to_compute_dt from the input database.
  * Note all restart values are overriden with values from the input
@@ -2397,25 +2381,6 @@ void MblkHyperbolicLevelIntegrator::getFromInput(
    }
 
    d_do_coarsening = input_db->getBoolWithDefault("do_coarsening", true);
-}
-
-/*
- *************************************************************************
- *
- * First, gets the database corresponding to the object_name from the
- * restart file.   If this database exists, this method checks to make
- * sure that the version number of the class matches the version number
- * of the restart file.  If they match, then d_cfl, d_cfl_init,
- * d_lag_dt_computation, and d_use_ghosts_to_compute_dt are read from
- * restart database.
- * Note all restart values can be overriden with values from the input
- * database.
- *
- *************************************************************************
- */
-void MblkHyperbolicLevelIntegrator::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

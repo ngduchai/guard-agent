@@ -62,7 +62,6 @@ ImplicitIntegrator::ImplicitIntegrator(
 
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
 
    getFromInput(input_db, is_from_restart);
@@ -320,37 +319,6 @@ ImplicitIntegrator::getFromInput(
          }
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Write out class version number and data members to restart database.
- *
- *************************************************************************
- */
-
-void
-ImplicitIntegrator::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
- * Check to make sure that the version number of the class is that same
- * as the version number in the restart file.  If these values are equal
- * then read values for data members from the restart file.
- *
- *************************************************************************
- */
-
-void
-ImplicitIntegrator::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

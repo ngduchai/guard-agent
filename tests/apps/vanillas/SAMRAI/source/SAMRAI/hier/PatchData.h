@@ -252,27 +252,6 @@ public:
       const BoxOverlap& overlap);
 
    /**
-    * Checks that class version and restart file version are equal.  If so,
-    * reads in the data members common to all patch data types from restart
-    * database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   getFromRestart(
-      const std::shared_ptr<tbox::Database>& restart_db);
-
-   /**
-    * Writes out the class version number to the restart database.  Then,
-    * writes the data members common to all patch data types to database.
-    *
-    * @pre restart_db
-    */
-   virtual void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * @brief Return the dimension of this object.
     */
    const tbox::Dimension&

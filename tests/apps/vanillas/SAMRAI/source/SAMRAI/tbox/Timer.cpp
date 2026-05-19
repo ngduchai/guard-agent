@@ -287,54 +287,5 @@ Timer::computeMaxWallclock()
 #endif // ENABLE_SAMRAI_TIMERS
 }
 
-void
-Timer::putToRestart(
-   const std::shared_ptr<Database>& restart_db) const
-{
-#ifdef ENABLE_SAMRAI_TIMERS
-   TBOX_ASSERT(restart_db);
-
-   restart_db->putInteger("TBOX_TIMER_VERSION", TBOX_TIMER_VERSION);
-
-   restart_db->putString("d_name", d_name);
-
-   restart_db->putDouble("d_user_total", d_user_total);
-   restart_db->putDouble("d_system_total", d_system_total);
-   restart_db->putDouble("d_wallclock_total", d_wallclock_total);
-
-   restart_db->putDouble("d_user_exclusive", d_user_exclusive);
-   restart_db->putDouble("d_system_exclusive", d_system_exclusive);
-   restart_db->putDouble("d_wallclock_exclusive", d_wallclock_exclusive);
-#else
-   NULL_USE(restart_db);
-#endif // ENABLE_SAMRAI_TIMERS
-}
-
-void
-Timer::getFromRestart(
-   const std::shared_ptr<Database>& restart_db)
-{
-#ifdef ENABLE_SAMRAI_TIMERS
-   TBOX_ASSERT(restart_db);
-
-   int ver = restart_db->getInteger("TBOX_TIMER_VERSION");
-   if (ver != TBOX_TIMER_VERSION) {
-      TBOX_ERROR("Restart file version different than class version.");
-   }
-
-   d_name = restart_db->getString("d_name");
-
-   d_user_total = restart_db->getDouble("d_user_total");
-   d_system_total = restart_db->getDouble("d_system_total");
-   d_wallclock_total = restart_db->getDouble("d_wallclock_total");
-
-   d_user_exclusive = restart_db->getDouble("d_user_exclusive");
-   d_system_exclusive = restart_db->getDouble("d_system_exclusive");
-   d_wallclock_exclusive = restart_db->getDouble("d_wallclock_exclusive");
-#else
-   NULL_USE(restart_db);
-#endif // ENABLE_SAMRAI_TIMERS
-}
-
 }
 }

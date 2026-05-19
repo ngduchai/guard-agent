@@ -380,25 +380,6 @@ public:
       bool is_from_restart);
 
    /**
-    * Retrieve solver parameters from restart database matching object name.
-    *
-    * When assertion checking is active, an unrecoverable assertion
-    * will result if a restart database matching the object name does not
-    * exist, or if the class version number does not match that in restart.
-    */
-   void
-   getFromRestart();
-
-   /**
-    * Retrieve solver parameters from restart database matching object name.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const;
-
-   /**
     * Print out all members of integrator instance to given output stream.
     */
    virtual void

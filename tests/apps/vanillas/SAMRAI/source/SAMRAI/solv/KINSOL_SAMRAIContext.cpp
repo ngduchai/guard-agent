@@ -70,7 +70,6 @@ KINSOL_SAMRAIContext::KINSOL_SAMRAIContext(
     */
    bool is_from_restart = false;
    if (is_from_restart) {
-      getFromRestart();
    }
    getFromInput(input_db, is_from_restart);
 }
@@ -343,35 +342,6 @@ KINSOL_SAMRAIContext::getFromInput(
             (d_uses_jac_times_vector == false) ? 0 : 1);
       }
    }
-}
-
-/*
- *************************************************************************
- *
- * Read data members from restart database.
- *
- *************************************************************************
- */
-
-void
-KINSOL_SAMRAIContext::getFromRestart()
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
-}
-
-/*
- *************************************************************************
- *
- * Write data members to restart database.
- *
- *************************************************************************
- */
-
-void
-KINSOL_SAMRAIContext::putToRestart(
-   const std::shared_ptr<tbox::Database>& restart_db) const
-{
-   /* Checkpoint/restart API removed in vanilla strip 2026-05-15. */
 }
 
 /*

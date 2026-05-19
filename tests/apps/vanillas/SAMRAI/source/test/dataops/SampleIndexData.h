@@ -58,7 +58,6 @@ public:
     * data type for IndexData - i.e. IndexData<SampleIndexData>.  In
     * addition to this method, the other methods that must be defined are
     * getDataStreamSize(), packStream(), unpackStream() for communication,
-    * putToRestart(), getFromRestart() for restart.  These are
     * described below.
     */
    void
@@ -82,17 +81,6 @@ public:
    unpackStream(
       tbox::MessageStream& stream,
       const hier::IntVector& offset);
-
-   /**
-    * These functions are used to read/write SampleIndexData data to/from
-    * restart.
-    */
-   void
-   getFromRestart(
-      std::shared_ptr<tbox::Database>& restart_db);
-   void
-   putToRestart(
-      std::shared_ptr<tbox::Database>& restart_db) const;
 
 private:
    /*

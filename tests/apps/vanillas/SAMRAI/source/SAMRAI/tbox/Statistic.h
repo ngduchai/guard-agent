@@ -207,25 +207,6 @@ public:
       std::ostream& stream,
       int precision = 12) const;
 
-   /**
-    * Write statistic data members to restart database. The restart_db pointer
-    * must be non-null.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<Database>& restart_db) const;
-
-   /**
-    * Read restarted times from restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<Database>& restart_db);
-
    /*
     * These structures are used to store statistic data entries.
     * They need to be declared public for the Sun CC compiler.

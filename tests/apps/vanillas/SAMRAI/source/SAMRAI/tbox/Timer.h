@@ -281,24 +281,6 @@ public:
    void
    computeMaxWallclock();
 
-   /**
-    * Write timer data members to restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<Database>& restart_db) const;
-
-   /**
-    * Read restarted times from restart database.
-    *
-    * @pre restart_db
-    */
-   void
-   getFromRestart(
-      const std::shared_ptr<Database>& restart_db);
-
 protected:
    /**
     * The constructor for the Timer class sets timer name string

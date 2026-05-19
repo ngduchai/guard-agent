@@ -1382,18 +1382,6 @@ public:
    cacheGlobalReducedData() const;
 
    /*!
-    * @brief Write the neighborhoods to a restart database.
-    *
-    * @param[in] restart_db
-    */
-   void
-   putToRestart(
-      const std::shared_ptr<tbox::Database>& restart_db) const
-   {
-      d_relationships.putToRestart(restart_db);
-   }
-
-   /*!
     *
     * @brief Computes refinement ratio between head and base, whether that
     * ratio is exact and whether the head is coarser than the base.
@@ -1654,18 +1642,6 @@ private:
       t_acquire_remote_relationships.reset();
       t_cache_global_reduced_data.reset();
       t_find_overlaps_rbbt.reset();
-   }
-
-   /*!
-    * @brief Read the neighborhoods from a restart database.
-    *
-    * @param[in] restart_db
-    */
-   void
-   getFromRestart(
-      tbox::Database& restart_db)
-   {
-      d_relationships.getFromRestart(restart_db);
    }
 
    /*!
