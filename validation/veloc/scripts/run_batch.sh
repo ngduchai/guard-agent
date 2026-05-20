@@ -64,7 +64,7 @@ EXTRA_ARGS=""
 # All apps with app.yaml + reference checkpoint/restart code.
 # (Apps without app.yaml were removed; this list is the source of truth.)
 ALL_APPS_ORDERED=(
-  CoMD CLAMR SW4lite MMSP HyPar SPPARKS HPCG PRK_Stencil SST
+  CoMD CLAMR SW4lite HyPar SPPARKS HPCG PRK_Stencil SST
   Athena++ SPARTA OpenLB
   Smilei LAMMPS SAMRAI ROSS
   WarpX QMCPACK Nyx
@@ -73,8 +73,9 @@ ALL_APPS_ORDERED=(
 # --- Batches for the staged validation workflow ---
 # Each batch picks 1-2 apps per class (with class (1) at 3 because it has 9 apps).
 # Run order: fast → mid → slow.  Generated lists match validation/veloc/apps_<tier>.txt.
+# MMSP removed 2026-05-20 (ISSUES.md #92): excluded from active suite per user.
 FAST_APPS=(CoMD HPCG SPARTA Athena++ CLAMR PRK_Stencil SST)
-MID_APPS=(MMSP HyPar OpenLB LAMMPS SAMRAI ROSS)
+MID_APPS=(HyPar OpenLB LAMMPS SAMRAI ROSS)
 SLOW_APPS=(SPPARKS SW4lite QMCPACK Smilei Nyx WarpX)
 # Backwards-compatible aliases (older invocations may still pass --generate-list medium/heavy):
 MEDIUM_APPS=("${MID_APPS[@]}")
