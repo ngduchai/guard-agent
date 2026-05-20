@@ -627,7 +627,7 @@ bool QMCMain::runQMC(xmlNodePtr cur, bool reuse)
 }
 
 
- *
+/**
  *  TODO: Move this, it is not a concern of QMCMain
  */
 bool QMCMain::setMCWalkers(xmlXPathContextPtr context_)

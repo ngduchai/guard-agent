@@ -418,7 +418,8 @@ struct SimpleFixedNodeBranch : public QMCTraits
    */
   void collect(int iter, MCWalkerConfiguration& w);
 
-   * @param counter Counter to determine the cummulative average will be reset.
+  /** reset the cumulative averages
+   * @param counter Counter to determine the cumulative average will be reset.
    */
   void flush(int counter);
 

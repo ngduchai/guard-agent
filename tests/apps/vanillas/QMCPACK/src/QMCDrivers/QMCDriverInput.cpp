@@ -146,7 +146,7 @@ void QMCDriverInput::readXML(xmlNodePtr cur)
     throw UniformCommunicateError(error_tag + " steps must be a multiple of estimator measurement period!");
   }
 
-  dump_config_ = (Period4CheckPoint >= 0);
+  dump_config_ = false;
 }
 
 } // namespace qmcplusplus
