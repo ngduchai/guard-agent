@@ -39,6 +39,81 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 ---
 
+### #92 — Remove MMSP from active benchmark suite `Solved`
+
+**Reported:** 2026-05-20 (user directive during 8-hour-handoff prep).
+
+**Explanation:** MMSP was carried in the active suite (`tests/apps/configs/MMSP.yaml`, `validation/veloc/scripts/run_batch.sh` `ALL_APPS_ORDERED`+`MID_APPS`, `validation/veloc/apps_mid.txt`, `validation/veloc/benchmark_configs/MMSP.json`) and three `MMSP_*` units in `build/_experiment_state/_trust.json`. The user directed that MMSP be removed from the suite outright rather than re-benched after the 2026-05-19 deep-strip (commit 9fe33657a) that invalidated its pre-2026-05-19 TRUSTED bench data (mtime 2026-05-02).
+
+**Resolution:** 2026-05-20:
+- Deleted `tests/apps/configs/MMSP.yaml`.
+- Deleted `validation/veloc/benchmark_configs/MMSP.json` (regeneratable from the YAML; safe to remove).
+- Removed `MMSP` from `validation/veloc/scripts/run_batch.sh` `ALL_APPS_ORDERED` and `MID_APPS` arrays; added removal-date comment.
+- Updated `validation/veloc/apps_mid.txt` header comment (class (1) count 3→2; total batch 6→5) and removed the MMSP line.
+- Flipped `MMSP_audit`, `MMSP_baseline`, `MMSP_reference` in `build/_experiment_state/_trust.json` from `TRUSTED` → `REMOVED` with `previous_status`/`previous_reason` preserved and `reason` citing user directive + this issue number.
+- Removed `MMSP_baseline` from `_units_planned` in `_trust.json`.
+- Appended a `remove_from_suite` entry to `build/_experiment_state/_decisions.log` (ts=2026-05-20T07:21:06Z).
+- Source dirs `tests/apps/vanillas/MMSP/` and `tests/apps/checkpointed/MMSP/` left on disk — no production code references them anymore, and preserving them avoids losing the git history of the upstream MMSP source the project was vendored with.
+- Comment-only mentions of MMSP in `validation/veloc/{failure_injector,runner,metrics_collector,validate}.py`, `validation/veloc/scripts/{run_validate,generate_benchmark_configs}.sh,.py`, and `tests/apps/configs/SAMRAI.yaml` were left intact — they describe past behavior of related code paths (e.g., `cd <subdir>` wrapper handling, F-1 false-positive history) and editing them would be a tangential refactor.
+
+After removal, the active suite is 17 apps. The handoff prompt and any subsequent re-bench sweep should no longer include MMSP.
+
+---
+
+### #91 — PRK_Stencil/HPCG/SPPARKS BLOCKED at perturbation calibrator `Solved`
+
+**Reported:** 2026-05-19 (experimentor surfaced 3 BLOCKED apps after Step B calibrator failures).
+
+**Explanation:** The perturbation calibrator (`validation/veloc/perturbation_calibrator.py`) reported FAIL for three apps in different ways, each leaving them BLOCKED in `_trust.json`:
+
+1. **PRK_Stencil**: every calibrator run exited in 0.03 s with `mpirun was unable to launch ... Executable: build/baseline_cache/PRK_Stencil/stencil`. Root cause was a stale top-level symlink in `build/baseline_cache/PRK_Stencil/` pointing at `tests/apps/vanillas/PRK_Stencil/Stencil/stencil`, whose target was removed during the deep-strip cycle. `os.walk` enumerates dangling symlinks in `files`, so `runner._find_executable` returned the broken path instead of descending to the real binary at `_build/Stencil/stencil`.
+
+2. **HPCG**: calibrator runs at perturbation values 31 and 33 SIGABRT in 2.2 s with `xhpcg: src/GenerateCoarseProblem.cpp:50: void GenerateCoarseProblem(const SparseMatrix&): Assertion 'nzf%2==0' failed`. HPCG's default 4-level multigrid requires nz divisible by 8 — perturbing nz with `app_arg_override`'s uniform-random sampler over any range wider than `{32}` deterministically draws odd values that crash setup. Alternative knobs (rt, process grid) fail the timing or sensitivity invariants.
+
+3. **SPPARKS**: calibrator runs at temperature 0.98 and 1.02 produce output_diff = 0.0. The file-based validation signature `dumpValidationSignatureBin_spparks` captures only geometry + simulation-duration invariants (nsites, app->time, world_size, world_size * time); none vary with temperature, RNG seed, or any other physics knob. Switching the knob alone cannot help — the schema is fundamentally insensitive.
+
+**Resolution:** Three coordinated fixes landed on 2026-05-20:
+
+1. **PRK_Stencil**: patched `validation/veloc/runner.py:_find_executable` to skip dangling symlinks (`Path.exists()` returns False for them) and to require the executable bit (`os.access(..., X_OK)`), so the recursive `os.walk` continues past stale entries until it finds the real binary. Cleaned the four dangling entries (`stencil`, `MPI_bail_out.o`, `stencil.o`, `wtime.o`) from `build/baseline_cache/PRK_Stencil/` so the calibrator scratch dirs no longer mirror them. Added 8 regression tests in `tests/test_runner_find_executable.py` covering the dangling-symlink, non-executable same-named-file, and nested-walk cases. PRK_Stencil's existing `app_arg_override` perturbation spec stays unchanged.
+
+2. **HPCG**: switched `perturbation:` to `method: disabled` in `tests/apps/configs/HPCG.yaml` with a `reason:` field naming the multigrid coarsening assertion and the divisibility constraint. Detailed comment block documents the CLI option survey (nx/ny/nz, rt, pz/zl/zu, npx/npy/npz) and why each fails one of the three calibrator invariants. Falls back to the legacy single-point F-19 cold-replay detector.
+
+3. **SPPARKS**: switched `perturbation:` to `method: disabled` in `tests/apps/configs/SPPARKS.yaml` with a `reason:` field naming the geometry-only signature schema. Detailed comment block enumerates the 6-double schema slots, why temperature/seed knobs can't help without a schema extension, and the source-edit path required to re-enable (vanilla + checkpointed `main.cpp` would both need to add a T-sensitive quantity to `dumpValidationSignatureBin_spparks`, plus a re-cache of `baseline_cache/SPPARKS/validation_output.bin`). Falls back to the legacy single-point F-19 cold-replay detector.
+
+The `disabled` pattern matches ROSS (already in this state since 2026-05-17) and is fully supported by `app_config.PerturbationSpec` + `validate._enforce_validation_b`. The experimentor advances disabled apps via the legacy pipeline.
+
+Tests: 157 passed, 1 skipped across `test_runner_find_executable.py`, `test_perturbation.py`, `test_perturbation_calibrator.py`, `test_wiring_consistency.py`.
+
+---
+
+### #90 — SAMRAI iter loop used sub-agent: LLM reasoning/thought process not visible in transcript `Open`
+
+**Reported:** 2026-05-18
+
+**Explanation:** The experimentor used a sub-agent to drive SAMRAI's iter loop (under v2.2 + clean-state re-run, currently `_trust.json` status = TRUSTED, verdict from `resilience_analyzer_skill_v2.2_post_runner_fix`). Sub-agents do not surface their internal reasoning/thought-process to the parent transcript — only the final tool calls and outputs are visible. This means:
+
+- The per-iteration narration the iter loop's resilience-analyzer audit normally inspects (`opencode_stdout` transcripts that record reconnaissance / state-classification / implementation / self-review reasoning) is not available for SAMRAI's converging-iteration run.
+- The audit's source-read forensic phase (Phase 5) still ran on the final LLM-modified source under `build/tests_baseline/SAMRAI/` and found no gaming markers, but the *path* by which the LLM arrived at that source is hidden.
+- For paper-grade rigor (the paper claims to characterize the agent's four-phase procedure across all apps), SAMRAI's transcript is the one outlier where the reasoning chain is not transcribed.
+
+The SAMRAI bench data is methodologically sound (gates pass, source-read clean, no gaming markers) and the `_trust.json` status remains TRUSTED so paper figures can use the numbers. The gap is reasoning-transparency only.
+
+**Resolution:** (pending — future re-run obligation)
+
+Re-run SAMRAI's iter loop WITHOUT sub-agent dispatch so the `opencode_stdout` transcript fully captures the LLM's reasoning/thought process. The re-run must:
+
+1. Use the parent OpenCode session (no sub-agent) so per-iteration reasoning streams to the iter-loop log.
+2. Run under the same v8 methodology (perturbation, v2.2 cold-replay gate, file-based comparison, anti-gaming directive).
+3. Replicate (or differ from, with explanation) the existing TRUSTED verdict — same gates, same audit.
+4. Replace the existing `build/iterative_logs/SAMRAI_baseline/` artifact with the re-run's reasoning-disclosed version.
+5. Re-audit under `resilience-analyzer` skill; trust state stays TRUSTED if Phase 5 source-read remains clean.
+
+Scheduling: not blocking — can be done after the full 14-app v8 sweep completes, when the host has free wall time. Estimated wall: ~2.5 h (matches the original iter+bench timing).
+
+Tracking field in `_trust.json` for SAMRAI_baseline: `needs_redo_for_reasoning_disclosure: true` with the reason recorded.
+
+---
+
 ### #89 — Cross-cell isolation hardening: hide baseline + move isolation under build/ `Solved`
 
 **Reported:** 2026-05-18
@@ -252,6 +327,50 @@ Pipeline is READY for the SAMRAI/Nyx pilot.  User's experimentor will run the ac
 ---
 
 ### #77 — SAMRAI baseline (post-#75): un-stub tbox::RestartManager + use SAMRAI native restart for honest mid-run resume `Open`
+
+**Attempt 49 (2026-05-18 — all-levels checkpoint + post-advance fine-level cache replay):**
+
+**Validation outcome being reacted to:** Validator rejected the live tree with `Validation B failed: recovery output mismatch vs baseline.`  Sub-gates: `checkpoint_observed=True (12 files, 6068640 B), output_correct=False (Test 1 [VeloC, failure-prone] score=4.658e+08 FAIL, max_abs_diff=4.658e+08, max_rel_diff=6.301e-01; Test 2 [VeloC, failure-free] score=9.537e-07 PASS), recovery_actually_resumed=None (gated on output_correct), fast_at_1.488x=True (ratio=0.96x), recovery_floor_ok=True (recovery/kill=0.365, floor=0.1), perturbation_active=True, ckpt_size=6068640B, sidecar_ok=True (n=0), gaming_artifacts_ok=None (F-20, n=0), replay_ok=True, coordinator_ok=True (hits=0)`.  Recovery elapsed 21.34s (kill+recovery 79.86s, ratio 0.96x failure-free — wall-time gates would PASS).  Failure-prone `VALIDATION_SIGNATURE: sum=4.6022e+07 sum2=3.2413e+09 max=89.66 min=-5.18 count=1315280` vs failure-free `count=1430688` (8 % under-count; sum, max, min also differ).  Recovery resumed from VeloC checkpoint at iter=435 (cumulative step) / loop_time=9.82 / 87th checkpoint version, then ran 10 more timesteps to t=10.005.
+
+**Root cause diagnosis (this attempt):** Live tree on disk regressed to a level-0-only partial-AMR restore variant: `LinAdvCheckpoint.cpp` saved only `target_level = 0` patches; main.cpp's post-restore block dropped fine levels 1+ and relied on the integrator's natural regrid (every 2 advance steps; `regrid_interval={2,2,2}` per the deck) to rebuild them.  The deck has `max_levels=3` with `ratio_to_coarser=4,4,4`; the cold-start failure-free run accumulates ~1.43M cells across all levels by t=10, but the post-restore run only has ~10 timesteps remaining → ~5 regrid passes → AMR layout never re-converges to the cold-start topology.  Net effect: count under-count (8 %), and the level-0 field values also diverge because in the cold-start run level 0 is influenced by feedback from fine-level corrections at every regrid.  This is exactly the failure mode catalogued for attempts 34–38, 45 ("Partial-AMR restore variants: F-19 PASS, output_correct=False, 6–27 % count divergence").
+
+**Why pivot to all-levels checkpoint + post-advance cache replay (new lever):** Three options were on the table:
+- **(a) Stay on level-0-only partial-AMR** — currently failing output_correct; cannot bit-match without saving and reapplying fine-level data.
+- **(b) Switch back to from-scratch deterministic replay (attempts 39–47)** — output_correct=True but F-19 fails (recovery wall 0.93x of failure-free, threshold 0.9); the HIGHEST-PRIORITY rule explicitly lists "deterministic cold-start replay" as a forbidden gaming pattern, so this is OFF the table even though it technically passes correctness.
+- **(c) All-levels checkpoint + cache + post-advance replay** (this attempt) — saves all levels' uval cell data, caches fine-level records in `linadv_velo::g_restore_cache` (in-memory, per-rank), and applies them after each `advanceHierarchy()` call: any patch whose box matches a saved record gets its cells overwritten with the saved bytes; patches whose boxes do not match remain populated by the integrator's own conservative-linear-interpolation rebuild from coarser levels.
+
+Option (c) is the only path that is honest (real checkpoint, real restore, no replay, no precomputed cache) AND has a chance of fixing output_correct.  It does not claim to bit-match perfectly — the gradient detector's clustering may pick slightly different fine-patch boxes than the saved layout, so some patches will be populated by interpolation rather than direct restore.  But it gives the integrator a much closer starting point than level-0-only, and any patch that does match is restored byte-for-byte.
+
+**What attempt 49 changes:**
+
+1. **`LinAdvCheckpoint.h`** — adds three new public functions: `restore_post_advance()`, `clear_post_advance_cache()`, `post_advance_cache_nonempty()`.  Documents the design (cache populated by `restore()`, drained by post-advance hook in the time loop).
+2. **`LinAdvCheckpoint.cpp`** — adds an in-memory cache (`g_restore_cache`, file-scope vector of `CachedPatch`); rewrites the checkpoint write loop to iterate ALL hierarchy levels (not just level 0); rewrites the restore loop to: (i) immediately apply level-N records whose boxes match live level-N patches (the common case for level 0 due to deterministic CascadePartitioner decomposition), (ii) cache unmatched records for post-advance replay.  Implements the three new functions.  Updates the restore-end diagnostic to print `patches_restored_immediately` and `patches_cached_for_post_advance` separately (replaces the misleading single `patches_skipped` counter).
+3. **`main.cpp`** — adds a ~70-line block immediately after `time_integrator->advanceHierarchy(...)`: gated on `linadv_velo::post_advance_cache_nonempty()` (short-circuits to a fast no-op once the cache is drained); on each call, walks the cache and overwrites any matching patch's cell data; logs a one-liner from rank 0 only when at least one patch was matched.  Block-comment header (~50 lines) documents the honesty argument and the failure-mode comparison (level-0-only → 8 % count under-count → 60 % max_rel_diff vs all-levels + cache → expected dramatic reduction of both).
+
+**Corner cases:**
+- Checkpoint write file_ok=false mid-loop: file header has stale num_patches; restore() will read past EOF and set file_ok=false → returns false → main.cpp logs failure and proceeds with cold start.  Pre-count loop now also skips patches without uval data (e.g., mid-regrid transient), so num_patches in the file header always matches the actual writeable patches.
+- Fine-level patch with no uval at checkpoint time: skipped silently (no cache entry, no file write).  This is benign — uval is the only field we restore.
+- Restore: a level-0 record whose box doesn't match any live level-0 patch (should be rare; would indicate the rank count changed between runs): cached for post-advance replay.  If the post-advance hook never finds a match either, the data is just discarded at simulation end via `finalize()` cache clear.
+- Post-advance: two cached records claim the same box (a future regrid splits a parent patch and one child inherits the same box): we drop the cache entry on first match, so the second never fires.  This is correct because the saved bytes describe ONE patch's contents; applying them to two live patches would be wrong.
+- Cache memory: ~6 MB per checkpoint (12 files × ~0.5 MB).  Held until `finalize()` or `clear_post_advance_cache()`.  Bounded and small.
+- `restore_post_advance` called when cache is empty (post-drain): early-exit via `g_restore_cache_drained || g_restore_cache.empty()` guard; cost ~10 ns.
+
+**Predicted outcome (honest assessment):**
+- **output_correct**: should improve significantly because (i) level-0 cells are restored exactly (deterministic CascadePartitioner gives bit-match on box layout for fixed nproc), (ii) fine-level cells whose boxes match the saved layout are restored exactly, (iii) fine-level cells whose boxes don't match are populated by the integrator's conservative-linear-interpolation rebuild from the (correct) restored level-0 field.  Best case: bit-exact match (would require all post-restore regrids to reproduce the cold-start's exact box layout — possible if the integrator's clustering is deterministic given the same level-0 gradient field).  Worst case: ~1–2 % count divergence + small per-cell values divergence + likely still fails the 1e-12 numeric-tolerance comparator.  Honest acknowledgement: bit-exact AMR restore is structurally impossible without `BoxLevel::putToRestart/getFromRestart` round-trips through `MemoryDatabase` and re-installation via `PatchHierarchy::makeNewPatchLevel`, which is the multi-day deep-SAMRAI-internals work catalogued at attempt-48's option (A).
+- **F-19 (recovery_actually_resumed)**: predicted PASS — recovery still does only the remaining ~10 timesteps of physics work (~0.25× failure-free), well under the 0.9 threshold.
+- **fast_at_1.488x**: predicted PASS — same wall-time profile as the current tree (~0.96× failure-free).
+- **All other gates**: unchanged from current PASS state.
+
+If output_correct still fails: the next iteration's narrator has a clean signal that even with all-levels-restore + post-advance cache replay, the AMR layout cannot be bit-matched without proper BoxLevel reconstruction.  At that point the only honest remaining path is the multi-day BoxLevel restoration work (estimated 300–500 LOC of new code touching PatchHierarchy box reconstruction + per-patch CellData serialization on ALL levels + HyperbolicLevelIntegrator schedule reset + custom binary `MemoryDatabase`-to-buffer converter).  See attempt 48's narrative for the option-A inventory.
+
+**Files modified:**
+- `build/tests_baseline/SAMRAI/source/test/applications/LinAdv/LinAdvCheckpoint.h` (~50 LOC of new function declarations + doxygen).
+- `build/tests_baseline/SAMRAI/source/test/applications/LinAdv/LinAdvCheckpoint.cpp` (~150 LOC: cache data structure + 3 new function implementations + checkpoint-write all-levels rewrite + restore-loop cache-population rewrite + finalize cache clear).
+- `build/tests_baseline/SAMRAI/source/test/applications/LinAdv/main.cpp` (~70 LOC: post-advance restore block + comments).
+
+No changes under `source/SAMRAI/` (#76 class A' lock honoured).  No changes to `CMakeLists.txt`, `veloc.cfg`, `LinAdv.cpp/.h`, the LinAdv-app-level `CMakeLists.txt`, `validation_inputs/`, `tbox::RestartManager::*` (still absent — verified), or any file outside `build/tests_baseline/SAMRAI/`.  Vanilla tree at `tests/apps/vanillas/SAMRAI/` is unmodified.
+
+---
 
 **Attempt 48 (2026-05-17 — additional IEEE-safe compiler flags on the resilient build; explicit acknowledgement that single-attempt source levers are exhausted):**
 
@@ -3106,7 +3225,7 @@ Reading `Source/Initialization/WarpXInit.cpp::initialize_external_libraries`, th
 
 ---
 
-### #52 — WarpX baseline correctness stage aborts with "No VeloC checkpoint directories resolved from veloc.cfg" — same regression pattern as the closed #46 / Nyx #48 / SPPARKS #32 `Open`
+### #52 — WarpX baseline correctness stage aborts with "No VeloC checkpoint directories resolved from veloc.cfg" — same regression pattern as the closed #46 / Nyx #48 / SPPARKS #32 `Solved`
 
 **Reported:** 2026-05-03
 
@@ -3135,6 +3254,8 @@ Three coordinated edits, each addressing one defect, with no changes to vanilla 
    - Keep all existing extern signatures (`initialize`, `finalize`, `notify_checkpoint`, `discovered_restart_path`) so `Source/main.cpp` and `Source/Evolve/WarpXEvolve.cpp` need no changes.
 
 Files changed: `build/tests_baseline/WarpX/veloc.cfg` (new); `build/tests_baseline/WarpX/CMakeLists.txt` (option default + missing-lib graceful degrade); `build/tests_baseline/WarpX/Source/Initialization/WarpXVeloC.cpp` (replace registration logic with explicit protect+checkpoint); `ISSUES.md` (this entry). No changes to `WarpXVeloC.H` (public surface unchanged), `main.cpp`, `WarpXEvolve.cpp`, `tests/apps/vanillas/WarpX/`, or `validation/veloc/`.
+
+**2026-05-19 resolution applied:** the prior iteration already wired the VeloC integration into `Source/Utils/WarpXVeloc.cpp`, `Source/main.cpp`, `Source/Evolve/WarpXEvolve.cpp`, and `Source/Utils/CMakeLists.txt`, but the static `veloc.cfg` at the codebase root was still missing — so the validator's pre-flight `extract_checkpoint_dirs_from_veloc_cfg` (validation/veloc/runner.py:1949-1958) raised `ValidationError` before the binary ever launched. Created `build/tests_baseline/WarpX/veloc.cfg` with `scratch=/tmp/warpx_veloc_ckpt/scratch`, `persistent=/tmp/warpx_veloc_ckpt/persistent`, `mode=sync`, `persistent_interval=1`, `max_versions=4` — matching the `kScratchDir`/`kPersistDir` constants the binary already uses (`WarpXVeloc.cpp:67-69`) so the directories the harness polls are exactly the directories the binary checkpoints to. The runtime `ensure_default_cfg()` (`WarpXVeloc.cpp:171`) is now a fallback only — it short-circuits on `file_exists(kDefaultCfg)`, so the shipped cfg wins.
 
 ---
 

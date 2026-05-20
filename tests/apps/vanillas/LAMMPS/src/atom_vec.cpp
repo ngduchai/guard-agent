@@ -116,7 +116,7 @@ AtomVec::~AtomVec()
 }
 
 /* ----------------------------------------------------------------------
-   make copy of args for use by restart & replicate
+
 ------------------------------------------------------------------------- */
 
 void AtomVec::store_args(int narg, char **arg)
@@ -1332,7 +1332,7 @@ int AtomVec::unpack_exchange(double *buf)
 }
 
 /* ----------------------------------------------------------------------
-   size of restart data for all atoms owned by this proc
+
    include extra data stored by fixes
 ------------------------------------------------------------------------- */
 
@@ -1372,14 +1372,14 @@ int AtomVec::size_restart()
 
   if (bonus_flag) n += size_restart_bonus();
 
-  // fix-driven restart-extra was removed in vanilla strip; no extra bytes
+
   (void)nlocal; (void)i;
 
   return n;
 }
 
 /* ----------------------------------------------------------------------
-   pack atom I's data for restart file including extra quantities
+
    xyz must be 1st 3 values, so that read_restart can test on them
    molecular types may be negative, but write as positive
 ------------------------------------------------------------------------- */
@@ -1469,14 +1469,14 @@ int AtomVec::pack_restart(int i, double *buf)
 
   pack_restart_post(i);
 
-  // fix-driven restart-extra was removed in vanilla strip
+
 
   buf[0] = m;
   return m;
 }
 
 /* ----------------------------------------------------------------------
-   unpack data for one atom from restart file including extra quantities
+
 ------------------------------------------------------------------------- */
 
 int AtomVec::unpack_restart(double *buf)
@@ -1566,7 +1566,7 @@ int AtomVec::unpack_restart(double *buf)
 
   unpack_restart_init(nlocal);
 
-  // store extra restart info which fixes can unpack when instantiated
+
 
   double **extra = atom->extra;
   if (atom->nextra_store) {

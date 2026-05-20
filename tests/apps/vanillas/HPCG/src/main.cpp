@@ -360,10 +360,17 @@ int main(int argc, char * argv[]) {
   // The variable total_runtime is the target benchmark execution time in seconds
 
   double total_runtime = params.runningTime;
-  int numberOfCgSets = int(total_runtime / opt_worst_time) + 1; // Run at least once, account for rounding
-
-  /* HPCG_FIXED_SETS env var: pin numberOfCgSets to a fixed value
-     (compute-only knob, no I/O). */
+  /* numberOfCgSets is pinned to HPCG_FIXED_SETS exclusively.  The legacy
+     timing-derived auto-tune `int(total_runtime / opt_worst_time) + 1` was
+     removed 2026-05-20 because it produced non-deterministic counts
+     (409/416/418 across runs on identical input) — the LLM-resilient binary
+     used the non-determinism as cover to hardcode field[4]=409 (the cached
+     baseline's count) and pass the signature comparator while ignoring the
+     framework's workload-pin env.  Pinning unconditionally here removes the
+     escape hatch: both vanilla and resilient must honor the env, both
+     produce signatures with field[4]=HPCG_FIXED_SETS, and the count
+     becomes a perturbable knob for the cold-replay detector. */
+  int numberOfCgSets = 180;  // default if env unset (matches reference cell)
   {
     const char *fs = getenv("HPCG_FIXED_SETS");
     if (fs && *fs) {
@@ -371,6 +378,7 @@ int main(int argc, char * argv[]) {
       if (n > 0) numberOfCgSets = n;
     }
   }
+  (void)total_runtime;  /* retained for legacy HPCG_DEBUG logging below */
 
 #ifdef HPCG_DEBUG
   if (rank==0) {
