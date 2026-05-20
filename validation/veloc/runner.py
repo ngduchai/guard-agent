@@ -472,20 +472,33 @@ def _find_executable(build_dir: Path, executable_name: str) -> Path:
     a top-level or recursive match: wrapper scripts (e.g. HPCG's xhpcg_run)
     can appear at multiple paths in a build tree but only function when their
     sibling binary is alongside them in `_build/bin/`.
+
+    Skips dangling symlinks: ``os.walk`` lists symlink entries in ``files``
+    regardless of whether the target resolves, so a stale top-level symlink
+    in ``build_dir`` (e.g. a pre-strip artifact pointing into the vanilla
+    source tree whose binary was later removed) would otherwise shadow the
+    real binary deeper in ``_build/<subdir>/``. ``Path.exists()`` returns
+    False for a dangling symlink, and ``os.access(..., X_OK)`` ensures the
+    candidate is actually runnable rather than a same-named data file.
     """
+    def _runnable(p: Path) -> bool:
+        return p.exists() and os.access(str(p), os.X_OK)
+
     for canonical in (
         build_dir / "_build" / "bin" / executable_name,
         build_dir / "_build" / executable_name,
         build_dir / "bin" / executable_name,
     ):
-        if canonical.exists():
+        if _runnable(canonical):
             return canonical
     candidate = build_dir / executable_name
-    if candidate.exists():
+    if _runnable(candidate):
         return candidate
     for root, _dirs, files in os.walk(build_dir):
         if executable_name in files:
-            return Path(root) / executable_name
+            hit = Path(root) / executable_name
+            if _runnable(hit):
+                return hit
     raise FileNotFoundError(
         f"Executable {executable_name!r} not found under {build_dir}"
     )
