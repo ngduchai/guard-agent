@@ -1019,3 +1019,85 @@ def test_run_validate_sh_exports_workload_pin_universally():
     universal_section = text[fi_pos:]
     assert "HPCG_FIXED_SETS" in universal_section
     assert "Workload-pin env (universal)" in universal_section
+
+
+# ---------------------------------------------------------------------------
+# Exit-code gate (2026-05-21) — _exit_code_check turns non-zero exit from the
+# resilient binary into a correctness FAIL so the LLM iter-loop sees the
+# stderr instead of hitting an opaque BLOCKED at bench time.  Anchor case:
+# ROSS iter-2 wrote bit-exact output, then aborted on MPI_Barrier after
+# MPI_FINALIZE; comparator said PASS but mpirun rc=1 BLOCKed bench.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_code_gate_passes_on_zero(tmp_path):
+    from validation.veloc.validate import _exit_code_check
+    r = _exit_code_check("failure-prone", 0, None)
+    assert r.passed is True
+    assert r.details["exit_code"] == 0
+    assert r.details["exempt"] is False
+
+
+def test_exit_code_gate_fails_on_nonzero_without_stderr(tmp_path):
+    from validation.veloc.validate import _exit_code_check
+    r = _exit_code_check("failure-prone", 1, None)
+    assert r.passed is False
+    assert "exit_code=1" in r.message
+    assert r.details["exit_code"] == 1
+    assert r.details["stderr_tail"] == ""
+
+
+def test_exit_code_gate_embeds_stderr_tail(tmp_path):
+    from validation.veloc.validate import _exit_code_check
+    stderr = tmp_path / "stderr.txt"
+    stderr.write_text(
+        "\n".join([f"line {i}" for i in range(50)])
+        + "\n*** The MPI_Barrier() function was called after MPI_FINALIZE was invoked.\n"
+        + "*** This is disallowed by the MPI standard.\n"
+    )
+    r = _exit_code_check("failure-free", 1, stderr)
+    assert r.passed is False
+    # Only the last 20 lines are kept — earliest is "line 32" (50-20+2 of which
+    # 2 are the MPI banner).  Just assert the banner survives.
+    assert "MPI_Barrier" in r.message
+    assert "MPI_FINALIZE" in r.message
+    assert "MPI_Barrier" in r.details["stderr_tail"]
+
+
+def test_exit_code_gate_exempts_sigkill():
+    """137 (SIGKILL) is what the injector deliberately sends to attempt_1.
+    The recovery attempt's status is what matters for correctness; exempt 137
+    so the legacy-path failure-prone leg doesn't fail correctness when the
+    final RunResult.exit_code carries the kill signal."""
+    from validation.veloc.validate import _exit_code_check
+    r = _exit_code_check("failure-prone", 137, None, exempt_codes=(137,))
+    assert r.passed is True
+    assert r.details["exempt"] is True
+
+
+def test_exit_code_gate_does_not_exempt_137_by_default():
+    """The default exempt list is empty — only the failure-prone caller
+    opts in to (137,).  The failure-free caller must NOT exempt anything."""
+    from validation.veloc.validate import _exit_code_check
+    r = _exit_code_check("failure-free", 137, None)
+    assert r.passed is False
+
+
+def test_exit_code_gate_method_includes_label():
+    from validation.veloc.validate import _exit_code_check
+    r_fp = _exit_code_check("failure-prone", 0, None)
+    r_ff = _exit_code_check("failure-free", 0, None)
+    assert r_fp.method == "exit_code [VeloC, failure-prone]"
+    assert r_ff.method == "exit_code [VeloC, failure-free]"
+
+
+def test_exit_code_gate_call_sites_present_in_stage_correctness():
+    """Sanity check: the gate is actually invoked from _stage_correctness."""
+    text = (REPO_ROOT / "validation" / "veloc" / "validate.py").read_text()
+    # Both call sites + the helper must appear, and the helper guard for
+    # the v2.2 collapsed run must be present.
+    assert text.count("_exit_code_check(") >= 3  # helper def + 2 call sites
+    assert "Test 1b (exit_code [VeloC, failure-prone])" in text
+    assert "Test 2b (exit_code [VeloC, failure-free])" in text
+    assert "_fp_recovery_actually_ran" in text
+    assert "exempt_codes=(137,)" in text
