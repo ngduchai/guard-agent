@@ -366,6 +366,126 @@ class TestApplyPerturbation:
                 # write operation on source_dir for non-regex_replace methods.
                 pass
 
+    def test_regex_replace_writes_top_level_alias_when_input_subdir(self, tmp_path):
+        # REGRESSION (2026-05-21): _symlink_input_data places the input
+        # file at cwd/<basename> as a symlink so that
+        # `mpirun ... -in <basename>` (cwd top-level) actually opens it.
+        # apply_perturbation previously wrote ONLY to cwd/<spec.file>
+        # (the deep input_subdir path), so the binary kept reading the
+        # unperturbed top-level alias and the perturbation was a silent
+        # no-op.  Calibrator FAILed 4-of-4 apps with
+        # output_sensitivity_ok=False (sensitivity=0.0) caused by this.
+        # Fix: also overwrite cwd/<basename> when it is a symlink
+        # resolving to the same source we just read from.
+        src = tmp_path / "src"
+        cwd = tmp_path / "cwd"
+        (src / "examples" / "free").mkdir(parents=True)
+        cwd.mkdir()
+        original = "seed            12345\nstep            1000\n"
+        (src / "examples" / "free" / "in.validation").write_text(original)
+
+        # Mirror what runner._symlink_input_data lays down for an app
+        # with input_subdir=examples/free + app_args=[-in, in.validation]:
+        #   cwd/in.validation              -> symlink to source basename
+        #   cwd/examples/free/in.validation -> via parent-dir symlink
+        (cwd / "in.validation").symlink_to(src / "examples" / "free" / "in.validation")
+        (cwd / "examples").mkdir()
+        (cwd / "examples" / "free").symlink_to(src / "examples" / "free")
+
+        spec = _parse_perturbation({
+            "method": "regex_replace",
+            "file": "examples/free/in.validation",
+            "pattern": r"seed\s+[0-9]+",
+            "replacement_template": "seed            {value:d}",
+            "value_range": [10000, 999999],
+        })
+        apply_perturbation(spec, 10000, cwd=cwd, source_dir=src,
+                           app_args=["-in", "in.validation"], env={})
+
+        # Deep path: perturbed (the original target_in_cwd write)
+        assert "seed            10000" in (
+            cwd / "examples" / "free" / "in.validation"
+        ).read_text()
+
+        # Top-level alias: also perturbed, no longer a symlink.  This
+        # is the path the binary opens at runtime — without the fix it
+        # would still resolve to the unperturbed source via symlink.
+        assert not (cwd / "in.validation").is_symlink(), (
+            "top-level alias must be replaced with a real file so the "
+            "binary reads perturbed content"
+        )
+        assert "seed            10000" in (cwd / "in.validation").read_text()
+
+        # Source preserved.
+        assert (src / "examples" / "free" / "in.validation").read_text() == original
+
+    def test_regex_replace_top_level_alias_unrelated_file_preserved(self, tmp_path):
+        # SAFETY: when cwd/<basename> exists but is NOT a symlink to the
+        # same source (e.g., basename collision with an unrelated input),
+        # apply_perturbation must NOT clobber it.  We verify by setting
+        # up a hostile collision: cwd/in.validation is a real file with
+        # different content; the perturbation spec targets a deep path
+        # with the same basename under a separate source.
+        src = tmp_path / "src"
+        cwd = tmp_path / "cwd"
+        (src / "examples" / "free").mkdir(parents=True)
+        cwd.mkdir()
+        (src / "examples" / "free" / "in.validation").write_text("seed 12345\n")
+
+        unrelated_payload = "UNRELATED_TOP_LEVEL_CONTENT\n"
+        (cwd / "in.validation").write_text(unrelated_payload)  # real file, no symlink
+        (cwd / "examples").mkdir()
+        (cwd / "examples" / "free").symlink_to(src / "examples" / "free")
+
+        spec = _parse_perturbation({
+            "method": "regex_replace",
+            "file": "examples/free/in.validation",
+            "pattern": r"seed\s+[0-9]+",
+            "replacement_template": "seed {value:d}",
+            "value_range": [10000, 999999],
+        })
+        apply_perturbation(spec, 22222, cwd=cwd, source_dir=src,
+                           app_args=[], env={})
+
+        # Deep path perturbed as before.
+        assert "seed 22222" in (
+            cwd / "examples" / "free" / "in.validation"
+        ).read_text()
+        # Unrelated top-level file preserved exactly — never opened, never written.
+        assert (cwd / "in.validation").read_text() == unrelated_payload
+
+    def test_regex_replace_top_level_alias_other_symlink_target_preserved(
+        self, tmp_path,
+    ):
+        # SAFETY: cwd/<basename> is a symlink, but resolves to a DIFFERENT
+        # source file (also basename collision).  Must not be overwritten.
+        src = tmp_path / "src"
+        cwd = tmp_path / "cwd"
+        (src / "examples" / "free").mkdir(parents=True)
+        (src / "other").mkdir()
+        cwd.mkdir()
+        (src / "examples" / "free" / "in.validation").write_text("seed 12345\n")
+        (src / "other" / "in.validation").write_text("DIFFERENT_SOURCE\n")
+        # cwd top-level alias points at the OTHER source, not the
+        # perturbation target's source.
+        (cwd / "in.validation").symlink_to(src / "other" / "in.validation")
+        (cwd / "examples").mkdir()
+        (cwd / "examples" / "free").symlink_to(src / "examples" / "free")
+
+        spec = _parse_perturbation({
+            "method": "regex_replace",
+            "file": "examples/free/in.validation",
+            "pattern": r"seed\s+[0-9]+",
+            "replacement_template": "seed {value:d}",
+            "value_range": [10000, 999999],
+        })
+        apply_perturbation(spec, 33333, cwd=cwd, source_dir=src,
+                           app_args=[], env={})
+        # Top-level alias still points at the unrelated source.
+        assert (cwd / "in.validation").is_symlink()
+        assert (cwd / "in.validation").resolve() == (src / "other" / "in.validation")
+        assert (src / "other" / "in.validation").read_text() == "DIFFERENT_SOURCE\n"
+
     def test_regex_replace_no_match_raises(self, tmp_path):
         src = tmp_path / "src"
         cwd = tmp_path / "cwd"

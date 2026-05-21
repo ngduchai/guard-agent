@@ -251,6 +251,26 @@ def apply_perturbation(
         target_in_cwd.write_text(new_content)
         modified_file = target_in_cwd
 
+        # Top-level alias write: _symlink_input_data may have placed a
+        # symlink at cwd/<basename> pointing at the same source the
+        # binary actually opens (e.g. `mpirun ... -in in.validation`
+        # from cwd top-level).  Without this, perturbations whose
+        # spec.file lives under input_subdir land at the deep path and
+        # the binary keeps reading the unperturbed symlink — silent
+        # no-op detected 2026-05-21 for SPARTA/SPPARKS/QMCPACK/HyPar.
+        # Overwrite the alias only when it is a symlink resolving to
+        # the same source we just read from, so an unrelated file with
+        # a colliding basename is never clobbered.
+        top_level_alias = cwd / Path(spec.file).name
+        if top_level_alias != target_in_cwd and top_level_alias.is_symlink():
+            try:
+                alias_matches = top_level_alias.resolve() == source_path.resolve()
+            except OSError:
+                alias_matches = False
+            if alias_matches:
+                top_level_alias.unlink()
+                top_level_alias.write_text(new_content)
+
     elif spec.method == "app_arg_override":
         if spec.arg_index >= len(new_args):
             raise IndexError(
