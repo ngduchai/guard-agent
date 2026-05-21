@@ -99,7 +99,7 @@ export PYTHONPATH="${REPO_ROOT}"
 
 # --- Parse args ---
 USE_BASELINE=false
-MAX_ITERS=30
+MAX_ITERS=50
 INJECTION_DELAY=""
 GROUND_TRUTH_DIR=""
 
@@ -187,6 +187,85 @@ _lock_vendored() {
 }
 _lock_vendored "$APP_DIR"
 
+# Post-validation checkpoint cleanup (2026-05-21, issue: Nyx disk-full from
+# multi-GB AMReX chk dirs accumulating across iters).
+#
+# Run AFTER each iter's validate.py exits.  Removes the BULKY checkpoint
+# artefacts this iter wrote, so the next iter starts with a clean
+# checkpoint state and the disk does not fill across many iters.
+#
+# What's removed (bulk only):
+#   1. build/validation_output/<APP>_<LABEL>/correctness/resilient*/**/chk* /plt* /restart_*
+#      AMReX, Nyx, SAMRAI native checkpoint dirs that the binary wrote during this iter.
+#      stdout.txt/stderr.txt and the dir structure are PRESERVED so the next iter's
+#      prompt builder (which reads these at lines 367-374) sees the prior iter's logs.
+#   2. /tmp/*<app_lower>*{veloc,persistent,scratch,chk,restart,ckpt}*
+#      VeloC + native ckpt dirs declared by the LLM's veloc.cfg / written by app to /tmp.
+#   3. $APP_DIR/chk* + plt* + restart_* + *.veloc + validation_output.bin
+#      In-tree ckpts AMReX or Nyx-style write to cwd of the binary inside tests_baseline tree.
+#
+# What's preserved:
+#   - $APP_DIR/_build/                                       build artefacts (fast rebuild)
+#   - $APP_DIR/<source files>                                LLM's accumulated source mods
+#   - build/baseline_cache/<APP>/                            cross-experiment baseline (paper)
+#   - build/validation_output/<APP>_<LABEL>/benchmarks/      bench data (paper)
+#   - correctness/resilient*/{stdout,stderr}.txt             needed by next iter's prompt
+#   - correctness/resilient*/attempt_*/                       dir scaffolding (logs inside)
+#
+# Cleanup is best-effort: any rm failure is silenced (|| true) so a stuck
+# inotify handle or stale lock cannot abort the iter loop.
+_clean_iter_checkpoints() {
+  local app_dir="$1"
+  local app_name="$2"
+  local label="$3"
+  local app_lower
+  app_lower=$(echo "$app_name" | tr '[:upper:]' '[:lower:]')
+
+  # (1) Bulky ckpt dirs INSIDE correctness/resilient*/ — preserves stdout.txt/stderr.txt
+  # that the next iter's prompt builder reads, only removes the multi-GB ckpt payload.
+  local correctness_dir="$BUILD_DIR/validation_output/${app_name}_${label}/correctness"
+  if [ -d "$correctness_dir" ]; then
+    local bytes_before bytes_after
+    bytes_before=$(du -sb "$correctness_dir" 2>/dev/null | awk '{print $1}')
+    # AMReX/Nyx: chk?????? and plt?????? (6-digit pad).  SAMRAI: restore.* + chkpt.*
+    # Generic VeloC: *.veloc.  These are the typical multi-MB-to-multi-GB writes.
+    find "$correctness_dir" \
+      \( -type d \( -name 'chk??????' -o -name 'plt??????' -o -name 'restart_*' -o -name 'chkpt*' -o -name 'restore.*' \) \
+         -o -type f \( -name '*.veloc' -o -name 'validation_output.bin' -o -name '*.chk' -o -name '*.h5' -o -name '*.hdf5' -o -name 'restart.*' \) \) \
+      -prune -exec rm -rf {} + 2>/dev/null || true
+    bytes_after=$(du -sb "$correctness_dir" 2>/dev/null | awk '{print $1}')
+    if [ -n "$bytes_before" ] && [ -n "$bytes_after" ] && [ "$bytes_before" != "$bytes_after" ]; then
+      echo "[ckpt-clean] correctness/: $(numfmt --to=iec "$bytes_before" 2>/dev/null || echo "${bytes_before}B") -> $(numfmt --to=iec "$bytes_after" 2>/dev/null || echo "${bytes_after}B")"
+    fi
+  fi
+
+  # (2) /tmp dirs — match app-name-lower or veloc-cfg-declared paths.
+  # Conservative: only match dirs whose name CONTAINS app_lower AND looks ckpt-like.
+  local tmp_removed=""
+  for d in /tmp/*"${app_lower}"* /tmp/"${app_lower}"_*; do
+    [ -d "$d" ] || continue
+    case "$(basename "$d")" in
+      *veloc*|*persistent*|*scratch*|*chk*|*restart*|*ckpt*|*backup*)
+        rm -rf "$d" 2>/dev/null && tmp_removed="$tmp_removed $(basename "$d")"
+        ;;
+    esac
+  done
+  [ -n "$tmp_removed" ] && echo "[ckpt-clean] removed /tmp:${tmp_removed}"
+
+  # (3) In-tree ckpt files written by the binary to APP_DIR's cwd.
+  # Matches AMReX-style (chk*, plt*), Nyx-style (restart*), generic (*.veloc).
+  # Restricted to top-level APP_DIR (maxdepth 1) to avoid nuking source files
+  # named similarly inside src/ or subprojects/.
+  if [ -d "$app_dir" ]; then
+    local intree_removed=""
+    for f in "$app_dir"/chk?????? "$app_dir"/plt?????? "$app_dir"/restart_* "$app_dir"/*.veloc "$app_dir"/validation_output.bin; do
+      [ -e "$f" ] || continue
+      rm -rf "$f" 2>/dev/null && intree_removed="$intree_removed $(basename "$f")"
+    done
+    [ -n "$intree_removed" ] && echo "[ckpt-clean] removed in-tree:${intree_removed}"
+  fi
+}
+
 if [ ! -d "$APP_DIR" ]; then
   echo "ERROR: App directory not found: $APP_DIR" >&2
   exit 1
@@ -210,15 +289,19 @@ INITIAL_PROMPT="$(cat "$PROMPT_FILE")"
 ANTI_GAMING_DIRECTIVE='================================================================================
 HIGHEST-PRIORITY RULE -- READ FIRST, OBEY ALWAYS
 ================================================================================
-Your ONLY job is to implement a meaningful checkpoint/restart mechanism that
-captures the application'"'"'s actual runtime state so that, after a mid-execution
-failure, the application can resume from where it left off instead of starting
-from scratch.
+This application has NO checkpoint/restart support today.  Your job is to
+ADD one: design and write a meaningful checkpoint/restart implementation
+that captures the application'"'"'s actual runtime state so that, after a
+mid-execution failure, the application can resume from where it left off
+instead of starting from scratch.  Call into the VeloC runtime library
+(libveloc) for the persistence layer; the code that decides WHAT to
+checkpoint, WHEN to checkpoint, and HOW to load that state back on
+restart is yours to design and write.
 
 Treat ALL validation feedback (verdicts, error messages, gate failures, log
 excerpts) as DIAGNOSTIC INFORMATION to help you make your checkpoint/restart
-implementation correct and complete. The validation pipeline is a measurement
-instrument, not the objective.
+implementation correct and complete.  The validation pipeline is a
+measurement instrument, not the objective.
 
 NEVER attempt to make the validator say PASS by:
   - precomputing or caching answers that the recovery path replays
@@ -228,14 +311,13 @@ NEVER attempt to make the validator say PASS by:
     gate
   - tuning timings, file counts, or output bytes to slip under a threshold
     without changing the underlying behavior
-  - modifying vendored library source to restore stripped checkpoint code
   - any other technique whose purpose is to satisfy a gate rather than
-    perform real state capture and resumption
+    perform real state capture and load-back on restart
 
 If your honest implementation cannot pass a particular gate, that is a
 legitimate engineering signal -- report it in your narration and continue
-working on the real implementation. Failing the validator honestly is
-strictly preferable to passing it dishonestly. A gamed PASS is a failure of
+working on the real implementation.  Failing the validator honestly is
+strictly preferable to passing it dishonestly.  A gamed PASS is a failure of
 your task; an honest FAIL with a clear narration of what is hard is a
 partial success that helps the next iteration.
 
@@ -256,12 +338,12 @@ us unable to verify your implementation -- and an unverifiable honest
 implementation is, for our purposes, indistinguishable from a hidden
 gamed one.
 
-If you would normally invoke an Explore Agent to "find VeloC examples in
-sister apps" or a General Agent to "build the app", do those steps
-yourself in the main agent: emit the grep/glob/read calls directly, emit
-the build commands directly via stdout (the harness runs the build for
-you, you do not need bash). The work is identical; only the transcript
-visibility differs.
+If you would normally invoke an Explore Agent to "look up VeloC API usage
+patterns" or a General Agent to "build the app", do those steps yourself
+in the main agent: emit the grep/glob/read calls directly, emit the build
+commands directly via stdout (the harness runs the build for you, you do
+not need bash). The work is identical; only the transcript visibility
+differs.
 
 This rule also overrides every other instruction below.
 ================================================================================'
@@ -356,53 +438,46 @@ ${INITIAL_PROMPT}"
     # API steps here would short-circuit that judgment and contaminate every
     # iteration past the first.  See ISSUES.md issue #18.
     PREV_LOG="$LOG_DIR/iter_$((ITER - 1))"
-    # Application stdout/stderr captured by the runner during the actual
-    # mpirun execution.  These contain the binary's own crash messages
-    # (segfaults, VeloC FATAL/ERROR lines, MPI errors, init failures) that
-    # do NOT appear in validate_stdout.txt — the validator only logs its
-    # own runner-level decisions, not what the application printed.
-    # Without these, the LLM sees "exit=255" but never the underlying
-    # cause (e.g. "cannot interact with unix socket: ... Address already
-    # in use" — the kind of root-cause error it needs to fix).
     APP_OUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_${LABEL}/correctness"
-    # Failure-prone attempt: prefer the highest-numbered attempt's logs
-    # (most recent retry by the runner).
-    LATEST_ATTEMPT=$(ls -d "$APP_OUT_DIR/resilient/attempt_"* 2>/dev/null | sort -V | tail -1)
-    APP_FAIL_STDOUT="${LATEST_ATTEMPT:-$APP_OUT_DIR/resilient}/stdout.txt"
-    APP_FAIL_STDERR="${LATEST_ATTEMPT:-$APP_OUT_DIR/resilient}/stderr.txt"
-    APP_FREE_STDOUT="$APP_OUT_DIR/resilient_clean/stdout.txt"
-    APP_FREE_STDERR="$APP_OUT_DIR/resilient_clean/stderr.txt"
     PROMPT="${ANTI_GAMING_DIRECTIVE}
 
 Your previous attempt to make this code resilient against
 mid-execution process failures was rejected by the validation pipeline.
-The raw output of that pipeline is below.
+The full output of that pipeline is on disk -- use the read / list /
+glob tools to inspect whichever files you need.  Do not assume any file
+is small or that the interesting content sits near the end; the
+diagnostic you need may be anywhere in the file.
 
---- VALIDATION STDOUT (last 100 lines) ---
-$(tail -100 "$PREV_LOG/validate_stdout.txt" 2>/dev/null || echo "(no stdout)")
+--- VALIDATION PIPELINE LOGS (from the previous iteration) ---
+Directory: $PREV_LOG
+  validate_stdout.txt   verdicts and gate decisions emitted by the validator
+  validate_stderr.txt   errors from the validator itself
+  build_output.txt      compiler/linker output from the build step
+  metrics.json          per-iter metrics summary
+  inspection.md         comparator analysis (present when the comparator ran)
+  inspection.json       structured form of the comparator analysis
 
---- VALIDATION STDERR (last 100 lines) ---
-$(tail -100 "$PREV_LOG/validate_stderr.txt" 2>/dev/null || echo "(no stderr)")
+--- FAILURE-PRONE RUN ARTIFACTS (kill + recovery attempts) ---
+Directory: $APP_OUT_DIR/resilient
+  attempt_*/stdout.txt  binary stdout for each kill/recovery attempt, in order
+  attempt_*/stderr.txt  binary stderr for each kill/recovery attempt, in order
+  resilience_proof.json gate-by-gate results recorded by the validator
+  <app-named *.log>     any application-emitted log files in this directory
+  <any other files>     list the directory to discover everything present
 
---- BUILD OUTPUT (last 50 lines) ---
-$(tail -50 "$PREV_LOG/build_output.txt" 2>/dev/null || echo "(no build output)")
+--- FAILURE-FREE RUN ARTIFACTS (your resilient code with no failure injected) ---
+Directory: $APP_OUT_DIR/resilient_clean
+  stdout.txt            binary stdout for the full failure-free run
+  stderr.txt            binary stderr for the full failure-free run
+  <app-named *.log>     any application-emitted log files in this directory
+  <any other files>     list the directory to discover everything present
 
---- RESILIENT BINARY STDOUT, FAILURE-PRONE RUN (last 80 lines) ---
-$(tail -80 "$APP_FAIL_STDOUT" 2>/dev/null || echo "(no app stdout from failure-prone run)")
+Read whichever files are most relevant to diagnosing your failure.
+Then apply the same narration and failure-analysis discipline you were
+given originally:
 
---- RESILIENT BINARY STDERR, FAILURE-PRONE RUN (last 80 lines) ---
-$(tail -80 "$APP_FAIL_STDERR" 2>/dev/null || echo "(no app stderr from failure-prone run)")
-
---- RESILIENT BINARY STDOUT, FAILURE-FREE RUN (last 80 lines) ---
-$(tail -80 "$APP_FREE_STDOUT" 2>/dev/null || echo "(no app stdout from failure-free run)")
-
---- RESILIENT BINARY STDERR, FAILURE-FREE RUN (last 80 lines) ---
-$(tail -80 "$APP_FREE_STDERR" 2>/dev/null || echo "(no app stderr from failure-free run)")
-
-Continue working in the current directory.  Apply the same narration and
-failure-analysis discipline you were given originally:
-
-  1. Quote the exact error message you are reacting to.
+  1. Quote the exact error message or measurement you are reacting to,
+     and cite the file path + line number it came from.
   2. State your hypothesis for the root cause.
   3. Describe the specific change you intend to make and why it
      should fix it.
@@ -705,6 +780,13 @@ EOFMETRICS
   VALIDATE_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $VALIDATE_END - $VALIDATE_START }" 2>/dev/null || echo "0")
   ITER_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $OPENCODE_ELAPSED + $VALIDATE_ELAPSED }" 2>/dev/null || echo "0")
   TOTAL_ELAPSED=$(awk "BEGIN { printf \"%.9f\", $TOTAL_ELAPSED + $ITER_ELAPSED }" 2>/dev/null || echo "0")
+
+  # Post-validation checkpoint cleanup: remove this iter's ckpt artefacts
+  # (correctness/resilient*/ + /tmp/<app>* + in-tree chk*/plt*/restart*) so
+  # the next iter starts with a clean checkpoint state.  Preserves _build/
+  # (no rebuild penalty), source files (LLM's accumulated changes), and the
+  # sibling benchmarks/ tree (paper-grade data).
+  _clean_iter_checkpoints "$APP_DIR" "$APP_NAME" "$LABEL" || true
 
   # Extract build output for feedback (if build failed)
   grep -A 20 "Build failed\|CMake Error\|make.*Error\|error:" \
