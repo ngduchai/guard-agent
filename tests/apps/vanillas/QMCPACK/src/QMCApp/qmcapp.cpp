@@ -19,6 +19,10 @@
 #include <stdexcept>
 #include <memory>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include "Configuration.h"
 #include "Message/Communicate.h"
 #include "Utilities/SimpleParser.h"
@@ -203,33 +207,85 @@ int main(int argc, char** argv)
     if (!qmcSuccess)
       qmcComm->barrier_and_abort("main(). QMC Execution failed.");
 
-    /* Step 0 v8: emit binary validation signature for file-based comparison.
-     * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
-     * rank 0.  QMCPACK is stochastic (Monte Carlo) with input-file-driven
-     * seeds, so a state-based signature with strict tolerance would be
-     * unreliable.  Instead, this CONFIG signature captures deterministic
-     * runtime invariants:
+    /* Step 0 v9 (QMCPACK-A 2026-05-21): augment the binary validation
+     * signature with a 7th double — the trajectory hash — so the
+     * comparator is sensitive to input perturbation (required by the
+     * v2.2 cold-replay detector; calibrator's output_sensitivity_ok
+     * invariant was unsatisfiable under v8 because the prior 6 doubles
+     * were config-only and invariant under any non-crashing perturbation).
+     *
+     * Writes 8 raw doubles (64 bytes) to "validation_output.bin" in CWD
+     * on rank 0:
      *   [0] (double)qmcComm->size()              (MPI ranks)
      *   [1] (double)inputs.size()                (number of <qmc> input files)
-     *   [2] (double)(qmcSuccess ? 1.0 : 0.0)     (1.0 since we passed the abort above)
+     *   [2] (double)(qmcSuccess ? 1.0 : 0.0)     (always 1.0 if we reach the dump)
      *   [3] (double)argc                         (command-line arg count)
-     *   [4] (double)0.0                          (reserved)
-     *   [5] (double)0.0                          (reserved)
-     * Sufficient for Step 0.6c cross-consistency at same workload: vanilla
-     * and reference produce byte-identical bytes if they both ran with the
-     * same CLI args and the same input list and both succeeded.  Rank-root-only.
+     *   [4] (double)series_count                 (number of <title>.s*.scalar.dat files)
+     *   [5] (double)block_count                  (total LocalEnergy rows across all .scalar.dat files)
+     *   [6] (double)trajectory_sum               (sum of column 1 'LocalEnergy' across every block of every series)
+     *   [7] (double)0.0                          (reserved)
+     *
+     * The trajectory_sum is computed BY the simulation (not derivable from
+     * the input file alone): the linear optimizer reads the starting
+     * Jastrow B and converges over 60 loop iterations, producing a
+     * trajectory whose per-block LocalEnergy values depend on B.  Reading
+     * the .scalar.dat files post-execute() is a passive observation, not
+     * an intercept on the optimizer.  Determinism across runs is
+     * enforced by the <random seed=.../> element in the input XML; per-app
+     * patch overlay and v2.2 perturbation regex preserve the seed line.
+     *
+     * Rank-root-only.
      */
     if (OHMMS::Controller->rank() == 0) {
-      double sig_buf[6];
+      double sig_buf[8];
       sig_buf[0] = static_cast<double>(qmcComm->size());
       sig_buf[1] = static_cast<double>(inputs.size());
       sig_buf[2] = qmcSuccess ? 1.0 : 0.0;
       sig_buf[3] = static_cast<double>(argc);
-      sig_buf[4] = 0.0;
-      sig_buf[5] = 0.0;
+
+      double trajectory_sum = 0.0;
+      int series_count = 0;
+      int block_count = 0;
+      const std::string title = qmc->getTitle();
+      const std::string suffix = ".scalar.dat";
+      try {
+        for (const auto& entry : std::filesystem::directory_iterator(".")) {
+          if (!entry.is_regular_file()) continue;
+          const auto fname = entry.path().filename().string();
+          // Match <title>.s###.scalar.dat — title prefix, '.s' marker, suffix.
+          if (fname.size() < title.size() + suffix.size() + 5) continue;
+          if (fname.compare(0, title.size(), title) != 0) continue;
+          if (fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+          if (fname[title.size()] != '.' || fname[title.size() + 1] != 's') continue;
+          series_count++;
+          std::ifstream f(entry.path());
+          std::string line;
+          while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream iss(line);
+            double idx, energy;
+            if (iss >> idx >> energy) {
+              trajectory_sum += energy;
+              block_count++;
+            }
+          }
+        }
+      } catch (const std::exception& e) {
+        // Filesystem traversal failure: emit zeros so the comparator
+        // surfaces a mismatch instead of silently passing.
+        std::cerr << "WARN: trajectory_sum scan failed: " << e.what() << std::endl;
+        trajectory_sum = 0.0;
+        series_count = 0;
+        block_count = 0;
+      }
+      sig_buf[4] = static_cast<double>(series_count);
+      sig_buf[5] = static_cast<double>(block_count);
+      sig_buf[6] = trajectory_sum;
+      sig_buf[7] = 0.0;
+
       FILE* sig_f = std::fopen("validation_output.bin", "wb");
       if (sig_f) {
-        std::fwrite(sig_buf, sizeof(double), 6, sig_f);
+        std::fwrite(sig_buf, sizeof(double), 8, sig_f);
         std::fclose(sig_f);
       }
     }
