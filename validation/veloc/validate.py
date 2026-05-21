@@ -959,6 +959,9 @@ def _enforce_validation_b(
     legitimate_output_paths: "list[str] | None" = None,
     per_fraction_results: "list[dict] | None" = None,
     perturbation_active: "bool | None" = None,
+    perturbation_seed: "int | None" = None,
+    perturbation_value: "object | None" = None,
+    perturbation_method: "str | None" = None,
     early_exit_cold_replay: bool = False,
     # v2.2 single-fraction inputs (preferred path).  When supplied,
     # they take precedence over per_fraction_results (which becomes
@@ -1301,6 +1304,13 @@ def _enforce_validation_b(
         if kill_attempts_log is not None:
             s["kill_attempts_log"] = list(kill_attempts_log)
         s["perturbation_active"] = perturbation_active
+        # Echo the per-run perturbation identity (seed + applied value +
+        # method) into the canonical proof JSON so post-hoc auditors can
+        # see WHICH random perturbation was applied without having to hunt
+        # the sidecar at correctness/_perturbed_baseline/seed_<N>/.
+        s["perturbation_seed"] = perturbation_seed
+        s["perturbation_value"] = perturbation_value
+        s["perturbation_method"] = perturbation_method
         # Deprecated slope-test fields preserved for backwards-compat readers.
         s["recovery_resume_threshold"] = 0.9
         s["recovery_resume_slope"] = recovery_resume_slope
@@ -1660,6 +1670,63 @@ def is_run_incomplete(output_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Disk loaders – restore previous stage results without re-running
 # ---------------------------------------------------------------------------
+
+
+def _exit_code_check(
+    label: str,
+    exit_code: int,
+    stderr_log_path: "Path | None",
+    exempt_codes: tuple = (),
+) -> CompareResult:
+    """Gate the resilient binary's exit code, surfacing stderr as feedback.
+
+    The byte-comparison comparators only check that the output file matches
+    the baseline; they say nothing about whether the binary terminated
+    cleanly.  A binary that writes the right output then crashes on cleanup
+    (e.g. ROSS calling MPI_Barrier after MPI_FINALIZE) still produces a
+    valid validation_output.bin but mpirun exits non-zero, which makes the
+    downstream bench stage refuse to record metrics and BLOCKs the audit.
+
+    By failing correctness on a non-zero exit and embedding the last
+    stderr lines in the failure message, the next iter-loop prompt sees
+    the actual MPI error (run_iterative.sh:451-479 already tails stderr)
+    instead of hitting an opaque "bench unmeasurable" wall.
+
+    `exempt_codes` lets callers ignore expected signals — primarily 137
+    (SIGKILL) which the failure injector sends to attempt_1 by design.
+    """
+    method = f"exit_code [VeloC, {label}]"
+    if exit_code == 0 or exit_code in exempt_codes:
+        return CompareResult(
+            passed=True,
+            method=method,
+            score=0.0,
+            message=f"exit_code={exit_code}",
+            details={"exit_code": exit_code, "exempt": exit_code in exempt_codes},
+        )
+    stderr_tail = ""
+    if stderr_log_path and stderr_log_path.exists():
+        try:
+            lines = stderr_log_path.read_text(errors="replace").splitlines()
+            stderr_tail = "\n".join(lines[-20:])
+        except OSError:
+            stderr_tail = "(unable to read stderr log)"
+    return CompareResult(
+        passed=False,
+        method=method,
+        score=None,
+        message=(
+            f"non-zero exit on {label} run: exit_code={exit_code}; "
+            f"the output file may compare equal but the binary terminated "
+            f"abnormally (mpirun returned {exit_code}, which BLOCKS bench). "
+            f"Last stderr lines:\n{stderr_tail}"
+        ),
+        details={
+            "exit_code": exit_code,
+            "stderr_log_path": str(stderr_log_path) if stderr_log_path else None,
+            "stderr_tail": stderr_tail,
+        },
+    )
 
 
 def _save_correctness_results(output_dir: Path, results: list[CompareResult]) -> None:
@@ -2535,6 +2602,18 @@ def _stage_correctness(
             flush=True,
         )
 
+        # ISSUES.md #97: wipe stale `kill_attempt_*` sibling dirs from prior
+        # runs.  Otherwise a successful re-run that needs fewer attempts than
+        # the previous one leaves orphan dirs next to the current run's
+        # artifacts, confusing forensic readers who cannot tell which
+        # attempts belong to which run.  The proof JSON's kill_attempts_log
+        # is the authoritative record either way; this just keeps the
+        # on-disk layout matched to it.
+        import shutil as _shutil
+        for _stale in resilient_out.glob("kill_attempt_*"):
+            if _stale.is_dir():
+                _shutil.rmtree(_stale, ignore_errors=True)
+
         kill_attempts_log: list[dict] = []
         fp_result = None
         used_kill_fraction = initial_kill_fraction
@@ -2860,6 +2939,46 @@ def _stage_correctness(
     print(f"[validate] Test 1 (VeloC, failure-prone): {result1}", flush=True)
     results.append(result1)
 
+    # Test 1b: exit-code gate for the failure-prone (recovery) attempt.
+    # The output comparator says nothing about how the binary exited; a
+    # binary that writes the right output then crashes on cleanup (e.g.
+    # ROSS's MPI_Barrier-after-MPI_FINALIZE) still BLOCKs bench.  Failing
+    # correctness here turns that opaque downstream wall into actionable
+    # iter-loop feedback (stderr tail is forwarded by run_iterative.sh).
+    # Skip when the v2.2 orchestrator already marked the run structurally
+    # collapsed (no recovery actually ran → exit_code carries no signal
+    # about the recovery path).  Exempt 137 (SIGKILL) because the injector
+    # deliberately kills attempt_1 in the legacy path — only attempt_2's
+    # status matters for correctness.
+    _fp_recovery_actually_ran = (
+        fp_result.recovery_attempt_elapsed_s is not None
+    )
+    if _fp_recovery_actually_ran:
+        _fp_stderr_candidates = [
+            resilient_out / "attempt_2" / "stderr.txt",
+            resilient_out / "stderr.txt",
+        ]
+        _fp_stderr_path = next(
+            (p for p in _fp_stderr_candidates if p.exists()), None
+        )
+        result1b = _exit_code_check(
+            "failure-prone",
+            fp_result.exit_code,
+            _fp_stderr_path,
+            exempt_codes=(137,),
+        )
+        print(
+            f"[validate] Test 1b (exit_code [VeloC, failure-prone]): {result1b}",
+            flush=True,
+        )
+        results.append(result1b)
+    else:
+        print(
+            "[validate] Skipping exit-code check on failure-prone leg: "
+            "no recovery attempt ran (orchestrator-collapsed run).",
+            flush=True,
+        )
+
     # Test 2: baseline vs resilient (failure-free)
     resilient_clean_file = resilient_clean_out / args.output_file_name
     if resilient_clean_file.exists():
@@ -2878,6 +2997,22 @@ def _stage_correctness(
             f"{resilient_clean_file} not found.",
             flush=True,
         )
+
+    # Test 2b: exit-code gate for the failure-free run.  No injection
+    # happened, so a non-zero exit is unambiguously a defect — no SIGKILL
+    # exemption.  Always evaluated when clean_result exists.
+    _clean_stderr_path = resilient_clean_out / "stderr.txt"
+    result2b = _exit_code_check(
+        "failure-free",
+        clean_result.exit_code,
+        _clean_stderr_path if _clean_stderr_path.exists() else None,
+        exempt_codes=(),
+    )
+    print(
+        f"[validate] Test 2b (exit_code [VeloC, failure-free]): {result2b}",
+        flush=True,
+    )
+    results.append(result2b)
 
     # --- Resilience policy enforcement ---
     # Validation A (vanilla audit): also build the reference checkpointed
@@ -3114,6 +3249,16 @@ def _stage_correctness(
         _kill_fraction = locals().get("kill_fraction")
         _z_p_walltime_s = locals().get("z_p_walltime")
         _kill_attempts_log = locals().get("kill_attempts_log")
+        # Per-run perturbation identity for proof JSON enrichment
+        # (ISSUES.md #96).  When perturbation is inactive these stay None.
+        _perturbation_seed = locals().get("perturbation_seed") if _perturbation_active else None
+        _perturbation_value = locals().get("z_p_value") if _perturbation_active else None
+        _perturbation_spec_obj = locals().get("perturbation_spec") if _perturbation_active else None
+        _perturbation_method = (
+            getattr(_perturbation_spec_obj, "method", None)
+            if _perturbation_spec_obj is not None
+            else None
+        )
         _enforce_validation_b(
             signals=resilience_signals,
             output_correct=bool(result1.passed),
@@ -3130,6 +3275,9 @@ def _stage_correctness(
             legitimate_output_paths=_legitimate_output_paths,
             per_fraction_results=_per_fraction_results,
             perturbation_active=bool(_perturbation_active),
+            perturbation_seed=_perturbation_seed,
+            perturbation_value=_perturbation_value,
+            perturbation_method=_perturbation_method,
             early_exit_cold_replay=_early_exit_cold_replay,
             kill_fraction=_kill_fraction,
             z_p_walltime_s=_z_p_walltime_s,

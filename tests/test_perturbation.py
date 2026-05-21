@@ -723,6 +723,38 @@ class TestEnforceValidationB:
         assert proof["recovery_resume_slope"] is None
         assert proof["perturbation_active"] is False
 
+    def test_proof_json_records_perturbation_identity(self, tmp_path):
+        """ISSUES.md #96: perturbation seed/value/method round-trip into proof.json."""
+        _seed_proof(tmp_path)
+        sigs = _base_signals()
+        sigs["recovery_attempt_elapsed_s"] = 35.0
+        _enforce_validation_b(
+            sigs, output_correct=True, out_dir=tmp_path,
+            perturbation_active=True,
+            perturbation_seed=495208423,
+            perturbation_value=2.030203501943399e-05,
+            perturbation_method="regex_replace",
+            kill_fraction=0.65, z_p_walltime_s=100.0,
+        )
+        proof = json.loads((tmp_path / "resilience_proof.json").read_text())
+        assert proof["perturbation_active"] is True
+        assert proof["perturbation_seed"] == 495208423
+        assert proof["perturbation_value"] == pytest.approx(2.030203501943399e-05)
+        assert proof["perturbation_method"] == "regex_replace"
+
+    def test_proof_json_perturbation_identity_absent_when_inactive(self, tmp_path):
+        """When perturbation is inactive the identity fields stay None — no false attribution."""
+        _seed_proof(tmp_path)
+        _enforce_validation_b(
+            _base_signals(), output_correct=True, out_dir=tmp_path,
+            per_fraction_results=None, perturbation_active=False,
+        )
+        proof = json.loads((tmp_path / "resilience_proof.json").read_text())
+        assert proof["perturbation_active"] is False
+        assert proof["perturbation_seed"] is None
+        assert proof["perturbation_value"] is None
+        assert proof["perturbation_method"] is None
+
 
 # ---------------------------------------------------------------------------
 # _compute_perturbed_baseline (Piece A)
