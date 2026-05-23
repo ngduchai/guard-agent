@@ -31,7 +31,15 @@ import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+# Signature for the per-run output-correctness check used by the bench stage.
+# Inputs are (baseline_path, candidate_path); returns
+# (passed, method_label, message).  The caller (validate._stage_benchmarks)
+# wraps either the file-based ``make_comparator`` or the stdout-text
+# comparator behind this signature so _run_scenario_once does not need to
+# know which backend is in use.
+OutputComparatorFn = Callable[[Path, Path], "tuple[bool, str, str]"]
 
 from .runner import (
     RunResult,
@@ -133,6 +141,16 @@ class RunMetrics:
     recovery_time_s: float | None = None
     peak_memory_bytes: int | None = None    # kept for backward compat with saved data
     memory_samples_bytes: list[int] = field(default_factory=list)
+    # Per-run output-correctness verdict (None = check not performed; True =
+    # output matched the canonical baseline; False = mismatch / missing file).
+    # Populated by _run_scenario_once after a successful run when the caller
+    # passes a comparator + baseline path through run_benchmark_sweep.  The
+    # bench stage uses the same comparator config as the correctness stage so
+    # a TRUSTED app cannot silently regress its per-run output on the
+    # measurement leg.
+    output_correct: bool | None = None
+    output_compare_method: str | None = None
+    output_compare_message: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -781,6 +799,9 @@ def _run_scenario_once(
     app_input_subdir: str | None = None,
     extra_source_dirs: list[Path] | None = None,
     priority_source_dirs: list[Path] | None = None,
+    output_comparator: "OutputComparatorFn | None" = None,
+    output_baseline_file: Path | None = None,
+    output_file_name: str | None = None,
 ) -> RunMetrics:
     """Execute one run of *scenario* for *codebase* and collect metrics.
 
@@ -1120,6 +1141,46 @@ def _run_scenario_once(
         mem_samples = mem_samples_holder[0] if mem_samples_holder[0] else []
     peak_mem = max(mem_samples) if mem_samples else None
 
+    # Per-run output-correctness check (applied to BOTH original and
+    # resilient codebases when the caller provides a comparator + baseline
+    # file).  Closes the gap where the bench stage measured timing only —
+    # a TRUSTED LLM solution that silently regresses its output on the
+    # measurement leg (different from the correctness leg's perturbed
+    # inputs) would have been accepted.  Validator design principle:
+    # bench cells use FIXED canonical inputs (not the correctness stage's
+    # random perturbation) so the per-run output is directly comparable
+    # to a pre-computed canonical baseline shared across vanilla,
+    # reference, and LLM baseline measurements.
+    out_correct: bool | None = None
+    out_method: str | None = None
+    out_message: str | None = None
+    if (
+        output_comparator is not None
+        and output_baseline_file is not None
+        and output_file_name
+    ):
+        candidate_file = run_output_dir / output_file_name
+        try:
+            ok, method_label, message = output_comparator(
+                output_baseline_file, candidate_file
+            )
+            out_correct = bool(ok)
+            out_method = method_label
+            out_message = message
+        except Exception as exc:
+            # Comparator crash should be visible in raw_metrics but must
+            # not abort the sweep — a downstream summary check surfaces
+            # missing-True verdicts to the trust gate.
+            out_correct = False
+            out_method = "comparator_error"
+            out_message = f"{type(exc).__name__}: {exc}"
+        verdict = "PASS" if out_correct else "FAIL"
+        print(
+            f"[metrics] output check ({codebase} {scenario.name} "
+            f"run_{run_index}): {verdict} ({out_method}) — {out_message}",
+            flush=True,
+        )
+
     return RunMetrics(
         scenario_name=scenario.name,
         codebase=codebase,
@@ -1134,6 +1195,9 @@ def _run_scenario_once(
         recovery_time_s=None,
         peak_memory_bytes=peak_mem,
         memory_samples_bytes=mem_samples,
+        output_correct=out_correct,
+        output_compare_method=out_method,
+        output_compare_message=out_message,
     )
 
 
@@ -1165,8 +1229,22 @@ _BENCH_WORKLOAD_OVERHEAD_DEFAULT = 1.50
 
 
 def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
-    """Build a nested summary dict: scenario → codebase → metric → stats."""
+    """Build a nested summary dict: scenario → codebase → metric → stats.
+
+    A side-channel ``output_correct`` block is layered on top of the numeric
+    summary so the trust gate can read per-(scenario,codebase) verdicts
+    without re-traversing every RunMetrics entry.  Layout:
+
+        summary[scenario][codebase]["output_correct"] = {
+            "n_total": int,
+            "n_checked": int,   # excludes runs whose comparator returned None
+            "n_passed": int,
+            "all_passed": bool, # False if any checked run failed
+            "any_checked": bool,
+        }
+    """
     summary: dict[str, Any] = {}
+    output_correct_raw: dict[str, dict[str, list[bool]]] = {}
     for run in runs:
         s = run.scenario_name
         c = run.codebase
@@ -1189,6 +1267,12 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
         if run.memory_samples_bytes:
             bucket["memory_samples_bytes"].extend(run.memory_samples_bytes)
         bucket["num_attempts"].append(run.num_attempts)
+        # Track raw output_correct booleans (None = "not checked", excluded
+        # from passed/checked counts) in a side dict so we can layer the
+        # verdict in after the numeric aggregation overwrites the inner
+        # dicts.
+        oc_bucket = output_correct_raw.setdefault(s, {}).setdefault(c, [])
+        oc_bucket.append(run.output_correct)
 
     # Replace raw lists with aggregated stats.
     for s in summary:
@@ -1196,6 +1280,18 @@ def _build_summary(runs: list[RunMetrics]) -> dict[str, Any]:
             bucket = summary[s][c]
             for metric in list(bucket.keys()):
                 bucket[metric] = _aggregate(bucket[metric])
+
+    # Layer output_correct verdict on each (scenario,codebase) bucket.
+    for s, codebases in output_correct_raw.items():
+        for c, verdicts in codebases.items():
+            checked = [v for v in verdicts if v is not None]
+            summary[s][c]["output_correct"] = {
+                "n_total": len(verdicts),
+                "n_checked": len(checked),
+                "n_passed": sum(1 for v in checked if v),
+                "all_passed": bool(checked) and all(checked),
+                "any_checked": bool(checked),
+            }
 
     return summary
 
@@ -1272,9 +1368,15 @@ def _load_bench_progress(benchmarks_dir: Path) -> tuple[list[RunMetrics], set[st
                 injected=bool(r.get("injected", False)),
                 num_attempts=int(r.get("num_attempts", 1)),
                 checkpoint_size_bytes=r.get("checkpoint_size_bytes"),
+                checkpoint_per_frame_bytes=r.get("checkpoint_per_frame_bytes"),
+                checkpoint_frames_on_disk=r.get("checkpoint_frames_on_disk"),
+                checkpoint_files_count=r.get("checkpoint_files_count"),
                 recovery_time_s=r.get("recovery_time_s"),
                 peak_memory_bytes=r.get("peak_memory_bytes"),
                 memory_samples_bytes=r.get("memory_samples_bytes", []),
+                output_correct=r.get("output_correct"),
+                output_compare_method=r.get("output_compare_method"),
+                output_compare_message=r.get("output_compare_message"),
             )
             for r in raw.get("runs", [])
         ]
@@ -1547,6 +1649,9 @@ def run_benchmark_sweep(
     skip_original_codebase: bool = False,
     skip_original_inject_scenarios: bool = True,
     warmup_runs_per_codebase: int = 1,
+    output_comparator: OutputComparatorFn | None = None,
+    output_baseline_file: Path | None = None,
+    output_file_name: str | None = None,
 ) -> BenchmarkResults:
     """Execute all scenarios for all codebases and collect RunMetrics.
 
@@ -1814,6 +1919,9 @@ def run_benchmark_sweep(
                     executable_name=original_executable_name,
                     veloc_config_name=veloc_config_name,
                     app_input_subdir=app_input_subdir,
+                    output_comparator=output_comparator,
+                    output_baseline_file=output_baseline_file,
+                    output_file_name=output_file_name,
                 )
                 all_runs.append(orig_metrics)
                 completed_keys.add(orig_key)
@@ -1856,6 +1964,9 @@ def run_benchmark_sweep(
                     app_input_subdir=app_input_subdir,
                     extra_source_dirs=[original_source_dir],
                     priority_source_dirs=resilient_priority_source_dirs,
+                    output_comparator=output_comparator,
+                    output_baseline_file=output_baseline_file,
+                    output_file_name=output_file_name,
                 )
                 all_runs.append(res_metrics)
                 completed_keys.add(res_key)
@@ -1902,6 +2013,9 @@ def run_benchmark_sweep(
                         install_prefix=approach.install_prefix,
                         app_input_subdir=app_input_subdir,
                         extra_source_dirs=[original_source_dir],
+                        output_comparator=output_comparator,
+                        output_baseline_file=output_baseline_file,
+                        output_file_name=output_file_name,
                     )
                     all_runs.append(a_metrics)
                     completed_keys.add(a_key)

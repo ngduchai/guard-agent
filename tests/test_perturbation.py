@@ -486,6 +486,59 @@ class TestApplyPerturbation:
         assert (cwd / "in.validation").resolve() == (src / "other" / "in.validation")
         assert (src / "other" / "in.validation").read_text() == "DIFFERENT_SOURCE\n"
 
+    def test_regex_replace_top_level_alias_refreshed_on_subsequent_cycle(
+        self, tmp_path,
+    ):
+        # REGRESSION (2026-05-23): the 2026-05-21 alias-refresh fix
+        # (commit 44c737672) guarded the overwrite with is_symlink(),
+        # which was correct only for the FIRST perturbation cycle in a
+        # freshly symlinked resilient_clean/.  On the SECOND cycle the
+        # alias is already a real file (written by cycle 1) so the
+        # is_symlink() guard returns False and the alias goes stale;
+        # the binary then reads cycle 1's value while Z_P is computed
+        # against cycle 2's value → Test 2 FAIL.  Caused the
+        # SPPARKS/SPARTA 2026-05-23 UNTRUSTED verdicts.  Fix: when the
+        # alias is a real file, overwrite when its content matches the
+        # perturbation regex (collision-safe).
+        src = tmp_path / "src"
+        cwd = tmp_path / "cwd"
+        (src / "examples" / "free").mkdir(parents=True)
+        cwd.mkdir()
+        (src / "examples" / "free" / "in.validation").write_text(
+            "seed            12345\n"
+        )
+        (cwd / "in.validation").symlink_to(
+            src / "examples" / "free" / "in.validation"
+        )
+        (cwd / "examples").mkdir()
+        (cwd / "examples" / "free").symlink_to(src / "examples" / "free")
+
+        spec = _parse_perturbation({
+            "method": "regex_replace",
+            "file": "examples/free/in.validation",
+            "pattern": r"seed\s+[0-9]+",
+            "replacement_template": "seed            {value:d}",
+            "value_range": [10000, 999999],
+        })
+
+        # Cycle 1: promotes alias from symlink → real file.
+        apply_perturbation(spec, 111111, cwd=cwd, source_dir=src,
+                           app_args=["-in", "in.validation"], env={})
+        alias = cwd / "in.validation"
+        assert not alias.is_symlink(), "cycle 1 should promote alias to real file"
+        assert "seed            111111" in alias.read_text()
+
+        # Cycle 2: alias is now a real file.  Must be REFRESHED to the
+        # new value, not left stale at cycle 1's content.
+        apply_perturbation(spec, 222222, cwd=cwd, source_dir=src,
+                           app_args=["-in", "in.validation"], env={})
+        contents = alias.read_text()
+        assert "seed            222222" in contents, (
+            "cycle 2 must overwrite the real-file alias; otherwise the "
+            "binary reads stale cycle-1 input and Z_P diverges"
+        )
+        assert "111111" not in contents
+
     def test_regex_replace_no_match_raises(self, tmp_path):
         src = tmp_path / "src"
         cwd = tmp_path / "cwd"

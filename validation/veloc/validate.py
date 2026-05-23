@@ -3945,6 +3945,129 @@ def _compute_perturbed_baseline(
     return float(result.elapsed_s), cached_output, value
 
 
+def _build_bench_output_check(
+    *,
+    args: argparse.Namespace,
+    original_src: Path,
+) -> tuple["object | None", "Path | None"]:
+    """Build the bench-stage per-run output-correctness comparator closure.
+
+    Returns ``(comparator_fn, baseline_file)`` where ``comparator_fn`` has
+    signature ``(baseline_path, candidate_path) -> (passed, method, message)``
+    and is plumbed into :func:`metrics_collector.run_benchmark_sweep`.
+
+    The closure uses the SAME backend as the correctness stage's
+    :func:`_stage_correctness` chooses (stdout-text path when
+    ``output_file_name == "stdout.txt"``, otherwise the file-based
+    :func:`make_comparator`).  Sourcing both stages from the same
+    comparator config means a TRUSTED LLM solution cannot regress its
+    per-run output silently on the measurement leg.
+
+    Returns ``(None, None)`` when prerequisites for the check are not met
+    (no ``output_file_name``, no canonical baseline file on disk).  The
+    bench sweep then skips per-run comparison and records
+    ``output_correct=None`` on every RunMetrics.  This keeps the change
+    additive — apps without a baseline cache populate continue to bench
+    as before.
+    """
+    output_file_name = getattr(args, "output_file_name", None)
+    if not output_file_name:
+        return None, None
+
+    baseline_file = _default_baseline_cache_dir(original_src) / output_file_name
+    if not baseline_file.exists():
+        # baseline_cache is populated by _autodetect_or_collect_baseline_cache
+        # earlier in the validate run; if it's still missing here something
+        # upstream skipped collection (--skip-baseline, broken cache).
+        # Skip the check rather than fail the whole bench stage — operator
+        # sees an explicit log line and can re-run with baseline collection
+        # enabled.
+        print(
+            f"[validate] bench output-check: SKIPPED (baseline file "
+            f"{baseline_file} does not exist; per-run output correctness "
+            "will not be verified in the bench cells).",
+            flush=True,
+        )
+        return None, None
+
+    use_stdout_compare = output_file_name == "stdout.txt"
+
+    if use_stdout_compare:
+        from .reference_validator import _compare_outputs as _stdout_compare
+        from .reference_validator import (
+            _compare_outputs_streaming as _stdout_compare_streaming,
+        )
+        _METHOD_REVERSE = {
+            "numeric-tolerance": "numeric",
+            "text-diff": "text",
+            "hash": "hash",
+            "streaming-text": "streaming-text",
+            "streaming-numeric": "streaming-numeric",
+        }
+        ref_method = _METHOD_REVERSE.get(args.comparison_method, "text")
+        ref_tolerance = float(args.numeric_rtol or args.numeric_atol or 1e-6)
+
+        def _bench_stdout_compare(
+            baseline_path: Path, candidate_path: Path
+        ) -> tuple[bool, str, str]:
+            if not candidate_path.exists():
+                return (False, ref_method,
+                        f"candidate stdout missing: {candidate_path}")
+            if ref_method.startswith("streaming-"):
+                inner_method = ref_method.replace("streaming-", "")
+                res = _stdout_compare_streaming(
+                    golden_file=baseline_path,
+                    test_file=candidate_path,
+                    method=inner_method,
+                    tolerance=ref_tolerance,
+                    ignore_patterns=args.text_ignore_patterns,
+                    keep_patterns=args.text_keep_patterns,
+                    strip_patterns=args.text_strip_patterns,
+                )
+            else:
+                golden_text = baseline_path.read_text(errors="replace")
+                test_text = candidate_path.read_text(errors="replace")
+                res = _stdout_compare(
+                    golden_stdout=golden_text,
+                    test_stdout=test_text,
+                    method=ref_method,
+                    tolerance=ref_tolerance,
+                    ignore_patterns=args.text_ignore_patterns,
+                    keep_patterns=args.text_keep_patterns,
+                    strip_patterns=args.text_strip_patterns,
+                )
+            return (bool(res.passed), str(res.method),
+                    str(res.details or ""))
+
+        return _bench_stdout_compare, baseline_file
+
+    # File-based comparison.
+    plugin_path = (
+        Path(args.custom_comparator) if args.custom_comparator else None
+    )
+    comparator = make_comparator(
+        method=args.comparison_method,
+        plugin_path=plugin_path,
+        dataset=args.hdf5_dataset,
+        ssim_threshold=args.ssim_threshold,
+        atol=args.numeric_atol,
+        rtol=args.numeric_rtol,
+        ignore_patterns=args.text_ignore_patterns,
+    )
+
+    def _bench_file_compare(
+        baseline_path: Path, candidate_path: Path
+    ) -> tuple[bool, str, str]:
+        if not candidate_path.exists():
+            return (False, args.comparison_method,
+                    f"candidate output missing: {candidate_path}")
+        result = comparator.compare(baseline_path, candidate_path)
+        return (bool(result.passed), str(result.method),
+                str(result.message or ""))
+
+    return _bench_file_compare, baseline_file
+
+
 def _stage_benchmarks(
     args: argparse.Namespace,
     original_src: Path,
@@ -4037,6 +4160,19 @@ def _stage_benchmarks(
     #   keep *original* (= vanilla baseline that BENCH-BASELINE will reuse).
     is_baseline_mode = "tests_baseline" in str(Path(resilient_src).resolve())
 
+    # Per-run output-correctness check (closure passed to
+    # run_benchmark_sweep).  Uses the SAME comparator backend the
+    # correctness stage uses, with the canonical baseline file at
+    # build/baseline_cache/<APP>/<output_file_name>.  Bench cells use
+    # fixed canonical inputs (no perturbation), so the per-run output is
+    # directly comparable to this pre-computed golden — the user's design
+    # principle that the bench must use a pre-defined benchmark, not a
+    # randomised one, makes this comparison meaningful across vanilla,
+    # reference, and LLM-baseline measurements.
+    bench_output_comparator, bench_output_baseline = _build_bench_output_check(
+        args=args, original_src=original_src,
+    )
+
     return run_benchmark_sweep(
         original_source_dir=original_src,
         original_build_dir=original_build,
@@ -4064,6 +4200,9 @@ def _stage_benchmarks(
         # Cost: 3 extra mpirun cycles per app (~5 min per app at typical
         # T_nofail≈60s, f=0.5); ~85 min over the 17-app sweep.
         skip_original_inject_scenarios=False,
+        output_comparator=bench_output_comparator,
+        output_baseline_file=bench_output_baseline,
+        output_file_name=args.output_file_name,
     )
 
 
