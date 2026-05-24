@@ -53,6 +53,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,16 @@ RUN_LOGS_DIR = BUILD_DIR / "run_logs"
 
 HELPER_SH = SCRIPT_DIR / "_iter_gen.sh"
 VALIDATE_SH = SCRIPT_DIR / "run_validate.sh"
+
+# --- Control-plane files (see run_parallel_queue_ctl.py for the client) ------
+# The orchestrator reads new lines appended to CONTROL_FILE during its main
+# wait loop (~2s polling cadence) and writes one ack record per command to
+# CONTROL_ACK_FILE.  Both files are append-only JSONL so a crash mid-write
+# never corrupts past records.  Sibling files keep the control plane in the
+# same dir as the pid file so dynamic-queue and orchestrator state live
+# together under build/_experiment_state/.
+CONTROL_FILE = EXP_STATE_DIR / "queue_control.jsonl"
+CONTROL_ACK_FILE = EXP_STATE_DIR / "queue_control.ack.jsonl"
 
 VANILLA_ROOTS = [
     REPO_ROOT / "tests" / "apps" / "vanillas",
@@ -199,6 +210,21 @@ class AppState(enum.Enum):
     BENCHING = "benching"
     DONE_PASSED = "done_passed"
     DONE_FAILED = "done_failed"
+
+
+# An app is "active" when it owns a slot in either queue OR is currently
+# being processed by a gen worker / the executor.  Adding to the same queue
+# again is refused unless the user passes force=true on the ctl command —
+# this is the duplicate-detection rule the dynamic-queue spec requires.
+ACTIVE_APP_STATES = frozenset({
+    AppState.READY_FOR_GEN,
+    AppState.GENERATING,
+    AppState.QUEUED_FOR_EXECUTOR,
+    AppState.EXECUTING,
+    AppState.QUEUED_FOR_BENCH,
+    AppState.BENCHING,
+})
+TERMINAL_APP_STATES = frozenset({AppState.DONE_PASSED, AppState.DONE_FAILED})
 
 
 @dataclasses.dataclass
@@ -676,9 +702,17 @@ class Orchestrator:
         self.state_lock = threading.RLock()
         self.ready_for_gen: queue.Queue = queue.Queue()
         self.executor_queue: queue.Queue = queue.Queue()
+        # Side-channel queue checked FIRST by the executor loop.  Lets ctl
+        # add --queue exec --immediate jump the line without preempting the
+        # task already running (OP-0 forbids killing running execution).
+        self.executor_priority_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.all_done_event = threading.Event()
         self.remaining = len(self.apps)
+        # Byte offset into CONTROL_FILE — only commands appended AFTER the
+        # orchestrator starts are honored.  Historical commands from a
+        # previous run are ignored on startup (see run() initialization).
+        self._control_file_offset = 0
 
     # --- Public entry point --------------------------------------------------
     def run(self) -> int:
@@ -686,6 +720,13 @@ class Orchestrator:
         ITERATIVE_LOGS.mkdir(parents=True, exist_ok=True)
         RUN_LOGS_DIR.mkdir(parents=True, exist_ok=True)
         self._claim_pid_file()
+
+        # Snap the control file offset to current EOF so prior-run commands
+        # left in queue_control.jsonl are not re-applied.  The ack file is
+        # left intact for forensic browsing.
+        if CONTROL_FILE.exists():
+            with contextlib.suppress(OSError):
+                self._control_file_offset = CONTROL_FILE.stat().st_size
 
         # Wipe stale /tmp/opencode_worker_* from any prior orchestrator run,
         # then pre-warm one SQLite DB per gen slot so the first concurrent
@@ -730,6 +771,7 @@ class Orchestrator:
             # Wait for either all done OR a signal.
             while not self.all_done_event.is_set() and not self.stop_event.is_set():
                 self.all_done_event.wait(timeout=2.0)
+                self._apply_control_commands()
                 self._write_experiment_timing(status="running")
 
             # Drain: tell workers to stop.
@@ -974,10 +1016,18 @@ class Orchestrator:
     # --- Executor (serialized) loop -----------------------------------------
     def _executor_loop(self) -> None:
         while not self.stop_event.is_set():
+            # Priority queue (populated by ctl add --immediate) is drained
+            # FIRST so dynamic-queue commands land ahead of normally queued
+            # work without preempting the task already in flight.  Falls
+            # through to the main queue with a 1s wait when priority is empty.
+            item = None
             try:
-                item = self.executor_queue.get(timeout=1.0)
+                item = self.executor_priority_queue.get_nowait()
             except queue.Empty:
-                continue
+                try:
+                    item = self.executor_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
             if item is None:
                 return
             name, kind, iter_n = item
@@ -1209,6 +1259,300 @@ class Orchestrator:
             app.state = AppState.DONE_PASSED if rc == 0 else AppState.DONE_FAILED
             self._mark_app_done(app)
         print(f"[exec] {app.name} BENCH DONE rc={rc} wall={bench_wall:.1f}s", flush=True)
+
+    # --- Dynamic-queue control plane ----------------------------------------
+    # See run_parallel_queue_ctl.py for the CLI client.  Commands are append-
+    # only JSONL records (one record per line) in CONTROL_FILE; we read the
+    # newly-appended slice each wait tick, apply each command under
+    # state_lock, and write one ack record per command to CONTROL_ACK_FILE.
+    #
+    # Why polling vs IPC: zero new runtime dependency, command history
+    # survives orchestrator restarts, the file doubles as an audit trail.
+    # Latency is bounded by the wait-loop timeout (~2s, plus current task
+    # holding state_lock).
+    @staticmethod
+    def _snapshot_queue(q: queue.Queue) -> list:
+        """Snapshot the FIFO contents of *q* without disturbing it.
+
+        queue.Queue exposes its internal deque as ``.queue`` and its lock as
+        ``.mutex``; holding the mutex while copying the deque is the
+        canonical safe-iteration pattern documented in the CPython stdlib.
+        """
+        with q.mutex:
+            return list(q.queue)
+
+    def _app_in_queue(self, app_name: str, q: queue.Queue) -> bool:
+        for item in self._snapshot_queue(q):
+            if item is None:
+                continue
+            if isinstance(item, str) and item == app_name:
+                return True
+            if isinstance(item, tuple) and item and item[0] == app_name:
+                return True
+        return False
+
+    def _filter_queue(self, q: queue.Queue, app_name: str) -> int:
+        """Drop every entry for *app_name* from *q* in place, preserving
+        order and the shutdown sentinel ``None``.  Returns the count removed.
+        """
+        removed = 0
+        with q.mutex:
+            keep: list = []
+            for item in q.queue:
+                if item is None:
+                    keep.append(item)
+                    continue
+                if isinstance(item, str) and item == app_name:
+                    removed += 1
+                    continue
+                if isinstance(item, tuple) and item and item[0] == app_name:
+                    removed += 1
+                    continue
+                keep.append(item)
+            q.queue.clear()
+            for k in keep:
+                q.queue.append(k)
+        return removed
+
+    def _write_ack(self, cmd_id: str, status: str, msg: str) -> None:
+        """Append one ack record + mirror to orchestrator stdout."""
+        record = {
+            "id": cmd_id,
+            "ts": _utc_iso(),
+            "status": status,
+            "msg": msg,
+        }
+        with contextlib.suppress(Exception):
+            CONTROL_ACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with CONTROL_ACK_FILE.open("a") as fh:
+                fh.write(json.dumps(record) + "\n")
+        print(f"[ctl] ack {cmd_id} {status}: {msg}", flush=True)
+
+    def _reset_app_for_redo(self, app: AppRun) -> None:
+        """Take a terminal app back to a clean READY state for re-enqueue.
+
+        Per-iter history (``per_iter``, ``prior_attempts``) is preserved on
+        the object so chart-gen can still see prior runs; new iters append.
+        ``remaining`` is bumped and ``all_done_event`` cleared so the main
+        wait loop does not exit on a now-incomplete experiment.
+        """
+        app.iter = 0
+        app.loop_attempt = 1
+        app.loop_stall_count = 0
+        app.loop_max_iters_count = 0
+        app.verdict_passed = False
+        app.final_stall_aborted = False
+        app.final_stall_iteration = 0
+        app.app_started_at = time.monotonic()
+        app.app_finished_at = 0.0
+        app.iter_loop_finished_at = 0.0
+        app.bench_wall_s = 0.0
+        app.bench_queue_wait_s = 0.0
+        app.bench_started_at = None
+        app.bench_exit_code = 0
+        self.remaining += 1
+        self.all_done_event.clear()
+
+    def _ctl_add_gen(self, cmd_id: str, app_name: str, force: bool) -> None:
+        with self.state_lock:
+            if app_name not in self.apps:
+                self._write_ack(cmd_id, "err",
+                                f"unknown app '{app_name}' (not in initial --apps list; "
+                                f"dynamic enrollment is not supported in this version)")
+                return
+            app = self.apps[app_name]
+            already_queued = self._app_in_queue(app_name, self.ready_for_gen)
+            if app.state in ACTIVE_APP_STATES or already_queued:
+                if not force:
+                    self._write_ack(
+                        cmd_id, "duplicate",
+                        f"'{app_name}' already active (state={app.state.value}, "
+                        f"in_gen_queue={already_queued}) — pass force=true to override",
+                    )
+                    return
+                print(
+                    f"[ctl] force-add to gen: {app_name} already active "
+                    f"({app.state.value}, in_queue={already_queued}); proceeding",
+                    flush=True,
+                )
+            if app.state in TERMINAL_APP_STATES:
+                self._reset_app_for_redo(app)
+            app.state = AppState.READY_FOR_GEN
+            app.queued_for_gen_at = time.monotonic()
+        self.ready_for_gen.put(app_name)
+        self._write_ack(cmd_id, "ok", f"'{app_name}' enqueued to gen queue")
+
+    def _ctl_add_exec(self, cmd_id: str, app_name: str, kind: str,
+                      iter_n: Optional[int], immediate: bool, force: bool) -> None:
+        if kind not in ("validate", "bench"):
+            self._write_ack(cmd_id, "err",
+                            f"unknown kind '{kind}' (use validate or bench)")
+            return
+        with self.state_lock:
+            if app_name not in self.apps:
+                self._write_ack(cmd_id, "err",
+                                f"unknown app '{app_name}' (not in initial --apps list)")
+                return
+            app = self.apps[app_name]
+            in_main = self._app_in_queue(app_name, self.executor_queue)
+            in_pri = self._app_in_queue(app_name, self.executor_priority_queue)
+            running = app.state in (AppState.EXECUTING, AppState.BENCHING)
+            if running or in_main or in_pri:
+                if not force:
+                    self._write_ack(
+                        cmd_id, "duplicate",
+                        f"'{app_name}' already in executor "
+                        f"(state={app.state.value}, in_exec_queue={in_main}, "
+                        f"in_priority_queue={in_pri}) — pass force=true to override",
+                    )
+                    return
+                print(
+                    f"[ctl] force-add to exec: {app_name} already present; proceeding",
+                    flush=True,
+                )
+            if app.state in TERMINAL_APP_STATES:
+                self._reset_app_for_redo(app)
+            if kind == "validate":
+                # Default to the most-recently-completed iter; if the app has
+                # never run, default to 1.  Callers can override with --iter.
+                if iter_n is None or iter_n <= 0:
+                    iter_n = app.iter if app.iter > 0 else 1
+                app.state = AppState.QUEUED_FOR_EXECUTOR
+                app.queued_for_executor_at = time.monotonic()
+            else:  # bench
+                iter_n = iter_n or 0
+                app.state = AppState.QUEUED_FOR_BENCH
+                app.queued_for_bench_at = time.monotonic()
+        target = self.executor_priority_queue if immediate else self.executor_queue
+        target.put((app_name, kind, iter_n))
+        where = "priority" if immediate else "main"
+        self._write_ack(
+            cmd_id, "ok",
+            f"'{app_name}' enqueued to {where} executor queue ({kind}, iter={iter_n})",
+        )
+
+    def _ctl_remove(self, cmd_id: str, app_name: str, which: str) -> None:
+        if which not in ("gen", "exec", "all"):
+            self._write_ack(cmd_id, "err",
+                            f"unknown queue '{which}' (use gen, exec, or all)")
+            return
+        details: list[str] = []
+        total = 0
+        with self.state_lock:
+            if which in ("gen", "all"):
+                n = self._filter_queue(self.ready_for_gen, app_name)
+                if n:
+                    details.append(f"gen={n}")
+                total += n
+            if which in ("exec", "all"):
+                n = self._filter_queue(self.executor_queue, app_name)
+                if n:
+                    details.append(f"executor={n}")
+                total += n
+                n = self._filter_queue(self.executor_priority_queue, app_name)
+                if n:
+                    details.append(f"priority={n}")
+                total += n
+        if total == 0:
+            self._write_ack(
+                cmd_id, "noop",
+                f"'{app_name}' had no pending entries in {which} queue "
+                f"(any in-flight task is NOT killed — use SIGINT/SIGTERM on "
+                f"the orchestrator for that, with user confirmation)",
+            )
+        else:
+            self._write_ack(
+                cmd_id, "ok",
+                f"removed {total} pending entr{'y' if total == 1 else 'ies'} "
+                f"for '{app_name}' ({', '.join(details)}); in-flight tasks unaffected",
+            )
+
+    def _ctl_list(self, cmd_id: str) -> None:
+        with self.state_lock:
+            gen_snap = self._snapshot_queue(self.ready_for_gen)
+            exec_snap = self._snapshot_queue(self.executor_queue)
+            pri_snap = self._snapshot_queue(self.executor_priority_queue)
+            per_app = {
+                name: {"state": app.state.value, "iter": app.iter,
+                       "loop_attempt": app.loop_attempt}
+                for name, app in self.apps.items()
+            }
+            remaining = self.remaining
+        summary = {
+            "gen_queue": [x for x in gen_snap if x is not None],
+            "executor_queue": [list(x) for x in exec_snap if x is not None],
+            "priority_queue": [list(x) for x in pri_snap if x is not None],
+            "per_app": per_app,
+            "remaining": remaining,
+        }
+        self._write_ack(cmd_id, "ok", json.dumps(summary))
+
+    def _dispatch_control_command(self, cmd: dict) -> None:
+        cmd_id = str(cmd.get("id") or uuid.uuid4())
+        cmd_type = cmd.get("cmd", "")
+        try:
+            if cmd_type == "add":
+                queue_kind = cmd.get("queue", "")
+                if queue_kind == "gen":
+                    self._ctl_add_gen(cmd_id, cmd["app"],
+                                      bool(cmd.get("force", False)))
+                elif queue_kind == "exec":
+                    self._ctl_add_exec(
+                        cmd_id, cmd["app"], cmd.get("kind", "validate"),
+                        cmd.get("iter"), bool(cmd.get("immediate", False)),
+                        bool(cmd.get("force", False)),
+                    )
+                else:
+                    self._write_ack(cmd_id, "err",
+                                    f"unknown queue '{queue_kind}' for add")
+            elif cmd_type == "remove":
+                self._ctl_remove(cmd_id, cmd["app"], cmd.get("queue", "all"))
+            elif cmd_type == "list":
+                self._ctl_list(cmd_id)
+            else:
+                self._write_ack(cmd_id, "err", f"unknown cmd '{cmd_type}'")
+        except KeyError as e:
+            self._write_ack(cmd_id, "err", f"missing required field: {e}")
+        except Exception as e:
+            self._write_ack(cmd_id, "err", f"exception applying cmd: {e!r}")
+
+    def _apply_control_commands(self) -> None:
+        """Read new lines from CONTROL_FILE since the last poll, dispatch each.
+
+        No-op if the file does not exist or has not grown.  Malformed lines
+        are logged and skipped — they do not stall the loop.
+        """
+        if not CONTROL_FILE.exists():
+            return
+        try:
+            size = CONTROL_FILE.stat().st_size
+        except OSError:
+            return
+        if size <= self._control_file_offset:
+            return
+        try:
+            with CONTROL_FILE.open("r") as fh:
+                fh.seek(self._control_file_offset)
+                new_data = fh.read()
+                self._control_file_offset = fh.tell()
+        except Exception as e:
+            print(f"[ctl] error reading control file: {e}", flush=True)
+            return
+        for raw in new_data.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                cmd = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"[ctl] skipping malformed control line: {e} :: {line!r}",
+                      flush=True)
+                continue
+            if not isinstance(cmd, dict):
+                print(f"[ctl] skipping non-object control line: {cmd!r}",
+                      flush=True)
+                continue
+            self._dispatch_control_command(cmd)
 
     # --- D3 retry decision (called under state_lock) ------------------------
     def _finalize_loop_attempt(self, app: AppRun, *, outcome: str,
