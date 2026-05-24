@@ -35,6 +35,7 @@
 #include "Utilities/qmc_common.h"
 
 #include <array>
+#include <vector>
 
 void output_hardware_info(Communicate* comm, Libxml2Document& doc, xmlNodePtr root);
 
@@ -207,32 +208,40 @@ int main(int argc, char** argv)
     if (!qmcSuccess)
       qmcComm->barrier_and_abort("main(). QMC Execution failed.");
 
-    /* Step 0 v9 (QMCPACK-A 2026-05-21): augment the binary validation
-     * signature with a 7th double — the trajectory hash — so the
-     * comparator is sensitive to input perturbation (required by the
-     * v2.2 cold-replay detector; calibrator's output_sensitivity_ok
-     * invariant was unsatisfiable under v8 because the prior 6 doubles
-     * were config-only and invariant under any non-crashing perturbation).
+    /* Step 0 v9.1 (QMCPACK-B 2026-05-24): widen the STATE-derived signature
+     * from a single trajectory column (LocalEnergy only) to four MPI-meaningful
+     * accumulators (LocalEnergy, Kinetic, LocalPotential, BlockWeight) so a
+     * resilient cold-replay that drifts in any energy-flavoured channel — not
+     * just total energy — diverges on the comparator.  Replaces v9 schema
+     * whose 6/8 slots were config-only echo (qmcComm size, inputs size,
+     * qmcSuccess flag, argc) — half the comparator surface was therefore
+     * tautological.
      *
-     * Writes 8 raw doubles (64 bytes) to "validation_output.bin" in CWD
-     * on rank 0:
-     *   [0] (double)qmcComm->size()              (MPI ranks)
-     *   [1] (double)inputs.size()                (number of <qmc> input files)
-     *   [2] (double)(qmcSuccess ? 1.0 : 0.0)     (always 1.0 if we reach the dump)
-     *   [3] (double)argc                         (command-line arg count)
-     *   [4] (double)series_count                 (number of <title>.s*.scalar.dat files)
-     *   [5] (double)block_count                  (total LocalEnergy rows across all .scalar.dat files)
-     *   [6] (double)trajectory_sum               (sum of column 1 'LocalEnergy' across every block of every series)
-     *   [7] (double)0.0                          (reserved)
+     * Writes 8 raw doubles (64 bytes) to "validation_output.bin" in CWD on
+     * rank 0:
+     *   [0] (double)qmcComm->size()      MPI rank count        (config sanity)
+     *   [1] (double)inputs.size()        <qmc> input file count(config sanity)
+     *   [2] (double)(qmcSuccess?1:0)     reached-dump flag     (config sanity)
+     *   [3] sum(BlockWeight)             total walker-steps    (STATE)
+     *   [4] sum(LocalEnergy)             trajectory energy sum (STATE)
+     *   [5] sum(Kinetic)                 kinetic-energy sum    (STATE)
+     *   [6] sum(LocalPotential)          potential-energy sum  (STATE)
+     *   [7] (double)block_count          completed blocks      (STATE)
      *
-     * The trajectory_sum is computed BY the simulation (not derivable from
-     * the input file alone): the linear optimizer reads the starting
-     * Jastrow B and converges over 60 loop iterations, producing a
-     * trajectory whose per-block LocalEnergy values depend on B.  Reading
-     * the .scalar.dat files post-execute() is a passive observation, not
-     * an intercept on the optimizer.  Determinism across runs is
-     * enforced by the <random seed=.../> element in the input XML; per-app
-     * patch overlay and v2.2 perturbation regex preserve the seed line.
+     * Parser strategy: read the .scalar.dat header line (`#  index  Name1
+     * Name2 ...`) and resolve LocalEnergy/Kinetic/LocalPotential/BlockWeight
+     * to per-file column indices.  This tolerates per-system column layout
+     * variation (e.g. He uses 'Coulomb', heavy systems use 'IonElec'/'IonIon').
+     * Missing columns are skipped silently and contribute zero — the comparator
+     * still discriminates on the surviving columns.  Reading post-execute()
+     * is a passive observation, not an intercept on the optimizer.  Per-block
+     * values depend on RNG seed (preserved via patch overlay) and on starting
+     * Jastrow B (perturbed by the v2.2 cold-replay detector).
+     *
+     * Comparator: tests/apps/configs/QMCPACK.yaml comparison.method =
+     * numeric-tolerance, tolerance preserved.  Slots [3..7] react to
+     * RNG/Jastrow drift; cold-replayed (re-seeded or block-skipped) runs
+     * produce different trajectories and diverge.
      *
      * Rank-root-only.
      */
@@ -241,10 +250,11 @@ int main(int argc, char** argv)
       sig_buf[0] = static_cast<double>(qmcComm->size());
       sig_buf[1] = static_cast<double>(inputs.size());
       sig_buf[2] = qmcSuccess ? 1.0 : 0.0;
-      sig_buf[3] = static_cast<double>(argc);
 
-      double trajectory_sum = 0.0;
-      int series_count = 0;
+      double sum_local_energy = 0.0;
+      double sum_kinetic = 0.0;
+      double sum_local_potential = 0.0;
+      double sum_block_weight = 0.0;
       int block_count = 0;
       const std::string title = qmc->getTitle();
       const std::string suffix = ".scalar.dat";
@@ -257,31 +267,62 @@ int main(int argc, char** argv)
           if (fname.compare(0, title.size(), title) != 0) continue;
           if (fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
           if (fname[title.size()] != '.' || fname[title.size() + 1] != 's') continue;
-          series_count++;
+
           std::ifstream f(entry.path());
           std::string line;
+          // Per-file column indices (resolved from header line).
+          int idx_le = -1, idx_kin = -1, idx_lp = -1, idx_bw = -1;
+          bool header_seen = false;
+
           while (std::getline(f, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            std::istringstream iss(line);
-            double idx, energy;
-            if (iss >> idx >> energy) {
-              trajectory_sum += energy;
-              block_count++;
+            if (line.empty()) continue;
+            if (line[0] == '#') {
+              if (!header_seen) {
+                // Header format: "#   index   Name1   Name2   ..."
+                // Skip the leading '#'; columns are whitespace-separated.
+                std::istringstream hiss(line.substr(1));
+                std::string tok;
+                int col = -1;  // 'index' is column 0 of data rows
+                while (hiss >> tok) {
+                  if (tok == "index") { col = 0; continue; }
+                  ++col;
+                  if (tok == "LocalEnergy")    idx_le  = col;
+                  else if (tok == "Kinetic")        idx_kin = col;
+                  else if (tok == "LocalPotential") idx_lp  = col;
+                  else if (tok == "BlockWeight")    idx_bw  = col;
+                }
+                header_seen = true;
+              }
+              continue;
             }
+            // Data row: parse all whitespace-separated doubles, index by column.
+            std::istringstream diss(line);
+            std::vector<double> row;
+            double v;
+            while (diss >> v) row.push_back(v);
+            if (row.empty()) continue;
+            ++block_count;
+            if (idx_le  >= 0 && (size_t)idx_le  < row.size()) sum_local_energy    += row[idx_le];
+            if (idx_kin >= 0 && (size_t)idx_kin < row.size()) sum_kinetic         += row[idx_kin];
+            if (idx_lp  >= 0 && (size_t)idx_lp  < row.size()) sum_local_potential += row[idx_lp];
+            if (idx_bw  >= 0 && (size_t)idx_bw  < row.size()) sum_block_weight    += row[idx_bw];
           }
         }
       } catch (const std::exception& e) {
         // Filesystem traversal failure: emit zeros so the comparator
         // surfaces a mismatch instead of silently passing.
-        std::cerr << "WARN: trajectory_sum scan failed: " << e.what() << std::endl;
-        trajectory_sum = 0.0;
-        series_count = 0;
+        std::cerr << "WARN: scalar.dat scan failed: " << e.what() << std::endl;
+        sum_local_energy = 0.0;
+        sum_kinetic = 0.0;
+        sum_local_potential = 0.0;
+        sum_block_weight = 0.0;
         block_count = 0;
       }
-      sig_buf[4] = static_cast<double>(series_count);
-      sig_buf[5] = static_cast<double>(block_count);
-      sig_buf[6] = trajectory_sum;
-      sig_buf[7] = 0.0;
+      sig_buf[3] = sum_block_weight;
+      sig_buf[4] = sum_local_energy;
+      sig_buf[5] = sum_kinetic;
+      sig_buf[6] = sum_local_potential;
+      sig_buf[7] = static_cast<double>(block_count);
 
       FILE* sig_f = std::fopen("validation_output.bin", "wb");
       if (sig_f) {

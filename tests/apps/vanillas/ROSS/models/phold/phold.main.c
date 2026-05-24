@@ -1,4 +1,5 @@
 #include "phold.h"
+#include "network-mpi.h"  /* tw_net_statistics — not pulled in via ross.h umbrella */
 
 
 tw_peid
@@ -282,32 +283,56 @@ main(int argc, char **argv)
     } // end if(g_st_ross_rank)
 #endif
 
-	/* Step 0 v8: emit binary validation signature for file-based comparison.
-	 * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
-	 * rank 0.  ROSS is stochastic (event-driven Monte Carlo) so a strict
-	 * state-based signature would be unreliable; instead this CONFIG
-	 * signature captures deterministic runtime invariants:
-	 *   [0] (double)g_tw_nlp                                (total LPs per rank)
-	 *   [1] g_tw_lookahead                                  (lookahead config)
-	 *   [2] (double)g_tw_synchronization_protocol           (sync mode)
-	 *   [3] (double)g_phold_start_events                    (per-LP starting events)
-	 *   [4] mean                                            (exponential dist mean)
-	 *   [5] percent_remote                                  (remote event rate)
-	 * Sufficient for Step 0.6c cross-consistency at same workload.
-	 * Rank-root-only via g_tw_mynode == 0.
+	/* Step 0 v9 (2026-05-24): emit STATE-derived binary validation
+	 * signature.  Replaces v8 config-only schema (which made the comparator
+	 * tautological — every slot was a g_tw_* config global populated before
+	 * tw_run() and never mutated by it, so a resilient implementation that
+	 * skipped tw_run() entirely could pass the comparator byte-identically).
+	 *
+	 * Per-rank stats are first aggregated locally via tw_get_stats(), then
+	 * MPI-reduced across the partition via tw_net_statistics() (collective —
+	 * ALL ranks must call it; see core/network-mpi.c:696-747).  After the
+	 * reduce, g_tw_pe->stats holds globally-summed event counters on
+	 * masternode (rank 0) only.  The 17-element s_net_events block carries
+	 * s_nevent_processed/s_e_rbs/s_rb_total via a single MPI_Reduce with
+	 * MPI_SUM (see ross-types.h:117-170 for struct layout).
+	 *
+	 * Schema (48 bytes, slot-compatible with v8):
+	 *   [0] (double)s_nevent_processed   global-SUM events committed
+	 *   [1] (double)s_e_rbs              global-SUM events rolled back
+	 *   [2] (double)s_rb_total           global-SUM total rollbacks issued
+	 *   [3] (double)g_tw_gvt_done        completed GVT computations
+	 *                                    (per-rank counter, deterministic
+	 *                                    across ranks for fixed seed/cfg)
+	 *   [4] g_tw_lookahead               config sanity marker
+	 *   [5] (double)g_tw_synchronization_protocol  config sanity marker
+	 *
+	 * Comparator: tests/apps/configs/ROSS.yaml comparison.method =
+	 * numeric-tolerance, tolerance=1e-12.  Slots [0..2] react to RNG-driven
+	 * event-distribution shifts (e.g. --mean= perturbation propagates into
+	 * commit/rollback counts); a cold-replayed (re-seeded or zero-init)
+	 * resilient run produces different event traces and diverges on these
+	 * slots.  Bit-exact under correctly-resumed replay (same seed → same
+	 * deterministic event order → same counts).
 	 */
-	if (g_tw_mynode == 0) {
-		double sig_buf[6];
-		sig_buf[0] = (double)g_tw_nlp;
-		sig_buf[1] = g_tw_lookahead;
-		sig_buf[2] = (double)g_tw_synchronization_protocol;
-		sig_buf[3] = (double)g_phold_start_events;
-		sig_buf[4] = mean;
-		sig_buf[5] = percent_remote;
-		FILE* sig_f = fopen("validation_output.bin", "wb");
-		if (sig_f) {
-			fwrite(sig_buf, sizeof(double), 6, sig_f);
-			fclose(sig_f);
+	{
+		tw_statistics s;
+		memset(&s, 0, sizeof(s));
+		tw_get_stats(g_tw_pe, &s);
+		tw_net_statistics(g_tw_pe, &s);  /* collective: all ranks */
+		if (g_tw_mynode == 0) {
+			double sig_buf[6];
+			sig_buf[0] = (double)g_tw_pe->stats.s_nevent_processed;
+			sig_buf[1] = (double)g_tw_pe->stats.s_e_rbs;
+			sig_buf[2] = (double)g_tw_pe->stats.s_rb_total;
+			sig_buf[3] = (double)g_tw_gvt_done;
+			sig_buf[4] = g_tw_lookahead;
+			sig_buf[5] = (double)g_tw_synchronization_protocol;
+			FILE* sig_f = fopen("validation_output.bin", "wb");
+			if (sig_f) {
+				fwrite(sig_buf, sizeof(double), 6, sig_f);
+				fclose(sig_f);
+			}
 		}
 	}
 

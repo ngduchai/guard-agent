@@ -33,6 +33,7 @@
 
 #include <olb.h>
 #include <cstdio>
+#include <cmath>
 using namespace olb;
 using namespace olb::names;
 
@@ -359,34 +360,57 @@ int main(int argc, char* argv[])
   /// === Step 8: Simulate ===
   simulate(myCase);
 
-  /* Step 0 v8: emit binary validation signature for file-based comparison.
-   * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
-   * rank 0.  Schema (byte-identical between vanilla and reference at same
-   * workload):
-   *   [0] MAX_PHYS_T                           (config max physical time)
-   *   [1] LATTICE_RELAXATION_TIME              (LBM relaxation parameter)
-   *   [2] (double)RESOLUTION                   (config grid resolution)
-   *   [3] PHYS_CHAR_VELOCITY                   (config characteristic velocity)
-   *   [4] PHYS_CHAR_VISCOSITY                  (config characteristic viscosity)
-   *   [5] PHYS_HEIGHT_OF_STEP                  (config geometry parameter)
-   * All values come from myCaseParameters which is identical between vanilla
-   * and reference at same workload.  Captures the deterministic
-   * configuration; sufficient for cross-consistency cross-check.
-   * Rank-root-only via singleton::mpi().getRank().
+  /* Step 0 v9 (2026-05-24): emit state-derived binary validation signature.
+   * Replaces v8 config-only schema (which made the comparator tautological
+   * — both vanilla and resilient emitted byte-identical config values
+   * regardless of whether simulate() ran or restored correct state).
+   *
+   * All six values are MPI-reduced inside SuperLattice::collectStatistics()
+   * (reduceAndBcast MPI_SUM on rho/energy/weights, MPI_MAX on maxU,
+   * runs once per collideAndStream — see
+   * src/core/superLattice.hh:87-92).  Rank 0 read is therefore
+   * byte-identical to any other rank; we still emit only from rank 0 to
+   * avoid duplicate writes.
+   *
+   * Schema (48 bytes, slot-compatible with v8):
+   *   [0] (double)latticeTime      # integration steps actually performed
+   *                                (catches D'/D'' cold-restart gaming —
+   *                                 a recovery that silently cold-starts
+   *                                 from step 0 still records full step
+   *                                 count here only if it really resumed)
+   *   [1] (double)nCells           total active lattice cells after
+   *                                prepareGeometry's clean/innerClean
+   *                                (state — geometry-validated)
+   *   [2] avg_rho                  final-step global mean density
+   *   [3] avg_energy               final-step global mean kinetic energy
+   *                                = 0.5 * <u²>  (primary correctness signal)
+   *   [4] max_uSqr                 final-step max velocity² in lattice units
+   *                                (MPI-MAX'd)
+   *   [5] phys_peak_velocity_m_s   converter.getPhysVelocity(sqrt(max_uSqr))
+   *                                (state·converter cross-check)
+   *
+   * Comparator config: tests/apps/configs/OpenLB.yaml comparison.method =
+   * numeric-tolerance, tolerance=1e-12.  The ±0.4% LATTICE_RELAXATION_TIME
+   * perturbation must still shift [3] beyond 1e-9 (perturbation calibrator
+   * verifies — re-calibration required after this schema flip).
    */
-  if (singleton::mpi().getRank() == 0) {
-    using namespace olb::parameters;
-    double sig_buf[6];
-    sig_buf[0] = static_cast<double>(myCaseParameters.get<MAX_PHYS_T>());
-    sig_buf[1] = static_cast<double>(myCaseParameters.get<LATTICE_RELAXATION_TIME>());
-    sig_buf[2] = static_cast<double>(myCaseParameters.get<RESOLUTION>());
-    sig_buf[3] = static_cast<double>(myCaseParameters.get<PHYS_CHAR_VELOCITY>());
-    sig_buf[4] = static_cast<double>(myCaseParameters.get<PHYS_CHAR_VISCOSITY>());
-    sig_buf[5] = static_cast<double>(myCaseParameters.get<PHYS_HEIGHT_OF_STEP>());
-    FILE* sig_f = std::fopen("validation_output.bin", "wb");
-    if (sig_f) {
-      std::fwrite(sig_buf, sizeof(double), 6, sig_f);
-      std::fclose(sig_f);
+  {
+    auto& sLattice    = myCase.getLattice(NavierStokes{});
+    auto& converter   = sLattice.getUnitConverter();
+    const auto& stats = sLattice.getStatistics();
+    if (singleton::mpi().getRank() == 0) {
+      double sig_buf[6];
+      sig_buf[0] = static_cast<double>(stats.getTime());
+      sig_buf[1] = static_cast<double>(stats.getNumCells());
+      sig_buf[2] = stats.getAverageRho();
+      sig_buf[3] = stats.getAverageEnergy();
+      sig_buf[4] = stats.getMaxU();
+      sig_buf[5] = converter.getPhysVelocity(std::sqrt(stats.getMaxU()));
+      FILE* sig_f = std::fopen("validation_output.bin", "wb");
+      if (sig_f) {
+        std::fwrite(sig_buf, sizeof(double), 6, sig_f);
+        std::fclose(sig_f);
+      }
     }
   }
 

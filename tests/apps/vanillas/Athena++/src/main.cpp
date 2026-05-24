@@ -34,7 +34,10 @@
 
 // Athena++ headers
 #include "athena.hpp"
+#include "athena_arrays.hpp"
 #include "chem_rad/chem_rad.hpp"
+#include "coordinates/coordinates.hpp"
+#include "hydro/hydro.hpp"
 #include "crdiffusion/mg_crdiffusion.hpp"
 #include "fft/turbulence.hpp"
 #include "globals.hpp"
@@ -572,6 +575,57 @@ int main(int argc, char *argv[]) {
   }
 #endif // ENABLE_EXCEPTIONS
 
+  /* Step 0 v9 (Athena++-B 2026-05-24): collective MPI reduction of
+   * volume-integrated hydro state for the binary validation signature.
+   * Must run BEFORE the rank-0-only diagnostic block below — MPI_Reduce is
+   * collective and would deadlock if entered by rank 0 alone.
+   *
+   * Accumulates per-rank sums of (rho * dV), (m_x * dV), and
+   * (0.5 * m_x^2 / rho * dV) across all MeshBlocks owned by this rank,
+   * then MPI_SUM-reduces to rank 0.  Pattern mirrors
+   * src/outputs/history.cpp:79-104,324-329 (HistoryOutput's volume-weighted
+   * sums + MPI_IN_PLACE reduce).  Cast Real -> double so the reduction
+   * buffer matches the validation_output.bin layout regardless of whether
+   * Athena++ was configured for single or double precision (athena.hpp:34/39).
+   */
+  double athena_sig_mass = 0.0;
+  double athena_sig_mom_x = 0.0;
+  double athena_sig_ke_x = 0.0;
+  {
+    AthenaArray<Real> vol;
+    const int ncells1 = pmesh->my_blocks(0)->block_size.nx1 + 2*(NGHOST);
+    vol.NewAthenaArray(ncells1);
+    for (int b = 0; b < pmesh->nblocal; ++b) {
+      MeshBlock *pmb = pmesh->my_blocks(b);
+      for (int k = pmb->ks; k <= pmb->ke; ++k) {
+        for (int j = pmb->js; j <= pmb->je; ++j) {
+          pmb->pcoord->CellVolume(k, j, pmb->is, pmb->ie, vol);
+          for (int i = pmb->is; i <= pmb->ie; ++i) {
+            const double u_d  = static_cast<double>(pmb->phydro->u(IDN, k, j, i));
+            const double u_mx = static_cast<double>(pmb->phydro->u(IM1, k, j, i));
+            const double dV   = static_cast<double>(vol(i));
+            athena_sig_mass  += dV * u_d;
+            athena_sig_mom_x += dV * u_mx;
+            athena_sig_ke_x  += dV * 0.5 * u_mx * u_mx / u_d;
+          }
+        }
+      }
+    }
+  }
+#ifdef MPI_PARALLEL
+  {
+    double local_buf[3]  = {athena_sig_mass, athena_sig_mom_x, athena_sig_ke_x};
+    double global_buf[3] = {0.0, 0.0, 0.0};
+    MPI_Reduce(local_buf, global_buf, 3, MPI_DOUBLE, MPI_SUM,
+               0, MPI_COMM_WORLD);
+    if (Globals::my_rank == 0) {
+      athena_sig_mass  = global_buf[0];
+      athena_sig_mom_x = global_buf[1];
+      athena_sig_ke_x  = global_buf[2];
+    }
+  }
+#endif
+
   //--- Step 10. -------------------------------------------------------------------------
   // Print diagnostic messages related to the end of the simulation
 
@@ -617,26 +671,34 @@ int main(int argc, char *argv[]) {
     std::cout << "zone-cycles/omp_wsecond = " << zc_omps << std::endl;
 #endif
 
-    /* Step 0 v8: emit binary validation signature for file-based comparison.
-     * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
-     * rank 0.  Schema (byte-identical between vanilla and reference at
-     * same workload):
-     *   [0] pmesh->time                            (final simulated time)
-     *   [1] (double)pmesh->ncycle                  (final cycle count)
-     *   [2] pmesh->dt                              (final timestep size)
-     *   [3] (double)pmesh->nbtotal                 (total mesh blocks)
-     *   [4] pmesh->tlim                            (time limit; constant)
-     *   [5] (double)pmesh->nlim                    (cycle limit; constant or -1)
-     * All values are globally consistent mesh-wide scalars; rank-root-only
-     * (we are inside the `if (Globals::my_rank == 0)` block).
+    /* Step 0 v9 (Athena++-B 2026-05-24): emit STATE-derived binary
+     * validation signature.  Replaces v8 schema whose slots [3..5] were
+     * config constants (nbtotal, tlim, nlim) — explicitly labelled "constant"
+     * in the old comment, so half the comparator surface was tautological
+     * (a resilient cold-start that skipped simulate() would pass those slots
+     * byte-identically).
+     *
+     * Schema (48 bytes, slot-compatible with v8):
+     *   [0] pmesh->time                        (final simulated time)   [STATE]
+     *   [1] (double)pmesh->ncycle              (final cycle count)      [STATE]
+     *   [2] pmesh->dt                          (final timestep size)    [STATE]
+     *   [3] athena_sig_mass                    sum(rho*dV) globally     [STATE-new]
+     *   [4] athena_sig_mom_x                   sum(m_x*dV) globally     [STATE-new]
+     *   [5] athena_sig_ke_x                    sum(0.5*m_x^2/rho*dV)    [STATE-new]
+     *
+     * Slots [3..5] are filled by the collective MPI_Reduce inserted before
+     * the rank-0 diagnostic block above (mirrors history.cpp:79-104,324-329).
+     * Rank-root-only file write.  Comparator: tests/apps/configs/Athena++.yaml
+     * comparison.method = numeric-tolerance, tolerance preserved.  Slots
+     * [3..5] react to any integrator drift; cold-replayed runs diverge.
      */
     double sig_buf[6];
     sig_buf[0] = pmesh->time;
     sig_buf[1] = static_cast<double>(pmesh->ncycle);
     sig_buf[2] = pmesh->dt;
-    sig_buf[3] = static_cast<double>(pmesh->nbtotal);
-    sig_buf[4] = pmesh->tlim;
-    sig_buf[5] = static_cast<double>(pmesh->nlim);
+    sig_buf[3] = athena_sig_mass;
+    sig_buf[4] = athena_sig_mom_x;
+    sig_buf[5] = athena_sig_ke_x;
     FILE* sig_f = std::fopen("validation_output.bin", "wb");
     if (sig_f) {
       std::fwrite(sig_buf, sizeof(double), 6, sig_f);
