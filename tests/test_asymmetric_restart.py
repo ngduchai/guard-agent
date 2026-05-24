@@ -48,6 +48,7 @@ def _common_call_args(
         snapshot_src=snapshot_src,
         veloc_cfg_dirs=[cfg_dir],
         veloc_cfg_name="veloc.cfg",
+        source_dir=cfg_dir,
         build_dir=cfg_dir,
         executable_name="dummy_exe",
         num_procs=num_procs,
@@ -60,6 +61,7 @@ def _common_call_args(
         do_compare=do_compare or (lambda *_: CompareResult(
             passed=True, method="dummy", score=None, message="",
         )),
+        app_input_subdir=None,
     )
 
 
@@ -183,6 +185,35 @@ def test_skip_when_victim_rank_has_no_files(tmp_path: Path) -> None:
     assert res is None
 
 
+def test_skip_when_victim_has_single_version(tmp_path: Path) -> None:
+    """mode='latest' needs ≥2 victim versions: deleting the only one
+    reduces to mode='all', which triggers VELOC's collective missing-rank
+    path and produces a spurious PASS by unanimous cold-start determinism
+    (the 2026-05-24 SPPARKS demo confirmed this masks the bug).  Gate
+    skips rather than report a misleading verdict."""
+    scratch = tmp_path / "scratch"
+    persistent = tmp_path / "persistent"
+    scratch.mkdir(); persistent.mkdir()
+    cfg_dir = tmp_path / "cfg"
+    _write_veloc_cfg(cfg_dir, scratch, persistent)
+    snapshot = tmp_path / "snap"
+    # All ranks present; victim rank 3 has only ONE version.
+    _build_snapshot(snapshot, "persistent", {
+        "app-0-1.dat": b"r0v1", "app-0-2.dat": b"r0v2",
+        "app-1-1.dat": b"r1v1", "app-1-2.dat": b"r1v2",
+        "app-2-1.dat": b"r2v1", "app-2-2.dat": b"r2v2",
+        "app-3-1.dat": b"r3v1",  # single version → must skip
+    })
+    res = _run_asymmetric_restart_check(
+        **_common_call_args(
+            snapshot_src=snapshot, cfg_dir=cfg_dir,
+            output_dir=tmp_path / "out", num_procs=4,
+            golden=tmp_path / "g.bin",
+        )
+    )
+    assert res is None
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -205,11 +236,13 @@ def test_happy_path_restores_corrupts_runs_and_compares(
     _write_veloc_cfg(cfg_dir, scratch, persistent)
 
     snapshot = tmp_path / "snap"
+    # Two versions per rank so the gate's ≥2-versions guard is satisfied
+    # and mode="latest" deletes only rank-3's v2 file (leaving v1 intact).
     _build_snapshot(snapshot, "persistent", {
-        "app-0-1.dat": b"r0",
-        "app-1-1.dat": b"r1",
-        "app-2-1.dat": b"r2",
-        "app-3-1.dat": b"r3",
+        "app-0-1.dat": b"r0v1", "app-0-2.dat": b"r0v2",
+        "app-1-1.dat": b"r1v1", "app-1-2.dat": b"r1v2",
+        "app-2-1.dat": b"r2v1", "app-2-2.dat": b"r2v2",
+        "app-3-1.dat": b"r3v1", "app-3-2.dat": b"r3v2",
     })
 
     out = tmp_path / "out"
@@ -263,16 +296,22 @@ def test_happy_path_restores_corrupts_runs_and_compares(
     assert captured_compare["golden"] == golden_file
     assert captured_compare["test"] == out / "validation_output.bin"
 
-    # Live persistent dir holds rank-0/1/2 files; rank-3 was deleted.
+    # Live persistent dir holds all rank-0/1/2 files plus rank-3's older v1.
+    # mode="latest" deletes only rank-3's highest version (app-3-2.dat).
     live_names = sorted(p.name for p in persistent.iterdir())
-    assert live_names == ["app-0-1.dat", "app-1-1.dat", "app-2-1.dat"]
+    assert live_names == [
+        "app-0-1.dat", "app-0-2.dat",
+        "app-1-1.dat", "app-1-2.dat",
+        "app-2-1.dat", "app-2-2.dat",
+        "app-3-1.dat",  # older version survives → exercises asymmetric path
+    ]
 
     # Forensic JSON exists and references victim rank.
     forensic = out / "asymmetric_corruption.json"
     assert forensic.exists()
     text = forensic.read_text()
     assert '"victim_rank": 3' in text
-    assert "app-3-1.dat" in text
+    assert "app-3-2.dat" in text  # the deleted latest-version file
 
 
 def test_missing_output_returns_failing_result(
@@ -288,11 +327,12 @@ def test_missing_output_returns_failing_result(
     _write_veloc_cfg(cfg_dir, scratch, persistent)
 
     snapshot = tmp_path / "snap"
+    # Two versions per rank to satisfy gate's ≥2-versions guard.
     _build_snapshot(snapshot, "persistent", {
-        "app-0-1.dat": b"r0",
-        "app-1-1.dat": b"r1",
-        "app-2-1.dat": b"r2",
-        "app-3-1.dat": b"r3",
+        "app-0-1.dat": b"r0v1", "app-0-2.dat": b"r0v2",
+        "app-1-1.dat": b"r1v1", "app-1-2.dat": b"r1v2",
+        "app-2-1.dat": b"r2v1", "app-2-2.dat": b"r2v2",
+        "app-3-1.dat": b"r3v1", "app-3-2.dat": b"r3v2",
     })
 
     def fake_run_once(**kwargs: Any) -> Any:

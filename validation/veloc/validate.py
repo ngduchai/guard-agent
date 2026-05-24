@@ -49,7 +49,7 @@ from .metrics_collector import (
     load_benchmark_config,
     run_benchmark_sweep,
 )
-from .failure_injector import corrupt_rank_checkpoint
+from .failure_injector import _VELOC_PER_RANK_FILE_RE, corrupt_rank_checkpoint
 from .reporter import generate_report
 from .runner import (
     ValidationError,
@@ -140,6 +140,7 @@ def _run_asymmetric_restart_check(
     snapshot_src: Path,
     veloc_cfg_dirs: list[Path],
     veloc_cfg_name: str,
+    source_dir: Path,
     build_dir: Path,
     executable_name: str,
     num_procs: int,
@@ -150,8 +151,22 @@ def _run_asymmetric_restart_check(
     output_file_name: str,
     comparison_golden_file: Path,
     do_compare,
+    app_input_subdir: str | None = None,
 ) -> "CompareResult | None":
     """Run the F-collective-restart asymmetric-restart gate.
+
+    RETIRED 2026-05-24 (kept dormant — not called from the main pipeline).
+    SPPARKS gate-demo Runs 2+3 demonstrated the gate cannot reach the bug
+    class it was designed to catch: VELOC's collective MPI_Allreduce(MPI_LOR)
+    inside restart_begin (veloc/src/lib/client.cpp:280) collapses any
+    file-system-corruption-based per-rank divergence into a uniform rc=-1
+    on every rank, so the per-rank `if (rc != VELOC_SUCCESS) return 0;`
+    branch fires symmetrically and the resilient run cold-starts as a unit,
+    reproducing the vanilla baseline byte-for-byte.  Retained for potential
+    future use with a stronger injection method (LD_PRELOAD shim that
+    produces per-rank rc divergence at the library boundary, bypassing
+    VELOC's coordination).  See build/_experiment_state/_decisions.log
+    2026-05-24 SPPARKS entry for the forensic trace.
 
     Restores the failure-prone leg's VELOC snapshot, deletes rank-(N-1)'s
     per-rank checkpoint files, restarts the binary, and compares its output
@@ -249,9 +264,20 @@ def _run_asymmetric_restart_check(
         )
         return None
 
-    # --- Step 6: delete rank-(N-1)'s per-rank checkpoint files ---
+    # --- Step 6: delete rank-(N-1)'s LATEST per-rank checkpoint file ---
+    # mode="latest" leaves older versions intact: VELOC_Restart_test on the
+    # victim rank returns max_version-k while other ranks return max_version,
+    # so each rank calls VELOC_Restart with a *different* version argument.
+    # This exercises the app's per-rank `if (rc != VELOC_SUCCESS) return 0;`
+    # branch — the genuine asymmetric-restart bug class.  mode="all" was
+    # demonstrated (2026-05-24, SPPARKS) to fall through to VELOC's
+    # collective "missing rank" path that returns rc=-1 uniformly →
+    # unanimous cold-start → output matches baseline by determinism →
+    # bug never manifests.  See _decisions.log for the forensic trace.
     victim_rank = num_procs - 1
-    deleted, scanned = corrupt_rank_checkpoint(victim_rank, live_ckpt_dirs)
+    deleted, scanned = corrupt_rank_checkpoint(
+        victim_rank, live_ckpt_dirs, mode="latest"
+    )
     if not scanned:
         print(
             "[validate] Skipping Test 3 (asymmetric-restart): "
@@ -267,6 +293,29 @@ def _run_asymmetric_restart_check(
             f"victim rank {victim_rank} has no per-rank files in restored "
             f"snapshot (scanned {len(scanned)} per-rank file(s) across "
             "other ranks only); gate cannot exercise the divergence path.",
+            flush=True,
+        )
+        return None
+    # With mode="latest", deleting the only-version-available of the victim
+    # leaves it with zero files → VELOC_Restart_test returns 0 → victim
+    # early-returns from the app's check before the asymmetric VELOC_Restart
+    # call ever fires → the "unanimous cold-start" path described above
+    # would mask the bug.  Skip in that case rather than report a spurious
+    # PASS.  Need ≥2 distinct versions for the victim rank.
+    _victim_versions = {
+        int(_VELOC_PER_RANK_FILE_RE.match(p.name).group("version"))
+        for p in scanned
+        if (m := _VELOC_PER_RANK_FILE_RE.match(p.name))
+        and int(m.group("rank")) == victim_rank
+    }
+    if len(_victim_versions) < 2:
+        print(
+            f"[validate] Skipping Test 3 (asymmetric-restart): "
+            f"victim rank {victim_rank} has only {len(_victim_versions)} "
+            "checkpoint version(s) in restored snapshot; gate needs ≥2 "
+            "so deleting the latest still leaves the victim with a valid "
+            "older version (the corruption mode that exercises the "
+            "asymmetric VELOC_Restart path).",
             flush=True,
         )
         return None
@@ -294,12 +343,25 @@ def _run_asymmetric_restart_check(
     )
 
     # --- Step 8: restart binary; bypass run_once's pre-run clear ---
+    # The binary will execute with cwd=output_dir, so its input files
+    # must be reachable from there.  Mirror the Test 1/2 setup:
+    # symlink the app's input data into the run cwd before invoking
+    # run_once.  Without this, apps with relative-path input args (e.g.
+    # SPPARKS `-in in.validation`, SPARTA, HyPar) crash on the very
+    # first read with "cannot open input script", masking the gate's
+    # real purpose.
+    from .runner import _symlink_input_data
+    _symlink_input_data(
+        source_dir, build_dir, output_dir, app_args,
+        input_subdir=app_input_subdir,
+    )
     asym_result = run_once(
         build_dir=build_dir,
         executable_name=executable_name,
         num_procs=num_procs,
         app_args=app_args,
         output_dir=output_dir,
+        run_cwd=output_dir,
         env=env,
         veloc_config_sources=veloc_cfg_dirs,
         veloc_config_name=veloc_cfg_name,
@@ -3211,58 +3273,21 @@ def _stage_correctness(
     results.append(result2b)
 
     # --- Test 3: F-collective-restart (asymmetric checkpoint corruption) ---
-    # Catches the non-collective restart bug (SPPARKS app_lattice.cpp:1572-1592,
-    # Smilei VelocCheckpoint.cpp:478-567, OpenLB bstep2d.cpp:75-145) at per-iter
-    # validation time instead of post-bench audit.  v2.2's cold-replay detector
-    # cannot surface this class because it SIGKILLs all ranks synchronously —
-    # after restart, all ranks see identical checkpoint state and unanimously
-    # make the same (correct-or-buggy) resume-vs-cold-start decision.  This gate
-    # forces per-rank divergence by restoring the failure-prone leg's checkpoint
-    # snapshot and then deleting rank-(N-1)'s VELOC per-rank files BEFORE
-    # restarting.  A correct implementation MPI_Allreduces on per-rank load
-    # outcome and unanimously cold-starts; a buggy one lets some ranks resume
-    # and rank-(N-1) cold-start, producing mixed-state output that diverges
-    # from baseline OR deadlocks at the next collective MPI call.
+    # RETIRED 2026-05-24 after SPPARKS gate-demo Runs 2+3 demonstrated the gate
+    # cannot reach the bug class it was designed to catch.  VELOC's library-
+    # level coordination (MPI_Allreduce(MPI_LOR) inside restart_begin at
+    # veloc/src/lib/client.cpp:280) collapses any file-system-corruption-based
+    # per-rank divergence into a uniform rc=-1 / unanimous-cold-start outcome,
+    # so the per-rank `if (rc != VELOC_SUCCESS) return 0;` branch fires
+    # symmetrically and the run reproduces the vanilla baseline byte-for-byte.
+    # Forensic evidence preserved at
+    # build/validation_output/SPPARKS_gate_demo/correctness/resilient_asym/ and
+    # in build/_experiment_state/_decisions.log under 2026-05-24 SPPARKS entry.
     #
-    # Late-gated: only runs when every prior test (1, 1b, 2, 2b) has PASSED,
-    # so the cost (~1 extra resilient run at validation-size workload) is
-    # paid only on candidate-TRUSTED iters.  Skipped automatically for:
-    #   * non-VELOC apps (no veloc.cfg)
-    #   * apps using posix_agg_module (aggregated checkpoint files do not
-    #     match the per-rank <prefix>-<rank>-<version>.dat pattern)
-    #   * single-rank runs (no per-rank divergence possible)
-    #   * empty checkpoint snapshots
-    _all_prior_passed = all(r.passed for r in results)
-    if not _all_prior_passed:
-        print(
-            "[validate] Skipping Test 3 (asymmetric-restart): "
-            "at least one prior test failed; gate is reserved for "
-            "otherwise-passing iters to keep per-iter cost low.",
-            flush=True,
-        )
-    else:
-        result3 = _run_asymmetric_restart_check(
-            snapshot_src=resilient_out / "checkpoints",
-            veloc_cfg_dirs=[resilient_src, resilient_build],
-            veloc_cfg_name=args.veloc_config_name,
-            build_dir=resilient_build,
-            executable_name=res_exe,
-            num_procs=args.num_procs,
-            app_args=_clean_app_args,
-            output_dir=output_dir / "correctness" / "resilient_asym",
-            env=_clean_run_env,
-            timeout_s=max(60.0, 2.0 * (clean_result.elapsed_s or 30.0)),
-            output_file_name=args.output_file_name,
-            comparison_golden_file=comparison_golden_file,
-            do_compare=_do_compare,
-        )
-        if result3 is not None:
-            print(
-                f"[validate] Test 3 (asymmetric-restart [VeloC, collective-restart]): "
-                f"{result3}",
-                flush=True,
-            )
-            results.append(result3)
+    # The helper `_run_asymmetric_restart_check` and `corrupt_rank_checkpoint`
+    # are retained (dormant) for potential future use with a stronger injection
+    # method (e.g., LD_PRELOAD shim around VELOC_Restart producing per-rank rc
+    # divergence) that could actually exercise the bug class.
 
     # --- Resilience policy enforcement ---
     # Validation A (vanilla audit): also build the reference checkpointed

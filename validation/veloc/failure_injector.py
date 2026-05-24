@@ -512,12 +512,13 @@ _VELOC_PER_RANK_FILE_RE = re.compile(
 def corrupt_rank_checkpoint(
     rank_id: int,
     checkpoint_dirs: list[Path],
+    mode: str = "all",
 ) -> tuple[list[Path], list[Path]]:
     """Delete VELOC per-rank checkpoint files belonging to *rank_id*.
 
     Scans each directory in *checkpoint_dirs* for files matching the VELOC
     posix-module naming convention (``<prefix>-<rank>-<version>.dat``) and
-    unlinks those whose ``<rank>`` field equals *rank_id*.
+    unlinks a subset belonging to ``<rank>`` == *rank_id*.
 
     Parameters
     ----------
@@ -526,6 +527,30 @@ def corrupt_rank_checkpoint(
     checkpoint_dirs:
         Live scratch + persistent directories (typically extracted from
         veloc.cfg via :func:`extract_checkpoint_dirs_from_veloc_cfg`).
+    mode:
+        Corruption mode.  Supported:
+
+        ``"all"`` (default, backward-compatible) — delete every per-rank
+        file owned by *rank_id*.  Coarse: triggers VELOC's collective
+        "missing rank" path, which makes ``VELOC_Restart`` fail
+        uniformly on every rank → unanimous cold-start.  Useful for
+        catching apps that diverge under unanimous cold-replay but
+        masks app-level non-collective ``rc`` checks (the failing rank
+        early-returns from ``VELOC_Restart_test`` at ``v<=0`` before
+        the asymmetric branch can fire).
+
+        ``"latest"`` — delete only the file with the highest
+        ``<version>`` for *rank_id* (computed across all checkpoint
+        dirs; matching-version files in every dir are removed so VELOC
+        cannot fall back from scratch to persistent).  Leaves older
+        versions intact, so ``VELOC_Restart_test`` returns
+        ``max_version - k`` on the victim rank while other ranks
+        return ``max_version``.  This is the corruption mode that
+        exercises the genuine asymmetric-restart path: each rank
+        calls ``VELOC_Restart`` with a *different* version argument,
+        forcing the app's per-rank ``if (rc != VELOC_SUCCESS) return
+        0;`` branch to fire on a subset of ranks while the others
+        successfully resume → mixed state.
 
     Returns
     -------
@@ -538,8 +563,16 @@ def corrupt_rank_checkpoint(
           per-rank pattern; the caller should skip rather than treat this
           as a corruption-injection failure.
     """
-    deleted: list[Path] = []
+    if mode not in ("all", "latest"):
+        raise ValueError(
+            f"corrupt_rank_checkpoint: unknown mode {mode!r}; "
+            f"expected 'all' or 'latest'"
+        )
+
+    # First pass: scan every per-rank file across all dirs.
+    # Each entry: (path, rank, version).
     scanned: list[Path] = []
+    victim_entries: list[tuple[Path, int]] = []  # (path, version) for rank_id
     for d in checkpoint_dirs:
         if not d.exists() or not d.is_dir():
             continue
@@ -557,13 +590,26 @@ def corrupt_rank_checkpoint(
             if m is None:
                 continue
             scanned.append(entry)
-            if int(m.group("rank")) != rank_id:
-                continue
-            try:
-                entry.unlink()
-                deleted.append(entry)
-            except OSError:
-                pass
+            if int(m.group("rank")) == rank_id:
+                victim_entries.append((entry, int(m.group("version"))))
+
+    # Second pass: select which victim files to unlink based on mode.
+    if mode == "all":
+        to_delete = [p for p, _ in victim_entries]
+    else:  # mode == "latest"
+        if not victim_entries:
+            to_delete = []
+        else:
+            max_v = max(v for _, v in victim_entries)
+            to_delete = [p for p, v in victim_entries if v == max_v]
+
+    deleted: list[Path] = []
+    for entry in to_delete:
+        try:
+            entry.unlink()
+            deleted.append(entry)
+        except OSError:
+            pass
     return deleted, scanned
 
 

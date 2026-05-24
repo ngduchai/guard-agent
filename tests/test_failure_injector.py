@@ -303,3 +303,83 @@ def test_corrupt_rank_checkpoint_no_match_for_rank(tmp_path: Path) -> None:
     deleted, scanned = corrupt_rank_checkpoint(9, [scratch])
     assert deleted == []
     assert len(scanned) == 2  # rank-0 and rank-1 files seen but not deleted
+
+
+def test_corrupt_rank_checkpoint_invalid_mode_raises(tmp_path: Path) -> None:
+    """Unknown mode strings raise ValueError loudly (caller bug, not silent)."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    try:
+        corrupt_rank_checkpoint(0, [scratch], mode="nope")
+    except ValueError as exc:
+        assert "nope" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_corrupt_rank_checkpoint_latest_deletes_only_highest_version(
+    tmp_path: Path,
+) -> None:
+    """mode='latest' removes only the highest-version victim file across
+    every checkpoint dir, leaving older versions intact.  This is the
+    corruption mode that exercises the genuine asymmetric-restart path:
+    the victim's VELOC_Restart_test still reports the older version while
+    other ranks report the newer one, so each rank calls VELOC_Restart
+    with a different version argument."""
+    scratch = tmp_path / "scratch"
+    persistent = tmp_path / "persistent"
+    scratch.mkdir()
+    persistent.mkdir()
+    for d in (scratch, persistent):
+        (d / "spparks-0-0.dat").write_bytes(b"r0v0")
+        (d / "spparks-0-1.dat").write_bytes(b"r0v1")
+        (d / "spparks-0-2.dat").write_bytes(b"r0v2")  # latest
+        (d / "spparks-1-0.dat").write_bytes(b"r1v0")
+        (d / "spparks-1-1.dat").write_bytes(b"r1v1")
+        (d / "spparks-1-2.dat").write_bytes(b"r1v2")
+
+    deleted, scanned = corrupt_rank_checkpoint(
+        1, [scratch, persistent], mode="latest"
+    )
+
+    # Only the v2 victim files in each dir are deleted (2 dirs x 1 file = 2).
+    assert {p.name for p in deleted} == {"spparks-1-2.dat"}
+    assert len(deleted) == 2
+    # Older victim versions survive.
+    for d in (scratch, persistent):
+        assert (d / "spparks-1-0.dat").exists()
+        assert (d / "spparks-1-1.dat").exists()
+        assert not (d / "spparks-1-2.dat").exists()
+        # Rank 0 entirely untouched.
+        assert (d / "spparks-0-2.dat").exists()
+    # Scanner saw all 12 per-rank files (6 per dir).
+    assert len(scanned) == 12
+
+
+def test_corrupt_rank_checkpoint_latest_single_version_deletes_only_one(
+    tmp_path: Path,
+) -> None:
+    """mode='latest' with only one victim version → that file is deleted
+    (degenerate: equivalent to mode='all' for a single-version victim).
+    The caller (gate) is responsible for the ≥2-versions skip guard."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "spparks-0-0.dat").write_bytes(b"r0")
+    (scratch / "spparks-1-0.dat").write_bytes(b"r1")
+
+    deleted, scanned = corrupt_rank_checkpoint(1, [scratch], mode="latest")
+    assert {p.name for p in deleted} == {"spparks-1-0.dat"}
+    assert len(scanned) == 2
+
+
+def test_corrupt_rank_checkpoint_latest_no_victim_files(tmp_path: Path) -> None:
+    """mode='latest' targeting a rank with no files: deleted empty,
+    scanned reflects other-rank files."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "spparks-0-0.dat").write_bytes(b"r0")
+    (scratch / "spparks-0-1.dat").write_bytes(b"r0v1")
+
+    deleted, scanned = corrupt_rank_checkpoint(9, [scratch], mode="latest")
+    assert deleted == []
+    assert len(scanned) == 2
