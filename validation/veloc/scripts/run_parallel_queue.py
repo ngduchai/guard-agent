@@ -447,6 +447,141 @@ def _build_prompt(app: AppRun, iter_n: int) -> str:
     return body
 
 
+# --- Resume state loader -----------------------------------------------------
+def _load_app_resume_state(app: "AppRun") -> dict:
+    """Reconstruct AppRun state from on-disk artifacts.  Empty dict if no
+    prior data exists for this app+label.
+
+    Sources, in priority order:
+      - iter_N/metrics.json   : ground truth for completed iters (written
+                                immediately after each validate completes)
+      - result.json           : authoritative for loop_attempt_final +
+                                prior_loop_attempts (written at every
+                                end-of-attempt and at drain)
+      - parallel_timing.json  : auxiliary per-iter timing/queue-wait fields,
+                                bench fields, and per-iter exit codes
+
+    Returns a dict with keys:
+      verdict, completed_iters, loop_attempt, prior_attempts,
+      loop_stall_count, loop_max_iters_count, verdict_passed,
+      exhausted_retries, bench_wall_s, bench_queue_wait_s,
+      bench_started_at, bench_exit_code
+    """
+    log_dir = app.log_dir
+    if not log_dir.exists():
+        return {}
+
+    # 1. Scan iter_*/metrics.json — only iters that completed validate are
+    #    recorded here, so this is the ground truth for "what's done".
+    iter_files = []
+    for d in log_dir.iterdir():
+        if not d.is_dir() or not d.name.startswith("iter_"):
+            continue
+        try:
+            n = int(d.name[len("iter_"):])
+        except ValueError:
+            continue
+        m = d / "metrics.json"
+        if m.exists():
+            iter_files.append((n, m))
+    iter_files.sort(key=lambda t: t[0])
+    if not iter_files:
+        return {}
+
+    completed: list[IterMetrics] = []
+    for _, f in iter_files:
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        completed.append(IterMetrics(
+            iter=int(data["iter"]),
+            gen_wall_s=float(data.get("opencode_elapsed_s", 0.0)),
+            val_wall_s=float(data.get("validation_elapsed_s", 0.0)),
+            tokens_input=int(data.get("input_tokens", 0)),
+            tokens_output=int(data.get("output_tokens", 0)),
+            tokens_total=int(data.get("total_tokens", 0)),
+            validation_passed=bool(data.get("validation_passed", False)),
+            stall_aborted=bool(data.get("stall_aborted", False)),
+            gen_queue_wait_s=float(data.get("gen_queue_wait_s", 0.0)),
+            val_queue_wait_s=float(data.get("val_queue_wait_s", 0.0)),
+        ))
+    if not completed:
+        return {}
+
+    # 2. Augment per-iter rows from parallel_timing.json (started_at + exit).
+    bench_wall_s = 0.0
+    bench_queue_wait_s = 0.0
+    bench_started_at: Optional[str] = None
+    bench_exit_code = 0
+    pt_path = log_dir / "parallel_timing.json"
+    if pt_path.exists():
+        try:
+            pt = json.loads(pt_path.read_text())
+            pt_by_iter = {int(p["iter"]): p for p in pt.get("per_iter", [])}
+            for m in completed:
+                p = pt_by_iter.get(m.iter)
+                if p:
+                    m.gen_started_at = p.get("gen_started_at")
+                    m.val_started_at = p.get("val_started_at")
+                    m.gen_exit_code = int(p.get("gen_exit_code", 0))
+                    m.val_exit_code = int(p.get("val_exit_code", 0))
+            bench_wall_s = float(pt.get("bench_wall_s", 0.0))
+            bench_queue_wait_s = float(pt.get("bench_queue_wait_s", 0.0))
+            bench_started_at = pt.get("bench_started_at")
+            bench_exit_code = int(pt.get("bench_exit_code", 0))
+        except Exception:
+            pass
+
+    # 3. Read result.json for loop_attempt + prior_attempts + verdict.
+    loop_attempt = 1
+    prior_attempts: list[LoopAttempt] = []
+    loop_stall_count = 0
+    loop_max_iters_count = 0
+    verdict_passed = False
+    verdict = "IN_PROGRESS"
+    res_path = log_dir / "result.json"
+    if res_path.exists():
+        try:
+            r = json.loads(res_path.read_text())
+            loop_attempt = int(r.get("loop_attempt_final", 1))
+            loop_stall_count = int(r.get("loop_stall_count", 0))
+            loop_max_iters_count = int(r.get("loop_max_iters_count", 0))
+            verdict_passed = bool(r.get("passed", False))
+            prior_attempts = [
+                LoopAttempt(
+                    attempt=int(a["attempt"]),
+                    outcome=str(a["outcome"]),
+                    iters_run=int(a["iters_run"]),
+                    stall_iteration=int(a.get("stall_iteration", 0)),
+                )
+                for a in r.get("prior_loop_attempts", [])
+            ]
+            if verdict_passed:
+                verdict = "PASS"
+            elif loop_attempt >= app.max_loop_attempts and prior_attempts:
+                verdict = "FAIL"
+        except Exception:
+            pass
+
+    exhausted_retries = (verdict == "FAIL") or (loop_attempt > app.max_loop_attempts)
+
+    return {
+        "verdict": verdict,
+        "completed_iters": completed,
+        "loop_attempt": loop_attempt,
+        "prior_attempts": prior_attempts,
+        "loop_stall_count": loop_stall_count,
+        "loop_max_iters_count": loop_max_iters_count,
+        "verdict_passed": verdict_passed,
+        "exhausted_retries": exhausted_retries,
+        "bench_wall_s": bench_wall_s,
+        "bench_queue_wait_s": bench_queue_wait_s,
+        "bench_started_at": bench_started_at,
+        "bench_exit_code": bench_exit_code,
+    }
+
+
 def _apply_context_cap(prompt: str, iter_log: Path) -> str:
     """Mirror run_iterative.sh:423-431 — when OPENCODE_INPUT_TRUNC_TOKENS is
     set, pipe the prompt through validation.veloc.prompt_truncator and write
@@ -489,11 +624,13 @@ class Orchestrator:
         opencode_retries: int,
         skip_bench: bool,
         validate_timeout_s: float = 900.0,
+        resume: bool = False,
     ):
         self.max_gen_workers = max_gen_workers
         self.label = label
         self.skip_bench = skip_bench
         self.validate_timeout_s = validate_timeout_s
+        self.resume = resume
         self.experiment_started_at = time.monotonic()
         self.experiment_started_at_wall = _utc_iso()
 
@@ -563,11 +700,17 @@ class Orchestrator:
             # Initial state dump + per-app log dirs.
             for app in self.apps.values():
                 app.log_dir.mkdir(parents=True, exist_ok=True)
+                if self.resume and self._apply_resume_state(app):
+                    # Already terminal (PASS or exhausted FAIL) — skip enqueue.
+                    continue
                 with self.state_lock:
                     app.state = AppState.READY_FOR_GEN
                     app.queued_for_gen_at = time.monotonic()
                     app.app_started_at = time.monotonic()
                 self.ready_for_gen.put(app.name)
+
+            # If every requested app was already terminal, all_done_event
+            # fires inside _mark_app_done; the wait loop exits at once.
 
             # Install signal handlers in main thread BEFORE spawning workers.
             signal.signal(signal.SIGINT, self._on_signal)
@@ -633,6 +776,65 @@ class Orchestrator:
         with contextlib.suppress(Exception):
             if self.pid_file.exists() and self.pid_file.read_text().strip() == str(os.getpid()):
                 self.pid_file.unlink()
+
+    # --- Resume application -------------------------------------------------
+    def _apply_resume_state(self, app: AppRun) -> bool:
+        """Restore *app* from on-disk artifacts.  Returns True iff the app
+        is already terminal (PASS or exhausted-FAIL) and should be skipped
+        from the enqueue pass — in which case _mark_app_done was already
+        called here.  Returns False if no prior data exists OR if the app
+        is mid-attempt and should be re-enqueued at the next iter.
+
+        On a mid-attempt restore the caller still proceeds to set
+        READY_FOR_GEN and put it on the gen queue; we ONLY restore the
+        bookkeeping fields here.  The next gen iter increments app.iter
+        and writes iter_{N+1}/, so prior iter dirs are preserved.
+        """
+        prior = _load_app_resume_state(app)
+        if not prior:
+            return False
+
+        with self.state_lock:
+            app.per_iter = prior["completed_iters"]
+            app.iter = app.per_iter[-1].iter if app.per_iter else 0
+            app.loop_attempt = prior["loop_attempt"]
+            app.prior_attempts = prior["prior_attempts"]
+            app.loop_stall_count = prior["loop_stall_count"]
+            app.loop_max_iters_count = prior["loop_max_iters_count"]
+            app.verdict_passed = prior["verdict_passed"]
+            app.bench_wall_s = prior["bench_wall_s"]
+            app.bench_queue_wait_s = prior["bench_queue_wait_s"]
+            app.bench_started_at = prior["bench_started_at"]
+            app.bench_exit_code = prior["bench_exit_code"]
+
+            if prior["verdict"] == "PASS":
+                app.state = AppState.DONE_PASSED
+                self._mark_app_done(app)
+                print(
+                    f"[orchestrator] {app.name} RESUME: prior verdict=PASS "
+                    f"({len(app.per_iter)} iters, attempt {app.loop_attempt}"
+                    f"/{app.max_loop_attempts}) — skipping",
+                    flush=True,
+                )
+                return True
+            if prior["exhausted_retries"]:
+                app.state = AppState.DONE_FAILED
+                self._mark_app_done(app)
+                print(
+                    f"[orchestrator] {app.name} RESUME: prior verdict=FAIL "
+                    f"with exhausted retries ({app.loop_attempt}"
+                    f"/{app.max_loop_attempts}) — skipping",
+                    flush=True,
+                )
+                return True
+            print(
+                f"[orchestrator] {app.name} RESUME: continuing from "
+                f"iter={app.iter} attempt={app.loop_attempt}"
+                f"/{app.max_loop_attempts} ({len(app.per_iter)} prior iters "
+                f"restored)",
+                flush=True,
+            )
+            return False
 
     # --- Signal handling ----------------------------------------------------
     def _on_signal(self, signum, frame):
@@ -1231,6 +1433,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="D3 retry budget — max_loop_attempts = 1 + this (default 2)")
     parser.add_argument("--skip-bench", action="store_true",
                         help="Skip the post-PASS benchmark stage")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume an interrupted run.  For each --apps "
+                             "entry, scan build/iterative_logs/<APP>_<LABEL>/ "
+                             "and restore prior state from result.json, "
+                             "parallel_timing.json, and iter_*/metrics.json. "
+                             "Apps with a PASS verdict or exhausted retry "
+                             "budget are skipped; in-progress apps continue "
+                             "from iter+1.  Without this flag the prior "
+                             "state is ignored and iter dirs may be "
+                             "overwritten from iter 1.")
     parser.add_argument("--validate-timeout-s", type=float, default=900.0,
                         help="Per-iter VALIDATE wall cap in seconds (default 900 = "
                              "15 min). On timeout the executor SIGKILLs the entire "
@@ -1257,6 +1469,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         opencode_retries=args.opencode_retries,
         skip_bench=args.skip_bench,
         validate_timeout_s=args.validate_timeout_s,
+        resume=args.resume,
     )
     return orch.run()
 
