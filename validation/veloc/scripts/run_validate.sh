@@ -61,8 +61,49 @@ elif [ "${1:-}" = "--audit-vanilla" ]; then
   shift
 fi
 
-APP_NAME="${1:?Usage: run_validate.sh [--baseline] <app_name> [extra args...]}"
+APP_NAME="${1:?Usage: run_validate.sh [--baseline] <app_name> [--label <name>] [extra args...]}"
 shift
+
+# --- Parse optional --label flag (must come AFTER app name, BEFORE extras) ---
+# Default "baseline" preserves legacy paths.  Any other label routes BOTH the
+# resilient source directory and the validation output directory to the labeled
+# cell — e.g. --label smoke reads build/tests_smoke/<APP> and writes to
+# build/validation_output/<APP>_smoke.  This prevents a non-baseline run (smoke
+# probe, secondary sweep, model-tag cell via parallel queue) from clobbering
+# the canonical baseline output cell.  Only ASCII letters, digits, dot, dash,
+# underscore are allowed to keep the label safe as a path component.
+LABEL_ARG="baseline"
+if [ "${1:-}" = "--label" ]; then
+  LABEL_ARG="${2:?--label requires a value}"
+  if ! printf '%s' "$LABEL_ARG" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    echo "ERROR: --label '$LABEL_ARG' contains invalid characters (allowed: A-Za-z0-9._-)" >&2
+    exit 2
+  fi
+  shift 2
+fi
+
+# --- Per-app skip-bench sentinel ---
+# When an app is demoted UNTRUSTED with a critical bug mid-sweep, the
+# orchestrator needs a way to stop launching its bench leg without
+# disturbing the rest of the parallel queue.  A file at
+# build/_experiment_state/_skip_bench/<APP_NAME> short-circuits any
+# bench invocation (detected by --benchmark-num-runs in the remaining
+# args) with exit 99.  The sentinel body is echoed to stderr so the
+# bench log carries the reason.  Iter (validate) runs are unaffected.
+_IS_BENCH=false
+for _arg in "$@"; do
+  if [ "$_arg" = "--benchmark-num-runs" ]; then
+    _IS_BENCH=true
+    break
+  fi
+done
+SKIP_BENCH_SENTINEL="$BUILD_DIR/_experiment_state/_skip_bench/${APP_NAME}"
+if [ "$_IS_BENCH" = "true" ] && [ -f "$SKIP_BENCH_SENTINEL" ]; then
+  echo "[skip-bench] sentinel present at $SKIP_BENCH_SENTINEL" >&2
+  echo "[skip-bench] skipping bench for $APP_NAME (exit 99)" >&2
+  cat "$SKIP_BENCH_SENTINEL" >&2
+  exit 99
+fi
 
 # --- Load per-app config ---
 APP_CONFIG="$REPO_ROOT/validation/veloc/app_configs/${APP_NAME}.json"
@@ -198,15 +239,22 @@ else
 fi
 
 # --- Resilient source (agent-modified or reference) ---
+# When --label is non-default, the source directory uses tests_<label>/ instead
+# of tests_baseline${_TAG_PATH_SUFFIX}/ — this matches how run_parallel_queue.py
+# constructs app_dir at line 468 (BUILD_DIR / f"tests_{label}" / name).
 if [ "$USE_REFERENCE" = true ]; then
   RESILIENT_SRC="$REPO_ROOT/tests/apps/checkpointed/$APP_NAME"
   LABEL="reference (human-written)"
 elif [ "$USE_BASELINE" = true ]; then
-  RESILIENT_SRC="$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME"
-  if [ -n "$MODEL_TAG" ]; then
-    LABEL="baseline (no guard-agent; MODEL_TAG=$MODEL_TAG)"
+  if [ "$LABEL_ARG" = "baseline" ]; then
+    RESILIENT_SRC="$BUILD_DIR/tests_baseline${_TAG_PATH_SUFFIX}/$APP_NAME"
   else
-    LABEL="baseline (no guard-agent)"
+    RESILIENT_SRC="$BUILD_DIR/tests_${LABEL_ARG}/$APP_NAME"
+  fi
+  if [ -n "$MODEL_TAG" ]; then
+    LABEL="${LABEL_ARG} (no guard-agent; MODEL_TAG=$MODEL_TAG)"
+  else
+    LABEL="${LABEL_ARG} (no guard-agent)"
   fi
 elif [ "$USE_AUDIT_VANILLA" = true ]; then
   # Point "resilient" at the same vanilla source so the failure-injected run
@@ -235,12 +283,21 @@ if [ -f "$BENCH_FILE" ]; then
 fi
 
 # --- Output directory ---
+# When --label is non-default, the output cell uses <APP>_<label>/ instead of
+# <APP>_baseline${_TAG_PATH_SUFFIX}/.  This isolates smoke probes, secondary
+# sweeps, and parallel-queue label cells from the canonical baseline cell.
+# Callers that already encode MODEL_TAG in the label string (parallel queue at
+# line 1058) get correct sharding without double-suffixing.
 if [ "$USE_REFERENCE" = true ]; then
   # Reference (upstream human-written) outputs are not sharded — the upstream
   # source is a single ground truth shared across all model cells.
   OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_reference"
 elif [ "$USE_BASELINE" = true ]; then
-  OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline${_TAG_PATH_SUFFIX}"
+  if [ "$LABEL_ARG" = "baseline" ]; then
+    OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_baseline${_TAG_PATH_SUFFIX}"
+  else
+    OUTPUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_${LABEL_ARG}"
+  fi
 elif [ "$USE_AUDIT_VANILLA" = true ]; then
   # Audit (vanilla vs vanilla) is invariant across model cells.
   OUTPUT_DIR="$BUILD_DIR/audit_output/$APP_NAME"
