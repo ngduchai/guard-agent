@@ -381,18 +381,14 @@ def configure_and_build(
         # Copy source to build directory (same as reference_validator._build_app)
         if source_dir != build_dir:
             if build_dir.exists():
-                # Restore u+w on every entry before rmtree.  Source trees
-                # under iter+bench may carry F-15 read-only locks on
-                # vendored subprojects (set by run_iterative.sh's
-                # _lock_vendored helper) which propagate to the build_dir
-                # on first --install-resilient copy.  Without this, the
-                # second iter cycle's rmtree fails with PermissionError on
-                # files inside the locked dir (e.g. amrex/Tools/C_scripts/
-                # describe_sources.py — directory perms 555 prevent
-                # unlink even though the file itself is readable).  Note:
-                # F-15 is reapplied to the LLM source tree after each iter
-                # by run_iterative.sh, so this only relaxes the build_dir
-                # copy, not the LLM-facing source.
+                # Defensive: restore u+w on every entry before rmtree.
+                # The F-15 vendored-lock was retired on 2026-05-22 (the
+                # iter prompt now grants the LLM edit rights over the
+                # entire codebase, including vendored subprojects).  But
+                # build_dir copies made before that change may still
+                # carry read-only chmod bits on subprojects/_deps; this
+                # chmod keeps shutil.rmtree safe across the transition
+                # and is harmless on freshly-prepared trees.
                 _sp_chmod = __import__("subprocess")
                 _sp_chmod.run(
                     ["chmod", "-R", "u+w", str(build_dir)],
@@ -523,6 +519,7 @@ def run_once(
     memory_stop_event: "threading.Event | None" = None,
     memory_samples_holder: "list | None" = None,
     timeout_s: float | None = None,
+    skip_pre_run_clear: bool = False,
 ) -> RunResult:
     """Run the application once under mpirun, capturing stdout/stderr and timing.
 
@@ -558,8 +555,12 @@ def run_once(
 
     # Clear VeloC checkpoint/scratch directories before running so that leftover
     # checkpoints from a previous run cannot be accidentally picked up.
+    # skip_pre_run_clear=True bypasses this for callers that deliberately
+    # restored a curated checkpoint state into the dirs (e.g. the
+    # F-collective-restart asymmetric gate, which restores a snapshot then
+    # corrupts one rank's files before launching the binary).
     cfg_in_cwd = cwd / veloc_config_name
-    if cfg_in_cwd.exists():
+    if cfg_in_cwd.exists() and not skip_pre_run_clear:
         ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_in_cwd)
         if ckpt_dirs:
             print(
@@ -568,6 +569,12 @@ def run_once(
             for d in ckpt_dirs:
                 print(f"  - {d}", flush=True)
             clear_checkpoint_dirs(ckpt_dirs)
+    elif cfg_in_cwd.exists() and skip_pre_run_clear:
+        print(
+            "[runner] skip_pre_run_clear=True — preserving caller-prepared "
+            "checkpoint state in VeloC scratch/persistent dirs.",
+            flush=True,
+        )
 
     stdout_path = output_dir / "stdout.txt"
     stderr_path = output_dir / "stderr.txt"

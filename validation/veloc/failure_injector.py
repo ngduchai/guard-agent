@@ -490,6 +490,84 @@ def inject_failure_once(
 
 
 # ---------------------------------------------------------------------------
+# Asymmetric checkpoint corruption — F-collective-restart gate
+# ---------------------------------------------------------------------------
+#
+# VELOC's posix module writes one checkpoint file per rank per version with the
+# filename pattern ``<prefix>-<rank>-<version>.dat`` (mirrored at validate.py's
+# _VELOC_FILENAME_RE).  Deleting just rank K's files from a restored
+# checkpoint set simulates a partial-storage-loss scenario: a correct
+# resilient implementation must MPI_Allreduce on the per-rank load outcome and
+# unanimously fall back to cold-start; a buggy non-collective implementation
+# (e.g. SPPARKS app_lattice.cpp:1572-1592, Smilei VelocCheckpoint.cpp:478-567)
+# will let rank K cold-start while other ranks resume from t>0, producing
+# mixed-state output that diverges from baseline OR deadlocks at the next
+# collective MPI call.
+
+_VELOC_PER_RANK_FILE_RE = re.compile(
+    r"^(?P<prefix>[A-Za-z0-9_.+]+?)-(?P<rank>\d+)-(?P<version>\d+)\.dat$"
+)
+
+
+def corrupt_rank_checkpoint(
+    rank_id: int,
+    checkpoint_dirs: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Delete VELOC per-rank checkpoint files belonging to *rank_id*.
+
+    Scans each directory in *checkpoint_dirs* for files matching the VELOC
+    posix-module naming convention (``<prefix>-<rank>-<version>.dat``) and
+    unlinks those whose ``<rank>`` field equals *rank_id*.
+
+    Parameters
+    ----------
+    rank_id:
+        MPI rank whose checkpoint files should be removed.
+    checkpoint_dirs:
+        Live scratch + persistent directories (typically extracted from
+        veloc.cfg via :func:`extract_checkpoint_dirs_from_veloc_cfg`).
+
+    Returns
+    -------
+    (deleted, scanned)
+        * ``deleted`` — absolute paths of files that were successfully unlinked.
+        * ``scanned`` — every per-rank file the scanner observed (across all
+          ranks).  Empty ``scanned`` means the gate is not applicable —
+          either no VELOC checkpoints exist or the app uses aggregated
+          checkpointing (posix_agg_module) whose files do not match the
+          per-rank pattern; the caller should skip rather than treat this
+          as a corruption-injection failure.
+    """
+    deleted: list[Path] = []
+    scanned: list[Path] = []
+    for d in checkpoint_dirs:
+        if not d.exists() or not d.is_dir():
+            continue
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            m = _VELOC_PER_RANK_FILE_RE.match(entry.name)
+            if m is None:
+                continue
+            scanned.append(entry)
+            if int(m.group("rank")) != rank_id:
+                continue
+            try:
+                entry.unlink()
+                deleted.append(entry)
+            except OSError:
+                pass
+    return deleted, scanned
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

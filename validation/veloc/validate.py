@@ -49,6 +49,7 @@ from .metrics_collector import (
     load_benchmark_config,
     run_benchmark_sweep,
 )
+from .failure_injector import corrupt_rank_checkpoint
 from .reporter import generate_report
 from .runner import (
     ValidationError,
@@ -57,6 +58,7 @@ from .runner import (
     extract_checkpoint_dirs_from_veloc_cfg,
     measure_checkpoint_dirs,
     run_baseline,
+    run_once,
     run_with_checkpoint_observed_injection,
     run_with_failure_injection,
     snapshot_checkpoint_dirs,
@@ -131,6 +133,200 @@ def _capture_checkpoint_artifacts(
             f"({label}): {[str(d) for d in ckpt_dirs]}",
             flush=True,
         )
+
+
+def _run_asymmetric_restart_check(
+    *,
+    snapshot_src: Path,
+    veloc_cfg_dirs: list[Path],
+    veloc_cfg_name: str,
+    build_dir: Path,
+    executable_name: str,
+    num_procs: int,
+    app_args: list[str],
+    output_dir: Path,
+    env: dict | None,
+    timeout_s: float,
+    output_file_name: str,
+    comparison_golden_file: Path,
+    do_compare,
+) -> "CompareResult | None":
+    """Run the F-collective-restart asymmetric-restart gate.
+
+    Restores the failure-prone leg's VELOC snapshot, deletes rank-(N-1)'s
+    per-rank checkpoint files, restarts the binary, and compares its output
+    against *comparison_golden_file*.  The expected behaviour of a correct
+    implementation is that all ranks MPI_Allreduce on the per-rank load
+    outcome, detect the partial-storage-loss state, and unanimously
+    cold-start (output matches the baseline byte-identically); a buggy
+    non-collective implementation either diverges from baseline or
+    deadlocks at the next collective MPI call.
+
+    Returns ``None`` when the gate is structurally inapplicable
+    (non-VELOC app, single-rank run, empty snapshot, or aggregated
+    checkpoint layout with no per-rank files), so the caller treats the
+    gate as silently skipped rather than as a verdict.
+    """
+    # --- Step 1: locate veloc.cfg (skip silently for non-VELOC apps) ---
+    cfg_path: Path | None = None
+    for d in veloc_cfg_dirs:
+        c = d / veloc_cfg_name
+        if c.exists():
+            cfg_path = c
+            break
+    if cfg_path is None:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"no {veloc_cfg_name} found — non-VELOC app.",
+            flush=True,
+        )
+        return None
+
+    # --- Step 2: single-rank guard (no per-rank divergence possible) ---
+    if num_procs < 2:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"num_procs={num_procs} < 2; gate requires ≥2 ranks.",
+            flush=True,
+        )
+        return None
+
+    # --- Step 3: snapshot must exist and contain something ---
+    if not snapshot_src.exists() or not snapshot_src.is_dir():
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"no checkpoint snapshot at {snapshot_src}.",
+            flush=True,
+        )
+        return None
+    snapshot_children = [p for p in snapshot_src.iterdir() if p.is_dir()]
+    if not snapshot_children:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"snapshot {snapshot_src} is empty (no per-dir copies).",
+            flush=True,
+        )
+        return None
+
+    # --- Step 4: resolve live ckpt_dirs from veloc.cfg + defensive wipe ---
+    live_ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_path)
+    if not live_ckpt_dirs:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"{cfg_path} declares no scratch/persistent dirs.",
+            flush=True,
+        )
+        return None
+    clear_checkpoint_dirs(live_ckpt_dirs)
+
+    # --- Step 5: restore snapshot into live ckpt_dirs by basename match ---
+    live_by_name = {d.name: d for d in live_ckpt_dirs}
+    restored: list[str] = []
+    for snap_child in snapshot_children:
+        target = live_by_name.get(snap_child.name)
+        if target is None:
+            continue
+        target.mkdir(parents=True, exist_ok=True)
+        for src_file in snap_child.iterdir():
+            if not src_file.is_file():
+                continue
+            try:
+                shutil.copy2(src_file, target / src_file.name)
+            except OSError as e:
+                print(
+                    f"[validate] Test 3: failed to restore {src_file} → "
+                    f"{target}: {e}",
+                    flush=True,
+                )
+        restored.append(target.name)
+    if not restored:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            f"no snapshot basename matched a live ckpt dir; "
+            f"snapshot={[p.name for p in snapshot_children]}, "
+            f"live={list(live_by_name)}.",
+            flush=True,
+        )
+        return None
+
+    # --- Step 6: delete rank-(N-1)'s per-rank checkpoint files ---
+    victim_rank = num_procs - 1
+    deleted, scanned = corrupt_rank_checkpoint(victim_rank, live_ckpt_dirs)
+    if not scanned:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            "restored checkpoint contains no per-rank VELOC files "
+            "(aggregated posix_agg_module layout or unknown naming) — "
+            "gate inapplicable.",
+            flush=True,
+        )
+        return None
+    if not deleted:
+        print(
+            f"[validate] Skipping Test 3 (asymmetric-restart): "
+            f"victim rank {victim_rank} has no per-rank files in restored "
+            f"snapshot (scanned {len(scanned)} per-rank file(s) across "
+            "other ranks only); gate cannot exercise the divergence path.",
+            flush=True,
+        )
+        return None
+
+    # --- Step 7: persist forensic evidence ---
+    output_dir.mkdir(parents=True, exist_ok=True)
+    forensic = {
+        "victim_rank": victim_rank,
+        "num_procs": num_procs,
+        "veloc_cfg": str(cfg_path),
+        "live_ckpt_dirs": [str(p) for p in live_ckpt_dirs],
+        "snapshot_src": str(snapshot_src),
+        "restored_dirs": restored,
+        "deleted_files": [str(p) for p in deleted],
+        "scanned_file_count": len(scanned),
+    }
+    (output_dir / "asymmetric_corruption.json").write_text(
+        json.dumps(forensic, indent=2)
+    )
+    print(
+        f"[validate] Test 3: corrupted rank {victim_rank} — deleted "
+        f"{len(deleted)} file(s); restored ckpt set has "
+        f"{len(scanned) - len(deleted)} per-rank file(s) remaining.",
+        flush=True,
+    )
+
+    # --- Step 8: restart binary; bypass run_once's pre-run clear ---
+    asym_result = run_once(
+        build_dir=build_dir,
+        executable_name=executable_name,
+        num_procs=num_procs,
+        app_args=app_args,
+        output_dir=output_dir,
+        env=env,
+        veloc_config_sources=veloc_cfg_dirs,
+        veloc_config_name=veloc_cfg_name,
+        timeout_s=timeout_s,
+        skip_pre_run_clear=True,
+    )
+
+    # --- Step 9: compare output (missing file ⇒ FAIL: deadlock/crash) ---
+    asym_output = output_dir / output_file_name
+    if not asym_output.exists():
+        return CompareResult(
+            passed=False,
+            method=f"asymmetric-restart [VeloC, collective-restart]",
+            score=None,
+            message=(
+                f"asymmetric restart produced no output at {asym_output} "
+                f"(exit_code={asym_result.exit_code}, "
+                f"elapsed={asym_result.elapsed_s:.1f}s) — likely deadlock "
+                f"at next collective MPI call or crash on partial-state "
+                f"resume."
+            ),
+        )
+    return do_compare(
+        "VeloC, collective-restart",
+        comparison_golden_file,
+        asym_output,
+    )
 
 
 _PER_APP_CAP_CACHE: "dict[str, float]" = {}
@@ -3013,6 +3209,60 @@ def _stage_correctness(
         flush=True,
     )
     results.append(result2b)
+
+    # --- Test 3: F-collective-restart (asymmetric checkpoint corruption) ---
+    # Catches the non-collective restart bug (SPPARKS app_lattice.cpp:1572-1592,
+    # Smilei VelocCheckpoint.cpp:478-567, OpenLB bstep2d.cpp:75-145) at per-iter
+    # validation time instead of post-bench audit.  v2.2's cold-replay detector
+    # cannot surface this class because it SIGKILLs all ranks synchronously —
+    # after restart, all ranks see identical checkpoint state and unanimously
+    # make the same (correct-or-buggy) resume-vs-cold-start decision.  This gate
+    # forces per-rank divergence by restoring the failure-prone leg's checkpoint
+    # snapshot and then deleting rank-(N-1)'s VELOC per-rank files BEFORE
+    # restarting.  A correct implementation MPI_Allreduces on per-rank load
+    # outcome and unanimously cold-starts; a buggy one lets some ranks resume
+    # and rank-(N-1) cold-start, producing mixed-state output that diverges
+    # from baseline OR deadlocks at the next collective MPI call.
+    #
+    # Late-gated: only runs when every prior test (1, 1b, 2, 2b) has PASSED,
+    # so the cost (~1 extra resilient run at validation-size workload) is
+    # paid only on candidate-TRUSTED iters.  Skipped automatically for:
+    #   * non-VELOC apps (no veloc.cfg)
+    #   * apps using posix_agg_module (aggregated checkpoint files do not
+    #     match the per-rank <prefix>-<rank>-<version>.dat pattern)
+    #   * single-rank runs (no per-rank divergence possible)
+    #   * empty checkpoint snapshots
+    _all_prior_passed = all(r.passed for r in results)
+    if not _all_prior_passed:
+        print(
+            "[validate] Skipping Test 3 (asymmetric-restart): "
+            "at least one prior test failed; gate is reserved for "
+            "otherwise-passing iters to keep per-iter cost low.",
+            flush=True,
+        )
+    else:
+        result3 = _run_asymmetric_restart_check(
+            snapshot_src=resilient_out / "checkpoints",
+            veloc_cfg_dirs=[resilient_src, resilient_build],
+            veloc_cfg_name=args.veloc_config_name,
+            build_dir=resilient_build,
+            executable_name=res_exe,
+            num_procs=args.num_procs,
+            app_args=_clean_app_args,
+            output_dir=output_dir / "correctness" / "resilient_asym",
+            env=_clean_run_env,
+            timeout_s=max(60.0, 2.0 * (clean_result.elapsed_s or 30.0)),
+            output_file_name=args.output_file_name,
+            comparison_golden_file=comparison_golden_file,
+            do_compare=_do_compare,
+        )
+        if result3 is not None:
+            print(
+                f"[validate] Test 3 (asymmetric-restart [VeloC, collective-restart]): "
+                f"{result3}",
+                flush=True,
+            )
+            results.append(result3)
 
     # --- Resilience policy enforcement ---
     # Validation A (vanilla audit): also build the reference checkpointed

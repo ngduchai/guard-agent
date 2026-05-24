@@ -10,10 +10,13 @@ The matcher must:
      <APP>`` even when <APP> equals the app's binary name.
 """
 
+from pathlib import Path
+
 from validation.veloc.failure_injector import (
     _build_descendants,
     _find_rank_pids_local,
     _split_ppid_from_pscmd,
+    corrupt_rank_checkpoint,
     match_rank_pids,
 )
 
@@ -200,3 +203,103 @@ def test_build_descendants_handles_ppid_loop_defensively() -> None:
     ppid_of = {100: 200, 200: 100}
     # Neither pid descends from a non-existent parent.
     assert _build_descendants(ppid_of, 999) == set()
+
+
+# ---------------------------------------------------------------------------
+# corrupt_rank_checkpoint — F-collective-restart gate helper
+# ---------------------------------------------------------------------------
+
+def test_corrupt_rank_checkpoint_deletes_only_target_rank(tmp_path: Path) -> None:
+    """Files matching the target rank are unlinked; other ranks survive."""
+    scratch = tmp_path / "scratch"
+    persistent = tmp_path / "persistent"
+    scratch.mkdir()
+    persistent.mkdir()
+    # Two ranks, two versions each, in both dirs.
+    for d in (scratch, persistent):
+        (d / "spparks-0-0.dat").write_bytes(b"r0v0")
+        (d / "spparks-0-1.dat").write_bytes(b"r0v1")
+        (d / "spparks-1-0.dat").write_bytes(b"r1v0")
+        (d / "spparks-1-1.dat").write_bytes(b"r1v1")
+
+    deleted, scanned = corrupt_rank_checkpoint(1, [scratch, persistent])
+
+    # 2 files per dir x 2 dirs = 4 deletions for rank 1.
+    assert len(deleted) == 4
+    assert {p.name for p in deleted} == {"spparks-1-0.dat", "spparks-1-1.dat"}
+    # Scanner saw all 8 per-rank files (4 per dir).
+    assert len(scanned) == 8
+    # Rank 0 files remain on disk.
+    for d in (scratch, persistent):
+        assert (d / "spparks-0-0.dat").exists()
+        assert (d / "spparks-0-1.dat").exists()
+        assert not (d / "spparks-1-0.dat").exists()
+        assert not (d / "spparks-1-1.dat").exists()
+
+
+def test_corrupt_rank_checkpoint_empty_dirs(tmp_path: Path) -> None:
+    """Empty directories produce empty deleted+scanned lists, no error."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    deleted, scanned = corrupt_rank_checkpoint(0, [scratch])
+    assert deleted == []
+    assert scanned == []
+
+
+def test_corrupt_rank_checkpoint_missing_dirs(tmp_path: Path) -> None:
+    """Nonexistent directories are silently skipped (graceful in CI)."""
+    missing = tmp_path / "does-not-exist"
+    deleted, scanned = corrupt_rank_checkpoint(0, [missing])
+    assert deleted == []
+    assert scanned == []
+
+
+def test_corrupt_rank_checkpoint_aggregated_files_not_matched(tmp_path: Path) -> None:
+    """Aggregated checkpoint files (no per-rank suffix) are not in scanned
+    list — caller uses this to detect 'gate not applicable' for
+    posix_agg_module apps."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    # posix_agg_module typically writes aggregated names like these.
+    (scratch / "comd.ckpt").write_bytes(b"agg-blob")
+    (scratch / "checkpoint.bin").write_bytes(b"agg-blob")
+    (scratch / "node-0.meta").write_bytes(b"meta")
+
+    deleted, scanned = corrupt_rank_checkpoint(0, [scratch])
+    assert deleted == []
+    assert scanned == []  # No per-rank files found → gate skipped by caller.
+
+
+def test_corrupt_rank_checkpoint_mixed_per_rank_and_other_files(
+    tmp_path: Path,
+) -> None:
+    """Non-matching files in the same dir (sidecar logs, .meta) are
+    ignored; only the per-rank ``.dat`` files are touched."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "openlb-0-0.dat").write_bytes(b"r0")
+    (scratch / "openlb-1-0.dat").write_bytes(b"r1")
+    (scratch / "openlb-0-0.meta").write_bytes(b"meta")  # not .dat
+    (scratch / "sidecar.log").write_bytes(b"log")
+    (scratch / "subdir").mkdir()  # directory, not a file
+
+    deleted, scanned = corrupt_rank_checkpoint(0, [scratch])
+    assert {p.name for p in deleted} == {"openlb-0-0.dat"}
+    assert {p.name for p in scanned} == {"openlb-0-0.dat", "openlb-1-0.dat"}
+    assert (scratch / "openlb-1-0.dat").exists()
+    assert (scratch / "openlb-0-0.meta").exists()  # untouched
+    assert (scratch / "sidecar.log").exists()
+
+
+def test_corrupt_rank_checkpoint_no_match_for_rank(tmp_path: Path) -> None:
+    """Targeting a rank with no files: scanned non-empty (other ranks
+    exist), deleted empty.  Caller uses this to detect mismatched
+    rank_id vs actual rank count."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "spparks-0-0.dat").write_bytes(b"r0")
+    (scratch / "spparks-1-0.dat").write_bytes(b"r1")
+
+    deleted, scanned = corrupt_rank_checkpoint(9, [scratch])
+    assert deleted == []
+    assert len(scanned) == 2  # rank-0 and rank-1 files seen but not deleted
