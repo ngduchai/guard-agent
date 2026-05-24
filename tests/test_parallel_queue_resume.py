@@ -25,7 +25,12 @@ from validation.veloc.scripts.run_parallel_queue import (
     IterMetrics,
     LoopAttempt,
     Orchestrator,
+    _archive_crashed_logs,
+    _classify_iter_crash,
+    _gen_metrics_complete,
     _load_app_resume_state,
+    _load_partial_gen_iter,
+    _metrics_complete,
 )
 
 
@@ -414,4 +419,396 @@ def test_resume_flag_off_does_not_load_prior_state(tmp_path: Path,
     # And the AppRun is still pristine.
     assert app.iter == 0
     assert app.per_iter == []
+
+
+# --- Crash-immediate resume classification + dispatch ------------------------
+#
+# Per project policy (2026-05-24): when the orchestrator crashes mid-iter, the
+# on-disk source tree under app_dir may be a partial LLM edit.  Recovery rule
+# is differentiated by which stage of the iter was in flight:
+#
+#   mid_gen      → wipe app + restage vanilla + restart iter 1 (crash does
+#                  NOT burn a retry attempt; prior logs archived for the paper)
+#   mid_validate → preserve source (LLM iter completed = source is a clean
+#                  checkpoint), re-queue ("validate", N) on the executor
+#   mid_bench    → preserve everything, re-queue ("bench", final_iter)
+#   clean        → existing logic (continue from highest_complete + 1)
+#   terminal     → existing logic (skip)
+
+
+def _write_iter_gen_metrics(log_dir: Path, iter_n: int, *,
+                             gen_wall_s: float = 10.0,
+                             tokens_input: int = 100,
+                             tokens_output: int = 200) -> None:
+    """Write iter_N/metrics_gen.json only (no metrics.json) — simulates a
+    mid-validate crash where the helper completed gen but the orchestrator
+    never wrote the post-validate metrics."""
+    d = log_dir / f"iter_{iter_n}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "metrics_gen.json").write_text(json.dumps({
+        "gen_wall_s": gen_wall_s,
+        "tokens_input": tokens_input,
+        "tokens_output": tokens_output,
+        "tokens_total": tokens_input + tokens_output,
+        "stall_aborted": False,
+    }))
+
+
+def _write_iter_empty(log_dir: Path, iter_n: int) -> None:
+    """Create iter_N/ with no metrics files — simulates a mid-gen crash."""
+    (log_dir / f"iter_{iter_n}").mkdir(parents=True, exist_ok=True)
+
+
+# --- _metrics_complete / _gen_metrics_complete -------------------------------
+
+
+def test_metrics_complete_missing_file(tmp_path: Path) -> None:
+    assert _metrics_complete(tmp_path / "metrics.json") is False
+
+
+def test_metrics_complete_malformed(tmp_path: Path) -> None:
+    p = tmp_path / "metrics.json"
+    p.write_text("{ not json")
+    assert _metrics_complete(p) is False
+
+
+def test_metrics_complete_missing_validation_passed(tmp_path: Path) -> None:
+    p = tmp_path / "metrics.json"
+    p.write_text(json.dumps({"iter": 1}))
+    assert _metrics_complete(p) is False
+
+
+def test_metrics_complete_full(tmp_path: Path) -> None:
+    p = tmp_path / "metrics.json"
+    p.write_text(json.dumps({"iter": 1, "validation_passed": True}))
+    assert _metrics_complete(p) is True
+
+
+def test_gen_metrics_complete_full(tmp_path: Path) -> None:
+    p = tmp_path / "metrics_gen.json"
+    p.write_text(json.dumps({"gen_wall_s": 5.0}))
+    assert _gen_metrics_complete(p) is True
+
+
+def test_gen_metrics_complete_missing_field(tmp_path: Path) -> None:
+    p = tmp_path / "metrics_gen.json"
+    p.write_text(json.dumps({"tokens_input": 10}))
+    assert _gen_metrics_complete(p) is False
+
+
+# --- _classify_iter_crash ----------------------------------------------------
+
+
+def test_classify_iter_crash_no_log_dir(tmp_path: Path) -> None:
+    assert _classify_iter_crash(tmp_path / "nope")["mode"] == "clean"
+
+
+def test_classify_iter_crash_empty_log_dir(tmp_path: Path) -> None:
+    (tmp_path / "logs").mkdir()
+    assert _classify_iter_crash(tmp_path / "logs")["mode"] == "clean"
+
+
+def test_classify_iter_crash_all_iters_complete(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    _write_iter_metrics(log_dir, 1, validation_passed=False)
+    _write_iter_metrics(log_dir, 2, validation_passed=True)
+    assert _classify_iter_crash(log_dir)["mode"] == "clean"
+
+
+def test_classify_iter_crash_mid_gen_iter_1(tmp_path: Path) -> None:
+    """iter 1 dir exists but no metrics_gen.json → mid_gen at iter 1."""
+    log_dir = tmp_path / "logs"
+    _write_iter_empty(log_dir, 1)
+    result = _classify_iter_crash(log_dir)
+    assert result == {"mode": "mid_gen", "iter": 1}
+
+
+def test_classify_iter_crash_mid_gen_after_clean_iters(tmp_path: Path) -> None:
+    """iters 1-3 complete, iter 4 dir exists with no metrics_gen.json."""
+    log_dir = tmp_path / "logs"
+    _write_iter_metrics(log_dir, 1, validation_passed=False)
+    _write_iter_metrics(log_dir, 2, validation_passed=False)
+    _write_iter_metrics(log_dir, 3, validation_passed=False)
+    _write_iter_empty(log_dir, 4)
+    result = _classify_iter_crash(log_dir)
+    assert result == {"mode": "mid_gen", "iter": 4}
+
+
+def test_classify_iter_crash_mid_validate_iter_1(tmp_path: Path) -> None:
+    """iter 1 has metrics_gen.json but no metrics.json → mid_validate."""
+    log_dir = tmp_path / "logs"
+    _write_iter_gen_metrics(log_dir, 1)
+    result = _classify_iter_crash(log_dir)
+    assert result == {"mode": "mid_validate", "iter": 1}
+
+
+def test_classify_iter_crash_mid_validate_after_clean_iters(tmp_path: Path) -> None:
+    """iters 1-4 complete, iter 5 has gen but no validate."""
+    log_dir = tmp_path / "logs"
+    for n in range(1, 5):
+        _write_iter_metrics(log_dir, n, validation_passed=False)
+    _write_iter_gen_metrics(log_dir, 5, gen_wall_s=7.5)
+    result = _classify_iter_crash(log_dir)
+    assert result == {"mode": "mid_validate", "iter": 5}
+
+
+def test_classify_iter_crash_ignores_lower_incomplete(tmp_path: Path) -> None:
+    """Only the highest iter is classified — defensive shape check.  In
+    practice the orchestrator never starts iter N+1 until iter N completes,
+    so a lower iter without metrics is structurally impossible.  But the
+    classifier must not crash on the shape regardless."""
+    log_dir = tmp_path / "logs"
+    _write_iter_empty(log_dir, 1)  # lower incomplete
+    _write_iter_metrics(log_dir, 2, validation_passed=True)
+    # Highest iter (2) is complete → classifier returns clean.
+    assert _classify_iter_crash(log_dir)["mode"] == "clean"
+
+
+# --- _archive_crashed_logs ---------------------------------------------------
+
+
+def test_archive_crashed_logs_moves_dir(tmp_path: Path) -> None:
+    log_dir = tmp_path / "STUB_baseline"
+    log_dir.mkdir()
+    (log_dir / "marker.txt").write_text("hello")
+    archive = _archive_crashed_logs(log_dir)
+    assert archive is not None
+    assert archive.parent == tmp_path
+    assert archive.name.startswith("STUB_baseline.CRASHED_")
+    assert (archive / "marker.txt").read_text() == "hello"
+    assert not log_dir.exists()
+
+
+def test_archive_crashed_logs_collision_disambiguates(tmp_path: Path) -> None:
+    """Two archives in the same UTC second must not collide."""
+    log_dir = tmp_path / "X"
+    log_dir.mkdir()
+    a1 = _archive_crashed_logs(log_dir)
+    log_dir.mkdir()
+    a2 = _archive_crashed_logs(log_dir)
+    assert a1 is not None and a2 is not None
+    assert a1 != a2
+
+
+def test_archive_crashed_logs_no_dir_is_noop(tmp_path: Path) -> None:
+    assert _archive_crashed_logs(tmp_path / "missing") is None
+
+
+# --- _load_partial_gen_iter --------------------------------------------------
+
+
+def test_load_partial_gen_iter_full_fields(tmp_path: Path) -> None:
+    d = tmp_path / "iter_3"
+    d.mkdir()
+    (d / "metrics_gen.json").write_text(json.dumps({
+        "gen_wall_s": 8.25,
+        "tokens_input": 50,
+        "tokens_output": 75,
+        "tokens_total": 125,
+        "stall_aborted": False,
+    }))
+    m = _load_partial_gen_iter(d, 3)
+    assert m.iter == 3
+    assert m.gen_wall_s == 8.25
+    assert m.tokens_input == 50
+    assert m.tokens_output == 75
+    assert m.val_wall_s == 0.0  # not yet populated
+    assert m.validation_passed is False  # default
+
+
+def test_load_partial_gen_iter_missing_file(tmp_path: Path) -> None:
+    d = tmp_path / "iter_1"
+    d.mkdir()
+    m = _load_partial_gen_iter(d, 1)
+    assert m.iter == 1
+    assert m.gen_wall_s == 0.0
+
+
+# --- Orchestrator _apply_resume_state — crash branches ----------------------
+
+
+def test_apply_resume_mid_gen_archives_wipes_and_resets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """LLM was mid-edit at iter 4: prior 3 iters complete; iter 4 dir exists
+    with no metrics_gen.json; app_dir contains stale edits.
+
+    Expect: logs moved to CRASHED archive, app_dir wiped and restaged from
+    vanilla, AppRun reset to iter=0 / loop_attempt=1 (no retry burned),
+    log_dir recreated empty.  Returns False so caller enqueues at READY_FOR_GEN.
+    """
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    # 3 complete iters
+    _write_iter_metrics(app.log_dir, 1, validation_passed=False)
+    _write_iter_metrics(app.log_dir, 2, validation_passed=False)
+    _write_iter_metrics(app.log_dir, 3, validation_passed=False)
+    _write_result_json(app.log_dir, passed=False, loop_attempt_final=1)
+    _write_parallel_timing(app.log_dir)
+    # iter 4 mid-gen: dir exists, no metrics_gen.json
+    _write_iter_empty(app.log_dir, 4)
+    # Stale edits in app_dir (LLM was editing here when crash hit)
+    app.app_dir.mkdir(parents=True, exist_ok=True)
+    (app.app_dir / "STALE_EDIT.cpp").write_text("// half-edited junk")
+    # Vanilla source has a clean marker file
+    (app.vanilla_src / "VANILLA_MARKER.txt").write_text("clean")
+
+    initial_remaining = orch.remaining
+    result = orch._apply_resume_state(app)
+
+    assert result is False  # caller enqueues at READY_FOR_GEN
+    # Archive sibling exists under iterative_logs/ with the crashed contents.
+    archives = list(app.log_dir.parent.glob("STUB_baseline.CRASHED_*"))
+    assert len(archives) == 1
+    assert (archives[0] / "iter_4").is_dir()
+    assert (archives[0] / "iter_3" / "metrics.json").exists()
+    # log_dir recreated empty
+    assert app.log_dir.exists()
+    assert list(app.log_dir.iterdir()) == []
+    # app_dir restaged from vanilla, stale edit gone
+    assert not (app.app_dir / "STALE_EDIT.cpp").exists()
+    assert (app.app_dir / "VANILLA_MARKER.txt").exists()
+    # AppRun reset
     assert app.state == AppState.NOT_STARTED
+    assert app.iter == 0
+    assert app.loop_attempt == 1
+    assert app.per_iter == []
+    assert app.prior_attempts == []
+    # remaining is NOT decremented — app is alive, just restarted
+    assert orch.remaining == initial_remaining
+
+
+def test_apply_resume_mid_validate_requeues_executor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """iter 5 gen completed, validate crashed before writing metrics.json.
+
+    Expect: source preserved (no wipe), prior 4 iters restored, partial iter 5
+    appended with only gen fields, state = QUEUED_FOR_EXECUTOR, executor_queue
+    has ("STUB", "validate", 5).  Returns True (skip default enqueue).
+    """
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3, skip_bench=False,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    for n in range(1, 5):
+        _write_iter_metrics(app.log_dir, n, validation_passed=False)
+    _write_iter_gen_metrics(app.log_dir, 5, gen_wall_s=12.5)
+    _write_result_json(app.log_dir, passed=False, loop_attempt_final=1)
+    _write_parallel_timing(app.log_dir)
+    # Source tree from the LLM's iter-5 edit — must be preserved
+    app.app_dir.mkdir(parents=True, exist_ok=True)
+    (app.app_dir / "LLM_EDIT.cpp").write_text("// iter 5 final code")
+
+    initial_remaining = orch.remaining
+    result = orch._apply_resume_state(app)
+
+    assert result is True
+    # No archive should have been created
+    assert not list(app.log_dir.parent.glob("STUB_baseline.CRASHED_*"))
+    # Source preserved
+    assert (app.app_dir / "LLM_EDIT.cpp").read_text() == "// iter 5 final code"
+    # State restored
+    assert app.iter == 5
+    assert app.state == AppState.QUEUED_FOR_EXECUTOR
+    assert len(app.per_iter) == 5
+    assert app.per_iter[-1].iter == 5
+    assert app.per_iter[-1].gen_wall_s == 12.5
+    assert app.per_iter[-1].validation_passed is False  # not yet
+    # Executor queue has the validate task
+    items = list(orch.executor_queue.queue)
+    assert ("STUB", "validate", 5) in items
+    # remaining not decremented — app still in flight
+    assert orch.remaining == initial_remaining
+
+
+def test_apply_resume_mid_validate_at_iter_1(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Edge: mid_validate hits at iter 1 with no prior complete iters."""
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3, skip_bench=False,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    app.log_dir.mkdir(parents=True)
+    _write_iter_gen_metrics(app.log_dir, 1, gen_wall_s=4.0)
+
+    result = orch._apply_resume_state(app)
+    assert result is True
+    assert app.iter == 1
+    assert len(app.per_iter) == 1
+    assert app.per_iter[0].iter == 1
+    assert app.per_iter[0].gen_wall_s == 4.0
+    assert app.state == AppState.QUEUED_FOR_EXECUTOR
+    items = list(orch.executor_queue.queue)
+    assert ("STUB", "validate", 1) in items
+
+
+def test_apply_resume_mid_bench_requeues_executor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """iter loop passed (latest iter validation_passed=true), no result.json,
+    bench was queued or running.  Expect re-queue at executor as bench task.
+    """
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3, skip_bench=False,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    _write_iter_metrics(app.log_dir, 1, validation_passed=False)
+    _write_iter_metrics(app.log_dir, 2, validation_passed=True)
+    # NO result.json — bench never finalized
+    _write_parallel_timing(app.log_dir)
+
+    initial_remaining = orch.remaining
+    result = orch._apply_resume_state(app)
+
+    assert result is True
+    assert app.state == AppState.QUEUED_FOR_BENCH
+    assert app.verdict_passed is True
+    assert app.iter == 2
+    items = list(orch.executor_queue.queue)
+    assert ("STUB", "bench", 2) in items
+    # Bench fields reset so the new bench run captures fresh measurements
+    assert app.bench_started_at is None
+    assert app.bench_wall_s == 0.0
+    # remaining not decremented — still in flight
+    assert orch.remaining == initial_remaining
+
+
+def test_apply_resume_skip_bench_pass_without_result_is_terminal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When skip_bench=True, a validation_passed iter without result.json
+    must NOT be treated as mid_bench — the orchestrator would have written
+    result.json synchronously on PASS in skip_bench mode.  Such on-disk
+    shape is anomalous; we treat it as IN_PROGRESS (existing logic) rather
+    than queueing a bench that the user explicitly disabled."""
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3, skip_bench=True,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    _write_iter_metrics(app.log_dir, 1, validation_passed=True)
+    _write_parallel_timing(app.log_dir)
+
+    result = orch._apply_resume_state(app)
+    # NOT enqueued at bench (skip_bench=True suppresses the branch).
+    assert app.state != AppState.QUEUED_FOR_BENCH
+    assert not any(t for t in list(orch.executor_queue.queue) if t and t[1] == "bench")
+    # Falls through to normal in-progress disposition.
+    assert result is False
+
+
+def test_apply_resume_clean_path_still_works_after_crash_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: existing clean-resume PASS path must still mark terminal."""
+    orch = _make_orchestrator(tmp_path, max_loop_attempts=3,
+                              monkeypatch=monkeypatch)
+    app = orch.apps["STUB"]
+    _write_iter_metrics(app.log_dir, 1, validation_passed=False)
+    _write_iter_metrics(app.log_dir, 2, validation_passed=True)
+    _write_result_json(app.log_dir, passed=True, loop_attempt_final=1)
+    _write_parallel_timing(app.log_dir)
+
+    initial_remaining = orch.remaining
+    result = orch._apply_resume_state(app)
+    assert result is True
+    assert app.state == AppState.DONE_PASSED
+    assert orch.remaining == initial_remaining - 1

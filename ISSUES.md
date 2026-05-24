@@ -42,6 +42,27 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 > **Archive:** Closed + Solved + monster-entry bodies live in [ISSUES_ARCHIVE.md](ISSUES_ARCHIVE.md) (archived 2026-05-23).  Grep that file for historical fixes; this file holds only Open work.
 
+### #101 — `run_parallel_queue.py`: crash-immediate resume must be safe under all in-flight states `Solved`
+
+**Reported:** 2026-05-24.  Even with the new `--resume` flag (issue #100 work), an abrupt orchestrator crash (host reboot, OOM kill, signal beyond the graceful SIGINT path) could leave individual apps in indistinguishable mid-stage shapes on disk: half-edited source tree from an interrupted LLM gen, complete iter dir whose validation never ran, complete iter dir that passed but whose bench never started.  Without explicit classification the next `--resume` would silently skip or double-run work.  User constraint: "Only wipe and start from beginning with app that in the middle of LLM-code generation; for the app that already completed their iteration and waiting for validation/bench, resume from what they left because the LLM iter completion indicates the code-generation is complete and the code-base is its already checkpoint."  Crash must NOT burn a retry attempt; half-edited source is thrown away (not archived); partial validator output is left in place for the next run to overwrite.
+
+**Resolution:**
+
+1. **Crash-class detector** (`_classify_iter_crash` in `run_parallel_queue.py`).  Examines only the highest `iter_N/` dir under the app's `log_dir`:
+   - `metrics.json` complete (has `iter` and `validation_passed`) → `clean`
+   - `metrics_gen.json` present but no `metrics.json` → `mid_validate` (LLM finished, validate never ran or died mid-stage; source is a valid checkpoint per user policy)
+   - Neither present → `mid_gen` (LLM was editing the source tree; source may be syntactically broken)
+
+2. **Five-disposition dispatcher** in `Orchestrator._apply_resume_state`:
+   - **mid_gen** → archive `iter_logs/<APP>/` to `<APP>.CRASHED_<UTC>/` (preserves paper data), refresh app dir from vanilla (`_refresh_app_dir`), reset `AppRun` bookkeeping to NOT_STARTED (`_reset_app_run_after_wipe`), recreate empty log dir, re-enqueue at gen.  Crash does NOT bump `loop_attempt`.
+   - **mid_validate** → load prior iter state, append a partial `IterMetrics` carrying only gen fields (`gen_wall_s`, tokens), set state=QUEUED_FOR_EXECUTOR, push `(app.name, "validate", N)` on the executor queue.
+   - **mid_bench** → triggered when latest iter passed, `result.json` absent, and `skip_bench=False`; set `verdict_passed=True`, state=QUEUED_FOR_BENCH, push the bench task.  When `skip_bench=True` the orchestrator writes `result.json` synchronously on PASS so this branch is suppressed (falls through to the in-progress clean path).
+   - **clean / terminal** → existing prior-load path (unchanged).
+
+3. **Archive-not-delete policy.**  Crashed logs become `<log_dir>.CRASHED_<UTC>/`, collision-safe with `_1`, `_2`, … suffix.  Nothing in `build/baseline_cache/` or `build/validation_output/*_reference/` is touched.
+
+4. **Tests** in `tests/test_parallel_queue_resume.py` — 24 new cases covering the three helpers (`_metrics_complete`, `_gen_metrics_complete`, `_classify_iter_crash`, `_archive_crashed_logs`, `_load_partial_gen_iter`) and the five orchestrator dispatcher branches (mid_gen archives+wipes+resets, mid_validate requeues executor at iter N and iter 1, mid_bench requeues executor, skip_bench suppresses mid_bench, clean PASS path still marks terminal).  74 of 74 tests pass across `test_parallel_queue_resume.py` + `test_parallel_queue_control.py` + `test_parallel_queue_watchdog.py`.
+
 ### #100 — `run_parallel_queue.py`: dynamic add/remove of apps to gen + executor queues with duplicate detection `Solved`
 
 **Reported:** 2026-05-24.  User asked for the ability to add and remove apps from the running orchestrator's LLM-gen queue and executor queue without restarting; for the executor queue, an "run when added" option; and a duplicate check that refuses to enqueue an app already mid-flight or already queued unless the user explicitly confirms.

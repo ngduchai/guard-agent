@@ -433,6 +433,152 @@ def _resolve_vanilla(app_name: str) -> Optional[Path]:
     return None
 
 
+# --- Crash-immediate resume classification -----------------------------------
+def _metrics_complete(metrics_path: Path) -> bool:
+    """True iff iter_N/metrics.json exists and contains a post-validate record.
+
+    The orchestrator writes metrics.json only AFTER validate finishes (rc is
+    captured + validation_passed populated; see _do_one_validation). A missing
+    file or one lacking ``validation_passed`` signals the iter was interrupted
+    mid-validate.
+    """
+    if not metrics_path.exists():
+        return False
+    try:
+        data = json.loads(metrics_path.read_text())
+    except Exception:
+        return False
+    return isinstance(data, dict) and "iter" in data and "validation_passed" in data
+
+
+def _gen_metrics_complete(gen_metrics_path: Path) -> bool:
+    """True iff iter_N/metrics_gen.json exists and contains a gen-complete record.
+
+    The opencode helper writes metrics_gen.json only AFTER the LLM gen step
+    finishes (gen_wall_s populated). A missing file or one lacking
+    ``gen_wall_s`` signals the iter was interrupted mid-gen, so the source
+    tree under app_dir may be a partial LLM edit and is not safe to reuse.
+    """
+    if not gen_metrics_path.exists():
+        return False
+    try:
+        data = json.loads(gen_metrics_path.read_text())
+    except Exception:
+        return False
+    return isinstance(data, dict) and "gen_wall_s" in data
+
+
+def _classify_iter_crash(log_dir: Path) -> dict:
+    """Classify the resume disposition of the highest iter_N/ dir in *log_dir*.
+
+    Returns one of:
+      {"mode": "clean"}                            — no crash signal
+      {"mode": "mid_gen",      "iter": N}          — gen interrupted (no
+                                                     metrics_gen.json); source
+                                                     tree is suspect, wipe +
+                                                     restart iter 1
+      {"mode": "mid_validate", "iter": N}          — gen complete, validate
+                                                     interrupted (no
+                                                     metrics.json); LLM iter
+                                                     completed so source tree
+                                                     is a valid checkpoint —
+                                                     re-queue this iter for
+                                                     validation only
+
+    "mid_validate" preserves prior completed iters and the latest gen output.
+    "mid_gen" archives ALL logs because we cannot restore the source tree to
+    the post-iter-{N-1} state (no snapshotting at iter boundaries).
+    """
+    if not log_dir.exists():
+        return {"mode": "clean"}
+    iters: list[int] = []
+    for d in log_dir.iterdir():
+        if not d.is_dir() or not d.name.startswith("iter_"):
+            continue
+        try:
+            iters.append(int(d.name[len("iter_"):]))
+        except ValueError:
+            continue
+    if not iters:
+        return {"mode": "clean"}
+    last = max(iters)
+    iter_dir = log_dir / f"iter_{last}"
+    if _metrics_complete(iter_dir / "metrics.json"):
+        return {"mode": "clean"}
+    if _gen_metrics_complete(iter_dir / "metrics_gen.json"):
+        return {"mode": "mid_validate", "iter": last}
+    return {"mode": "mid_gen", "iter": last}
+
+
+def _archive_crashed_logs(log_dir: Path) -> Optional[Path]:
+    """Move *log_dir* to a timestamped CRASHED archive sibling, preserving
+    prior iter logs + result.json for forensics + paper data.  Returns the
+    archive path, or None if log_dir does not exist.  After the move the
+    caller is responsible for re-creating an empty log_dir.
+    """
+    if not log_dir.exists():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = log_dir.with_name(f"{log_dir.name}.CRASHED_{stamp}")
+    suffix = 1
+    while archive.exists():
+        archive = log_dir.with_name(f"{log_dir.name}.CRASHED_{stamp}_{suffix}")
+        suffix += 1
+    shutil.move(str(log_dir), str(archive))
+    return archive
+
+
+def _load_partial_gen_iter(iter_log_dir: Path, iter_n: int) -> "IterMetrics":
+    """Reconstruct IterMetrics with only the gen fields populated.  Used on
+    mid_validate resume: helper wrote metrics_gen.json but the orchestrator
+    never wrote the post-validate metrics.json.
+    """
+    m = IterMetrics(iter=iter_n)
+    gp = iter_log_dir / "metrics_gen.json"
+    if gp.exists():
+        try:
+            data = json.loads(gp.read_text())
+            m.gen_wall_s = float(data.get("gen_wall_s", 0.0))
+            m.tokens_input = int(data.get("tokens_input", 0))
+            m.tokens_output = int(data.get("tokens_output", 0))
+            m.tokens_total = int(data.get("tokens_total", 0))
+            m.stall_aborted = bool(data.get("stall_aborted", False))
+        except Exception:
+            pass
+    return m
+
+
+def _reset_app_run_after_wipe(app: "AppRun") -> None:
+    """Reset bookkeeping on *app* so the next gen iter behaves like a fresh
+    cold-start (iter=0, attempt 1, no per_iter, no prior_attempts, bench
+    zeroed).  Does NOT touch app_dir / log_dir / vanilla_src / max_iters /
+    max_loop_attempts / benchmark_num_runs (those are immutable config).
+
+    Crashes do NOT burn a retry attempt — per project policy, an
+    infrastructure crash is not an LLM-level failure.
+    """
+    app.state = AppState.NOT_STARTED
+    app.iter = 0
+    app.loop_attempt = 1
+    app.per_iter = []
+    app.prior_attempts = []
+    app.loop_stall_count = 0
+    app.loop_max_iters_count = 0
+    app.bench_wall_s = 0.0
+    app.bench_queue_wait_s = 0.0
+    app.bench_started_at = None
+    app.bench_exit_code = 0
+    app.verdict_passed = False
+    app.final_stall_aborted = False
+    app.final_stall_iteration = 0
+    app.queued_for_executor_at = 0.0
+    app.queued_for_gen_at = 0.0
+    app.queued_for_bench_at = 0.0
+    app.app_started_at = 0.0
+    app.app_finished_at = 0.0
+    app.iter_loop_finished_at = 0.0
+
+
 def _refresh_app_dir(app: AppRun) -> None:
     """Wipe app_dir and re-copy vanilla.  Matches run_iterative.sh REFRESH."""
     if app.app_dir.exists():
@@ -821,17 +967,92 @@ class Orchestrator:
 
     # --- Resume application -------------------------------------------------
     def _apply_resume_state(self, app: AppRun) -> bool:
-        """Restore *app* from on-disk artifacts.  Returns True iff the app
-        is already terminal (PASS or exhausted-FAIL) and should be skipped
-        from the enqueue pass — in which case _mark_app_done was already
-        called here.  Returns False if no prior data exists OR if the app
-        is mid-attempt and should be re-enqueued at the next iter.
+        """Restore *app* from on-disk artifacts under crash-immediate safety.
 
-        On a mid-attempt restore the caller still proceeds to set
-        READY_FOR_GEN and put it on the gen queue; we ONLY restore the
-        bookkeeping fields here.  The next gen iter increments app.iter
-        and writes iter_{N+1}/, so prior iter dirs are preserved.
+        Returns True iff the caller should SKIP the default READY_FOR_GEN
+        enqueue (because we already enqueued elsewhere — terminal, executor,
+        or bench — or because the app is done).  Returns False to let the
+        caller proceed with the normal READY_FOR_GEN enqueue path.
+
+        Five dispositions:
+
+          mid_gen      — gen helper was interrupted mid-LLM-edit.  Source
+                         tree under app_dir may be a partial edit and is
+                         not safe to reuse.  Archive all prior logs (still
+                         useful for the paper) + wipe app_dir + restage
+                         fresh vanilla + reset AppRun.  Crash does NOT
+                         burn a retry attempt.  Returns False (caller
+                         enqueues at READY_FOR_GEN, iter starts at 1).
+
+          mid_validate — gen completed cleanly (metrics_gen.json present)
+                         but validate never wrote metrics.json.  Source
+                         tree IS a valid checkpoint per LLM-iter-completion
+                         convention.  Restore prior completed iters and a
+                         partial IterMetrics for iter N (gen fields only),
+                         enqueue ("validate", N) on the executor.  No data
+                         lost.  Returns True (skip default enqueue).
+
+          mid_bench    — iter loop reached PASS but bench never reached
+                         terminal (no result.json).  Restore all iters,
+                         mark verdict_passed, enqueue ("bench", final_iter)
+                         on the executor.  Returns True.
+
+          terminal     — prior verdict=PASS or exhausted-retry FAIL.  Mark
+                         DONE_*, call _mark_app_done.  Returns True.
+
+          clean        — between iters with all iters complete.  Existing
+                         logic: restore bookkeeping, return False so caller
+                         enqueues at READY_FOR_GEN for next iter.
         """
+        crash = _classify_iter_crash(app.log_dir)
+
+        # --- Branch 1: mid_gen → wipe + restart iter 1 ---------------------
+        if crash["mode"] == "mid_gen":
+            crashed_iter = crash["iter"]
+            archive = _archive_crashed_logs(app.log_dir)
+            with self.state_lock:
+                _refresh_app_dir(app)
+                _reset_app_run_after_wipe(app)
+            app.log_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                f"[orchestrator] {app.name} CRASH-RESUME mid_gen iter={crashed_iter}: "
+                f"prior logs archived to {archive.name if archive else '(none)'}, "
+                f"vanilla restaged, restarting iter 1 (retry not consumed)",
+                flush=True,
+            )
+            return False
+
+        # --- Branch 2: mid_validate → re-queue executor for validate -------
+        if crash["mode"] == "mid_validate":
+            partial_iter = crash["iter"]
+            prior = _load_app_resume_state(app)
+            # prior may be {} if mid_validate hit iter 1 with no completed
+            # predecessors — handle by using empty defaults.
+            with self.state_lock:
+                app.per_iter = prior.get("completed_iters", [])
+                app.loop_attempt = prior.get("loop_attempt", 1)
+                app.prior_attempts = prior.get("prior_attempts", [])
+                app.loop_stall_count = prior.get("loop_stall_count", 0)
+                app.loop_max_iters_count = prior.get("loop_max_iters_count", 0)
+                app.per_iter.append(
+                    _load_partial_gen_iter(app.log_dir / f"iter_{partial_iter}",
+                                           partial_iter)
+                )
+                app.iter = partial_iter
+                app.state = AppState.QUEUED_FOR_EXECUTOR
+                app.queued_for_executor_at = time.monotonic()
+                if app.app_started_at == 0.0:
+                    app.app_started_at = time.monotonic()
+            self.executor_queue.put((app.name, "validate", partial_iter))
+            print(
+                f"[orchestrator] {app.name} CRASH-RESUME mid_validate iter={partial_iter}: "
+                f"gen complete (source preserved), re-queued for validate "
+                f"({len(app.per_iter) - 1} prior iters restored)",
+                flush=True,
+            )
+            return True
+
+        # --- Branch 3: clean — load state, then check for mid_bench --------
         prior = _load_app_resume_state(app)
         if not prior:
             return False
@@ -869,6 +1090,37 @@ class Orchestrator:
                     flush=True,
                 )
                 return True
+
+            # --- Branch 4: mid_bench ---------------------------------------
+            # Signal: latest iter passed validate, but no result.json on
+            # disk (terminal never reached).  Only meaningful when bench is
+            # the intended next step (skip_bench=False); with skip_bench=True
+            # the orchestrator goes straight to DONE_PASSED + writes
+            # result.json, so the "no result.json" condition implies bench.
+            result_json = app.log_dir / "result.json"
+            last_iter_passed = (app.per_iter and
+                                app.per_iter[-1].validation_passed)
+            if last_iter_passed and not result_json.exists() and not self.skip_bench:
+                final_iter = app.per_iter[-1].iter
+                app.verdict_passed = True
+                app.iter_loop_finished_at = time.monotonic()
+                app.bench_started_at = None
+                app.bench_wall_s = 0.0
+                app.bench_exit_code = 0
+                app.state = AppState.QUEUED_FOR_BENCH
+                app.queued_for_bench_at = time.monotonic()
+                if app.app_started_at == 0.0:
+                    app.app_started_at = time.monotonic()
+                self.executor_queue.put((app.name, "bench", final_iter))
+                print(
+                    f"[orchestrator] {app.name} CRASH-RESUME mid_bench: "
+                    f"iter loop passed at iter={final_iter}, no result.json — "
+                    f"re-queued for bench",
+                    flush=True,
+                )
+                return True
+
+            # --- Branch 5: clean in-progress between iters -----------------
             print(
                 f"[orchestrator] {app.name} RESUME: continuing from "
                 f"iter={app.iter} attempt={app.loop_attempt}"
