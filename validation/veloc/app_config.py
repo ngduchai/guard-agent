@@ -69,6 +69,11 @@ class PerturbationSpec:
     replacement_template: str | None = None
     # app_arg_override only
     arg_index: int | None = None
+    arg_template: str | None = None  # optional format string; when set,
+    # the perturbed value is rendered as arg_template.format(value=value)
+    # and replaces the whole token at arg_index. Required for apps with
+    # --key=value CLI syntax (e.g. ROSS) where bare str(value) substitution
+    # would drop the --key= prefix.
     # env_var_set only
     env_var: str | None = None
     # calibration metadata (set by perturbation_calibrator.py)
@@ -115,6 +120,7 @@ def _parse_perturbation(raw: object) -> PerturbationSpec | None:
         pattern=raw.get("pattern"),
         replacement_template=raw.get("replacement_template"),
         arg_index=raw.get("arg_index"),
+        arg_template=raw.get("arg_template"),
         env_var=raw.get("env_var"),
         calibration=dict(raw.get("calibration", {})),
     )
@@ -134,6 +140,11 @@ def _parse_perturbation(raw: object) -> PerturbationSpec | None:
         if spec.arg_index is None:
             raise ValueError(
                 "perturbation.method=app_arg_override requires 'arg_index'"
+            )
+        if spec.arg_template is not None and "{value" not in spec.arg_template:
+            raise ValueError(
+                "perturbation.arg_template must contain a '{value}' "
+                "placeholder (format specs like '{value:.4f}' also accepted)"
             )
     elif method == "env_var_set":
         if not spec.env_var:
@@ -177,7 +188,9 @@ def apply_perturbation(
     any symlink). Source files are NEVER modified.
 
     For ``app_arg_override``: returns a new app_args list with
-    ``app_args[spec.arg_index]`` replaced by ``str(value)``.
+    ``app_args[spec.arg_index]`` replaced by ``str(value)`` — or by
+    ``spec.arg_template.format(value=value)`` when ``arg_template`` is set
+    (needed for apps using ``--key=value`` single-token CLI syntax).
 
     For ``env_var_set``: returns a new env dict with ``env[spec.env_var]``
     set to ``str(value)``.
@@ -291,7 +304,10 @@ def apply_perturbation(
                 f"perturbation.arg_index={spec.arg_index} out of range for "
                 f"app_args of length {len(new_args)}"
             )
-        new_args[spec.arg_index] = str(value)
+        if spec.arg_template is not None:
+            new_args[spec.arg_index] = spec.arg_template.format(value=value)
+        else:
+            new_args[spec.arg_index] = str(value)
 
     elif spec.method == "env_var_set":
         new_env[spec.env_var] = str(value)

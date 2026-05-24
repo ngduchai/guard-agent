@@ -578,6 +578,42 @@ class TestApplyPerturbation:
                 app_args=["-x", "10"], env={},
             )
 
+    def test_app_arg_override_with_template_replaces_whole_token(self, tmp_path):
+        # Apps like ROSS use --key=value single-token CLI syntax; the template
+        # lets the perturbation reconstruct the full token.
+        spec = _parse_perturbation({
+            "method": "app_arg_override", "arg_index": 0,
+            "arg_template": "--mean={value}",
+            "value_range": [2.0, 3.0],
+        })
+        new_args, _, _ = apply_perturbation(
+            spec, 2.5, cwd=tmp_path, source_dir=tmp_path,
+            app_args=["--mean=2.5", "--remote=0.1"], env={},
+        )
+        assert new_args == ["--mean=2.5", "--remote=0.1"]
+
+    def test_app_arg_override_template_format_spec(self, tmp_path):
+        # Python format specs (e.g. {value:.4f}) work the same way as in
+        # regex_replace.replacement_template.
+        spec = _parse_perturbation({
+            "method": "app_arg_override", "arg_index": 0,
+            "arg_template": "--mean={value:.4f}",
+            "value_range": [2.0, 3.0],
+        })
+        new_args, _, _ = apply_perturbation(
+            spec, 2.123456789, cwd=tmp_path, source_dir=tmp_path,
+            app_args=["--mean=0.0"], env={},
+        )
+        assert new_args == ["--mean=2.1235"]
+
+    def test_app_arg_override_template_missing_placeholder_raises(self):
+        with pytest.raises(ValueError, match="arg_template.*\\{value"):
+            _parse_perturbation({
+                "method": "app_arg_override", "arg_index": 0,
+                "arg_template": "--mean=hardcoded",  # no {value}
+                "value_range": [2.0, 3.0],
+            })
+
     def test_env_var_set_adds_var(self, tmp_path):
         spec = _parse_perturbation({
             "method": "env_var_set", "env_var": "MY_SEED",
