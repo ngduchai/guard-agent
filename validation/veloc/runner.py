@@ -759,6 +759,67 @@ def extract_checkpoint_dirs_from_veloc_cfg(cfg_path: Path) -> list[Path]:
     return dirs
 
 
+def _build_missing_veloc_cfg_message(
+    source_dir: Path,
+    build_dir: Path,
+    veloc_config_name: str,
+) -> str:
+    """Compose an actionable FATAL body when veloc.cfg cannot be resolved.
+
+    The validator searches ONLY two fixed paths (build_dir and source_dir
+    roots).  The LLM-iter sandbox can only write under
+    ``build/tests_baseline/<APP>/`` which is source_dir for the iter case;
+    build_dir lives under ``build/validation_output/.../`` and is deny-
+    listed in OpenCode's permission config.  So the recommendation always
+    points at source_dir, and the message also surfaces any misplaced
+    ``veloc.cfg`` the LLM may have already created elsewhere in the tree
+    (most common cause: putting it next to the binary in a build subdir).
+    """
+    expected_primary = source_dir / veloc_config_name
+    expected_secondary = build_dir / veloc_config_name
+    misplaced: list[Path] = []
+    try:
+        for cand in source_dir.rglob(veloc_config_name):
+            if cand.resolve() == expected_primary.resolve():
+                continue
+            misplaced.append(cand)
+            if len(misplaced) >= 5:
+                break
+    except OSError:
+        pass
+
+    lines = [
+        f"No VeloC checkpoint directories resolved from {veloc_config_name}.",
+        "",
+        "The validator looked for veloc.cfg at exactly these two paths "
+        "(no recursive search):",
+        f"  1. {expected_primary}   <-- CREATE IT HERE (writable from "
+        "your sandbox)",
+        f"  2. {expected_secondary}  (deny-listed, do not write here)",
+    ]
+    if misplaced:
+        lines.append("")
+        lines.append(
+            "DIAGNOSTIC: a veloc.cfg already exists in the source tree but "
+            "NOT at the expected root.  Move (or copy) one of these to "
+            f"{expected_primary}:"
+        )
+        for m in misplaced:
+            lines.append(f"  - {m}")
+    lines.extend([
+        "",
+        "Required cfg content (absolute paths, scratch != persistent):",
+        "  scratch = /tmp/<app>_veloc_scratch",
+        "  persistent = /tmp/<app>_veloc_persistent",
+        "  mode = sync",
+        "",
+        "The checkpoint-observed injection strategy polls the scratch + "
+        "persistent dirs for newly-written checkpoint files; without a "
+        "resolvable cfg there is nothing to poll.",
+    ])
+    return "\n".join(lines)
+
+
 def clear_checkpoint_dirs(dirs: list[Path]) -> None:
     """Remove all contents from the given directories (best-effort)."""
     for d in dirs:
@@ -1978,11 +2039,9 @@ def run_with_checkpoint_observed_injection(
             break
     if not ckpt_dirs:
         raise ValidationError(
-            f"No VeloC checkpoint directories resolved from {veloc_config_name} "
-            f"under {source_dir} or {build_dir}.  The checkpoint-observed "
-            "injection strategy needs scratch/persistent paths to poll.  "
-            "Either ship a valid veloc.cfg or use the legacy fixed-delay "
-            "strategy.",
+            _build_missing_veloc_cfg_message(
+                source_dir, build_dir, veloc_config_name,
+            ),
             stdout="",
             stderr="",
             exit_code=-1,
