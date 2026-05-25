@@ -1,5 +1,7 @@
 #include "phold.h"
 #include "network-mpi.h"  /* tw_net_statistics — not pulled in via ross.h umbrella */
+#include <mpi.h>
+#include <stdint.h>
 
 
 tw_peid
@@ -283,54 +285,62 @@ main(int argc, char **argv)
     } // end if(g_st_ross_rank)
 #endif
 
-	/* Step 0 v9 (2026-05-24): emit STATE-derived binary validation
-	 * signature.  Replaces v8 config-only schema (which made the comparator
-	 * tautological — every slot was a g_tw_* config global populated before
-	 * tw_run() and never mutated by it, so a resilient implementation that
-	 * skipped tw_run() entirely could pass the comparator byte-identically).
+	/* Step 0 v9.5 (2026-05-25): per-LP RNG state fingerprint.
 	 *
-	 * Per-rank stats are first aggregated locally via tw_get_stats(), then
-	 * MPI-reduced across the partition via tw_net_statistics() (collective —
-	 * ALL ranks must call it; see core/network-mpi.c:696-747).  After the
-	 * reduce, g_tw_pe->stats holds globally-summed event counters on
-	 * masternode (rank 0) only.  The 17-element s_net_events block carries
-	 * s_nevent_processed/s_e_rbs/s_rb_total via a single MPI_Reduce with
-	 * MPI_SUM (see ross-types.h:117-170 for struct layout).
+	 * v9.4 derived its signature from pe->stats counters (s_net_events,
+	 * s_nsend_net_remote).  Those are engine instrumentation — RIO
+	 * (the RIO reference's checkpoint subsystem) does NOT persist them
+	 * (core/rio/io-serialize.c touches only pe->stats.s_rio_load).
+	 * After a failure-injected recovery, pe->stats restarts from zero
+	 * and reports only post-checkpoint work, even though the simulation
+	 * itself completes correctly.  This made the failure-injected leg
+	 * spuriously FAIL on a working RIO restore.
 	 *
-	 * Schema (48 bytes, slot-compatible with v8):
-	 *   [0] (double)s_nevent_processed   global-SUM events committed
-	 *   [1] (double)s_e_rbs              global-SUM events rolled back
-	 *   [2] (double)s_rb_total           global-SUM total rollbacks issued
-	 *   [3] (double)g_tw_gvt_done        completed GVT computations
-	 *                                    (per-rank counter, deterministic
-	 *                                    across ranks for fixed seed/cfg)
-	 *   [4] g_tw_lookahead               config sanity marker
-	 *   [5] (double)g_tw_synchronization_protocol  config sanity marker
+	 * v9.5 derives the signature from the simulation's actual output
+	 * state: per-LP CLCG4 RNG Cg[4] vectors.  Properties:
+	 *   - RIO DOES checkpoint Cg/Lg/Ig (core/rio/io-serialize.c:11-13)
+	 *     and restore them on load (lines 37-39) — so failure-injected
+	 *     recovery produces bit-identical Cg as a clean run.
+	 *   - tw_rand_reverse_unif (core/rand-clcg4.c:460-483) reverses
+	 *     each draw on rollback, so optimistic speculation does not
+	 *     leak into the committed-only final Cg.
+	 *   - Cold-replay (skipped tw_run()) leaves Cg = Ig (initial sub-
+	 *     seeds), differing from the clean-run sums by many orders of
+	 *     magnitude on every slot.
+	 *   - Perturbing --rng-seed1 changes every LP's initial Ig, which
+	 *     changes the trajectory of every Cg → sum shifts detectably.
 	 *
-	 * Comparator: tests/apps/configs/ROSS.yaml comparison.method =
-	 * numeric-tolerance, tolerance=1e-12.  Slots [0..2] react to RNG-driven
-	 * event-distribution shifts (e.g. --mean= perturbation propagates into
-	 * commit/rollback counts); a cold-replayed (re-seeded or zero-init)
-	 * resilient run produces different event traces and diverges on these
-	 * slots.  Bit-exact under correctly-resumed replay (same seed → same
-	 * deterministic event order → same counts).
+	 * Schema (32 bytes):
+	 *   [0..3] (double) global SUM across all LPs on all ranks of
+	 *                   lp->rng->Cg[j] for j = 0..3.
+	 *   Per-rank int64_t local sums → MPI_Reduce(MPI_SUM) to rank 0
+	 *   → cast to double.
+	 *
+	 * Overflow: 16,000 LPs (4000 nlp x 4 ranks) x INT32_MAX ~ 3.4e13,
+	 *   safely under INT64_MAX (~9.2e18) and within double's exact-
+	 *   integer range (2^53 ~ 9e15).
 	 */
 	{
-		tw_statistics s;
-		memset(&s, 0, sizeof(s));
-		tw_get_stats(g_tw_pe, &s);
-		tw_net_statistics(g_tw_pe, &s);  /* collective: all ranks */
+		int64_t local_rng_sum[4] = {0, 0, 0, 0};
+		for (unsigned int i = 0; i < g_tw_nlp; i++) {
+			tw_lp *lp = g_tw_lp[i];
+			if (lp && lp->rng) {
+				for (int j = 0; j < 4; j++) {
+					local_rng_sum[j] += (int64_t)lp->rng->Cg[j];
+				}
+			}
+		}
+		int64_t global_rng_sum[4] = {0, 0, 0, 0};
+		MPI_Reduce(local_rng_sum, global_rng_sum, 4, MPI_INT64_T,
+		           MPI_SUM, 0, MPI_COMM_WORLD);
 		if (g_tw_mynode == 0) {
-			double sig_buf[6];
-			sig_buf[0] = (double)g_tw_pe->stats.s_nevent_processed;
-			sig_buf[1] = (double)g_tw_pe->stats.s_e_rbs;
-			sig_buf[2] = (double)g_tw_pe->stats.s_rb_total;
-			sig_buf[3] = (double)g_tw_gvt_done;
-			sig_buf[4] = g_tw_lookahead;
-			sig_buf[5] = (double)g_tw_synchronization_protocol;
+			double sig_buf[4];
+			for (int j = 0; j < 4; j++) {
+				sig_buf[j] = (double)global_rng_sum[j];
+			}
 			FILE* sig_f = fopen("validation_output.bin", "wb");
 			if (sig_f) {
-				fwrite(sig_buf, sizeof(double), 6, sig_f);
+				fwrite(sig_buf, sizeof(double), 4, sig_f);
 				fclose(sig_f);
 			}
 		}

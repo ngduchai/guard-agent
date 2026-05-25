@@ -5,6 +5,8 @@
  */
 #include "pholdio.h"
 #include <string.h>
+#include <mpi.h>
+#include <stdint.h>
 
 #ifdef USE_RIO
 #include "rio/io.h"
@@ -232,36 +234,48 @@ int main(int argc, char **argv) {
      * Periodic gvt-hook checkpoints (pholdio_gvt_hook) are sufficient. */
 #endif
 
-    /* Step 0 v8: emit binary validation signature for file-based comparison.
-     * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on
-     * rank 0.  ROSS is stochastic (event-driven Monte Carlo) so a strict
-     * state-based signature would be unreliable; instead this CONFIG
-     * signature captures deterministic runtime invariants:
-     *   [0] (double)g_tw_nlp                                (total LPs per rank)
-     *   [1] g_tw_lookahead                                  (lookahead config)
-     *   [2] (double)g_tw_synchronization_protocol           (sync mode)
-     *   [3] (double)g_pholdio_start_events                  (per-LP starting events)
-     *   [4] mean                                            (exponential dist mean)
-     *   [5] percent_remote                                  (remote event rate)
-     * Sufficient for Step 0.6c cross-consistency at same workload.
-     * Rank-root-only via g_tw_mynode == 0.
+    /* Step 0 v9.5 (2026-05-25): per-LP RNG state fingerprint.
+     * MUST match vanilla phold.main.c v9.5 schema byte-for-byte.
      *
-     * NOTE: pholdio uses g_pholdio_start_events (with 'io' suffix); phold
-     * uses g_phold_start_events.  Both encode the same per-LP starting event
-     * count, so cross-binary signature values at same workload will match.
+     * Why v9.5 replaces v9.4: v9.4 used pe->stats counters, but RIO
+     * does NOT checkpoint pe->stats (core/rio/io-serialize.c only
+     * touches pe->stats.s_rio_load).  After a failure-injected
+     * recovery, pe->stats restarts at zero and reports only post-
+     * checkpoint work — the v9.4 comparator FAILED on legitimate
+     * RIO restores.  v9.5 derives the signature from per-LP CLCG4
+     * Cg[4], which RIO DOES checkpoint (io-serialize.c:11-13) and
+     * restore (lines 37-39) — bit-identical clean vs recovered.
+     *
+     * Schema (32 bytes):
+     *   [0..3] (double) global SUM across all LPs on all ranks of
+     *                   lp->rng->Cg[j] for j = 0..3.
+     *
+     * Cold-replay (tw_run skipped) leaves Cg = Ig (initial sub-seeds),
+     * differs from clean-run sums by many orders of magnitude.
      */
-    if (g_tw_mynode == 0) {
-        double sig_buf[6];
-        sig_buf[0] = (double)g_tw_nlp;
-        sig_buf[1] = g_tw_lookahead;
-        sig_buf[2] = (double)g_tw_synchronization_protocol;
-        sig_buf[3] = (double)g_pholdio_start_events;
-        sig_buf[4] = mean;
-        sig_buf[5] = percent_remote;
-        FILE* sig_f = fopen("validation_output.bin", "wb");
-        if (sig_f) {
-            fwrite(sig_buf, sizeof(double), 6, sig_f);
-            fclose(sig_f);
+    {
+        int64_t local_rng_sum[4] = {0, 0, 0, 0};
+        for (unsigned int i = 0; i < g_tw_nlp; i++) {
+            tw_lp *lp = g_tw_lp[i];
+            if (lp && lp->rng) {
+                for (int j = 0; j < 4; j++) {
+                    local_rng_sum[j] += (int64_t)lp->rng->Cg[j];
+                }
+            }
+        }
+        int64_t global_rng_sum[4] = {0, 0, 0, 0};
+        MPI_Reduce(local_rng_sum, global_rng_sum, 4, MPI_INT64_T,
+                   MPI_SUM, 0, MPI_COMM_WORLD);
+        if (g_tw_mynode == 0) {
+            double sig_buf[4];
+            for (int j = 0; j < 4; j++) {
+                sig_buf[j] = (double)global_rng_sum[j];
+            }
+            FILE* sig_f = fopen("validation_output.bin", "wb");
+            if (sig_f) {
+                fwrite(sig_buf, sizeof(double), 4, sig_f);
+                fclose(sig_f);
+            }
         }
     }
 
