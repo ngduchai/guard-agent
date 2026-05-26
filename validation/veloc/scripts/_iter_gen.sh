@@ -132,18 +132,10 @@ OPENCODE_STALL_KILL="${OPENCODE_STALL_KILL:-1200}"
 # are unaffected.
 WORKER_DATA_ROOT="/tmp/opencode_worker_${WORKER_SLOT}/.local/share"
 export XDG_DATA_HOME="$WORKER_DATA_ROOT"
-# Per-iter slot wipe: defensive — ensures every iter starts from the same
-# clean-DB precondition the orchestrator establishes at startup, not just
-# iter_1 of each slot.  Originally hypothesized that a stale opencode.db
-# from a prior iter caused 1.5s rc=137 no-ops on SAMRAI+Nyx fresh-vanilla
-# (2026-05-26), but that hypothesis is NOT confirmed — many multi-iter
-# TRUSTED apps ran fine without this wipe.  Keeping the wipe as cheap
-# defense-in-depth while the actual root cause is still under investigation.
-rm -rf "$XDG_DATA_HOME/opencode"
 mkdir -p "$XDG_DATA_HOME/opencode"
 OPENCODE_DB="$XDG_DATA_HOME/opencode/opencode.db"
 
-echo "[gen $APP_NAME iter $ITER] model=$OPENCODE_MODEL slot=$WORKER_SLOT hard_cap=${OPENCODE_TIMEOUT}s stall_check=${OPENCODE_STALL_CHECK}s stall_kill=${OPENCODE_STALL_KILL}s xdg_data=$XDG_DATA_HOME (slot wiped)"
+echo "[gen $APP_NAME iter $ITER] model=$OPENCODE_MODEL slot=$WORKER_SLOT hard_cap=${OPENCODE_TIMEOUT}s stall_check=${OPENCODE_STALL_CHECK}s stall_kill=${OPENCODE_STALL_KILL}s xdg_data=$XDG_DATA_HOME"
 
 # --- Hide reference dir ------------------------------------------------------
 # The LLM must DESIGN VeloC-based resilience independently rather than copy

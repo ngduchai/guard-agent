@@ -536,7 +536,16 @@ trap _cleanup EXIT INT TERM
 # Note: we do NOT pkill by $EXE_NAME because that pattern can match
 # the current shell script's own command line (e.g. "miniVite" in
 # "run_validate.sh --reference miniVite"), causing self-kill.
-pkill -9 -f "mpirun|mpiexec|orted|failure_injector.py" 2>/dev/null || true
+#
+# MPI binaries are matched by basename (no -f) — `-f` matches the full
+# command line, which would catch every concurrent opencode whose prompt
+# happens to contain "mpirun"/"mpiexec"/"orted" (parallel-queue gens
+# routinely embed those words in the prompt), SIGKILLing them at ~1.5s
+# during opencode startup and producing 0-token no-op iters. The failure
+# injector is a Python script (`python failure_injector.py`), so it still
+# needs `-f` to match through the interpreter argv.
+pkill -9 mpirun mpiexec orted 2>/dev/null || true
+pkill -9 -f failure_injector.py 2>/dev/null || true
 
 # Quote $CMD so embedded `"   pattern   "` (multi-space-leading patterns from
 # app.yaml's keep_patterns) survive word-splitting.  Without quotes bash drops
