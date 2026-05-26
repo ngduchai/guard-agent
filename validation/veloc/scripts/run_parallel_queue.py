@@ -196,6 +196,41 @@ YOU MAY NOT
 - Take any action whose purpose is to make a validator gate pass
   without performing real state capture on checkpoint and real state
   load on restart.
+
+================================================================================
+REQUIRED RUNTIME CONFIG FILE (infrastructure, not the resilience task)
+================================================================================
+The VeloC runtime needs a `veloc.cfg` text file in the SOURCE TREE ROOT
+(your current working directory) BEFORE the binary is launched.  The
+validator parses this file BEFORE invoking mpirun to know which
+directories to poll for checkpoint files.  If the file is absent, or
+its scratch/persistent values are NOT absolute filesystem paths, the
+validator immediately FATALs with "No VeloC checkpoint directories
+resolved from veloc.cfg" and you get zero credit for the iteration.
+
+Create it as a STATIC FILE in the tree at iteration start.  DO NOT
+generate it at runtime from inside the binary (e.g. via a
+`writeVelocConfig()` function called from main() before VELOC_Init):
+that approach cannot pass this validator because the cfg is parsed
+before mpirun launches the binary.
+
+Concrete requirements:
+  Path:          ./veloc.cfg   (in your current working directory)
+  Required keys: scratch, persistent, mode
+  Path rule:     scratch and persistent MUST be absolute /tmp paths
+                 and MUST differ from each other.
+
+Working example (substitute <app> with a short lowercase identifier;
+the exact subdirectory names are unconstrained as long as the two
+absolute paths differ):
+
+  scratch = /tmp/<app>_veloc_scratch
+  persistent = /tmp/<app>_veloc_persistent
+  mode = sync
+
+This is plumbing, not part of the resilience challenge.  Get it in
+place on iteration 1 and spend your iteration budget on actual
+checkpoint state capture and recovery logic instead.
 ================================================================================"""
 
 
