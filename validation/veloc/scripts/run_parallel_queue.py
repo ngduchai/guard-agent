@@ -1375,6 +1375,84 @@ class Orchestrator:
                 print(f"[gen] {app.name} iter {iter_n} stderr scan error: {e}",
                       flush=True)
 
+        # Defense-in-depth (2026-05-26 incident): even with the helper's
+        # OC_RC capture fix, opencode 1.4.0 has been observed exiting
+        # genuinely cleanly (rc=0) without producing ANY work — 0 tokens,
+        # 0 bytes of stdout/stderr, sub-second wall.  Root cause not fully
+        # known (suspected slot-reuse race or CLI internal session short-
+        # circuit), but the SIGNATURE is unambiguous: a real iter on this
+        # workload spends minutes generating and consumes millions of
+        # tokens.  We treat (rc=0 AND tokens_total=0 AND gen_wall_s<10) as
+        # a silent no-op and override to rc=99 so the orchestrator's retry
+        # path fires.  We also surface the helper's diagnostic dump to the
+        # orchestrator stdout so each occurrence is visible in real time.
+        metrics_path_for_check = iter_log / "metrics_gen.json"
+        if rc == 0 and metrics_path_for_check.exists():
+            try:
+                m_check = json.loads(metrics_path_for_check.read_text())
+                _toks = int(m_check.get("tokens_total", 0) or 0)
+                _wall = float(m_check.get("gen_wall_s", 999.0) or 999.0)
+                _stdout_size = 0
+                _stderr_size = 0
+                stdout_path = iter_log / "opencode_stdout.txt"
+                if stdout_path.exists():
+                    _stdout_size = stdout_path.stat().st_size
+                if stderr_path.exists():
+                    _stderr_size = stderr_path.stat().st_size
+                if _toks == 0 and _wall < 10.0:
+                    print(
+                        f"[gen] {app.name} iter {iter_n} SILENT NO-OP detected "
+                        f"(rc=0, tokens=0, gen_wall={_wall:.2f}s, "
+                        f"stdout={_stdout_size}B, stderr={_stderr_size}B) — "
+                        f"overriding to rc=99 for retry",
+                        flush=True,
+                    )
+                    rc = 99
+                    # Surface the helper's diagnostic dump verbatim so the
+                    # orchestrator log captures full forensic state for each
+                    # no-op occurrence (env, opencode --version, slot DB
+                    # state, latest opencode log tail).  Helps root-cause
+                    # without re-running.
+                    diag_path = iter_log / "opencode_diagnostic.txt"
+                    if diag_path.exists():
+                        try:
+                            diag_text = diag_path.read_text(errors="replace")
+                            print(
+                                f"[gen] {app.name} iter {iter_n} no-op "
+                                f"diagnostic ({diag_path}):\n"
+                                f"--- BEGIN opencode_diagnostic.txt ---\n"
+                                f"{diag_text}\n"
+                                f"--- END opencode_diagnostic.txt ---",
+                                flush=True,
+                            )
+                        except Exception as ex:
+                            print(
+                                f"[gen] {app.name} iter {iter_n} could not "
+                                f"surface diagnostic: {ex}",
+                                flush=True,
+                            )
+                    else:
+                        print(
+                            f"[gen] {app.name} iter {iter_n} no diagnostic "
+                            f"dump at {diag_path} — helper may pre-date the "
+                            f"diagnostic patch",
+                            flush=True,
+                        )
+                    # Mark stderr so a human grepping iter_N/opencode_stderr.txt
+                    # later sees why this iter was retried.
+                    with contextlib.suppress(Exception):
+                        with stderr_path.open("a") as fh:
+                            fh.write(
+                                "\n[orchestrator] silent no-op signature "
+                                f"(rc=0, tokens=0, wall={_wall:.2f}s); "
+                                "overriding opencode rc 0 -> 99 for retry\n"
+                            )
+            except Exception as ex:
+                print(
+                    f"[gen] {app.name} iter {iter_n} no-op detector error: {ex}",
+                    flush=True,
+                )
+
         # Read helper's metrics_gen.json (single source of truth for gen wall).
         metrics_path = iter_log / "metrics_gen.json"
         gen_wall_s = 0.0
