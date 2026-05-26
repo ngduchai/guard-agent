@@ -237,6 +237,11 @@ class IterMetrics:
     tokens_total: int = 0
     validation_passed: bool = False
     stall_aborted: bool = False
+    # Number of in-iter stall retries that preceded THIS gen attempt
+    # (0 on the first attempt of an iter, N if the prior N attempts
+    # were killed by the stall-watcher).  Forensics for the discarded
+    # stall attempts live in iter_<N>_stall<retry>/ archive dirs.
+    stall_retries: int = 0
     gen_queue_wait_s: float = 0.0      # time from ready->gen_start
     val_queue_wait_s: float = 0.0      # time from submit-to-executor->exec_start
     gen_started_at: Optional[str] = None
@@ -271,6 +276,14 @@ class AppRun:
     prior_attempts: list[LoopAttempt] = dataclasses.field(default_factory=list)
     loop_stall_count: int = 0
     loop_max_iters_count: int = 0
+
+    # Per-iter stall-retry counter: resets to 0 whenever a non-stall gen
+    # completes (i.e. validate is at least attempted).  Each consecutive
+    # stall on the same iter increments it; on hitting the cap below the
+    # orchestrator transitions the app to DONE_FAILED rather than
+    # restarting the loop from vanilla (user directive 2026-05-26).
+    iter_stall_retry_count: int = 0
+    max_iter_stall_retries: int = 2            # initialized from --opencode-retries
 
     bench_wall_s: float = 0.0
     bench_queue_wait_s: float = 0.0
@@ -564,6 +577,7 @@ def _reset_app_run_after_wipe(app: "AppRun") -> None:
     app.prior_attempts = []
     app.loop_stall_count = 0
     app.loop_max_iters_count = 0
+    app.iter_stall_retry_count = 0
     app.bench_wall_s = 0.0
     app.bench_queue_wait_s = 0.0
     app.bench_started_at = None
@@ -589,6 +603,100 @@ def _refresh_app_dir(app: AppRun) -> None:
         shutil.rmtree(app.app_dir, ignore_errors=True)
     app.app_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(app.vanilla_src, app.app_dir, symlinks=True)
+
+
+# --- Per-iter git-snapshot helpers ------------------------------------------
+# Used to make stall-retries safe: snapshot the tree at iter start, hard-reset
+# on stall so the retry begins from a clean iter-N-start state (rolling back
+# any partial mid-stall edits the LLM applied before the watchdog killed it).
+# The .git dir lives inside app_dir (build/tests_<label>/<APP>/) — vanilla
+# source under tests/apps/vanillas/ is never touched.
+
+def _git(app_dir: Path, *args: str) -> tuple[int, str]:
+    """Run a `git` subcommand inside app_dir.  Returns (rc, combined_output).
+
+    Output is captured (not streamed) so a long git operation does not pollute
+    the orchestrator's stdout log.  Best-effort — any failure is returned to
+    the caller rather than raised, so the orchestrator can degrade gracefully
+    if git is unavailable or the tree is in an unexpected state.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(app_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out
+    except FileNotFoundError:
+        return 127, "git binary not found"
+    except Exception as e:
+        return 1, f"git invocation failed: {e!r}"
+
+
+def _git_init_snapshot(app_dir: Path, message: str) -> bool:
+    """Ensure app_dir is a git repo and commit current state as a snapshot.
+
+    Idempotent: safe to call multiple times.  Returns True on success.
+    Failures are logged to orchestrator stdout but never raise — the iter
+    still runs even if snapshotting fails (the cost is that a subsequent
+    stall cannot be cleanly rolled back).
+    """
+    if not app_dir.exists():
+        return False
+
+    # `git init` is idempotent.  Use --quiet to avoid noisy output for the
+    # already-initialized case.
+    rc, _ = _git(app_dir, "init", "--quiet")
+    if rc != 0:
+        print(f"[git] {app_dir.name}: init failed (rc={rc})", flush=True)
+        return False
+
+    # Set local identity so commits work without relying on global config
+    # (CI containers may have no user.name/user.email).
+    _git(app_dir, "config", "user.email", "orchestrator@guard-agent.local")
+    _git(app_dir, "config", "user.name", "guard-agent orchestrator")
+
+    # Stage everything (including deletions) and commit.  --allow-empty
+    # handles the case where nothing changed between two consecutive
+    # snapshots (e.g. iter started but LLM made no edits before stall).
+    rc, out = _git(app_dir, "add", "-A")
+    if rc != 0:
+        print(f"[git] {app_dir.name}: add failed (rc={rc}): {out[-200:]}",
+              flush=True)
+        return False
+    rc, out = _git(app_dir, "commit", "--allow-empty", "-q", "-m", message)
+    if rc != 0:
+        print(f"[git] {app_dir.name}: commit failed (rc={rc}): {out[-200:]}",
+              flush=True)
+        return False
+    return True
+
+
+def _git_reset_hard(app_dir: Path) -> bool:
+    """Hard-reset the working tree to HEAD.  Returns True on success.
+
+    Discards any uncommitted changes (i.e. the LLM's partial mid-stall edits)
+    and restores the tree to the most recent _git_init_snapshot.  Untracked
+    files are removed via `git clean -fdx` so newly-created files from the
+    stalled iter (e.g. an unfinished new source file) also disappear.
+    """
+    if not (app_dir / ".git").exists():
+        print(f"[git] {app_dir.name}: no .git dir — cannot reset", flush=True)
+        return False
+    rc, out = _git(app_dir, "reset", "--hard", "-q", "HEAD")
+    if rc != 0:
+        print(f"[git] {app_dir.name}: reset --hard failed (rc={rc}): {out[-200:]}",
+              flush=True)
+        return False
+    rc, out = _git(app_dir, "clean", "-fdx", "-q")
+    if rc != 0:
+        # Non-fatal: reset already succeeded.  Log so the user notices.
+        print(f"[git] {app_dir.name}: clean -fdx failed (rc={rc}): {out[-200:]}",
+              flush=True)
+    return True
 
 
 # --- Prompt building (mirrors run_iterative.sh iter-1 + iter-2+ templates) ---
@@ -838,6 +946,7 @@ class Orchestrator:
                 vanilla_src=vanilla,
                 max_iters=max_iters,
                 max_loop_attempts=1 + opencode_retries,
+                max_iter_stall_retries=opencode_retries,
                 benchmark_num_runs=benchmark_num_runs,
             )
 
@@ -1172,6 +1281,17 @@ class Orchestrator:
             print(f"[gen] {app.name} attempt {app.loop_attempt}: re-copying vanilla", flush=True)
             _refresh_app_dir(app)
 
+        # Snapshot the tree BEFORE this iter starts.  On stall, a hard-reset
+        # to this commit rolls back any partial mid-stall edits so the retry
+        # begins from a clean iter-N-start state.  Idempotent — on resume
+        # the repo may already exist with a different last-commit; we
+        # overwrite by committing the current state.
+        _git_init_snapshot(
+            app.app_dir,
+            f"pre-iter {iter_n} (attempt {app.loop_attempt}, "
+            f"stall_retry={app.iter_stall_retry_count})",
+        )
+
         iter_log = app.log_dir / f"iter_{iter_n}"
         iter_log.mkdir(parents=True, exist_ok=True)
         prompt_text = _build_prompt(app, iter_n)
@@ -1246,24 +1366,102 @@ class Orchestrator:
                 tokens_output=tokens_out,
                 tokens_total=tokens_total,
                 stall_aborted=stall_aborted,
+                stall_retries=app.iter_stall_retry_count,
                 gen_queue_wait_s=gen_queue_wait_s,
                 gen_started_at=gen_started_wall,
                 gen_exit_code=rc,
             ))
 
             if stall_aborted:
-                # Skip validation; record loop-attempt outcome and decide D3.
-                self._finalize_loop_attempt(app, outcome="stall",
-                                            iters_run=iter_n,
-                                            stall_iteration=iter_n)
+                self._handle_stall(app, iter_n, iter_log)
                 return
 
+            # Non-stall gen completed (validate will be attempted): reset the
+            # per-iter stall-retry counter so a future stall on a LATER iter
+            # gets its own fresh budget.
+            app.iter_stall_retry_count = 0
             app.state = AppState.QUEUED_FOR_EXECUTOR
             app.queued_for_executor_at = time.monotonic()
 
         print(f"[gen] {app.name} iter {iter_n} DONE gen ({gen_wall_s:.1f}s) "
               f"-> queued for executor", flush=True)
         self.executor_queue.put((app.name, "validate", iter_n))
+
+    def _handle_stall(self, app: AppRun, iter_n: int, iter_log: Path) -> None:
+        """Handle a mid-iter OpenCode stall.
+
+        Called under ``state_lock`` from ``_do_one_gen_iter`` when the helper
+        reports ``stall_aborted=true`` for the current iter.
+
+        Per user directive 2026-05-26: do NOT restart the loop from vanilla
+        on stall.  Instead, hard-reset the codebase tree to the snapshot
+        taken at iter start (discarding any partial mid-stall edits), bump
+        the per-iter stall-retry counter, and re-queue the SAME iter.
+
+        Budget: ``app.max_iter_stall_retries`` (initialized from
+        ``--opencode-retries``, default 2) consecutive stalls per iter.
+        On exhaustion the app transitions directly to DONE_FAILED — the
+        loop-restart fallback is intentionally not used because the user
+        wants stall to be terminal once the per-iter budget is gone.
+
+        Forensics: the stalled iter's log dir (containing stall_watch.log,
+        opencode_stderr.txt, partial metrics_gen.json) is archived to
+        ``iter_<N>_stall<retry>`` BEFORE the retry overwrites it, so a
+        post-mortem can still see exactly where each attempt got stuck.
+        """
+        app.iter_stall_retry_count += 1
+        retry_n = app.iter_stall_retry_count
+
+        # Archive the stalled iter dir so the retry starts with a fresh
+        # iter_<N>/ directory and the forensics are preserved on disk.
+        archive_dir = iter_log.parent / f"iter_{iter_n}_stall{retry_n}"
+        with contextlib.suppress(Exception):
+            if iter_log.exists() and not archive_dir.exists():
+                os.rename(iter_log, archive_dir)
+
+        if retry_n > app.max_iter_stall_retries:
+            # Per-iter retries exhausted.  Treat as terminal: do NOT restart
+            # the loop from vanilla.  Record the terminal-stall outcome and
+            # transition to DONE_FAILED.
+            app.prior_attempts.append(LoopAttempt(
+                attempt=app.loop_attempt,
+                outcome="stall_exhausted",
+                iters_run=iter_n,
+                stall_iteration=iter_n,
+            ))
+            app.loop_stall_count += 1
+            app.final_stall_aborted = True
+            app.final_stall_iteration = iter_n
+            app.iter_loop_finished_at = time.monotonic()
+            app.state = AppState.DONE_FAILED
+            self._mark_app_done(app)
+            print(f"[orchestrator] {app.name} iter {iter_n} stall budget "
+                  f"exhausted ({retry_n - 1}/{app.max_iter_stall_retries} "
+                  f"retries used) — DONE_FAILED (no vanilla restart, per "
+                  f"user directive)", flush=True)
+            return
+
+        # Pop the just-appended stalled IterMetrics so per_iter stays
+        # 1-entry-per-iter (the retried attempt will append its own entry
+        # with stall_retries=retry_n).  Forensics for THIS stall are
+        # preserved in the archived iter_<N>_stall<retry>/ dir on disk.
+        # The terminal-exhaustion path above keeps its stall entry as a
+        # visible "this is where we gave up" record.
+        if app.per_iter and app.per_iter[-1].iter == iter_n and app.per_iter[-1].stall_aborted:
+            app.per_iter.pop()
+
+        # Roll back any partial mid-stall edits before retrying.
+        reset_ok = _git_reset_hard(app.app_dir)
+        # Re-queue the SAME iter: decrement app.iter so _do_one_gen_iter
+        # increments it back to iter_n on the next dispatch.
+        app.iter = iter_n - 1
+        app.state = AppState.READY_FOR_GEN
+        app.queued_for_gen_at = time.monotonic()
+        self.ready_for_gen.put(app.name)
+        print(f"[orchestrator] {app.name} iter {iter_n} stalled — retry "
+              f"{retry_n}/{app.max_iter_stall_retries} (git reset "
+              f"{'OK' if reset_ok else 'FAILED'}, archived to "
+              f"{archive_dir.name})", flush=True)
 
     # --- Executor (serialized) loop -----------------------------------------
     def _executor_loop(self) -> None:
@@ -1648,12 +1846,18 @@ class Orchestrator:
             app = self.apps[app_name]
             in_main = self._app_in_queue(app_name, self.executor_queue)
             in_pri = self._app_in_queue(app_name, self.executor_priority_queue)
-            running = app.state in (AppState.EXECUTING, AppState.BENCHING)
-            if running or in_main or in_pri:
+            # An exec add must lose to ANY active-state app: mid-gen would
+            # race the in-flight LLM edit, ready-for-gen would race the
+            # upcoming gen, and queued/executing/benching are already in
+            # one of the queues we just snapshotted.  Mirror the gen-side
+            # rule at _ctl_add_gen (uses ACTIVE_APP_STATES) so semantics
+            # are symmetric.
+            active = app.state in ACTIVE_APP_STATES
+            if active or in_main or in_pri:
                 if not force:
                     self._write_ack(
                         cmd_id, "duplicate",
-                        f"'{app_name}' already in executor "
+                        f"'{app_name}' already in pipeline "
                         f"(state={app.state.value}, in_exec_queue={in_main}, "
                         f"in_priority_queue={in_pri}) — pass force=true to override",
                     )
