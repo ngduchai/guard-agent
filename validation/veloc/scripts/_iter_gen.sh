@@ -132,13 +132,13 @@ OPENCODE_STALL_KILL="${OPENCODE_STALL_KILL:-1200}"
 # are unaffected.
 WORKER_DATA_ROOT="/tmp/opencode_worker_${WORKER_SLOT}/.local/share"
 export XDG_DATA_HOME="$WORKER_DATA_ROOT"
-# Per-iter slot wipe: a stale opencode.db (left by a previous iter that ended
-# with rc=137 or otherwise abandoned its session mid-stream) caused opencode
-# 1.4.0 to die in ~1.5s with SIGKILL before creating any new log file —
-# observed across both same-app (Nyx slot 0 iter_1 -> Nyx iter_2) and
-# cross-app (Nyx slot 0 iter_1 -> SAMRAI iter_2) reuse on 2026-05-26.
-# Wiping the slot's opencode dir start-of-iter restores the same clean-DB
-# precondition the orchestrator establishes at startup.
+# Per-iter slot wipe: defensive — ensures every iter starts from the same
+# clean-DB precondition the orchestrator establishes at startup, not just
+# iter_1 of each slot.  Originally hypothesized that a stale opencode.db
+# from a prior iter caused 1.5s rc=137 no-ops on SAMRAI+Nyx fresh-vanilla
+# (2026-05-26), but that hypothesis is NOT confirmed — many multi-iter
+# TRUSTED apps ran fine without this wipe.  Keeping the wipe as cheap
+# defense-in-depth while the actual root cause is still under investigation.
 rm -rf "$XDG_DATA_HOME/opencode"
 mkdir -p "$XDG_DATA_HOME/opencode"
 OPENCODE_DB="$XDG_DATA_HOME/opencode/opencode.db"

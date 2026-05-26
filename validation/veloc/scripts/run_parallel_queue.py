@@ -1387,12 +1387,13 @@ class Orchestrator:
         # path fires.  We also surface the helper's diagnostic dump to the
         # orchestrator stdout so each occurrence is visible in real time.
         # Predicate widened 2026-05-26: rc=137 (SIGKILL) and rc=124 (timeout)
-        # were observed producing the same silent-no-op signature when a stale
-        # slot DB caused opencode 1.4.0 to die ~1.5s into startup before any
-        # log/session was created.  The wrapper's per-iter slot wipe (see
-        # _iter_gen.sh) should prevent this from recurring, but we treat the
-        # signature as defense-in-depth: any rc with 0 tokens AND <10s wall
-        # is a no-op regardless of how opencode exited.
+        # were observed producing the same silent-no-op signature on SAMRAI+Nyx
+        # fresh-vanilla iter_2+.  Root cause NOT yet confirmed — the original
+        # stale-slot-DB hypothesis was disproven by the broader history (many
+        # apps reached 3-8 iters fine without per-iter wipe).  Treat the
+        # signature itself as authoritative: any rc with 0 tokens AND <10s
+        # wall on a workload that should take minutes is a no-op regardless
+        # of exit code.  Forensic dump still happens via the diagnostic file.
         metrics_path_for_check = iter_log / "metrics_gen.json"
         if rc in (0, 124, 137) and metrics_path_for_check.exists():
             try:
