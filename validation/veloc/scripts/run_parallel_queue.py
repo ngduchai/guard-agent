@@ -1386,8 +1386,15 @@ class Orchestrator:
         # a silent no-op and override to rc=99 so the orchestrator's retry
         # path fires.  We also surface the helper's diagnostic dump to the
         # orchestrator stdout so each occurrence is visible in real time.
+        # Predicate widened 2026-05-26: rc=137 (SIGKILL) and rc=124 (timeout)
+        # were observed producing the same silent-no-op signature when a stale
+        # slot DB caused opencode 1.4.0 to die ~1.5s into startup before any
+        # log/session was created.  The wrapper's per-iter slot wipe (see
+        # _iter_gen.sh) should prevent this from recurring, but we treat the
+        # signature as defense-in-depth: any rc with 0 tokens AND <10s wall
+        # is a no-op regardless of how opencode exited.
         metrics_path_for_check = iter_log / "metrics_gen.json"
-        if rc == 0 and metrics_path_for_check.exists():
+        if rc in (0, 124, 137) and metrics_path_for_check.exists():
             try:
                 m_check = json.loads(metrics_path_for_check.read_text())
                 _toks = int(m_check.get("tokens_total", 0) or 0)

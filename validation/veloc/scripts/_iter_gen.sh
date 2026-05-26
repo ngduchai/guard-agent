@@ -132,10 +132,18 @@ OPENCODE_STALL_KILL="${OPENCODE_STALL_KILL:-1200}"
 # are unaffected.
 WORKER_DATA_ROOT="/tmp/opencode_worker_${WORKER_SLOT}/.local/share"
 export XDG_DATA_HOME="$WORKER_DATA_ROOT"
+# Per-iter slot wipe: a stale opencode.db (left by a previous iter that ended
+# with rc=137 or otherwise abandoned its session mid-stream) caused opencode
+# 1.4.0 to die in ~1.5s with SIGKILL before creating any new log file —
+# observed across both same-app (Nyx slot 0 iter_1 -> Nyx iter_2) and
+# cross-app (Nyx slot 0 iter_1 -> SAMRAI iter_2) reuse on 2026-05-26.
+# Wiping the slot's opencode dir start-of-iter restores the same clean-DB
+# precondition the orchestrator establishes at startup.
+rm -rf "$XDG_DATA_HOME/opencode"
 mkdir -p "$XDG_DATA_HOME/opencode"
 OPENCODE_DB="$XDG_DATA_HOME/opencode/opencode.db"
 
-echo "[gen $APP_NAME iter $ITER] model=$OPENCODE_MODEL slot=$WORKER_SLOT hard_cap=${OPENCODE_TIMEOUT}s stall_check=${OPENCODE_STALL_CHECK}s stall_kill=${OPENCODE_STALL_KILL}s xdg_data=$XDG_DATA_HOME"
+echo "[gen $APP_NAME iter $ITER] model=$OPENCODE_MODEL slot=$WORKER_SLOT hard_cap=${OPENCODE_TIMEOUT}s stall_check=${OPENCODE_STALL_CHECK}s stall_kill=${OPENCODE_STALL_KILL}s xdg_data=$XDG_DATA_HOME (slot wiped)"
 
 # --- Hide reference dir ------------------------------------------------------
 # The LLM must DESIGN VeloC-based resilience independently rather than copy
