@@ -345,6 +345,18 @@ class AppRun:
 
 
 # --- Subprocess helpers ------------------------------------------------------
+# Module-level lock serializing the fork+exec syscall pair across orchestrator
+# threads.  Without it, a gen-worker thread launching `_iter_gen.sh` at the
+# same instant the executor thread launches `validate.py` produces a
+# silent-no-op iter on the gen side: opencode dies in ~1.5s with rc=137, zero
+# tokens, no source edits.  Observed n=3 on 2026-05-26 (SAMRAI/Nyx iter_3+
+# cascade) — every no-op fired exactly when a gen Popen and a validate Popen
+# raced through fork+setsid+execve at the same millisecond.  The lock is held
+# only across `Popen()` (sub-millisecond), released before `proc.wait()`, so
+# opencode/network-bound work still overlaps with mpirun the rest of the time.
+_POPEN_FORK_LOCK = threading.Lock()
+
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -384,14 +396,20 @@ def _run_subprocess(
         # returns but the deadlocked mpirun can stay alive — observed
         # 2026-05-24 WarpX hang where the validate timed out but mpirun PID
         # remained at ~0% CPU for 4h, wedging the host-wide mpirun lane.
-        proc = subprocess.Popen(
-            cmd,
-            env=env,
-            cwd=str(cwd) if cwd else None,
-            stdout=stdout_fh,
-            stderr=stderr_fh,
-            start_new_session=True,
-        )
+        #
+        # Popen is wrapped in _POPEN_FORK_LOCK to serialize fork+exec across
+        # the gen-pool and executor threads — see lock declaration above for
+        # the 2026-05-26 silent-no-op race.  Lock released before wait() so
+        # the long-running child doesn't hold up other launches.
+        with _POPEN_FORK_LOCK:
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                cwd=str(cwd) if cwd else None,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+                start_new_session=True,
+            )
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:

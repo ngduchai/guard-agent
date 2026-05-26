@@ -42,6 +42,26 @@ What was done to fix it — files changed, approach taken, commit hash if availa
 
 > **Archive:** Closed + Solved + monster-entry bodies live in [ISSUES_ARCHIVE.md](ISSUES_ARCHIVE.md) (archived 2026-05-23).  Grep that file for historical fixes; this file holds only Open work.
 
+### #102 — `run_parallel_queue.py`: concurrent gen + validate `subprocess.Popen(..., start_new_session=True)` race produces silent-no-op iters from iter_3+ `Solved`
+
+**Reported:** 2026-05-26.  Live 15-app parallel iter+bench run kept losing iterations on SAMRAI and Nyx from iter_3 onward: opencode launched, died in ~1.5 s with rc=137 (SIGKILL), produced 0 tokens, wrote no stdout, wrote a 155-byte stderr, and the iter was wasted.  Existing no-op detector at `run_parallel_queue.py:1389-1462` caught the signature and converted it to rc=99 for retry, but each retry burnt minutes and polluted per-iter metrics.  Earlier hypotheses (stale per-slot opencode DB; intra-process state accumulation in the orchestrator) were both refuted — restarting the orchestrator from scratch produced clean iter_2 on BOTH apps (3.5M tokens, ~511 s real work each) but iter_3 still no-op'd.  Field timing log showed n=3 correlation: every observed no-op fired the same second a gen-pool thread's `Popen(_iter_gen.sh, …)` raced an executor thread's `Popen(validate.py, …)` through fork+setsid+execve.  iter_2 only escaped because no validate was in flight when both gens launched.
+
+**Resolution:**
+
+1. **Module-level `_POPEN_FORK_LOCK = threading.Lock()`** at the top of `_run_subprocess`'s file (run_parallel_queue.py).  Wraps only the `subprocess.Popen(...)` call (sub-millisecond), released before `proc.wait()` so the long-running child does not hold up other launches.  Preserves the intended overlap: gen workers may still launch opencode CONCURRENTLY with a running validate's mpirun — only the fork+exec syscall pair is serialized.
+
+2. **Comment block above the lock** cites the 2026-05-26 incident and the n=3 timing correlation so a future reader understands the *why* (per AGENTS.md "Comment the why, not the obvious what").
+
+3. **Corner cases addressed:**
+   - Exception inside Popen — `with` block releases the lock even on `OSError` from fork.
+   - Reentrancy — `_run_subprocess` is never recursive, so a non-reentrant `Lock` (not `RLock`) is correct.
+   - SIGINT during Popen — signal handlers run on the main thread; `_on_signal` calls `os.killpg(0, …)` which does NOT contend on this lock.
+   - `stop_event` during long validate — unchanged: lock is not held during `proc.wait()`.
+
+4. **Tests** — full existing parallel-queue + disk-guard suite (103 tests across `test_parallel_queue_watchdog.py`, `test_parallel_queue_stall_retry.py`, `test_parallel_queue_control.py`, `test_parallel_queue_resume.py`, `test_runner_disk_guard.py`) all pass.  Behaviorally, the lock is exercised by every Popen in the orchestrator, so the existing harness covers it.
+
+5. **Verification on restart**: `[gen] <APP> iter <N> START` and `[exec] <APP> iter <N> VALIDATE START` lines that previously co-fired within the same second should now produce healthy `metrics_gen.json` (`tokens_total > 0`, `gen_wall_s > 60`, `opencode_exit_code in {0, 137}` with 137 only on legitimate 3600 s hard cap).  Persistent monitor `bm44l565n` continues alerting on any leftover `NO_OP_SIGNATURE`; two clean iter cycles per app without that alert = fix confirmed.
+
 ### #101 — `run_parallel_queue.py`: crash-immediate resume must be safe under all in-flight states `Solved`
 
 **Reported:** 2026-05-24.  Even with the new `--resume` flag (issue #100 work), an abrupt orchestrator crash (host reboot, OOM kill, signal beyond the graceful SIGINT path) could leave individual apps in indistinguishable mid-stage shapes on disk: half-edited source tree from an interrupted LLM gen, complete iter dir whose validation never ran, complete iter dir that passed but whose bench never started.  Without explicit classification the next `--resume` would silently skip or double-run work.  User constraint: "Only wipe and start from beginning with app that in the middle of LLM-code generation; for the app that already completed their iteration and waiting for validation/bench, resume from what they left because the LLM iter completion indicates the code-generation is complete and the code-base is its already checkpoint."  Crash must NOT burn a retry attempt; half-edited source is thrown away (not archived); partial validator output is left in place for the next run to overwrite.
