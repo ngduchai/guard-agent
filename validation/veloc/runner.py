@@ -560,8 +560,10 @@ def run_once(
     # F-collective-restart asymmetric gate, which restores a snapshot then
     # corrupts one rank's files before launching the binary).
     cfg_in_cwd = cwd / veloc_config_name
-    if cfg_in_cwd.exists() and not skip_pre_run_clear:
+    ckpt_dirs: list[Path] = []
+    if cfg_in_cwd.exists():
         ckpt_dirs = extract_checkpoint_dirs_from_veloc_cfg(cfg_in_cwd)
+    if cfg_in_cwd.exists() and not skip_pre_run_clear:
         if ckpt_dirs:
             print(
                 "[runner] clearing VeloC checkpoint directories before run:", flush=True
@@ -629,6 +631,43 @@ def run_once(
             )
             mem_thread.start()
 
+        # Disk-guard watchdog: terminate the run if the LLM-generated VeloC
+        # integration writes runaway checkpoints that would exhaust disk.
+        # Added after the Nyx 2026-05-26 incident (55 GB blowup) — see
+        # _start_checkpoint_size_watchdog docstring.  Cheap polling (du-style)
+        # on a small set of dirs; honest solutions never hit the cap so this
+        # imposes no measurable overhead on TRUSTED runs.
+        disk_guard_max_bytes, disk_guard_poll_s = _resolve_disk_guard_config()
+        disk_guard_stop_event: "threading.Event | None" = None
+        disk_guard_marker = output_dir / _DISK_GUARD_MARKER_NAME
+        if (
+            disk_guard_max_bytes is not None
+            and disk_guard_max_bytes > 0
+            and ckpt_dirs
+        ):
+            # Remove any stale marker from a previous run in the same
+            # output_dir so we don't falsely report overage.
+            try:
+                if disk_guard_marker.exists():
+                    disk_guard_marker.unlink()
+            except OSError:
+                pass
+            disk_guard_stop_event = threading.Event()
+            _start_checkpoint_size_watchdog(
+                proc=proc,
+                ckpt_dirs=ckpt_dirs,
+                max_bytes=disk_guard_max_bytes,
+                poll_interval_s=disk_guard_poll_s,
+                stop_event=disk_guard_stop_event,
+                marker_path=disk_guard_marker,
+            )
+            print(
+                f"[runner] disk-guard: armed "
+                f"(limit={disk_guard_max_bytes / 1e9:.1f} GB, "
+                f"poll={disk_guard_poll_s:.0f}s, dirs={len(ckpt_dirs)})",
+                flush=True,
+            )
+
         # Hard wallclock cap so a runaway LLM solution (infinite recovery
         # loop, deadlocked recovery, runaway checkpoint cadence) cannot hang
         # the harness indefinitely.  Without this, the failure-free check
@@ -666,8 +705,34 @@ def run_once(
         memory_stop_event.set()
         mem_thread.join(timeout=5.0)
 
+    # Signal the disk-guard watchdog to stop (no-op if it already fired).
+    if disk_guard_stop_event is not None:
+        disk_guard_stop_event.set()
+
     stdout_text = _read_text_tailed(stdout_path)
     stderr_text = _read_text_tailed(stderr_path)
+
+    # If the disk-guard fired during the run, append its structured message
+    # to BOTH the in-memory stderr and the on-disk stderr file so that:
+    #   (a) validate.py's exit-code gate (correctness Test 1b/2b) sees the
+    #       marker in RunResult.stderr and forwards it to the next iter's
+    #       LLM prompt via the existing feedback pipeline, and
+    #   (b) post-hoc forensic inspection of output_dir/stderr.txt shows the
+    #       reason for the kill alongside the mpirun output.
+    if disk_guard_marker.exists():
+        try:
+            guard_msg = disk_guard_marker.read_text(encoding="utf-8")
+        except OSError:
+            guard_msg = (
+                "[validator-guard] CHECKPOINT_SIZE_EXCEEDED "
+                "(marker file unreadable)\n"
+            )
+        stderr_text = (stderr_text or "") + "\n" + guard_msg
+        try:
+            with stderr_path.open("ab") as f:
+                f.write(b"\n" + guard_msg.encode("utf-8"))
+        except OSError:
+            pass
 
     return RunResult(
         exit_code=exit_code,
@@ -876,6 +941,194 @@ def measure_checkpoint_dirs(dirs: list[Path]) -> dict:
         out["total_size_bytes"] += entry["size_bytes"]
         out["total_file_count"] += entry["file_count"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint-size watchdog (disk-full guard)
+#
+# Background — Nyx 2026-05-26 incident
+# ------------------------------------
+# The Nyx LLM solution registered a fixed 32 MB VeloC buffer with
+# VELOC_Mem_protect (the entire region, not the meaningful byte count),
+# triggered a checkpoint after every coarse step with a monotonically-
+# increasing version, and did not configure max_versions / unlink old
+# versions.  VeloC retained every version, mode=sync wrote to both scratch
+# and persistent dirs, and 55 GB accumulated in /tmp before disk hit OSError
+# 28.  The cascade corrupted multiple unrelated iters via the orchestrator's
+# _atomic_write_json failing.
+#
+# This guard polls the checkpoint dirs while mpirun runs; if the combined
+# on-disk size exceeds the configured cap, the guard terminates mpirun and
+# writes a structured marker file.  run_once appends the marker to stderr so
+# the existing exit-code gate in validate.py forwards it to the next iter's
+# prompt verbatim (see feedback_exit_code_gate_in_correctness.md).
+# ---------------------------------------------------------------------------
+
+# Default cap: 10 GB combined across scratch + persistent.  Generous enough
+# that no honest solution touches it (paper-grade apps top out under 100 MB
+# per dir), tight enough to catch the Nyx-class runaway within one or two
+# poll cycles.  Override via env var GUARD_AGENT_MAX_CHECKPOINT_BYTES; set
+# to 0 to disable entirely.
+_DEFAULT_MAX_CHECKPOINT_BYTES = 10 * 1024 * 1024 * 1024
+# 5 s poll: the Nyx 2026-05-26 runaway wrote 128 MB per timestep × O(10 steps/s)
+# = >1 GB/s sustained.  A 30 s interval lets ~30 GB land between checks; 5 s
+# caps overshoot at a few GB and still imposes negligible CPU load (each poll
+# is just du-style stat() walks over a small fixed set of dirs).
+_DEFAULT_DISK_GUARD_POLL_S = 5.0
+_DISK_GUARD_MARKER_NAME = "_disk_guard_marker.txt"
+
+
+def _resolve_disk_guard_config() -> "tuple[int | None, float]":
+    """Read disk-guard settings from env.
+
+    Returns (max_bytes, poll_seconds).  max_bytes is None when the guard is
+    disabled (env var set to 0 or to an unparseable value).
+    """
+    raw = os.environ.get("GUARD_AGENT_MAX_CHECKPOINT_BYTES")
+    if raw is None:
+        max_bytes: int | None = _DEFAULT_MAX_CHECKPOINT_BYTES
+    else:
+        try:
+            parsed = int(raw)
+            max_bytes = parsed if parsed > 0 else None
+        except ValueError:
+            print(
+                f"[runner] disk-guard: invalid "
+                f"GUARD_AGENT_MAX_CHECKPOINT_BYTES={raw!r}; disabling",
+                flush=True,
+            )
+            max_bytes = None
+
+    poll_raw = os.environ.get("GUARD_AGENT_DISK_GUARD_POLL_S")
+    if poll_raw is None:
+        poll_s = _DEFAULT_DISK_GUARD_POLL_S
+    else:
+        try:
+            poll_s = float(poll_raw)
+        except ValueError:
+            poll_s = _DEFAULT_DISK_GUARD_POLL_S
+    if poll_s < 1.0:
+        poll_s = 1.0
+    return (max_bytes, poll_s)
+
+
+def _format_overage_message(summary: dict, max_bytes: int) -> str:
+    """Render the structured message that gets surfaced to the LLM on overage.
+
+    The message is intentionally action-oriented: the next iter's prompt
+    receives it via stderr-tail forwarding, so the LLM must be able to read
+    it and produce a fix without further human intervention.
+    """
+    total_gb = summary["total_size_bytes"] / 1e9
+    limit_gb = max_bytes / 1e9
+    lines = [
+        "[validator-guard] CHECKPOINT_SIZE_EXCEEDED",
+        f"  total: {total_gb:.2f} GB across {summary['total_file_count']} "
+        f"files (limit: {limit_gb:.2f} GB)",
+        "  per-dir:",
+    ]
+    for d in summary["per_dir"]:
+        if not d["exists"]:
+            continue
+        lines.append(
+            f"    - {d['path']}: {d['size_bytes'] / 1e9:.2f} GB "
+            f"({d['file_count']} files)"
+        )
+    lines.extend(
+        [
+            "",
+            "The application was terminated by the validator to prevent",
+            "disk exhaustion on the shared host.  Re-run will fail again",
+            "until the checkpoint footprint is bounded.",
+            "",
+            "Likely causes and fixes (apply at least one):",
+            "  1. VELOC_Mem_protect registers the FULL buffer instead of the",
+            "     meaningful serialized length.  Each VELOC_Checkpoint then",
+            "     writes the entire buffer, padding included.",
+            "     Fix: call VELOC_Mem_protect(id, ptr, used_bytes, 1) before",
+            "     each VELOC_Checkpoint, using the actual byte count.",
+            "  2. Old checkpoint versions are never purged.  VeloC retains",
+            "     every version unless told otherwise.",
+            "     Fix: set `max_ckpts = N` (or equivalent retention knob) in",
+            "     veloc.cfg, OR after VELOC_Checkpoint_wait succeeds, unlink",
+            "     the prior version's files directly from scratch+persistent.",
+            "  3. Checkpoint cadence is too aggressive (e.g. every timestep).",
+            "     Fix: checkpoint at coarse intervals (every N steps) sized",
+            "     to give usable recovery without unbounded disk growth.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _start_checkpoint_size_watchdog(
+    proc: "subprocess.Popen",
+    ckpt_dirs: "list[Path]",
+    max_bytes: int,
+    poll_interval_s: float,
+    stop_event: "threading.Event",
+    marker_path: Path,
+) -> "threading.Thread":
+    """Spawn a daemon thread that terminates *proc* if checkpoint dirs grow
+    beyond *max_bytes*.
+
+    On overage:
+      1. write the structured overage message to *marker_path*
+      2. call proc.terminate() (caller's existing wait/timeout logic harvests
+         the resulting non-zero exit code)
+      3. exit the thread
+
+    The thread exits cleanly when *stop_event* is set (caller signals
+    end-of-run) or when the process dies first.  All exceptions are caught
+    and logged — the watchdog must never raise into the daemon-thread void.
+    """
+
+    def _watch() -> None:
+        while not stop_event.is_set():
+            if proc.poll() is not None:
+                return
+            try:
+                summary = measure_checkpoint_dirs(ckpt_dirs)
+            except Exception as exc:  # noqa: BLE001 — defensive: never let
+                # the watchdog crash silently
+                print(
+                    f"[runner] disk-guard: measure error: {exc!r}", flush=True
+                )
+                stop_event.wait(poll_interval_s)
+                continue
+
+            if summary["total_size_bytes"] > max_bytes:
+                msg = _format_overage_message(summary, max_bytes)
+                try:
+                    marker_path.write_text(msg, encoding="utf-8")
+                except OSError as exc:
+                    print(
+                        f"[runner] disk-guard: marker write failed: {exc!r}",
+                        flush=True,
+                    )
+                print(
+                    f"[runner] disk-guard: TERMINATE "
+                    f"({summary['total_size_bytes'] / 1e9:.2f} GB > "
+                    f"{max_bytes / 1e9:.2f} GB limit)",
+                    flush=True,
+                )
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                except OSError as exc:
+                    print(
+                        f"[runner] disk-guard: terminate() raised: {exc!r}",
+                        flush=True,
+                    )
+                return
+
+            stop_event.wait(poll_interval_s)
+
+    t = threading.Thread(
+        target=_watch, daemon=True, name="ckpt-disk-guard"
+    )
+    t.start()
+    return t
 
 
 def snapshot_checkpoint_dirs(dirs: list[Path], dest: Path) -> dict:

@@ -19,7 +19,7 @@
 #
 # Format: "YYYY-MM-DD" (date of the most recent measurement-stack edit).
 # Bumped in lockstep with _decisions.log "framework_change" entries.
-FRAMEWORK_VERSION = "2026-05-15"
+FRAMEWORK_VERSION = "2026-05-26"
 
 from .runner import (
     RunResult,
