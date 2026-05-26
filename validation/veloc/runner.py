@@ -2189,6 +2189,36 @@ _snapshot_tmp_file_states = _snapshot_paths_for_gaming_check
 _diff_tmp_snapshots = _diff_path_snapshots
 
 
+def _append_attempt_disk_guard_marker_to_stderr(
+    attempt_dir: "Path",
+    stderr_path: "Path",
+    stderr_text: str,
+) -> str:
+    """If this attempt's disk-guard fired, fold the marker into the stderr.
+
+    Mirrors run_once's behavior: makes the structured CHECKPOINT_SIZE_EXCEEDED
+    message visible to (a) validate.py's exit-code gate, which forwards it to
+    the next iter's LLM prompt, and (b) post-hoc forensic readers of
+    attempt_dir/stderr.txt.  No-op when the marker is absent.
+    """
+    marker = attempt_dir / _DISK_GUARD_MARKER_NAME
+    if not marker.exists():
+        return stderr_text
+    try:
+        guard_msg = marker.read_text(encoding="utf-8")
+    except OSError:
+        guard_msg = (
+            "[validator-guard] CHECKPOINT_SIZE_EXCEEDED "
+            "(marker file unreadable)\n"
+        )
+    try:
+        with stderr_path.open("ab") as f:
+            f.write(b"\n" + guard_msg.encode("utf-8"))
+    except OSError:
+        pass
+    return (stderr_text or "") + "\n" + guard_msg
+
+
 def run_with_checkpoint_observed_injection(
     source_dir: "Path",
     build_dir: "Path",
@@ -2387,6 +2417,44 @@ def run_with_checkpoint_observed_injection(
                 stderr=err_f,
                 env=run_env,
             )
+
+        # Disk-guard watchdog: terminate this attempt's mpirun if the
+        # LLM-generated VeloC integration writes runaway checkpoints into
+        # the configured scratch/persistent dirs.  Without arming here on
+        # the resilient leg, the Nyx 2026-05-26 incident repeated (41 GB
+        # in /tmp before the host filled and the orchestrator crashed
+        # with ENOSPC).  run_once arms an equivalent guard on the
+        # perturbed-baseline path; this brings the resilient leg to
+        # parity.  Per-attempt marker so attempts don't clobber each
+        # other's record.  Daemon thread self-terminates on proc exit;
+        # no shutdown plumbing required.
+        disk_guard_max_bytes, disk_guard_poll_s = _resolve_disk_guard_config()
+        attempt_marker = attempt_dir / _DISK_GUARD_MARKER_NAME
+        if (
+            disk_guard_max_bytes is not None
+            and disk_guard_max_bytes > 0
+            and ckpt_dirs
+        ):
+            try:
+                if attempt_marker.exists():
+                    attempt_marker.unlink()
+            except OSError:
+                pass
+            _start_checkpoint_size_watchdog(
+                proc=proc,
+                ckpt_dirs=ckpt_dirs,
+                max_bytes=disk_guard_max_bytes,
+                poll_interval_s=disk_guard_poll_s,
+                stop_event=threading.Event(),
+                marker_path=attempt_marker,
+            )
+            print(
+                f"[runner] disk-guard: armed for attempt {attempt_idx} "
+                f"(limit={disk_guard_max_bytes / 1e9:.1f} GB, "
+                f"poll={disk_guard_poll_s:.0f}s, dirs={len(ckpt_dirs)})",
+                flush=True,
+            )
+
         return proc, attempt_dir, stdout_path, stderr_path, t0
 
     # F-20: snapshot /tmp/ AND build/ state BEFORE the kill attempt
@@ -2525,6 +2593,9 @@ def run_with_checkpoint_observed_injection(
                 all_mem_samples.extend(memory_samples_holder[0])
         a1_stdout = _read_text_tailed(a1_stdout_path)
         a1_stderr = _read_text_tailed(a1_stderr_path)
+        a1_stderr = _append_attempt_disk_guard_marker_to_stderr(
+            attempt1_dir, a1_stderr_path, a1_stderr,
+        )
         a1_exit = mpi_proc.returncode if mpi_proc.returncode is not None else -1
         # Refresh top-level stdout.txt / stderr.txt from this run so the
         # validate.py comparator reads CURRENT data, not a stale file from
@@ -2595,6 +2666,9 @@ def run_with_checkpoint_observed_injection(
                     all_mem_samples.extend(memory_samples_holder[0])
             a1_stdout = _read_text_tailed(a1_stdout_path)
             a1_stderr = _read_text_tailed(a1_stderr_path)
+            a1_stderr = _append_attempt_disk_guard_marker_to_stderr(
+                attempt1_dir, a1_stderr_path, a1_stderr,
+            )
             # Same stdout/stderr refresh as the no-checkpoint path; without
             # it, the comparator reads a stale file from a previous iter.
             try:
@@ -2748,6 +2822,9 @@ def run_with_checkpoint_observed_injection(
 
     a2_stdout = _read_text_tailed(a2_stdout_path)
     a2_stderr = _read_text_tailed(a2_stderr_path)
+    a2_stderr = _append_attempt_disk_guard_marker_to_stderr(
+        attempt2_dir, a2_stderr_path, a2_stderr,
+    )
 
     # Surface success_output_filename from the recovery attempt for the
     # caller's downstream comparison logic (mirrors run_with_failure_injection).

@@ -20,6 +20,8 @@ import pytest
 
 from validation.veloc.runner import (
     _DEFAULT_MAX_CHECKPOINT_BYTES,
+    _DISK_GUARD_MARKER_NAME,
+    _append_attempt_disk_guard_marker_to_stderr,
     _format_overage_message,
     _resolve_disk_guard_config,
     _start_checkpoint_size_watchdog,
@@ -219,3 +221,54 @@ def test_resolve_disk_guard_config_custom_limit(
     max_bytes, poll_s = _resolve_disk_guard_config()
     assert max_bytes == 2 * 1024**3
     assert poll_s == 15.0
+
+
+# ---------------------------------------------------------------------------
+# Per-attempt marker forwarding for the checkpoint-observed (resilient) path
+# ---------------------------------------------------------------------------
+# Added after the Nyx 2026-05-26 incident: _launch_attempt now arms the
+# watchdog per attempt; the helper below folds the marker into stderr so the
+# LLM sees a CHECKPOINT_SIZE_EXCEEDED message on the next iter instead of an
+# opaque SIGTERM.
+
+
+def test_append_marker_noop_when_marker_missing(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt_1"
+    attempt.mkdir()
+    stderr_path = attempt / "stderr.txt"
+    stderr_path.write_text("original stderr\n")
+    result = _append_attempt_disk_guard_marker_to_stderr(
+        attempt, stderr_path, "original stderr\n"
+    )
+    assert result == "original stderr\n"
+    # On-disk stderr unchanged.
+    assert stderr_path.read_text() == "original stderr\n"
+
+
+def test_append_marker_folds_into_stderr_when_present(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt_1"
+    attempt.mkdir()
+    stderr_path = attempt / "stderr.txt"
+    stderr_path.write_text("mpirun output\n")
+    marker = attempt / _DISK_GUARD_MARKER_NAME
+    marker.write_text("[validator-guard] CHECKPOINT_SIZE_EXCEEDED\n  total: 12 GB\n")
+    result = _append_attempt_disk_guard_marker_to_stderr(
+        attempt, stderr_path, "mpirun output\n"
+    )
+    assert "CHECKPOINT_SIZE_EXCEEDED" in result
+    assert "mpirun output" in result
+    # And the file on disk was also updated for forensic readers.
+    assert "CHECKPOINT_SIZE_EXCEEDED" in stderr_path.read_text()
+
+
+def test_append_marker_handles_empty_starting_stderr(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt_2"
+    attempt.mkdir()
+    stderr_path = attempt / "stderr.txt"
+    stderr_path.write_text("")
+    marker = attempt / _DISK_GUARD_MARKER_NAME
+    marker.write_text("[validator-guard] CHECKPOINT_SIZE_EXCEEDED\n")
+    result = _append_attempt_disk_guard_marker_to_stderr(
+        attempt, stderr_path, ""
+    )
+    assert "CHECKPOINT_SIZE_EXCEEDED" in result
