@@ -434,15 +434,16 @@ ${INITIAL_PROMPT}"
     # API steps here would short-circuit that judgment and contaminate every
     # iteration past the first.  See ISSUES.md issue #18.
     PREV_LOG="$LOG_DIR/iter_$((ITER - 1))"
-    APP_OUT_DIR="$BUILD_DIR/validation_output/${APP_NAME}_${LABEL}/correctness"
     PROMPT="${ANTI_GAMING_DIRECTIVE}
 
 Your previous attempt was rejected by the validation pipeline. Inspect
-the artifacts under these directories and fix the code.
+the artifacts under this directory and fix the code:
 
   $PREV_LOG
-  $APP_OUT_DIR/resilient
-  $APP_OUT_DIR/resilient_clean"
+
+It contains validate_stderr.txt (the exact gate / fatal that rejected
+the previous attempt — read it first), validate_stdout.txt,
+build_output.txt, opencode_stdout.txt, and metrics.json."
   fi
 
   # --- Optional context-cap (Deliverable 2, cell B1 enabler) ---

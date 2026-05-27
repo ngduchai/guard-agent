@@ -758,14 +758,14 @@ def _build_prompt(app: AppRun, iter_n: int) -> str:
         return f"{ANTI_GAMING_DIRECTIVE}\n\n{initial_prompt}"
 
     prev_log = app.log_dir / f"iter_{iter_n - 1}"
-    app_out_dir = BUILD_DIR / "validation_output" / f"{app.name}_{app.label}" / "correctness"
     body = (
         f"{ANTI_GAMING_DIRECTIVE}\n\n"
         f"Your previous attempt was rejected by the validation pipeline. Inspect\n"
-        f"the artifacts under these directories and fix the code.\n\n"
-        f"  {prev_log}\n"
-        f"  {app_out_dir}/resilient\n"
-        f"  {app_out_dir}/resilient_clean"
+        f"the artifacts under this directory and fix the code:\n\n"
+        f"  {prev_log}\n\n"
+        f"It contains validate_stderr.txt (the exact gate / fatal that rejected\n"
+        f"the previous attempt — read it first), validate_stdout.txt,\n"
+        f"build_output.txt, opencode_stdout.txt, and metrics.json."
     )
     # If the previous iter hit the watchdog timeout, surface the marker
     # contents directly so the LLM cannot miss it.  Standard validate
