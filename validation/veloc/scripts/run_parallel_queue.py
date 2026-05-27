@@ -181,9 +181,10 @@ YOU MAY
   was rejected before you start editing code:
     * /home/ndhai/diaspora/guard-agent/build/iterative_logs/
       (per-iter prompt.txt, build_output.txt, opencode_stdout.txt,
-       validate_stdout.txt, validate_stderr.txt, metrics.json — the
-       validator stderr at the previous iter dir contains the exact
-       gate / fatal that rejected the previous attempt; read it first.)
+       validate_stdout.txt, validate_stderr.txt, metrics.json —
+       validate_stdout.txt holds the ACTUAL failure cause: crash
+       trace, recovery exit code, ratio, gate decisions; read it
+       first. validate_stderr.txt is mostly resume-help boilerplate.)
 
 ================================================================================
 YOU MAY NOT
@@ -763,8 +764,9 @@ def _build_prompt(app: AppRun, iter_n: int) -> str:
         f"Your previous attempt was rejected by the validation pipeline. Inspect\n"
         f"the artifacts under this directory and fix the code:\n\n"
         f"  {prev_log}\n\n"
-        f"It contains validate_stderr.txt (the exact gate / fatal that rejected\n"
-        f"the previous attempt — read it first), validate_stdout.txt,\n"
+        f"It contains validate_stdout.txt (the ACTUAL failure cause:\n"
+        f"crash trace, recovery exit code, ratio, gate decisions — read it\n"
+        f"first), validate_stderr.txt (mostly resume-help boilerplate),\n"
         f"build_output.txt, opencode_stdout.txt, and metrics.json."
     )
     # If the previous iter hit the watchdog timeout, surface the marker
