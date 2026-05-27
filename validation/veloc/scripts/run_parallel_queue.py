@@ -175,18 +175,15 @@ YOU MAY
   working directory and everything under it).
 - Call into libveloc.
 - Use read, list, glob, grep, edit, write tools directly.
-- Read (read-only) any file under these external directories — they hold
+- Read (read-only) any file under this external directory — it holds
   the previous attempt(s) validator output and your build logs, and you
-  MUST consult them to understand exactly how/why the previous attempt
+  MUST consult it to understand exactly how/why the previous attempt
   was rejected before you start editing code:
     * /home/ndhai/diaspora/guard-agent/build/iterative_logs/
       (per-iter prompt.txt, build_output.txt, opencode_stdout.txt,
-       validate_stdout.txt, validate_stderr.txt, metrics.json)
-    * /home/ndhai/diaspora/guard-agent/build/validation_output/
-      (validator artifacts: correctness/resilient*, benchmarks/, proof JSON,
-       raw_metrics.json — the validator stderr at the previous iter dir
-       (validate_stderr.txt) contains the exact gate / fatal that rejected
-       the previous attempt; read it first.)
+       validate_stdout.txt, validate_stderr.txt, metrics.json — the
+       validator stderr at the previous iter dir contains the exact
+       gate / fatal that rejected the previous attempt; read it first.)
 
 ================================================================================
 YOU MAY NOT
