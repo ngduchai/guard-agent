@@ -563,11 +563,17 @@ build_output.txt, opencode_stdout.txt, and metrics.json."
   # to --max-gen-workers opencode invocations in flight at once, each
   # needing a DIFFERENT app's workspace allow-listed.  OPENCODE_CONFIG
   # env var points opencode at a per-iter config file with no race.
+  # 2026-05-29: scoping read alone left a hole — glob/grep/list/codesearch/lsp
+  # were globally "allow" and could bypass the read deny (grep returns matching
+  # lines + context = effectively reading).  Apply same per-app rule to all
+  # read-shaped tools.
   PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
   OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
   OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
   jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
-    .permission.read = {
+    ($ws) as $ws_path |
+    ($logs) as $logs_path |
+    {
       "/home/ndhai/.local/share/opencode/**": "deny",
       "/home/ndhai/.opencode/**":             "deny",
       "**/build/_cell_isolation/**":          "deny",
@@ -578,10 +584,17 @@ build_output.txt, opencode_stdout.txt, and metrics.json."
       "**/build/iterative_logs/**":           "deny",
       "**/build/tests_baseline/**":           "deny",
       "**/build/tests_baseline_*/**":         "deny",
-      ($ws):   "allow",
-      ($logs): "allow"
-    }' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
-  echo "[iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (allow read: $OWN_WORKSPACE + own iter_logs)"
+      ($ws_path):   "allow",
+      ($logs_path): "allow"
+    } as $per_app_rule |
+    .permission.read       = $per_app_rule |
+    .permission.glob       = $per_app_rule |
+    .permission.grep       = $per_app_rule |
+    .permission.list       = $per_app_rule |
+    .permission.codesearch = $per_app_rule |
+    .permission.lsp        = $per_app_rule
+  ' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
+  echo "[iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (read/glob/grep/list/codesearch/lsp scoped to: $OWN_WORKSPACE + own iter_logs)"
 
   # Launch opencode in the background under the hard wallclock cap.
   OPENCODE_CONFIG="$PER_LAUNCH_CFG" \

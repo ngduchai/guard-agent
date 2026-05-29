@@ -176,11 +176,26 @@ cd "$APP_DIR"
 # app's "rewrite from scratch" coping).  We keep the global file untouched
 # and pass a per-launch config via OPENCODE_CONFIG so the parallel orchestrator
 # can run --max-gen-workers helpers concurrently, each scoped to its own app.
+#
+# 2026-05-29 audit found that scoping ONLY `read` left a hole: glob/grep/list/
+# codesearch/lsp were still globally "allow" in the per-launch config (because
+# we didn't override them), so a curious LLM could grep -r "VELOC_Init"
+# build/tests_baseline_sonnet46/ and effectively read every other app's
+# source via grep's matching-line output.  Empirically no app exploited this
+# in the post-permfix runs, but the per-app isolation is incomplete without
+# the same deny+allow shape applied to all read-equivalent tools.  We now
+# build the rule once and apply it to read + glob + grep + list + codesearch
+# + lsp uniformly.
 PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
 OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
 OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
 jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
-  .permission.read = {
+  # Build the per-app scoped rule once: deny shared/other-app paths, allow
+  # this current-app own workspace + own iter_logs.  Applied to every
+  # read-shaped tool so glob/grep/list/codesearch/lsp cannot bypass read deny.
+  ($ws) as $ws_path |
+  ($logs) as $logs_path |
+  {
     "/home/ndhai/.local/share/opencode/**": "deny",
     "/home/ndhai/.opencode/**":             "deny",
     "**/build/_cell_isolation/**":          "deny",
@@ -191,10 +206,17 @@ jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
     "**/build/iterative_logs/**":           "deny",
     "**/build/tests_baseline/**":           "deny",
     "**/build/tests_baseline_*/**":         "deny",
-    ($ws):   "allow",
-    ($logs): "allow"
-  }' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
-echo "[gen $APP_NAME iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (allow read: $OWN_WORKSPACE + $OWN_ITER_LOGS)"
+    ($ws_path):   "allow",
+    ($logs_path): "allow"
+  } as $per_app_rule |
+  .permission.read       = $per_app_rule |
+  .permission.glob       = $per_app_rule |
+  .permission.grep       = $per_app_rule |
+  .permission.list       = $per_app_rule |
+  .permission.codesearch = $per_app_rule |
+  .permission.lsp        = $per_app_rule
+' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
+echo "[gen $APP_NAME iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (read/glob/grep/list/codesearch/lsp scoped to: $OWN_WORKSPACE + $OWN_ITER_LOGS)"
 
 # Hard-timeout-wrapped opencode in the background.
 OPENCODE_CONFIG="$PER_LAUNCH_CFG" \
