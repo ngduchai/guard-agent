@@ -176,16 +176,6 @@ cd "$APP_DIR"
 # app's "rewrite from scratch" coping).  We keep the global file untouched
 # and pass a per-launch config via OPENCODE_CONFIG so the parallel orchestrator
 # can run --max-gen-workers helpers concurrently, each scoped to its own app.
-#
-# 2026-05-29 audit found that scoping ONLY `read` left a hole: glob/grep/list/
-# codesearch/lsp were still globally "allow" in the per-launch config (because
-# we didn't override them), so a curious LLM could grep -r "VELOC_Init"
-# build/tests_baseline_sonnet46/ and effectively read every other app's
-# source via grep's matching-line output.  Empirically no app exploited this
-# in the post-permfix runs, but the per-app isolation is incomplete without
-# the same deny+allow shape applied to all read-equivalent tools.  We now
-# build the rule once and apply it to read + glob + grep + list + codesearch
-# + lsp uniformly.
 PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
 OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
 OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
