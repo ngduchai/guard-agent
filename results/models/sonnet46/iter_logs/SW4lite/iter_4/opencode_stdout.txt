@@ -1,0 +1,248 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The build succeeded, but the test failed because of **output correctness** after recovery. The checkpoint/restart is happening (8 checkpoint files detected), but after recovery the output doesn't match the expected output. This means the restart is loading checkpoint state correctly but continuing from there leads to different numerical output.
+
+Let me look at the current codebase state:
+Now let me look at the timesteploop function to see the current checkpoint implementation:
+Good, there's VeloC code. Let me read the specific section in EW.C where the timestep loop and checkpointing happen:
+Now I understand the issue. Looking at the validation output:
+
+```
+[validate] Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance [VeloC, failure-prone], score=1.16103e-05: max_abs_diff=1.161e-05, max_rel_diff=1.408e-02 (atol=1.000e-12, rtol=1.000e-12)
+```
+
+The output after recovery doesn't match. The problem is likely that after `cycleSolutionArrays`, U holds the current solution and Um holds the previous step - but the time `t` and `beginCycle` calculation may be off. Let me look at what happens around the checkpoint and time advancement:
+I can see a key issue. Look at the time loop flow:
+
+1. Loop starts at `currentTimeStep = beginCycle` (which after restart = `currentTimeStep_at_checkpoint + 1`)
+2. At the start of each loop iteration, forces are computed at `t` (time before increment)
+3. Time is incremented at `t += mDt` inside the loop
+4. After `cycleSolutionArrays`, U=new solution, Um=previous
+5. Checkpoint saves: `veloc_scalar[0] = t` (post-increment), `veloc_scalar[1] = currentTimeStep + 1`
+
+The problem is the **initial data setup**. After restart, the code:
+1. Restores `t` and `beginCycle` from checkpoint 
+2. Starts the loop at `currentTimeStep = beginCycle`
+3. But the initial data in U/Um is from after the cycle - so it should work...
+
+Wait, let me check more carefully. The issue might be the initial data section that records time series at `t = mTstart` at step 0. Let me check what happens at the very beginning:
+
+The loop runs from `beginCycle` to `mNumberOfTimeSteps`. Let me trace through:
+- Initial: `beginCycle = 1`, `t = mTstart`
+- After checkpoint at step `N`: `veloc_scalar[0] = t_N` (after `t += mDt`), `veloc_scalar[1] = N+1`
+- On restart: `t = t_N`, `beginCycle = N+1`
+- Loop starts at `currentTimeStep = N+1`
+
+The time series data at t=0 is recorded before the loop. On restart, that data isn't needed because we're starting from mid-simulation. But the initial data `extractRecordData` call before the loop uses `U` and `Um` which now contain the checkpoint state, not the initial state. 
+
+Wait, there's another critical issue: look at the initial data recording before the loop at line 2474-2491. On restart this runs again from the checkpoint arrays (not the original t=0 state). That would mess up time series output but not the validation output.
+
+Let me look more carefully at the validation. After recovery:
+- The loop completes and calls `normOfDifference(Up, U, ...)` at the final time
+- The error is computed vs exact solution at final time `t`
+
+The issue must be in the `t` value after recovery. After restart at version N:
+- t = t_N (time at which checkpoint was saved, i.e., after the `t += mDt` step)  
+- beginCycle = N+1
+
+Then the loop goes from N+1 to mNumberOfTimeSteps. Each iteration: compute force at current t, then `t += mDt`. 
+
+At the end: `t = t_N + (mNumberOfTimeSteps - N) * mDt`. This should be the same as the final `t` without restart. Let me verify:
+
+Without restart: `t = mTstart + mNumberOfTimeSteps * mDt`
+
+Let me check: initially `t = mTstart`, `beginCycle = 1` (after `beginCycle++`). The loop runs from 1 to mNumberOfTimeSteps. Each step does `t += mDt`. So final t = `mTstart + mNumberOfTimeSteps * mDt`. ✓
+
+With restart at step N: `t_N = mTstart + N * mDt`. `beginCycle = N+1`. Loop runs from N+1 to mNumberOfTimeSteps. Remaining steps = `mNumberOfTimeSteps - N`. Final t = `t_N + (mNumberOfTimeSteps - N) * mDt = mTstart + N*mDt + (mNumberOfTimeSteps - N)*mDt = mTstart + mNumberOfTimeSteps*mDt`. ✓
+
+So t is correct. The issue must be with the state of U and Um being wrong. Let me think about the Sarray structure - specifically what `c_ptr()` returns and whether m_npts is correct:
+I see that `m_npts` is available in Sarray. Now let me look at the `cycleSolutionArrays` function:
+I see! The `cycleSolutionArrays` uses `reference()` which just swaps the internal data pointer. After the cycle:
+- `U[g].c_ptr()` points to what was `Up[g].c_ptr()` 
+- `Um[g].c_ptr()` points to what was `U[g].c_ptr()`
+- `Up[g].c_ptr()` points to what was `Um[g].c_ptr()`
+
+The VELOC protection is registered with:
+```cpp
+VELOC_Mem_protect(1 + g,                  U[g].c_ptr(),  U[g].m_npts, sizeof(float_sw4));
+VELOC_Mem_protect(1 + mNumberOfGrids + g, Um[g].c_ptr(), Um[g].m_npts, sizeof(float_sw4));
+```
+
+This is done **before** the time loop. After `cycleSolutionArrays` runs, the **pointers inside `U[g]` and `Um[g]` have changed** due to the `reference()` swaps, but **VeloC was given the original pointer addresses** from before any cycles!
+
+So when VeloC checkpoints after cycle 1:
+- `U[g].c_ptr()` now points to the original `Up` buffer
+- But VeloC was registered with the original `U` buffer pointer
+- So VeloC will save the **wrong** data (the old Um, not the current U)
+
+This is the fundamental bug. The VELOC_Mem_protect was called once with initial addresses, but the cycle swaps the actual data pointers.
+
+The solution is: we need to re-register the memory protection before each checkpoint (or use a different approach).
+
+Let me look at what VeloC API is available:
+Now I understand the full picture. The VeloC API has:
+- `VELOC_Mem_protect(id, ptr, count, base_size)` - registers a memory region
+- `VELOC_Mem_unprotect(id)` - unregisters a memory region
+
+The fix is: before each checkpoint, **re-register** the VeloC memory regions with the current pointers (since `cycleSolutionArrays` swaps the internal data pointers via `reference()`).
+
+Let me also check the checkpoint uses `VELOC_Checkpoint` - the simplified convenience wrapper. We need to use the split begin/end form to re-register before saving.
+
+Looking at the code, the fundamental fix needed:
+
+1. Before calling `VELOC_Checkpoint`, unprotect and re-protect U and Um with their **current** `c_ptr()` values (since these change after each `cycleSolutionArrays` call).
+
+2. Similarly, before `VELOC_Restart`, make sure the protected pointers match the actual buffers.
+
+Let me now implement the fix:
+Now let me implement the fix. The key insight is:
+
+1. `cycleSolutionArrays` swaps the `c_ptr()` values inside U, Um, Up (by calling `reference()`)
+2. But VELOC was given the **original** pointer addresses at VELOC_Init time
+3. So VELOC is checkpointing/restoring the **wrong** memory
+
+The fix: before each `VELOC_Checkpoint`, unprotect all U/Um regions and re-protect with current `c_ptr()` values. Also, on restart, we need to make sure we restore to the correct buffers.
+
+Let me look at the checkpoint section more carefully and also look at what happens after restart with the solver arrays:
+Now I have a clear picture of the bug and the fix. The solution is to use `VELOC_Mem_unprotect` and `VELOC_Mem_protect` before each checkpoint to update the pointers. Here's the fix:
+
+The checkpoint section currently does:
+```cpp
+veloc_scalar[0] = (double)t;
+veloc_scalar[1] = (double)(currentTimeStep + 1);
+VELOC_Checkpoint("sw4ckpt", currentTimeStep);
+```
+
+After `cycleSolutionArrays`, `U[g].c_ptr()` and `Um[g].c_ptr()` point to different buffers than what was registered. We need to re-register before checkpointing.
+
+For the restart case, it's simpler: `VELOC_Restart` is called before the time loop, so U and Um still have their original pointers (no cycles have happened yet). The restart correctly loads data into those buffers. Then the loop starts and `cycleSolutionArrays` runs on cycle 1. But wait - the loaded state is already the state *after* cycle at checkpoint time: U = current, Um = previous. So the next step's predictor uses these correctly.
+
+The problem is **only in checkpointing**. Let me fix it:
+Now I also need to verify the restart path is correct. When restarting:
+1. `VELOC_Mem_protect` is called with the initial U/Um `c_ptr()` values (no cycles have happened)
+2. `VELOC_Restart` loads data into those buffers
+3. After loading, U has the post-cycle state (U = current at checkpoint time, Um = previous)
+4. The loop starts at `beginCycle = currentTimeStep + 1`
+
+Wait - but there's also an issue with what the checkpoint actually saved. At checkpoint time (step N):
+- Before my fix: VeloC saves the **original** U buffer (which is now the Um data after N cycles), not the current U data
+- After my fix: VeloC saves the actual current U/Um buffers
+
+So after my fix, the saved state will be correct. But does the restart path restore correctly?
+
+On restart:
+1. `VELOC_Mem_protect(1+g, U[g].c_ptr(), ...)` - registers U[g]'s current ptr (which is the original buffer)
+2. `VELOC_Restart` - loads the saved U data into U[g]'s registered buffer (original U buffer)
+3. After restart, U[g].c_ptr() points to the original U buffer, which now contains the correct saved state
+
+This is correct! The restart path is fine since no cycles have happened yet.
+
+Let me also verify the Makefile to ensure VeloC linking is correct:
+The Makefile is set up correctly. Now let me also verify my understanding of the veloc.cfg. The issue was `max_versions = 1` and `scratch_versions = 1` - this means VeloC itself will only keep 1 version of checkpoints. This is important.
+
+But wait, there's another critical issue I noticed: VeloC's own checkpoint pruning with `max_versions=1`. If we checkpoint at steps 25%, 50%, 75%, 100%, VeloC itself may only keep the latest one (version control by VeloC). When the kill happens at 57% and we restart, VeloC needs to find a checkpoint. With `max_versions=1`, it keeps only the latest - which should be sufficient.
+
+Let me also look at the `VELOC_Checkpoint_begin/end` split form and the `VELOC_Checkpoint` convenience wrapper to understand the timing better. The code uses `VELOC_Checkpoint("sw4ckpt", currentTimeStep)` as a version number.
+
+Now, let me also think about another potential issue: after restart, the code re-registers U and Um with the initial buffer pointers. Then VeloC restores the data into those initial buffers. Then the loop starts and the `cycleSolutionArrays` changes the internal pointers. So after each cycle call, U and Um point to different physical buffers. This is fine because:
+1. On the first checkpoint after restart, we re-register with the current (swapped) pointers ✓
+
+Let me verify the fix looks correct by reading the edited section:
+Good. The fix is in place. Now let me also think about the restart path more carefully.
+
+The issue: after restart, the code registers U[g] with the initial pointers (before any cycles), then calls `VELOC_Restart` which restores data into those buffers. Then the loop starts at `beginCycle`.
+
+Wait - I need to check if there's an issue with the initial TimeSeries recording that happens before the loop. Let me look at that more carefully:
+The TimeSeries doesn't affect the validation output (which is based on normOfDifference). So the key issue was only the checkpoint data mismatch.
+
+Let me also check what `veloc.cfg` has `max_versions = 1` - this means VeloC itself keeps only 1 version on persistent storage. But our code checkpoints at ~25%, 50%, 75%, 100% of the run. If the kill happens at 57%, the last checkpoint was at 50%. VeloC with `max_versions=1` would keep only the **latest** checkpoint (50%), so that should be fine for restart.
+
+But wait - looking at the validate output again:
+```
+[runner] checkpoint-observed: detected 8 checkpoint file(s) in scratch/persistent dirs.
+```
+
+8 checkpoint files for 4 MPI ranks. That means 2 checkpoint files per rank, which means 2 checkpoints were written. With `mNumberOfTimeSteps/4` intervals, checkpointing happened at ~25% and ~50% of the run before kill. Good.
+
+Now let me also double-check: the issue from the test log says `max_abs_diff=1.161e-05`. This is a floating-point difference, not zero. If the checkpoint was saving the **wrong** data (e.g., Um data as U), then after restart we'd get wrong results - which is exactly what we see.
+
+Let me verify the fix makes sense by tracing through:
+
+**Before fix:**
+- `VELOC_Mem_protect(1+g, U[g].c_ptr_original, ...)` registered at init
+- At checkpoint time N, after cycleSolutionArrays has run N times, `U[g].c_ptr()` ≠ `c_ptr_original`
+- `VELOC_Checkpoint` saves data at `c_ptr_original` (which is actually `Um` or `Up` data)
+- On restart, `VELOC_Restart` loads wrong data into `c_ptr_original` (U's buffer)
+- Wrong state → wrong numerical output
+
+**After fix:**
+- Before each `VELOC_Checkpoint`, unprotect and re-protect with current `c_ptr()` values
+- `VELOC_Checkpoint` now saves the correct current U and Um data
+- On restart, data is restored correctly
+
+This fix is correct. Let me also check if there are any issues with the `veloc.cfg` that could prevent checkpoints from being found correctly on restart:
+
+The veloc.cfg has `max_versions = 1` and `scratch_versions = 1`. When VeloC saves version N at ~50% (let's say step 25 out of 100), and then tries to save version N at step 50, it would delete step 25 and keep step 50 (max_versions=1). After kill at 57%, on restart, `VELOC_Restart_test("sw4ckpt", 0)` should find version at step 50. Good.
+
+Let me also check if there's any issue with the `VELOC_Restart_test` call with version=0:
+
+From the VeloC header:
+```
+// determine whether application can restart from a previous checkpoint
+//   IN name - label of the checkpoint
+//   IN needed_version - maximum version to look for
+//   returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise
+int VELOC_Restart_test(const char *name, int version);
+```
+
+Wait - it says "returns latest version < needed_version". With `needed_version=0`, that would mean it returns the latest version that is **less than 0**, which is no version. But the code expects this to succeed on restart!
+
+Let me look at the previous iter logs to see if restart was actually working:
+
+From the validate output:
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=55.54s, exit=0, timed_out=False).
+```
+
+Exit code 0 means it completed successfully. The issue was the numerical output was wrong (1.16e-05 diff), not that restart failed. So VeloC did find and restore a checkpoint. This means `VELOC_Restart_test("sw4ckpt", 0)` with version=0 does work as "find any version" or the behavior is different from the documentation.
+
+Actually, looking at VeloC documentation more carefully, version=0 is likely treated as "find any/latest version". The restart was working, just the data saved/restored was wrong due to the pointer aliasing issue.
+
+The fix I've made should be sufficient. Let me also look at the previous iteration logs to confirm exactly what error we're fixing:
+The failure-free test passes (max_abs_diff=0.000), but the failure-prone (with restart) fails. This confirms the issue is in the restart path - the saved checkpoint data was wrong (due to pointer swapping), causing the restored simulation to diverge.
+
+My fix - re-registering U and Um with their current pointers before each checkpoint - should resolve this issue.
+
+Let me also look at the earlier iteration logs to see if there are any additional issues I might have missed:
+I can see the progression across iterations:
+- **iter_1**: Too much disk usage (19GB checkpoints) - solved in iter_2/3 by limiting checkpoint frequency
+- **iter_3**: Checkpoint works (8 files, fast recovery) but numerical mismatch after restart
+
+The iter_3 fix (my current fix) specifically addresses the pointer aliasing bug.
+
+Now let me verify the current state of the code is good by reviewing the complete checkpoint section once more:
+The code looks correct. Now let me verify by also examining what `Sarray::m_npts` is - I want to make sure it doesn't include the offset (m_base) incorrectly:
+
+Looking at Sarray.h again: `size_t m_npts` is a member variable. Let me check how it's defined:
+`m_npts = m_ni * m_nj * m_nk * m_nc`. And `c_ptr()` returns `m_data`. The actual data array is `m_data[0..m_npts-1]` but with indexing that uses `m_base` which can be negative. So the data is stored from `m_data[0]` to `m_data[m_npts-1]`... wait, let me check the constructor:
+The data is allocated as `new float_sw4[m_nc*m_ni*m_nj*m_nk]` which is exactly `m_npts` elements. The `m_base` offset is used for **indexing** (to handle 1-based indices), but the actual storage starts at `m_data[0]`. So registering `(ptr=c_ptr(), count=m_npts, base_size=sizeof(float_sw4))` correctly captures the entire array. ✓
+
+My fix is correct. The key insight is:
+1. `m_data` (accessed via `c_ptr()`) points to the allocated buffer, which is `m_npts` floats
+2. After `cycleSolutionArrays`, `c_ptr()` returns a different pointer (pointing to what was previously `Up`'s buffer)
+3. We need to re-register before each checkpoint
+
+Let me do a final review of the edited EW.C to confirm everything looks right:
+The fix is in place. Let me summarize what was done:
+
+**Root cause**: The `cycleSolutionArrays()` function uses `Sarray::reference()` to swap internal data pointers between U, Um, and Up arrays. After N time steps, `U[g].c_ptr()` points to a different physical buffer than the one registered with VeloC at initialization. So VeloC was checkpointing the wrong data (reading from the original U buffer which had been reassigned to Um or Up).
+
+**Fix**: Before each `VELOC_Checkpoint` call, unprotect and re-protect each U[g] and Um[g] memory region with the current `c_ptr()` values. This ensures VeloC saves the actual current solution state, not stale buffer contents.
+
+**Why the restart path was OK**: `VELOC_Restart` is called before the time loop starts, so no `cycleSolutionArrays` calls have occurred yet — the registered pointers match the actual buffers at that point. The restored data is loaded correctly into the original buffers, and then the loop continues from the restored state.
+The fix is complete. Here's a summary:
+
+**Problem**: In `EW.C`, the `cycleSolutionArrays()` function swaps internal data pointers between U, Um, and Up arrays via `Sarray::reference()`. VeloC's memory protections were registered once at initialization with the original buffer addresses. After each time step cycle, `U[g].c_ptr()` and `Um[g].c_ptr()` pointed to different physical buffers than what VeloC had registered — so checkpoints saved wrong (stale) data.
+
+**Fix** (line ~2856-2862 in `src/EW.C`): Before each `VELOC_Checkpoint` call, the code now calls `VELOC_Mem_unprotect` + `VELOC_Mem_protect` for every U[g] and Um[g] using their **current** `c_ptr()` values. This ensures VeloC saves the actual post-cycle solution state.
+
+The restart path was already correct since `VELOC_Restart` is called before the time loop (no cycles have occurred yet, so pointers still match the initially-registered buffers).
