@@ -190,12 +190,7 @@ PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
 OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
 OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
 jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
-  # Build the per-app scoped rule once: deny shared/other-app paths, allow
-  # this current-app own workspace + own iter_logs.  Applied to every
-  # read-shaped tool so glob/grep/list/codesearch/lsp cannot bypass read deny.
-  ($ws) as $ws_path |
-  ($logs) as $logs_path |
-  {
+  .permission.read = {
     "/home/ndhai/.local/share/opencode/**": "deny",
     "/home/ndhai/.opencode/**":             "deny",
     "**/build/_cell_isolation/**":          "deny",
@@ -206,17 +201,10 @@ jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
     "**/build/iterative_logs/**":           "deny",
     "**/build/tests_baseline/**":           "deny",
     "**/build/tests_baseline_*/**":         "deny",
-    ($ws_path):   "allow",
-    ($logs_path): "allow"
-  } as $per_app_rule |
-  .permission.read       = $per_app_rule |
-  .permission.glob       = $per_app_rule |
-  .permission.grep       = $per_app_rule |
-  .permission.list       = $per_app_rule |
-  .permission.codesearch = $per_app_rule |
-  .permission.lsp        = $per_app_rule
-' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
-echo "[gen $APP_NAME iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (read/glob/grep/list/codesearch/lsp scoped to: $OWN_WORKSPACE + $OWN_ITER_LOGS)"
+    ($ws):   "allow",
+    ($logs): "allow"
+  }' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
+echo "[gen $APP_NAME iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (allow read: $OWN_WORKSPACE + $OWN_ITER_LOGS)"
 
 # Hard-timeout-wrapped opencode in the background.
 OPENCODE_CONFIG="$PER_LAUNCH_CFG" \
