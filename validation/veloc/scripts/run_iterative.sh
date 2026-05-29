@@ -552,7 +552,39 @@ build_output.txt, opencode_stdout.txt, and metrics.json."
   }
   trap _restore_ref_dir EXIT INT TERM
 
+  # Per-launch opencode config: scope the read-deny to OTHER apps only,
+  # so this app's LLM can read its own workspace + its own past iter logs.
+  # Without this, the global read-deny on tests_baseline_*/** also blocks
+  # the LLM from reading its OWN source files — forcing rewrite-from-scratch
+  # every iter (the HyPar !-prefix workspace pollution at iter 14 of the
+  # 2026-05-28 sonnet46 sweep was the canonical symptom).
+  #
+  # Per-launch (not global) because the parallel orchestrator may have up
+  # to --max-gen-workers opencode invocations in flight at once, each
+  # needing a DIFFERENT app's workspace allow-listed.  OPENCODE_CONFIG
+  # env var points opencode at a per-iter config file with no race.
+  PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
+  OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
+  OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
+  jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
+    .permission.read = {
+      "/home/ndhai/.local/share/opencode/**": "deny",
+      "/home/ndhai/.opencode/**":             "deny",
+      "**/build/_cell_isolation/**":          "deny",
+      "**/build/validation_output/**":        "deny",
+      "**/build/baseline_cache/**":           "deny",
+      "**/build/_archives/**":                "deny",
+      "**/tests/apps/**":                     "deny",
+      "**/build/iterative_logs/**":           "deny",
+      "**/build/tests_baseline/**":           "deny",
+      "**/build/tests_baseline_*/**":         "deny",
+      ($ws):   "allow",
+      ($logs): "allow"
+    }' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
+  echo "[iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (allow read: $OWN_WORKSPACE + own iter_logs)"
+
   # Launch opencode in the background under the hard wallclock cap.
+  OPENCODE_CONFIG="$PER_LAUNCH_CFG" \
   timeout --kill-after=10 "$OPENCODE_TIMEOUT" \
     opencode run --dangerously-skip-permissions --model "$OPENCODE_MODEL" "$PROMPT" \
     > "$ITER_LOG/opencode_stdout.txt" 2> "$ITER_LOG/opencode_stderr.txt" &
