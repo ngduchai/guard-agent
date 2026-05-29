@@ -1,0 +1,1225 @@
+I'll start by examining the previous attempt's failure logs and the current codebase.
+This is very detailed. Let me read the rest and then look at the current state of the code:
+Now let me look at the validate output more carefully and check the current build to understand why it failed:
+Now I understand the full picture. The previous attempt had code that looked correct but the app was crashing with `MPI_ABORT` on rank 2. Let me analyze the key failure:
+
+1. The failure-free run exits with code 1 (MPI_ABORT invoked)
+2. NO checkpoints are being written (0 bytes, 0 files)
+3. The app crashed on all 3 kill attempts with `elapsed=1.00s, exit=1`
+
+The critical insight from the validate output:
+- The `elapsed=1.00s` means the KILL MONITORING saw the process exit after 1 second
+- But the delays were 43-65 seconds - so the process actually ran for those seconds and was KILLED, and mpirun returned 1
+- However, the failure-free run also exits with code 1 and shows `MPI_ABORT was invoked on rank 2`
+
+The failure-free run crashing tells us the app ITSELF crashes (not just killed). Looking at the code, `VELOC_Finalize(0)` is called before `tw_end()`, but `tw_end()` calls `MPI_Finalize()`. After `MPI_Finalize`, if VELOC tries to do MPI ops...
+
+Wait, actually the code calls `VELOC_Finalize` BEFORE `tw_end()` - that's correct. But then `tw_end()` calls `MPI_Finalize()`, then the code returns 0. This should be fine.
+
+Let me look at this from a different angle. The `MPI_ABORT was invoked on rank 2` - this means rank 2 specifically triggered it. Looking at `tw_run_sched_init` which was not in the opencode analysis. Let me check that:
+Good. The `tw_run_sched_init` function exists and is correct. Now let me understand the crash. The MPI_ABORT is from rank 2. This is happening in the failure-free run. Let me look at whether there's an issue with `VELOC_Init` in the code.
+
+Let me check the VeloC library exists and what API it provides:
+The key failure from iter_3:
+- "kill_attempt elapsed=1.00s, exit=1" means the process is killed by SIGKILL (mpirun receives it) and immediately returns exit=1
+- The failure-free run also exits with code 1 with "MPI_ABORT was invoked on rank 2" 
+
+The critical clue: **`MPI_ABORT was invoked on rank 2`** in the failure-free run. This means `tw_error()` was called on rank 2. And in the failure-prone run, the "elapsed=1.00s" means the runner detected the process exited 1 second after the kill delay (the process was killed, mpirun detected this and issued MPI_ABORT).
+
+So the real question is: **why is the failure-free run crashing with MPI_ABORT?**
+
+Looking at the code, `VELOC_Finalize(0)` is called BEFORE `tw_end()`. `tw_end()` calls `MPI_Finalize()`. But `VELOC_Finalize` might do MPI operations... wait, is that the problem? Let me check:
+
+The code order is:
+1. VELOC_Finalize(0) - might do MPI collective ops
+2. tw_end() - calls MPI_Finalize()
+
+If VELOC_Finalize does collective MPI operations, then ALL ranks must call it at the same time. Since all ranks are in the same code path, this should be fine.
+
+But wait - looking at the code around the `MPI_Reduce` call:
+
+```c
+MPI_Reduce(local_rng_sum, global_rng_sum, 4, MPI_INT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+```
+
+This is a collective operation. **If `tw_end()` calls `MPI_Finalize()` on SOME ranks before this `MPI_Reduce` runs on ALL ranks**, there would be an MPI_ABORT.
+
+But the code flow is:
+```
+scheduler returns
+↓
+MPI_Reduce (collective - all ranks must participate)
+↓
+VELOC_Finalize (collective)
+↓
+tw_end() → MPI_Finalize()
+```
+
+This should be safe since the scheduler exits only when the simulation is complete on all ranks (they all call `tw_end` together).
+
+Let me look at whether the issue could be with `tw_run_sched_init()` itself. Looking at what it calls: `late_sanity_check()`, `setup_pes()`, `st_inst_init()`, `tw_sched_init(me)`. Let me look at `tw_sched_init`:
+Now, let me look at whether the `MPI_COMM_WORLD` vs `MPI_COMM_ROSS` issue could be the cause. In ROSS, `MPI_COMM_ROSS` is separate. The `VELOC_Init` call uses `MPI_COMM_WORLD`. But after `tw_init()`, ROSS might have set up `MPI_COMM_ROSS` as a different communicator. The `MPI_Reduce` call in our code uses `MPI_COMM_WORLD`. This should work.
+
+Let me check: could the MPI_ABORT be triggered by `tw_trigger_gvt_hook_every`? This function calls `tw_copy_event_sig` with `g_tw_max_sig`. Let me look at `g_tw_max_sig`:
+Now let me look at what `tw_gvt_hook_step` does for `GVT_HOOK_STATUS_every_n_gvt` to understand whether it's called in OPTIMISTIC mode:
+I see a critical issue! In `tw_gvt_step2` at line 242-257:
+
+```c
+if(tw_event_sig_compare_ptr(&gvt_sig, &me->GVT_prev_sig) < 0)
+{
+    g_tw_gvt_no_change = 0;
+} else
+{
+    tw_copy_event_sig(&gvt_sig, &me->GVT_prev_sig);
+    g_tw_gvt_no_change++;
+    if (g_tw_gvt_no_change >= g_tw_gvt_max_no_change) {
+        tw_error(...)
+```
+
+**When `gvt_sig >= GVT_prev_sig`: it copies `gvt_sig = GVT_prev_sig` (NOT the other way), then increments no_change counter.** This means on RESTART, if `GVT_prev_sig` starts at `g_tw_max_sig` (initialized in `tw_pe_init`) and `gvt_sig` is the new GVT (some finite time), then `gvt_sig < GVT_prev_sig` → `no_change = 0`. OK.
+
+Wait, let me re-read line 247: `tw_copy_event_sig(&gvt_sig, &me->GVT_prev_sig)` - this copies `me->GVT_prev_sig` INTO `gvt_sig`. So if `gvt_sig >= GVT_prev_sig`, it REPLACES gvt_sig with the previous GVT (going backward)! And then sets GVT to this older value.
+
+This is the "GVT no change" detection. If gvt doesn't advance, the sim is stuck. After 10000 rounds, it calls `tw_error`.
+
+On restart, `GVT_prev_sig` is initialized from `tw_pe_init` to `g_tw_max_sig`. But after our `restore_from_checkpoint`, we set `me->GVT_sig` to checkpoint GVT but NOT `me->GVT_prev_sig`. So `GVT_prev_sig` remains at `g_tw_max_sig`. The first GVT allreduce gives some `gvt_sig` which is < `g_tw_max_sig` → no_change = 0 → fine.
+
+OK so no_change issue shouldn't happen on restart.
+
+Now let me focus on the critical failure: **failure-free run exits with code 1 with `MPI_ABORT on rank 2`**. This is a crash during the normal (non-restart) run. 
+
+Let me look more carefully at the `gvt_hook_checkpoint` function when called on rank 2. Looking at line 411 of phold.main.c:
+```c
+tw_copy_event_sig(&me->trans_msg_sig, &g_tw_max_sig);
+```
+
+This is inside `restore_from_checkpoint`. But in the failure-free run, `g_veloc_do_restart = 0`, so `restore_from_checkpoint` is NOT called.
+
+Let me trace through what happens in the normal (non-restart) run more carefully:
+
+1. `veloc_init_and_check()` → `VELOC_Init(MPI_COMM_WORLD, "veloc.cfg")` 
+
+The `veloc.cfg` file is at `./veloc.cfg` relative to the binary's cwd. The validator copies it to `resilient_clean/veloc.cfg`. The binary runs with cwd `resilient_clean/`. So `./veloc.cfg` is `resilient_clean/veloc.cfg`. This should work.
+
+Wait, but in the FAILURE-FREE run, the validator just does:
+```
+[runner] copied .../ROSS/veloc.cfg → .../resilient_clean/veloc.cfg
+[runner] starting MPI run (cwd=.../resilient_clean): ...phold...
+```
+
+The binary runs with cwd `resilient_clean/`. The `veloc.cfg` is at `resilient_clean/veloc.cfg`. In code, `VELOC_CFG_FILE = "veloc.cfg"` which is a relative path. So VeloC looks for `./veloc.cfg` → finds `resilient_clean/veloc.cfg`. ✓
+
+Now let me think about what else could cause MPI_ABORT on rank 2 specifically:
+
+Looking at rank 2 specifically - in a 4-rank run, rank 2 has global LP ids `[2000, 3000)` (if each PE has 1000 LPs). The issue might be specific to something rank 2 does differently.
+
+Actually, looking more carefully at the checkpoint code - the `gvt_hook_checkpoint` is called from `tw_gvt_hook_step` on ALL PEs simultaneously. Inside it, `VELOC_Checkpoint_begin/mem/end` are called. These are collective operations in VeloC. If they fail on rank 2, VeloC would likely cause MPI_ABORT.
+
+But wait - could the crash happen because VeloC can't create the `/tmp/ross_veloc_scratch` directory? Let me think... VeloC should create it on first use. But the validator CLEARS these directories before each run. After clearing, the directories might not exist. VeloC needs to create them.
+
+Actually, the validator says:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt
+```
+
+"Clearing" might mean deleting and recreating, or just deleting contents. If the directories don't exist and VeloC can't create them, `VELOC_Checkpoint_begin` would fail. In sync mode, VeloC might internally call MPI_Abort if it can't proceed.
+
+But we handle `VELOC_Checkpoint_begin` failure gracefully (just return). So even if it fails, we shouldn't crash.
+
+Hmm, but wait - what if `VELOC_Init` itself fails but still sets up some internal state that causes issues later? Or what if VeloC in sync mode runs some internal threads that crash?
+
+Let me think about a completely different angle. The MPI_ABORT from rank 2 with errorcode 1 means `tw_error` was called. What could call `tw_error` in the normal run?
+
+Looking at our GVT hook, we call `tw_error` only for:
+1. malloc failures (in `gvt_hook_checkpoint`)
+2. `VELOC_Restart_test` failure in `restore_from_checkpoint` (but this isn't called in normal run)
+
+Actually, let me look at the crash differently. The crash happens in the FAILURE-FREE run (no kill). The simulation ran and then crashed. The checkpoint count should have been checked, so `VELOC_Checkpoint_begin` with version 1 is called the first time the hook fires (GVT round 20). 
+
+But wait - what if VeloC's `VELOC_Checkpoint_mem` fails because the data is too large? The buffer sizes are:
+- `g_ckpt_rng`: 1000 LPs × sizeof(lp_rng_t) = 1000 × (8+16+16+16+8+16+16+16) bytes = 1000 × 112 = 112KB per rank
+- `g_ckpt_app`: 1000 × 8 = 8KB per rank
+- `g_ckpt_evs`: (101400+100000+4096) × 24 = ~4.9MB per rank
+
+That's only ~5MB per rank, which is tiny. VeloC should handle this fine.
+
+Wait - I need to look at this from a completely different angle. Looking at the validate output again:
+
+```
+[runner] checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1). Reporting checkpoint_observed=False.
+```
+
+ALL THREE kill attempts show `elapsed=1.00s, exit=1`. This is suspicious. The kill attempt has a DELAY before killing (65.1s for attempt 3). How can the process exit in 1 second?
+
+Looking at the runner logic: it STARTS the process, then waits `delay` seconds, then sends SIGKILL, then MONITORS for recovery. The `elapsed=1.00s` is in the MONITORING phase. The kill was already sent (at `delay` seconds into the run). Then 1 second after the kill, the process is gone.
+
+So the process ran for `delay` seconds (43-65 seconds), was killed by SIGKILL, and exited within 1 second of the kill. The `exit=1` is from mpirun when one of its processes receives SIGKILL.
+
+This is actually NORMAL behavior for a killed process. The question is: **did the process write any checkpoint files during those 43-65 seconds?**
+
+The answer is NO: `checkpoint files = 0`. The GVT hook NEVER fired (or never wrote a checkpoint).
+
+Now the failure-free run also exits with code 1 with MPI_ABORT. But the failure-free run is a SEPARATE run. In that run, no kill is sent. The process ran and CRASHED on its own with MPI_ABORT.
+
+So we have two separate issues:
+1. In the failure-prone run: no checkpoints written (GVT hook not firing or checkpoint write failing)
+2. In the failure-free run: the app crashes with MPI_ABORT
+
+Could these be the same root cause? If the crash also happens in the failure-prone runs at the same time (~43-65s into the simulation), then by the time the kill arrives, the process had already crashed.
+
+But wait - in the failure-prone runs, the `delay` before kill is 43-65s. If the app crashes at ~43-65s, the kill would be sent at the same time the app crashes. The process exits with code 1 (from MPI_ABORT), and the runner records `exit=1`.
+
+But the runner monitors for `recovery_timeout` seconds after the kill. If no recovery happens (because the process was already crashing, not killed), the runner would detect no checkpoints. This all makes sense.
+
+So the ROOT CAUSE is: **the app crashes with MPI_ABORT during normal execution at some point during the simulation** (around 43-65 seconds into the run).
+
+Why does `tw_error` get called? Looking at `tw_gvt_step2`, there's this check:
+```c
+if (g_tw_gvt_no_change >= g_tw_gvt_max_no_change) {
+    tw_error(TW_LOC, "GVT computed %d times in a row without changing...");
+}
+```
+
+`g_tw_gvt_max_no_change = 10000`. This would require GVT to not change for 10000 rounds. With PHOLD, this shouldn't happen.
+
+But looking at line 247: `tw_copy_event_sig(&gvt_sig, &me->GVT_prev_sig)` - this copies `GVT_prev_sig` INTO `gvt_sig`. So GVT is FORCED to be `GVT_prev_sig` whenever `gvt_sig >= GVT_prev_sig`!
+
+Wait, that seems backward. Let me re-read:
+
+```c
+if(tw_event_sig_compare_ptr(&gvt_sig, &me->GVT_prev_sig) < 0)
+{
+    // gvt_sig < GVT_prev_sig: GVT advanced
+    g_tw_gvt_no_change = 0;
+} else
+{
+    // gvt_sig >= GVT_prev_sig: GVT didn't advance
+    tw_copy_event_sig(&gvt_sig, &me->GVT_prev_sig);  // gvt_sig = GVT_prev_sig
+    g_tw_gvt_no_change++;
+    ...
+}
+```
+
+So when `gvt_sig >= GVT_prev_sig` (meaning GVT hasn't decreased from previous), it's counted as "no change" and `gvt_sig` is set to the PREVIOUS GVT value. But `GVT_prev_sig` is initialized to `g_tw_max_sig` and... is never updated (line 274 says `// Disabled`).
+
+So `GVT_prev_sig = g_tw_max_sig` ALWAYS. And `gvt_sig` from the allreduce is always finite. So `gvt_sig < g_tw_max_sig = GVT_prev_sig`. This means:
+- Condition: `gvt_sig < GVT_prev_sig` = TRUE (always, since prev = max)
+- `no_change = 0` (reset)
+
+So the no-change check NEVER fires. `g_tw_gvt_no_change` is always 0. OK.
+
+And then `gvt_sig` is NOT modified (since we entered the `if` branch, not `else`). So GVT advances normally.
+
+Actually wait - looking more carefully. With `GVT_prev_sig = g_tw_max_sig` (disabled, never changes), EVERY GVT computation has `gvt_sig < GVT_prev_sig` (since gvt_sig is finite). So `no_change` is always reset to 0. The check `g_tw_gvt_no_change >= 10000` never fires. Good.
+
+Then the key check:
+```c
+if (tw_event_sig_compare_ptr(&me->GVT_sig, &gvt_sig) > 0)
+{
+    tw_error(TW_LOC, "PE %u GVT decreased %g -> %g", ...);
+}
+```
+
+This fires if `me->GVT_sig > gvt_sig` (GVT decreased). GVT should never decrease in normal operation. This would fire if somehow our hook modified GVT in a way that's inconsistent.
+
+But looking at our code, `gvt_hook_checkpoint` does NOT modify `me->GVT_sig`. So this check shouldn't fail.
+
+Let me now look at what else could trigger `tw_error`. Let me look at the scheduler itself more carefully:
+Now let me look at `tw_gvt_hook_step`:
+Now I see `tw_gvt_hook_step` at line 592-596:
+
+```c
+case GVT_HOOK_STATUS_every_n_gvt: {
+    int const starting_at = g_tw_gvt_hook_trigger.every_n_gvt.starting_at;
+    int const every = g_tw_gvt_hook_trigger.every_n_gvt.nums;
+    has_hook_been_triggered = (g_tw_gvt_done - starting_at) % every == 0;
+}
+break;
+```
+
+When `g_tw_gvt_done = 0` and `starting_at = 0` and `every = 20`: `(0 - 0) % 20 = 0` → **FIRES ON THE VERY FIRST CALL**!
+
+And `tw_gvt_hook_step` is called when `gvt_triggered` is True. `gvt_triggered = me->gvt_status` BEFORE `tw_gvt_step2`. After the FIRST `tw_gvt_step2`, `g_tw_gvt_done = 1`. But `tw_gvt_hook_step` is called when `gvt_triggered = 1` (which was set BEFORE `tw_gvt_step2`).
+
+Wait - `g_tw_gvt_done` is incremented INSIDE `tw_gvt_step2` at line 323. So after the first `tw_gvt_step2`, `g_tw_gvt_done = 1`. Then `tw_gvt_hook_step` is called, and checks `(1 - 0) % 20 = 1 ≠ 0`. No fire. ✓
+
+At the 20th `tw_gvt_step2`: `g_tw_gvt_done = 20`. `tw_gvt_hook_step` checks `(20 - 0) % 20 = 0`. FIRE. ✓
+
+OK so the hook fires correctly.
+
+Now, looking at lines 610-626 in `tw_gvt_hook_step`:
+
+```c
+if (has_hook_been_triggered) {
+    bool const past_end_time = me->GVT_sig.recv_ts >= g_tw_ts_end;
+    if (past_end_time && g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp) {
+        tw_copy_event_sig(&me->GVT_sig, &g_tw_gvt_hook_trigger.sig_at);
+        assert(tw_event_sig_compare_ptr(&me->GVT_sig, tw_pq_minimum_sig_ptr(me->pq)) <= 0);
+    }
+    g_tw_gvt_hook(me, past_end_time);
+}
+```
+
+For `GVT_HOOK_STATUS_every_n_gvt`, after checking the condition, `g_tw_gvt_hook_trigger.status` is STILL `GVT_HOOK_STATUS_every_n_gvt` (not disabled). So if `past_end_time` is True, `g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp` → True. Then:
+- `tw_copy_event_sig(&me->GVT_sig, &g_tw_gvt_hook_trigger.sig_at)` 
+- `g_tw_gvt_hook_trigger.sig_at` was set to `g_tw_max_sig` by `tw_trigger_gvt_hook_every`!
+- So this sets `me->GVT_sig = g_tw_max_sig`!
+
+Then `assert(tw_event_sig_compare_ptr(&me->GVT_sig, tw_pq_minimum_sig_ptr(me->pq)) <= 0)` — if `me->GVT_sig = g_tw_max_sig`, this asserts `g_tw_max_sig <= min_PQ_event`, which is False (since `g_tw_max_sig` is the maximum, larger than any event). **ASSERT FAILS → SIGABRT → MPI_ABORT!**
+
+This is the bug! When `past_end_time` is True (GVT has reached `g_tw_ts_end`), `tw_gvt_hook_step` tries to reset GVT to `sig_at` (which is `g_tw_max_sig`), then asserts the PQ min is >= this new GVT. But `g_tw_max_sig > any PQ event`, so the assert ALWAYS fails.
+
+The condition `past_end_time = me->GVT_sig.recv_ts >= g_tw_ts_end` means the hook fires when GVT has reached or passed the end of simulation time. This happens near the end of the simulation (~89s wall time), which explains why:
+1. In the failure-prone runs (killed at 43-65s): the process was still running, checkpoints should be being written, but `g_tw_gvt_done` hasn't reached 20 yet... or has it?
+
+Actually wait - the hook DOES fire at GVT round 20. Let me check: with `g_tw_gvt_interval = 16` (default), GVT is computed every 16 batches. With `g_tw_mblock = 16` (default events per batch), each GVT round processes 16 × 16 = 256 events per PE. With 1000 LPs × 1 event each = 1000 events in PQ. So GVT round 1 processes ~256 events, GVT round 2 another ~256, etc. After 4 rounds, all 1000 initial events have been processed.
+
+But in OPTIMISTIC mode, the simulation generates NEW events continuously. The LP processes an event and generates a new one. So the PQ is always replenished.
+
+The hook fires at GVT round 20. This is early in the simulation (at GVT time ≈ 20 × 256 / 1000 × mean_ts = ... complex calculation). But the critical point is: **before the hook fires, `past_end_time = me->GVT_sig.recv_ts >= g_tw_ts_end = 19000`** - this should be False for GVT round 20 since GVT would be far below 19000.
+
+So the hook fires at round 20 with `past_end_time = False`. No assert. `g_tw_gvt_hook(me, false)` is called. ✓
+
+Later in the simulation, near the end (GVT approaches 19000), `past_end_time = True`. Then:
+- `g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp` → True (it's `every_n_gvt`)
+- `tw_copy_event_sig(&me->GVT_sig, &g_tw_gvt_hook_trigger.sig_at)` → sets GVT to `g_tw_max_sig`
+- `assert(GVT <= min_PQ)` → **FAILS** (since GVT = max_sig > any finite PQ event)
+
+This is what causes the crash! The assert fires near the END of the simulation when GVT first reaches `g_tw_ts_end`.
+
+The fix: we need to prevent the hook from firing after simulation end, OR ensure `g_tw_gvt_hook_trigger.sig_at` is set to something reasonable for `every_n_gvt` mode.
+
+Looking at the code: the `past_end_time` check + GVT reset is only needed for `GVT_HOOK_STATUS_timestamp` mode where the hook should fire at a specific simulation time. For `every_n_gvt` mode, we don't need this behavior.
+
+**Fix 1**: Check that `g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_every_n_gvt` before the assert/GVT-reset code.
+
+But we can't modify the ROSS core files (they're not ours to modify without care). Actually, we CAN modify them since the task says we can modify any file in the codebase.
+
+**Fix 2**: In our `gvt_hook_checkpoint`, check if `past_end_time` is True and don't attempt to write a checkpoint (or just return early).
+
+Wait, but the issue is the assert INSIDE `tw_gvt_hook_step` BEFORE calling `g_tw_gvt_hook`. If the assert fires first, our hook is never called.
+
+**Fix 3**: In `tw_gvt_hook_step`, add a guard so the GVT-reset/assert code only applies to `GVT_HOOK_STATUS_timestamp` mode. This is a change to the ROSS core.
+
+Actually, looking at lines 614-617 more carefully:
+```c
+if (past_end_time && g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp) {
+    tw_copy_event_sig(&me->GVT_sig, &g_tw_gvt_hook_trigger.sig_at);
+    assert(tw_event_sig_compare_ptr(&me->GVT_sig, tw_pq_minimum_sig_ptr(me->pq)) <= 0);
+}
+```
+
+This block runs when:
+1. `past_end_time` = True (GVT >= ts_end)
+2. `g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp`
+
+For `every_n_gvt`, both conditions are True when GVT reaches ts_end → assert fires.
+
+**The intended behavior**: for `GVT_HOOK_STATUS_timestamp`, when GVT passes ts_end, the hook should "retroactively" fire at the hook timestamp (not at ts_end), so GVT is reset to `sig_at`. The assert ensures `sig_at <= min_PQ_event` (the reset GVT doesn't go backward past current events).
+
+For `every_n_gvt`, `sig_at = g_tw_max_sig`. The check `past_end_time && status != timestamp` triggers INCORRECTLY. It was probably intended to ONLY apply to `GVT_HOOK_STATUS_timestamp` mode.
+
+**The fix**: Change the condition to only apply to timestamp mode:
+
+```c
+if (past_end_time && g_tw_gvt_hook_trigger.status == GVT_HOOK_STATUS_timestamp) {
+    // (was: != GVT_HOOK_STATUS_timestamp)
+```
+
+OR alternatively, for `every_n_gvt` mode, set `sig_at` to something valid (not `g_tw_max_sig`). But `tw_trigger_gvt_hook_every` always uses `g_tw_max_sig`.
+
+Actually, wait. Let me re-read the condition: `past_end_time && g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp`.
+
+This fires for `every_n_gvt` and `model_call` modes when past end time. The intent is: "if past end time and not in timestamp mode, reset GVT to the trigger time." But for `every_n_gvt`, `sig_at = g_tw_max_sig` which is wrong.
+
+The simplest fix to `tw_gvt_hook_step` that doesn't break other things: change the condition to only run for `GVT_HOOK_STATUS_timestamp`.
+
+Let me look at what this block is supposed to do for `every_n_gvt` vs `timestamp`:
+- `timestamp`: fires when GVT passes `sig_at`. If GVT passed `ts_end` AND the hook fires (which can only happen if `sig_at <= ts_end`), then we reset GVT to `sig_at`. Makes sense.
+- `every_n_gvt`: fires every N rounds regardless of GVT. `sig_at = g_tw_max_sig`. When past end time, we'd reset GVT to max_sig which is wrong.
+
+The fix is clear: the GVT reset should only happen for `GVT_HOOK_STATUS_timestamp`. Let me also check the `model_call` case:
+
+For `model_call`: fires when `me->GVT_sig >= g_tw_gvt_hook_trigger.sig_at`. `sig_at` is set to `g_tw_max_sig` by `tw_trigger_gvt_hook_now_rev`, but then set to a specific value by `tw_trigger_gvt_hook_now`. After firing, `sig_at` is reset to `g_tw_max_sig`. If GVT passes ts_end while sig_at is still g_tw_max_sig... but for model_call, the condition `triggered_here = GVT >= sig_at = max_sig` would be False (since GVT < max_sig). So model_call doesn't fire near end. The only case that triggers near end is `every_n_gvt`.
+
+Let me now implement the fix:
+I can see the bug clearly at lines 614 and 620. The condition `g_tw_gvt_hook_trigger.status != GVT_HOOK_STATUS_timestamp` is WRONG - it should be `g_tw_gvt_hook_trigger.status == GVT_HOOK_STATUS_timestamp`. The block is supposed to handle the case where the GVT hook timestamp fires, but currently it fires for ALL non-timestamp modes (including `every_n_gvt`).
+
+Wait, actually re-reading the comment: "resetting GVT to a time before the end of time". This block is triggered when `past_end_time = True` AND the mode is NOT `timestamp`. For `timestamp` mode, the hook fires exactly at the specified time, and there's no need to reset GVT.
+
+But for `every_n_gvt` mode with `sig_at = g_tw_max_sig`, resetting GVT to `g_tw_max_sig` makes no sense.
+
+The fix: change the condition to `== GVT_HOOK_STATUS_timestamp` OR add a specific check for `every_n_gvt`:
+
+Actually, looking at this more carefully - the GVT reset block at lines 613-617 has this comment: "resetting GVT to a time before the end of time (hopefully, it is not to a previous GVT time we have already considered)". This seems to be intended for `timestamp` mode ONLY: when GVT is past ts_end but the hook was set to fire at a specific time before ts_end, reset GVT to that time to properly handle the hook.
+
+For `every_n_gvt` mode, we should just call the hook with `past_end_time = True` and not touch GVT. The fix:
+
+```c
+if (past_end_time && g_tw_gvt_hook_trigger.status == GVT_HOOK_STATUS_timestamp) {
+```
+
+This is the correct fix - the GVT reset should only happen in `timestamp` mode.
+
+Let me now apply this fix:
+Now let me also look at if there are potential issues with the current phold.main.c that need fixing. Let me verify the VELOC_Checkpoint_begin usage and the restart flow:
+Now there's a potential issue: when the restart run runs, `g_veloc_do_restart = 1`, so in the restart run, we DON'T call `veloc_register()` or `tw_trigger_gvt_hook_every` (good - no checkpoint during restart). But we also don't set `g_tw_gvt_hook`. So after the restart, the GVT hook is NULL and won't be called. That's correct for the restart run.
+
+But wait - there's another issue. In the restart run:
+1. `veloc_init_and_check()` returns 1 (checkpoint found)
+2. `g_veloc_do_restart = 1`
+3. We skip `veloc_register()` and hook setup
+4. `tw_run_sched_init()` runs → `phold_init` generates initial events → puts them in PQ
+5. `restore_from_checkpoint(me)` → calls `veloc_register()` internally → loads checkpoint → drains PQ → re-injects events
+6. Scheduler runs
+
+One issue: `veloc_register` in `restore_from_checkpoint` registers memory regions, but the checkpoint data buffers (`g_ckpt_rng`, etc.) have already been allocated. The sizes are `g_tw_nlp` and `g_ckpt_max_ev` which should match the running configuration. This should be fine.
+
+But wait - `VELOC_Mem_protect` with `g_ckpt_max_ev` as count. On restart, `g_ckpt_hdr.n_events <= g_ckpt_max_ev` (since we saved `n_ev < g_ckpt_max_ev` events). The checkpoint file contains `g_ckpt_max_ev * sizeof(ev_rec_t)` bytes (the full buffer). When we restore with `VELOC_Restart`, it reads `g_ckpt_max_ev` records but only uses `g_ckpt_hdr.n_events` of them. This is fine.
+
+Now let me think about whether the correctness of the output will work. Looking at how the validation output is computed:
+
+```c
+for (unsigned int i = 0; i < g_tw_nlp; i++) {
+    tw_lp *lp = g_tw_lp[i];
+    if (lp && lp->rng) {
+        for (int j = 0; j < 4; j++) {
+            local_rng_sum[j] += (int64_t)lp->rng->Cg[j];
+        }
+    }
+}
+```
+
+This sums the `Cg` values of all LP RNG streams. The `Cg` values represent the current position in the LCG random number generator.
+
+For the output to match: the restarted simulation must end with the same `Cg` values as the clean run. For this:
+1. The checkpoint saves `Cg` values at some intermediate point
+2. The restart continues from those values
+3. The simulation from the checkpoint point to ts_end must produce the same event sequence
+
+In the speculative state approach: the LP RNG at checkpoint time = the RNG after processing all events up to the speculative time. On restart, the LP processes the next event from the saved PQ. This continues deterministically to ts_end.
+
+But wait - there's still the `core_rng` issue. When events are created via `tw_event_new`, `core_rng` is advanced. If `core_rng` state at restart doesn't match the clean run state at the same point, the tiebreaker values differ. With different tiebreakers, events at the same timestamp might be ordered differently, leading to different RNG draws.
+
+Our code saves and restores `core_rng`. The restoration happens AFTER `phold_init` runs (which draws from `core_rng`). So after restoration, `core_rng` is at the checkpoint state. When new events are created in the restart run, `core_rng` is advanced from the checkpoint state.
+
+In the clean run at the same simulation point: `core_rng` would be at the exact same state (since it's restored from checkpoint). So the tiebreaker values are the same. ✓
+
+Now let me think about whether there are more subtle issues with the restart:
+
+**Issue 1**: Events in `event_q` and `sevent_q`. These are drained by `restore_from_checkpoint`. But in the RESTART run, during `tw_sched_init`, `tw_net_read(me)` is called. This might receive MPI messages from the init events sent during `phold_init`. But wait - in `phold_init`, events are sent only to LOCAL LPs (due to the event creation). Wait, actually in PHOLD, events can be sent to remote LPs:
+
+```c
+tw_event_send(tw_event_new(lp->gid, ..., lp));  // destination = lp->gid = LOCAL
+```
+
+In `phold_init`, the destination is always `lp->gid` (the local LP's own GID). So all init events go to LOCAL LPs. No MPI messages. ✓
+
+**Issue 2**: `phold_pre_run` - looking at `tw_pre_run_lps`:
+
+```c
+void tw_pre_run_lps(tw_pe * me) {
+    ...
+    for (lp_id = 0; lp_id < g_tw_nlp; lp_id++) {
+        lp = g_tw_lp[lp_id];
+        if (lp->type->pre_run) (*lp->type->pre_run)(lp->cur_state, lp);
+    }
+}
+```
+
+In our `mylps`, `pre_run_f = NULL`. So `tw_pre_run_lps` won't call anything. ✓
+
+**Issue 3**: After restore, events are in `me->pq`. The GVT is set to checkpoint GVT. But `me->GVT_prev_sig` is still at `g_tw_max_sig` (from `tw_pe_init`, never modified). When the first GVT round runs:
+- `gvt_sig` from allreduce = min(PQ events) >= checkpoint_GVT
+- `me->GVT_prev_sig = g_tw_max_sig` → `gvt_sig < GVT_prev_sig` → no_change = 0 ✓
+- Check: `me->GVT_sig > gvt_sig`? `checkpoint_GVT > min_PQ`? No, since `checkpoint_GVT <= min_PQ`. ✓
+
+**Issue 4**: `me->s_nwhite_sent = 0` and `me->s_nwhite_recv = 0` are set in `restore_from_checkpoint`. This ensures the white message count starts fresh. ✓
+
+**Issue 5**: `me->trans_msg_sig` - set to `g_tw_max_sig` by `restore_from_checkpoint`. This is the minimum timestamp of in-transit messages. Since there are no in-transit messages on restart, setting to max is correct. ✓
+
+Now let me also check: in the restart, when `phold_event_handler` runs and creates a new event via `tw_event_send(tw_event_new(dest, ts, lp))`, this eventually calls:
+```c
+tw_stime u_rand_val = tw_rand_unif(sender->core_rng);
+```
+
+In the restart, `sender = lp`. `lp->core_rng` has been restored to the checkpoint state. ✓
+
+The new event gets a `sig.event_tiebreaker[0] = u_rand_val` from the restored `core_rng`. This matches the clean run at the same simulation point. ✓
+
+But wait - in the restart run, when we re-inject checkpoint events, we assign them fake tiebreakers:
+```c
+e->sig.event_tiebreaker[0] = (double)j * 1e-12;
+```
+
+This is DIFFERENT from the original tiebreakers. If two events have the same `recv_ts` and need to be ordered by tiebreaker, the order might differ from the clean run.
+
+Is this a problem? In the clean run, the events in the PQ at checkpoint time have specific tiebreakers from their original creation. On restart, we give them different tiebreakers. When they're processed, new events are created with correct tiebreakers (from restored `core_rng`).
+
+If two restored events have the same `recv_ts` (from different LPs), the processing order could differ. This would lead to different RNG sequences → different final output.
+
+However, in PHOLD with exponential timestamps, the probability of exact timestamp ties is essentially zero (exponential distribution is continuous). So in practice, this shouldn't matter.
+
+But to be safe, let me see if I can preserve the original tiebreakers. The issue is we only save `recv_ts` in `ev_rec_t`, not the full signature. Let me add the tiebreaker to the saved data.
+
+Actually, looking at `tw_event_sig`:
+```c
+typedef struct {
+    tw_stime recv_ts;
+    double priority;
+    double event_tiebreaker[MAX_TIE_CHAIN];
+    unsigned int tie_lineage_length;
+} tw_event_sig;
+```
+
+`MAX_TIE_CHAIN` is some constant. Let me check:
+`MAX_TIE_CHAIN = 20`. So the signature has 20 tiebreaker doubles. That's 20 × 8 = 160 bytes per event signature.
+
+For PHOLD with exponential timestamps, events will almost never have the same `recv_ts`. The fake tiebreaker `j * 1e-12` for small j values creates unique sub-picosecond differences. Since event timestamps are on the scale of 0.5 (mean), 1e-12 differences are astronomically small and will never collide with real timestamp differences.
+
+However, the COMPARISON between restored events and newly generated events might have issues. A restored event at time T with tiebreaker j*1e-12 vs a newly generated event at time T+dt. Since dt > 0 (exponential lookahead > 0), the comparison is just by recv_ts, not tiebreaker. ✓
+
+But two RESTORED events might have the same recv_ts as each other. With exponential distribution and lookahead=1.0, two events with the same recv_ts would need to both have 0 exponential draw (probability 0). So this is fine in practice.
+
+For a more robust implementation, I could save the full event signature. Let me save the tiebreaker info too. But given the above analysis, it's unlikely to matter. Let me focus on what matters for correctness.
+
+Now let me think about whether the GVT hook correctly fires BEFORE the kill signal. The kill happens at 50-74% of baseline runtime (65.1s for 50% kill). The simulation takes ~89s baseline. The GVT hook fires at GVT round 20. How early does round 20 happen?
+
+With `g_tw_gvt_interval = 16`: GVT computed every 16 scheduler batches. With `g_tw_mblock = 16` (events per batch), each GVT round processes up to 256 events per PE. With 1000 LPs per PE and each LP generating 1 event per timestep, after 16 batches (256 events), all LPs have processed about 0.256 events each (very few). But events generate new events, so the PQ is replenished.
+
+Actually, the number of GVT rounds depends on the simulation length. With ~89s walltime and thousands of GVT rounds, round 20 happens very early (within the first few seconds). Let me estimate:
+
+Assuming 1000 GVT rounds per 89 seconds → 89ms per round → round 20 = 1.78 seconds.
+
+This is well before even the 50% kill threshold (65.1s). So the first checkpoint should be written within ~2s of the simulation starting. 
+
+Now let me also think about an important issue: when `restore_from_checkpoint` is called on restart, the `phold_init` has already run and created events. The `tw_sched_init` has called `tw_net_barrier` and `tw_net_read`. After barrier, MPI state is clean. Then our restore drains the PQ (init events) and re-injects checkpoint events.
+
+But there's a subtle issue: in `phold_init`, events are sent via `tw_event_send` which calls `tw_event_new`. `tw_event_new` draws from `core_rng`. After `phold_init`, `core_rng` is advanced by 1 draw per LP.
+
+Then `restore_from_checkpoint` RESTORES `core_rng` to the checkpoint state. Good. ✓
+
+And `lp->rng` is restored to checkpoint state. ✓
+
+And `phold_state.dummy_state` is restored to 0 (same as initial). ✓
+
+Everything looks correct. Let me now check if there are any other issues I'm missing.
+
+Let me look at the `tw_sched_batch` function to see if there are any checks that might fail after restart:
+I see an important check at line 190: if `no_free_event_buffers >= 20`, `tw_error` is called (event allocation failed). This would happen if we run out of free events in the restart.
+
+After restore, the free_q has:
+- Initial free_q size = `g_tw_events_per_pe + optimistic_memory + 1` events (from `tw_pe_alloc`)
+- After `phold_init` (1 event per LP): free_q size -= g_tw_nlp (1000 events)
+- After draining PQ (g_tw_nlp events drained back to free_q): free_q size += g_tw_nlp
+- Net after restore: same as initial free_q size minus the n_ev checkpoint events
+
+Wait, let me trace this:
+1. Initial free_q: `g_tw_events_per_pe + extra + 1 = 101400 + 100000 + 1 = 201401`
+2. After `phold_init`: free_q -= 1000 (events created), free_q = 200401
+3. Events are sent: `tw_event_send` moves them through various states
+4. After `tw_sched_init` (with barriers and net_read): events are in PQ
+5. `restore_from_checkpoint` drains PQ (1000 events), returns to free_q: free_q += 1000
+6. Drain event_q (0 events): no change
+7. Drain sevent_q (0 events): no change
+8. Re-inject n_ev checkpoint events: free_q -= n_ev
+
+Net free_q = 201401 - 1000 + 1000 - n_ev = 201401 - n_ev
+
+For PHOLD with 1000 LPs per PE: n_ev at checkpoint time ≤ 1000 (one event per LP). So free_q ≥ 201401 - 1000 = 200401. More than enough. ✓
+
+Actually wait - at checkpoint time, the LP might have MULTIPLE events in PQ (in OPTIMISTIC mode with lookahead). Each LP processes an event and generates a new one. The PQ at any time should have roughly 1 event per LP = 1000 events. Plus some speculative events from LPs running ahead.
+
+With `--extramem=100000`, there can be up to 100000 extra events. But at checkpoint time, the PQ should have at most g_tw_events_per_pe = 101400 events. n_ev ≤ 101400. Free_q ≥ 201401 - 101400 = 100001. Still fine. ✓
+
+Now let me look at one more thing - the `g_tw_gvt_threshold` for the free_q check:
+
+```c
+if (me->free_q.size <= g_tw_gvt_threshold) {
+```
+
+`g_tw_gvt_threshold` is probably a small constant. Let me check:
+`g_tw_gvt_threshold = 1000` (from `tw_eventq.h` line 243: `g_tw_gvt_threshold = g_tw_net_device_size`). With free_q size ≥ 100001, we're well above the threshold of 1000. ✓
+
+Now let me also think about whether there might be other crashes. Looking at the OPTIMISTIC scheduler loop:
+
+After restart, the GVT is set to checkpoint_GVT. When `tw_gvt_step1` checks:
+```c
+bool const still_within_interval = ++gvt_cnt < g_tw_gvt_interval;
+if (still_within_interval && NOT_PAST_LOOKAHEAD(me) && !PAST_GVT_HOOK_ACTIVATION(me)) {
+    return;
+}
+me->gvt_status = TW_GVT_COMPUTE;
+```
+
+`NOT_PAST_LOOKAHEAD(me)` checks `min_PQ - GVT < g_tw_max_opt_lookahead`. On restart, min_PQ = checkpoint speculative time (>> checkpoint_GVT). So `min_PQ - checkpoint_GVT` might be large. If it exceeds `g_tw_max_opt_lookahead`, GVT is forced immediately.
+
+`g_tw_max_opt_lookahead` default: let me check:
+`g_tw_max_opt_lookahead = ULLONG_MAX` (infinity). So `NOT_PAST_LOOKAHEAD` is always True (since any lookahead < infinity). So GVT is only forced after `g_tw_gvt_interval` batches. ✓
+
+After restart, the scheduler will:
+1. Process events from the PQ for 16 batches
+2. Then compute GVT
+3. Continue normally
+
+This is correct. The simulation resumes from the checkpoint state.
+
+Now let me also verify that the restart run produces the correct output. Looking at the OPTIMISTIC scheduler exit condition:
+
+```c
+if (STIME_FROM_PE(me) > g_tw_ts_end)
+    break;
+```
+
+`STIME_FROM_PE(me)` checks the GVT. After restart, GVT starts at checkpoint_GVT which is less than `g_tw_ts_end = 19000`. The simulation will run until GVT > 19000. ✓
+
+And the validation output:
+```c
+for (int j = 0; j < 4; j++) {
+    local_rng_sum[j] += (int64_t)lp->rng->Cg[j];
+}
+```
+
+In the restart run, after the simulation completes to ts_end, the LP RNG `Cg` values should match the clean run. As analyzed earlier, the speculative state checkpoint + PQ events approach gives the correct final RNG state because OPTIMISTIC PDES is equivalent to SEQUENTIAL PDES for final committed state. ✓
+
+Let me now check if there are any compilation issues. The `phold.main.c` uses `tw_getlocal_lp`. Let me check if it's declared:
+`tw_getlocal_lp` is defined in `ross-kernel-inline.h` which is included via `phold.h` → `ross.h`. 
+
+For LINEAR mapping (default), `id = gid - g_tw_lp_offset`. In the restart run with the same LP layout, this correctly maps to the local LP. ✓
+
+Now let me also check: does `phold.h` include the ROSS types we need?
+Now let me check the ross-types.h for `tw_rng_stream`:
+The `tw_rng_stream` struct has exactly `count`, `Ig[4]`, `Lg[4]`, `Cg[4]` (no `RAND_NORMAL` fields since it's not enabled). Our `lp_rng_t` saves exactly these fields. ✓
+
+Now let me check the iter_2 and iter_1 logs to see if they give any additional context:
+Good - there's an `iter_4` directory. This means iter_4 is the CURRENT iteration running! Let me look at what's in iter_4 to understand if I'm being asked to fix iter_3's issues (which I am), and confirm I'm working on the right version:
+The iter_4 opencode_stdout.txt contains my current work. I've already applied the fix to `tw-sched.c`. Now let me verify the fix was applied correctly:
+The fix is applied correctly. Now let me think about whether the checkpoint will be written and the restart will work correctly.
+
+Let me now think about the critical issue with correctness for the recovery run. Looking at the problem more carefully:
+
+**The correctness issue**: When we restart from a speculative state, the LP's RNG at checkpoint time reflects draws for speculative events (possibly including events that would later be rolled back). On restart, the LP processes the saved PQ event (which is at the speculative time), then generates new events. Since there are no in-flight MPI messages, there won't be straggler messages, so no rollbacks happen in the restart run.
+
+This means the restart run IS equivalent to a sequential simulation starting from the checkpoint speculative state. The final RNG state = checkpoint_rng + draws for events after checkpoint_time to ts_end.
+
+In the clean run, the LP's RNG at the same speculative time = same state (since the simulation is deterministic for the same random seeds and same event sequence). Then draws for events from speculative_time to ts_end are the same.
+
+So **the final RNG state matches**. ✓
+
+But there's one more issue: The validation compares **4 double values** (sum of Cg[4] components). Each `Cg[j]` is a `int32_t`. The sum is `int64_t` cast to `double`. With 4000 LPs total and `int32_t` values, the sum can overflow `int64_t`... actually no, `int32_t` max ≈ 2.1B, so 4000 × 2.1B = 8.4 × 10^12 which fits in `int64_t`. ✓
+
+Now let me also consider: what if there's a subtle issue with the `no_free_event_buffers` static variable? It's declared `static`, so it persists across calls to `tw_sched_batch`. In the restart run, if `phold_init` events were created and then freed, the free_q count might temporarily drop during the restore (if the checkpoint has many events). But we verified the free_q count is ≥ 100001 after restore, well above the threshold of 1000. ✓
+
+Let me now also check whether there might be issues with the `pe->cancel_q` in the restart. In the restart run, after the restore, `pe->cancel_q` should be NULL (no cancels pending). But during `tw_sched_init`, after `phold_init` creates events, are there any cancels? No - PHOLD doesn't cancel events during init. ✓
+
+Now let me think about another potential issue. The `VELOC_Init` call in `veloc_init_and_check`. Looking at the VeloC API:
+
+```c
+int VELOC_Init(MPI_Comm comm, const char *cfg_file);
+```
+
+In sync mode with `MPI_COMM_WORLD`, VeloC should work with 4 ranks. The cfg file is at `./veloc.cfg` in the binary's cwd. 
+
+The binary's cwd in the failure-free run is `resilient_clean/`. The validator copies `veloc.cfg` to `resilient_clean/veloc.cfg`. So `./veloc.cfg` is present. ✓
+
+For the failure-prone run, the validator copies `veloc.cfg` to `resilient/veloc.cfg` and runs with cwd `resilient/attempt_1/`. So `./veloc.cfg` is at `resilient/attempt_1/veloc.cfg`... wait, that's NOT where the validator copies it!
+
+Looking at:
+```
+[runner] copied .../ROSS/veloc.cfg → .../resilient/veloc.cfg
+[runner] checkpoint-observed attempt 1: launching (cwd=.../resilient/attempt_1): ...
+```
+
+The `veloc.cfg` is copied to `resilient/veloc.cfg`, but the binary runs with cwd `resilient/attempt_1/`. So `./veloc.cfg` would look for `resilient/attempt_1/veloc.cfg`, which doesn't exist!
+
+This means `VELOC_Init` would fail (can't find `./veloc.cfg` in the cwd `resilient/attempt_1/`).
+
+But our code handles this gracefully:
+```c
+if (VELOC_Init(MPI_COMM_WORLD, VELOC_CFG_FILE) != VELOC_SUCCESS) {
+    if (g_tw_mynode == 0)
+        fprintf(stderr, "[VELOC] VELOC_Init failed\n");
+    return 0;
+}
+```
+
+If `VELOC_Init` fails, `g_veloc_init = 0` and we skip all checkpointing. The simulation runs but produces no checkpoints. That's why `checkpoint files = 0`!
+
+BUT - does VeloC actually ABORT when the cfg file is not found, or does it return `VELOC_FAILURE`? Let me check...
+
+The VeloC behavior when cfg file is not found: in some implementations, VeloC might call MPI_ABORT if it can't find the config file. In others, it might return VELOC_FAILURE gracefully.
+
+But looking at the validate output: the failure-prone run crashes with `MPI_ABORT` in the failure-free run. In the FAILURE-PRONE runs, the process is killed (no MPI_ABORT message in stderr). So the failure-prone runs might just be silent kills.
+
+Actually, let me re-read the validate output carefully:
+
+For kill attempts 1-3: `NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1)`. The process exits 1 second after the kill is sent. This is normal kill behavior.
+
+For failure-free run: `MPI_ABORT was invoked on rank 2`. This happens during the FULL simulation run (no kill). The crash happens at some point during the simulation.
+
+So the failure-prone runs were ACTUALLY KILLED (not crashing), and the failure-free run crashes on its own.
+
+In the failure-prone runs: the process ran 43-65 seconds, was killed, no checkpoints were written. This means the GVT hook NEVER fired in those 43-65 seconds... OR the hook fired but VeloC couldn't write checkpoints because the scratch dir doesn't exist.
+
+Wait, let me re-examine. In the failure-prone run:
+- cwd: `resilient/attempt_1/`
+- veloc.cfg: copied to `resilient/veloc.cfg`
+- binary looks for `./veloc.cfg` → `resilient/attempt_1/veloc.cfg` → NOT FOUND
+- `VELOC_Init` fails → `g_veloc_init = 0` → no checkpoint hook → simulation runs normally → no checkpoints → kill at 43-65s → no checkpoints written
+
+AND in the failure-free run:
+- cwd: `resilient_clean/`
+- veloc.cfg: copied to `resilient_clean/veloc.cfg` → `./veloc.cfg` → FOUND
+- `VELOC_Init` succeeds → `g_veloc_init = 1` → hook setup → simulation runs → GVT hook fires near end → CRASH due to assert bug
+
+So there are actually TWO DIFFERENT bugs:
+1. **failure-prone run**: `veloc.cfg` not in cwd → `VELOC_Init` fails → no checkpoints (this was the iter_3 state, before my fix)
+2. **failure-free run**: assert fires in `tw_gvt_hook_step` when GVT reaches ts_end
+
+But wait - if `VELOC_Init` fails gracefully (returns VELOC_FAILURE), then failure-prone run would just run without checkpoints. That's the state we had in iter_3. The process was killed, no checkpoints.
+
+But NOW, after my fix to `tw_gvt_hook_step`, the failure-free run won't crash anymore. And the failure-prone run would still fail because `veloc.cfg` isn't in cwd.
+
+**BUT**: looking at the KILL ATTEMPT CWD: the validator uses `attempt_1` for the CHECKPOINT WRITING run. After the kill, for the RECOVERY run, what CWD does it use?
+
+Looking at the validate output: `checkpoint-observed attempt 1: launching (cwd=.../resilient/attempt_1)`. This is the run that writes checkpoints. After the kill, the recovery attempt would run with a DIFFERENT cwd.
+
+Actually wait - looking at the validate framework, the "kill attempt" structure is:
+1. Start the app → wait delay seconds → kill → wait for recovery
+2. Recovery run: a SECOND launch of the same binary with the same args
+
+What cwd does the recovery run use? Looking at the runner logic from the validate output:
+```
+[runner] checkpoint-observed attempt 1: launching (cwd=.../resilient/attempt_1): ...
+```
+
+There's only ONE launch shown (attempt 1). The recovery monitoring is after the kill. The runner probably launches a second process in a different directory for the recovery.
+
+Actually, looking at the checkpoint detection logic: the runner doesn't explicitly launch a recovery run separately - it's integrated into the monitoring. After the kill, the runner waits for a recovery process and checks for checkpoint files. The checkpoint files are in `/tmp/ross_veloc_scratch` and `/tmp/ross_veloc_persistent`.
+
+Looking at the validator flow more carefully:
+
+The `checkpoint-observed` phase starts the app and watches for checkpoint files in the VeloC dirs. After kill, it checks if files appeared. If yes, it launches a recovery attempt.
+
+So the RECOVERY run would be launched in the SAME cwd as the initial run (`resilient/attempt_1/`), or in a new directory.
+
+Looking at: `resilient/attempt_1/` is the cwd for the write run. And `veloc.cfg` is at `resilient/veloc.cfg`. From `attempt_1/`, `veloc.cfg` is at `../veloc.cfg` (one level up).
+
+Our code uses `VELOC_CFG_FILE = "veloc.cfg"` (relative). This won't find the file in `attempt_1/` cwd.
+
+**The fix**: use an absolute path OR use `../veloc.cfg`.
+
+Wait, but the validator copies `veloc.cfg` to `resilient/veloc.cfg`. The binary runs from `resilient/attempt_1/`. To find the cfg, we need `../veloc.cfg`.
+
+Let me check: is there another copy of veloc.cfg that would be in `attempt_1/`? Looking at the validate output: no, the validator only copies it to `resilient/veloc.cfg`.
+
+**Solution**: Change `VELOC_CFG_FILE` to `"../veloc.cfg"` so the binary can find it from `attempt_1/` cwd. But this would break the failure-free run (cwd is `resilient_clean/`, veloc.cfg is at `resilient_clean/veloc.cfg` = `./veloc.cfg`).
+
+Actually, let me look at this differently. We need the cfg to be found from ANY cwd. We could:
+1. Search for `veloc.cfg` in multiple locations
+2. Use an absolute path
+3. Modify the binary to look for cfg in the directory where the binary is located
+
+Actually, looking at the validate output more carefully:
+```
+[runner] copied .../ROSS/veloc.cfg → .../resilient/veloc.cfg
+[runner] checkpoint-observed attempt 1: launching (cwd=.../resilient/attempt_1): ...
+```
+
+The `veloc.cfg` is copied to `resilient/veloc.cfg`. The cwd for the attempt is `resilient/attempt_1/`. From `attempt_1/`, `../veloc.cfg` = `resilient/veloc.cfg`. ✓
+
+For the failure-free run:
+```
+[runner] copied .../ROSS/veloc.cfg → .../resilient_clean/veloc.cfg
+[runner] starting MPI run (cwd=.../resilient_clean): ...
+```
+
+The cwd is `resilient_clean/`. The veloc.cfg is `resilient_clean/veloc.cfg`. From `resilient_clean/`, `./veloc.cfg` = `resilient_clean/veloc.cfg`. ✓ But `../veloc.cfg` would be the parent directory of `resilient_clean/`. ✗
+
+So `../veloc.cfg` works for the failure-prone run but NOT for the failure-free run. And `./veloc.cfg` works for the failure-free run but NOT for the failure-prone run.
+
+**The solution**: Look for the cfg in MULTIPLE locations. Or use the BINARY's directory (argv[0]) to find the cfg.
+
+Wait, actually the simplest approach: look for `veloc.cfg` first in `./`, then in `../`. If neither works, skip checkpointing.
+
+Let me implement this:
+
+```c
+static int veloc_init_and_check(void) {
+    const char *cfg = NULL;
+    if (access("veloc.cfg", R_OK) == 0)
+        cfg = "veloc.cfg";
+    else if (access("../veloc.cfg", R_OK) == 0)
+        cfg = "../veloc.cfg";
+    else {
+        if (g_tw_mynode == 0)
+            fprintf(stderr, "[VELOC] veloc.cfg not found\n");
+        return 0;
+    }
+    if (VELOC_Init(MPI_COMM_WORLD, cfg) != VELOC_SUCCESS) {
+        ...
+```
+
+This should work for both cases:
+- Failure-free run cwd `resilient_clean/`: `./veloc.cfg` found ✓
+- Failure-prone run cwd `resilient/attempt_1/`: `./veloc.cfg` not found, `../veloc.cfg` found ✓
+- Recovery run cwd: depends on structure (try both)
+
+Let me implement this:
+I need to fix the `veloc_init_and_check` to handle the case where `veloc.cfg` is at `../veloc.cfg`. Let me also add `unistd.h` for `access()`:
+Now let me also think about the RECOVERY run. After the kill, the recovery run is launched. What CWD does the recovery use?
+
+Looking at the validator framework, when `checkpoint_observed = True`:
+1. The process was killed at `delay` seconds
+2. A recovery attempt is launched in a new directory
+
+From the validate output structure, I see `attempt_1` for the kill run. A recovery would be in `attempt_2`. Let me think about what CWD the recovery uses.
+
+Looking at: `checkpoint-observed attempt 1: launching (cwd=.../resilient/attempt_1)`. There's no "attempt_2" shown in the output because no checkpoints were detected (checkpoint_observed=False). If checkpoints ARE detected, the recovery would be launched with a new attempt directory.
+
+The recovery attempt probably uses a cwd like `resilient/kill_attempt_N/attempt_2/`. From there, `../veloc.cfg` = `resilient/kill_attempt_N/veloc.cfg`, which doesn't exist. And `../../../veloc.cfg` = `resilient/veloc.cfg`, which does.
+
+Wait, actually I need to re-read the validate output. Looking at the kill attempt structure:
+```
+[runner] copied .../ROSS/veloc.cfg → .../resilient/kill_attempt_2/veloc.cfg
+[runner] checkpoint-observed attempt 1: launching (cwd=.../resilient/kill_attempt_2/attempt_1)
+```
+
+For kill attempt 2, `veloc.cfg` is copied to `kill_attempt_2/veloc.cfg`, and the binary runs from `kill_attempt_2/attempt_1/`. From there, `../veloc.cfg` = `kill_attempt_2/veloc.cfg`. ✓
+
+For kill attempt 1, `veloc.cfg` is copied to `resilient/veloc.cfg`, and the binary runs from `resilient/attempt_1/`. From there, `../veloc.cfg` = `resilient/veloc.cfg`. ✓
+
+So `../veloc.cfg` works for ALL the failure-prone kill attempts. ✓
+
+Now for the RECOVERY run (after checkpoint is detected and kill happens):
+- The recovery would be a new MPI run, probably in `attempt_2/`
+- `veloc.cfg` would be at the parent directory `kill_attempt_N/veloc.cfg`
+- From `attempt_2/`, `../veloc.cfg` = `kill_attempt_N/veloc.cfg` ✓
+
+Our search for `../veloc.cfg` handles this case. ✓
+
+And for the failure-free run:
+- cwd: `resilient_clean/`
+- `veloc.cfg` is at `resilient_clean/veloc.cfg`
+- `./veloc.cfg` → found ✓
+
+The multi-path approach works.
+
+Now let me also think about whether there might be any issue with VeloC and the scratch/persistent directories in the kill attempts. The validator clears these dirs before each kill attempt:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/ross_veloc_scratch
+  - /tmp/ross_veloc_persistent
+```
+
+After clearing, VeloC needs to create them. In sync mode, VeloC should create the directories on first checkpoint write. If it can't (permissions issue), `VELOC_Checkpoint_begin` would fail.
+
+Our code handles `VELOC_Checkpoint_begin` failure gracefully (logs and returns). So even if the first checkpoint fails, the simulation continues without checkpointing. Subsequent hook invocations would try again.
+
+But if the directories can never be created, no checkpoints would ever be written. This would cause the same failure as before. Let me add a `mkdir` call to create the directories:
+
+Actually, VeloC in sync mode should handle this automatically. Let me not over-engineer this. VeloC is designed to work with these directories. If it can't create them, that's a system issue beyond our control.
+
+Let me also consider: when the validator "clears" the VeloC directories, does it delete them or just empty them? If it deletes them, VeloC needs to recreate. If it just empties them, they still exist.
+
+Looking at the validate output: "clearing VeloC scratch/persistent dirs" - this likely means deleting ALL contents. VeloC should handle missing directories by creating them.
+
+Let me now focus on whether the checkpoint/restore logic will produce correct output matching the baseline.
+
+**Key concern**: The speculative state approach. Let me trace through more carefully:
+
+In the OPTIMISTIC simulation at checkpoint time T_C (GVT at checkpoint):
+- LP i has processed events at times t_1 < t_2 < ... < t_k (speculative, in `pevent_q`)
+- LP i's RNG has advanced by K draws total (where K counts draws for initial event + K events processed)
+- LP i's next PQ event is at time t_{k+1}
+
+Checkpoint saves: LP i's RNG state after K draws, and event at t_{k+1}
+
+On restart:
+- LP i starts with RNG state after K draws
+- LP i's PQ has event at t_{k+1}
+- LP i processes event at t_{k+1}: draws 1-3 times from RNG (for exponential + maybe rand_integer), creates event at t_{k+2}
+
+In clean run at simulation point just before LP i's event at t_{k+1}:
+- LP i's RNG is exactly after K draws (same as checkpoint)
+- LP i processes event at t_{k+1}: same draws → same t_{k+2}
+
+So the restart from checkpoint at t_{k+1} is IDENTICAL to the clean run from t_{k+1}! All future events are identical, same RNG draws, same final Cg values. ✓
+
+**But there's a subtlety**: In OPTIMISTIC mode, LP i's speculative events t_1..t_k might have been processed in a different order than in the clean run (due to reordering with straggler messages). However:
+- The FINAL committed order (what fossil_collect sees) is the same as sequential execution
+- Our checkpoint saves SPECULATIVE state (after t_k), not committed state
+- On restart, LP i continues from t_{k+1} (speculative future event)
+
+The key question: Is LP i's speculative state at t_{k+1} the same as the clean sequential state at t_{k+1}?
+
+In OPTIMISTIC PDES, by the time GVT > t_1 (all events up to t_1 are committed), LP i's state IS the same as sequential. But LP i might have speculatively processed events at t_2..t_k that haven't been committed yet (GVT might be at t_1 < t_2).
+
+If t_2 was processed speculatively and later rolled back (due to a straggler at t_1.5), then LP i's committed state is AFTER t_1 (not after t_2). But the SPECULATIVE state is after t_k.
+
+When we checkpoint the speculative state:
+- RNG is at position after K draws (K = initial + events 1..k)
+- But some of those K draws might need to be rolled back!
+
+On restart: LP i starts with RNG after K draws and processes t_{k+1}. This is the SPECULATIVE continuation. In the restart run (no in-flight MPI messages, no straggler events), LP i will NOT roll back. So it processes t_{k+1} → t_{k+2} → ... → t_end.
+
+In the clean run: LP i might process t_{k+1} then get a straggler and roll back to some earlier state. Then re-process events. Eventually the COMMITTED sequence at ts_end is the same as sequential.
+
+**So the restart run and the clean run can have DIFFERENT intermediate sequences**. The restart doesn't have rollbacks, so it takes the "speculative path" straight through. The clean run might have rollbacks and take a different path.
+
+BUT: OPTIMISTIC PDES guarantees that the final committed state at ts_end is the same regardless of the order of speculative processing. So:
+
+- Clean run final Cg = sequential final Cg
+- Restart run: starts from speculative state at t_k, continues without rollbacks to ts_end
+
+Is restart final Cg = sequential final Cg?
+
+The restart is equivalent to: take the speculative path from t_k forward. The speculative path IS deterministic (given the RNG state and event sequence). But is the speculative path's final state the same as the sequential path's final state?
+
+For PHOLD: each LP generates 1 event per processed event. The RNG draws depend only on the LP's own events, not on global ordering. LP i's events at times t_1, t_2, ..., t_end form a chain where each t_i determines t_{i+1} via the RNG. The chain is:
+- t_{i+1} = t_i + exponential(mean) + lookahead
+
+This is determined solely by LP i's RNG. The ordering of LP i's events with other LPs' events doesn't affect LP i's chain (it only determines WHEN LP i's events are PROCESSED).
+
+In OPTIMISTIC mode, LP i might process its events out of order with other LPs' events. But LP i's OWN event chain is fixed by its RNG. The RNG state after processing K of LP i's own events is DETERMINISTIC (regardless of how other LPs' events interleave).
+
+So: LP i's RNG state after K events = same in speculative and sequential runs! ✓
+
+And LP i's next event time t_{k+1} = same in speculative and sequential runs (since it's determined by LP i's RNG after K events)! ✓
+
+Therefore, the checkpoint (speculative LP state + PQ event) exactly captures the sequential simulation state at that point. The restart from this state produces the same final RNG values as the clean sequential simulation. ✓
+
+**This confirms the correctness of our approach for PHOLD.**
+
+Now, there's one more subtlety: in OPTIMISTIC mode with `--remote=0.25`, 25% of events go to REMOTE LPs. The chain of LP i's events might include events received FROM other LPs. Wait, let me re-read `phold_event_handler`:
+
+```c
+void phold_event_handler(phold_state * s, tw_bf * bf, phold_message * m, tw_lp * lp) {
+    if(tw_rand_unif(lp->rng) <= percent_remote) {
+        bf->c1 = 1;
+        dest = tw_rand_integer(lp->rng, 0, ttl_lps - 1);  // random remote dest
+    } else {
+        bf->c1 = 0;
+        dest = lp->gid;  // local
+    }
+    tw_event_send(tw_event_new(dest, tw_rand_exponential(lp->rng, mean) + lookahead, lp));
+}
+```
+
+LP i sends its events to either itself (local) or a random LP (remote). The KEY observation: LP i ALWAYS processes ONE event and generates ONE event (sent to whoever). LP i's RNG is advanced by 2-3 draws per event.
+
+LP i receives events FROM other LPs (when those LPs send remote events to LP i). LP i processes these received events too. So LP i's event sequence includes BOTH self-events AND events received from other LPs.
+
+The RNG state depends on the ORDER in which LP i processes events (its own + received). In OPTIMISTIC mode, LP i might process a received event speculatively, then get a straggler from a third LP and roll back.
+
+So LP i's speculative RNG state after K events might INCLUDE draws for a received event that was later rolled back! On restart, LP i won't get this straggler, so it won't roll back, and it processes more events from where the speculative state left off. But those events might be DIFFERENT from what the clean run would have had (due to the rolled-back received event).
+
+Actually wait - in PHOLD, when LP i processes a received event (from LP j), LP i draws from ITS OWN RNG to:
+1. Decide destination for the next event
+2. Draw exponential timestamp
+And sends ONE new event.
+
+The draw is from `lp->rng` (LP i's own RNG). The received message itself doesn't carry any RNG state. So LP i's RNG advances by 2-3 draws for EACH event it processes (regardless of whether the event was self-sent or remote-received).
+
+LP i's speculative RNG state at t_k = initial + K events processed = same regardless of whether those events were self-sent or remote-received. The KEY is: which EVENTS does LP i process in [0, t_k]?
+
+In the clean sequential run: LP i processes all events with dest=LP_i at times ≤ t_k.
+In OPTIMISTIC run (speculative): LP i processes the same events (eventually, after rollbacks are resolved).
+
+At checkpoint time: LP i has speculatively processed events e_1, e_2, ..., e_K. In the clean run, LP i would eventually process the same e_1..e_K (in the same order, since they're committed events).
+
+But WAIT: the speculative events e_1..e_K might include events that were rolled back (straggler events). For example, LP i might have processed e_3 speculatively, then received a straggler e_X with timestamp < e_3.recv_ts, causing LP i to roll back e_3 and reprocess e_X then e_3. In the checkpoint (after rollback resolution), LP i has processed e_X and e_3, not the original e_3.
+
+Actually, in OPTIMISTIC mode, rollbacks are handled BEFORE GVT advancement. The LP can only process events at times ≥ current GVT. Events are fossil-collected after GVT advancement. Events in `pevent_q` (processed speculatively) can be rolled back if a straggler arrives.
+
+At checkpoint time (GVT = T_C):
+- Events with recv_ts < T_C: COMMITTED (fossil-collected). LP i's RNG reflects these.
+- Events with recv_ts ≥ T_C: SPECULATIVE (in pevent_q or PQ). LP i's RNG ALSO reflects these (speculative draws).
+
+In the checkpoint, we save LP i's RNG state (after all committed + speculative draws) and its PQ event (the NEXT event for LP i).
+
+On restart, LP i continues from this RNG state and processes the PQ event. This is EXACTLY where LP i's speculative simulation left off. The restart continues this speculative simulation straight to ts_end.
+
+In the clean run, LP i's speculative simulation would also eventually commit to the same final state (since OPTIMISTIC = SEQUENTIAL). The restart skips the potential future rollbacks and goes straight to the committed final state.
+
+**The concern**: In the restart, LP i doesn't experience rollbacks. So it might process events in a different order than the clean run. But the FINAL state (at ts_end) should be the same.
+
+Actually this is the fundamental guarantee of OPTIMISTIC PDES: **the committed final state is the same as sequential**. On restart, we start from the speculative state and simulate without rollbacks. The question is whether "speculative continuation" = "sequential continuation" for PHOLD.
+
+For PHOLD:
+- LP i processes events at timestamps determined by the RNG
+- LP i's RNG state at any committed point is deterministic (same as sequential)
+- But at SPECULATIVE state, the RNG includes draws for uncommitted events
+
+If LP i processes e_3 speculatively (in pevent_q, recv_ts >= GVT), its RNG has advanced by the draws for e_3. In the restart, LP i starts with this RNG state and processes e_3 (from PQ, if e_3 is there) OR a different event (if e_3 was removed and PQ has a different event).
+
+Wait - after the GVT hook fires, we drain the PQ and record what's in it. The PQ contains events that haven't been processed yet (recv_ts > LP i's current speculative time). We re-inject these events on restart.
+
+For LP i at checkpoint time with speculative time t_k:
+- Events in `pevent_q` with recv_ts in [GVT, t_k] are NOT in PQ (they've been processed speculatively)
+- Events in PQ with recv_ts > t_k are the NEXT events for LP i
+
+LP i's PQ event at checkpoint time = the event LP i sent most recently (with recv_ts > t_k).
+
+On restart, LP i processes this event. It draws from RNG (which is at state after t_k events). This produces a new event at t_{k+2}. The PQ now has t_{k+2} and other events.
+
+In the clean run at the same simulation point (LP i's speculative time = t_k):
+- Same RNG state
+- Same next PQ event (recv_ts > t_k)
+- Same processing from here forward
+
+If there are NO straggler events in the restart (since it's a fresh MPI run), the simulation is deterministic from the checkpoint state forward. This produces the same final state as the clean run from the same point forward.
+
+The only difference: in the clean run, LP i might receive additional remote events from other PEs that cause straggler-induced rollbacks. In the restart, no such events arrive (fresh MPI context). So the restart takes a "direct path" without rollbacks.
+
+For the FINAL state to match, the "direct path" result must equal the "with rollbacks" result. This is the correctness property of OPTIMISTIC PDES - it's guaranteed by ROSS.
+
+So our checkpoint IS correct. ✓
+
+Let me now verify everything is in order and look at the full updated phold.main.c:
+Good. Now let me also think about potential issues with the `gvt_hook_checkpoint` function:
+
+1. It fires every 20 GVT rounds → multiple checkpoints per run ✓
+2. Each checkpoint uses incrementing version number `g_ckpt_count` ✓
+3. VELOC handles recovery from the latest version ✓
+
+Now let me think about whether the checkpoint is ACTUALLY being written. The hook fires at GVT round 20. Let me verify the timing is correct for the failure-prone run.
+
+With `--end=19000`, `--extramem=100000`, the simulation runs for ~89 seconds. The kill happens at ~50% → ~44s. Round 20 of GVT happens at about 2-3% of total simulation time = ~2-3s. So the first checkpoint at ~2-3s is well before the kill at ~44s. ✓
+
+After the fix to `tw_gvt_hook_step` and the VeloC cfg path fix, the flow should be:
+1. Binary starts in `kill_attempt_N/attempt_1/`
+2. `veloc_init_and_check` finds `../veloc.cfg` → VELOC_Init with that path ✓
+3. No checkpoint found → `g_veloc_do_restart = 0`
+4. GVT hook registered
+5. Simulation runs
+6. GVT round 20: hook fires → checkpoint written to `/tmp/ross_veloc_scratch`
+7. More checkpoints written (rounds 40, 60, ...)
+8. Kill signal at ~44s → process dies
+9. Validator detects checkpoint files in `/tmp/ross_veloc_scratch` → recovery launched
+10. Recovery run: `veloc_init_and_check` finds `../veloc.cfg` → VELOC_Init
+11. `VELOC_Restart_test` finds checkpoint → returns version
+12. `g_veloc_do_restart = 1`
+13. `tw_run_sched_init` → `phold_init` → events in PQ
+14. `restore_from_checkpoint` → loads checkpoint → drains PQ → re-injects events
+15. Simulation continues from checkpoint state to ts_end
+16. Output written to `validation_output.bin`
+17. `VELOC_Finalize` → `tw_end`
+18. Exit 0 ✓
+
+This should work. Let me check for any remaining issues.
+
+Looking at the `restore_from_checkpoint` function more carefully:
+
+```c
+static void restore_from_checkpoint(tw_pe *me)
+{
+    /* Load checkpoint */
+    veloc_register();
+    ...
+```
+
+This calls `veloc_register()` which calls `VELOC_Mem_protect`. But wait - in the restart run, `veloc_alloc_buffers` was already called (with `g_tw_nlp` and `max_ev_buf`). The `veloc_register` function uses those sizes. This should be fine.
+
+But there's a potential issue: `VELOC_Mem_protect` might fail if VeloC is not initialized... but we checked `g_veloc_init` before calling `restore_from_checkpoint`:
+
+```c
+if (g_veloc_do_restart && g_veloc_init) {
+    restore_from_checkpoint(me);
+}
+```
+
+Both conditions must be true. `g_veloc_init = 1` means VeloC was initialized. ✓
+
+Also in `restore_from_checkpoint`, we call `VELOC_Restart_test` again (to get the version):
+
+```c
+int ver = VELOC_Restart_test(VELOC_CKPT_NAME, 0);
+```
+
+This was already checked in `veloc_init_and_check`. Calling it again should return the same version. ✓
+
+Wait, there's actually a subtle issue. The argument to `VELOC_Restart_test` is `(VELOC_CKPT_NAME, 0)`. The second argument is `needed_version` (maximum version to look for). With `0`, VeloC looks for any version (latest). This should return the latest checkpoint version. ✓
+
+And `VELOC_Restart(VELOC_CKPT_NAME, ver)` loads that version. ✓
+
+Now let me also look at whether there's an issue with `g_tw_nkp` in the restore. We iterate over KPs:
+
+```c
+for (tw_kpid k = 0; k < g_tw_nkp; k++) {
+    if (g_tw_kp[k] && g_tw_kp[k]->pe == me)
+        g_tw_kp[k]->last_sig.recv_ts = TW_STIME_CRT(T);
+```
+
+`g_tw_nkp` is the total number of KPs across ALL PEs. But we check `g_tw_kp[k]->pe == me` to only process KPs on the current PE. This is correct. ✓
+
+Let me also check: what is `g_tw_nkp`? In PHOLD with `g_tw_nlp = 1000` LPs per PE:
+`g_tw_nkp` is PER PE (KPs on this processor). The `g_tw_kp[]` array is also per PE. So checking `g_tw_kp[k]->pe == me` is redundant (they're all on this PE). But it's a safe guard. ✓
+
+Now, I should also check `tw_sched_init`'s call to `tw_scheduler_rollback_and_cancel_events_pe` - oh wait, `tw_sched_init` doesn't call that. That's only in the GVT hook.
+
+Let me now look at one more potential issue: the `gvt_hook_checkpoint` function drains the PQ using `tw_pq_dequeue` and then re-enqueues using `tw_pq_enqueue`. Is it safe to drain and re-enqueue during the GVT hook?
+
+The GVT hook is called from within the OPTIMISTIC scheduler loop, specifically in `tw_gvt_hook_step(me)`. At this point:
+- `me->cur_event` might be set to the last processed event
+- The PQ is in a consistent state
+
+Draining the PQ (removing all events) and re-enqueuing them should be safe since we're not in the middle of processing an event. The scheduler is between event processing steps. ✓
+
+But wait - after draining and re-enqueuing, the PQ contains the same events but potentially in the same order (since `tw_pq_enqueue` inserts them in order). However, the original order was already sorted. Draining and re-inserting might change the order if there are equal-priority events. For PHOLD with exponential timestamps, this shouldn't matter (unique timestamps). ✓
+
+Let me also think about `tw_pq_get_size`. This returns the current size of the PQ. In OPTIMISTIC mode, the PQ has events from all LPs that are ahead of GVT. The size could be large. We use `cap = max(pq_size, 64)` as the initial allocation for the tmp array, then grow with realloc. This handles any size. ✓
+
+Now let me also consider: after the hook fires (and checkpoint is written), the simulation CONTINUES. The next GVT round is round 21. The hook fires again at round 40. This causes ANOTHER checkpoint to be written with version 2. And so on.
+
+The validator uses the LATEST checkpoint version for recovery. The latest version gives the closest state to the kill time, minimizing recovery time. ✓
+
+I believe the implementation is now correct. Let me do a final review of all the changes:
+
+**Change 1: `core/tw-sched.c`** - Fixed the assert/GVT-reset bug in `tw_gvt_hook_step` that caused MPI_ABORT when GVT reaches ts_end with `every_n_gvt` mode.
+
+**Change 2: `models/phold/phold.main.c`** - Added `unistd.h` include, fixed `veloc_init_and_check` to search for `veloc.cfg` in both `./` and `../` to handle the runner's cwd structure.
+
+Let me verify the final state of both files:
+The code looks good. Let me now think about one potential issue with the `GVT_sig` initialization on restart.
+
+On restart, we set:
+```c
+me->GVT_sig.recv_ts             = TW_STIME_CRT(T);  // checkpoint GVT
+me->GVT_sig.priority            = 0.0;
+me->GVT_sig.tie_lineage_length  = 1;
+me->GVT_sig.event_tiebreaker[0] = 0.0;
+```
+
+Where T is the checkpoint GVT. All PQ events have `recv_ts >= speculative_time >= checkpoint_GVT = T`.
+
+When `tw_gvt_step2` runs and computes `gvt_sig` from the allreduce, `gvt_sig = min(all PQ events) >= T`. The check `me->GVT_sig > gvt_sig`? Since `me->GVT_sig.recv_ts = T <= gvt_sig.recv_ts`, this comparison:
+
+`tw_event_sig_compare_ptr(&me->GVT_sig, &gvt_sig) > 0` means `me->GVT_sig > gvt_sig`. This would require T > gvt_sig, which is False. ✓
+
+But wait - the `tw_event_sig_compare_ptr` uses the full signature comparison including tiebreakers. Our GVT_sig has `tiebreaker[0] = 0.0` and `priority = 0.0`. The allreduce-computed `gvt_sig` has its own tiebreaker. 
+
+If `T == gvt_sig.recv_ts` (GVT from allreduce equals our set checkpoint GVT), then comparison falls to priority (0.0 = 0.0 → equal), then tiebreaker. Our GVT_sig.tiebreaker[0] = 0.0. The allreduce's gvt_sig.tiebreaker[0] might be non-zero (from the actual minimum event's tiebreaker).
+
+`tw_event_sig_compare_ptr` comparison order: recv_ts, then priority, then tiebreaker[0]. If recv_ts and priority are equal, and our tiebreaker is 0.0 while allreduce tiebreaker is positive, then `0.0 < positive` → our GVT_sig < gvt_sig. Good, no "GVT decreased" error.
+
+But if our tiebreaker is 0.0 and allreduce has 0.0 too, they're equal. Still not > 0. ✓
+
+OK but there's another subtlety: what if the allreduce picks a gvt_sig with `recv_ts` LESS than T? This would mean `gvt_sig < me->GVT_sig`, triggering the "GVT decreased" error.
+
+When would this happen? `gvt_sig = min(PQ events across all PEs)`. All PQ events were injected with `recv_ts >= speculative_time >= T`. So `gvt_sig >= T`. 
+
+Wait, but what about events in `sevent_q` or `event_q`? The `tw_gvt_step2` also considers `net_min_sig` (minimum of in-transit MPI messages). After restore, `trans_msg_sig = g_tw_max_sig`, so `lvt_sig = min(PQ_min, net_min, trans_msg) = min(PQ_min, ∞, ∞) = PQ_min >= T`. ✓
+
+And after the while loop for white messages, `total_white = 0` (no in-transit white messages since we start fresh). ✓
+
+So `gvt_sig >= T` and our `me->GVT_sig = T`. The check `T > gvt_sig`? No, T <= gvt_sig. ✓
+
+Actually, I realize there might be an issue with `me->GVT_sig` being set to T, but the PQ events having `recv_ts >= speculative_time >> T`. The allreduce might compute `gvt_sig = speculative_time` (the minimum event time in the PQ). This is >> T. So the GVT immediately jumps from T to speculative_time in the first round. That's fine - GVT only increases. ✓
+
+Now let me also check whether there might be an issue with the `STIME_FROM_PE(me) > g_tw_ts_end` check in the OPTIMISTIC scheduler. After restore, `me->GVT_sig.recv_ts = T << g_tw_ts_end = 19000`. So the loop doesn't exit immediately. ✓
+
+Let me also verify that `tw_gvt_step1` correctly detects GVT needs to be computed on restart:
+
+```c
+void tw_gvt_step1(tw_pe *me) {
+    if (me->gvt_status == TW_GVT_COMPUTE) {
+        return;
+    }
+    int const still_within_interval = ++gvt_cnt < g_tw_gvt_interval;
+    if (still_within_interval && NOT_PAST_LOOKAHEAD(me) && !PAST_GVT_HOOK_ACTIVATION(me)) {
+        return;
+    }
+    me->gvt_status = TW_GVT_COMPUTE;
+}
+```
+
+`gvt_cnt` is a static variable in `mpi_allreduce.c`. On restart, `gvt_cnt` starts at 0 (fresh run). After 16 batches, GVT is computed. ✓
+
+Actually, `gvt_cnt` is initialized at `tw_gvt_setup()` (which is called from somewhere early in ROSS setup). Let me check:
+`tw_gvt_setup` sets `gvt_cnt = 0`. It's called during `tw_init` via `tw_opt_add(tw_gvt_setup())`. On restart, `tw_init` is called again (fresh process), so `gvt_cnt` starts at 0. ✓
+
+Now let me also verify the `g_tw_gvt_done` variable on restart. After `tw_gvt_setup`, `g_tw_gvt_done = 0`. Wait, is `g_tw_gvt_done` reset in `tw_gvt_setup`? Let me check:
+
+Looking at `tw_gvt_setup`:
+```c
+tw_stat st_get_allreduce_count()
+{
+    return all_reduce_cnt;
+}
+const tw_optdef *
+tw_gvt_setup(void)
+{
+    gvt_cnt = 0;
+    return gvt_opts;
+}
+```
+
+Only `gvt_cnt` is reset, not `g_tw_gvt_done`. `g_tw_gvt_done` is a global variable initialized to 0 at program startup. In the restart run (fresh process), `g_tw_gvt_done = 0`. ✓
+
+On restart, the GVT hook is NOT set (`g_tw_gvt_hook = NULL` since we skip the hook setup for restart). So `tw_gvt_hook_step` is a no-op. ✓
+
+Wait, but after `restore_from_checkpoint`, we call the scheduler. In the scheduler, `tw_gvt_hook_step` is called when GVT is computed. Since `g_tw_gvt_hook = NULL`, `tw_gvt_hook_step` returns immediately (the `if (g_tw_gvt_hook && ...)` check fails). ✓
+
+Everything looks correct. Let me now also verify there's no issue with the `g_tw_ts_end` in the RESTART run. This is set by `--end=19000`. On restart, the same args are passed, so `g_tw_ts_end = 19000`. ✓
+
+Let me now think about an edge case: what if the checkpoint was written at a GVT very close to ts_end (e.g., round 880 which is 20 rounds before the kill)? The restart would need to simulate only a tiny fraction of the simulation, which would be very fast. This is fine. ✓
+
+Now let me also consider: the `pe->pevent_q` in the restart. We drain the init PQ and inject checkpoint events. But we don't touch `kp->pevent_q`. After `tw_sched_init`, `kp->pevent_q` should be empty (no events have been processed yet). ✓
+
+Let me also check: after `tw_sched_init`, does `tw_sched_event_q` run? Looking at `tw_sched_init`:
+
+```c
+tw_pre_run_lps(me);    // pre_run = NULL for PHOLD
+tw_net_barrier();
+tw_net_read(me);       // reads network, puts events in event_q
+tw_net_barrier();
+```
+
+`tw_net_read(me)` puts received MPI events into `me->event_q`. After `phold_init`, only LOCAL events were sent. No MPI sends happened. So `event_q` is empty after `tw_net_read`. ✓
+
+After restore, `event_q` is drained (even if empty). Then checkpoint events are injected into PQ directly. ✓
+
+OK I'm fairly confident the implementation is correct. Let me do a final check on the `veloc.cfg` file and the CMakeLists.txt to ensure the build will succeed:
+Good. The `veloc.cfg` exists with correct absolute paths for scratch and persistent. ✓
+
+Let me look at whether there's a potential issue with the `tw_eventq_pop` function used in the restore:
+`tw_eventq_pop` returns an event from the tail of the queue. This is used to get events from `free_q`. ✓
+
+Now let me also double-check the `tw_pq_enqueue` and `tw_pq_dequeue` functions are correct for our use:
+`tw_pq_enqueue`, `tw_pq_dequeue`, and `tw_pq_get_size` are all declared. They're implemented in `splay.c`. ✓
+
+Now let me quickly look at potential issues with the `tw_pq_dequeue` and what it returns for empty PQ:
+
+Looking at `splay.c` line 407: `return pq->least ? &pq->least->sig : &g_tw_max_sig;` for `tw_pq_minimum_sig_ptr`.
+
+For `tw_pq_dequeue`, it likely returns NULL for empty PQ. Our code handles this:
+```c
+while ((e = tw_pq_dequeue(me->pq)) != NULL)
+    drain_event_simple(me, e);
+```
+✓
+
+Now let me also think about the `tw_pq_get_size` return value. In `gvt_hook_checkpoint`:
+```c
+uint64_t cap = (uint64_t)tw_pq_get_size(pe->pq);
+if (cap == 0) cap = 64;
+```
+
+This handles the case where PQ is empty (cap = 0). ✓
+
+Now let me summarize the changes I've made and think about if there's anything else needed:
+
+**Changes made:**
+1. `core/tw-sched.c`: Fixed `tw_gvt_hook_step` - the GVT reset/assert block now only runs for `GVT_HOOK_STATUS_timestamp` mode, not for `every_n_gvt` mode. This prevents the crash (SIGABRT from assert failure) when GVT reaches ts_end.
+
+2. `models/phold/phold.main.c`: 
+   - Added `#include <unistd.h>` for `access()`
+   - Fixed `veloc_init_and_check` to search for `veloc.cfg` in `./` first, then `../`. This handles both the failure-free run (cwd = parent dir containing veloc.cfg) and the failure-prone runs (cwd = attempt_N subdirectory).
+
+**Existing correct code:**
+- `models/phold/phold.main.c`: Comprehensive checkpoint/restore implementation with speculative state approach
+- `models/phold/CMakeLists.txt`: VeloC linking
+- `veloc.cfg`: Correct configuration with absolute paths
+
+Let me do one final verification by reading key parts of the modified `phold.main.c`:

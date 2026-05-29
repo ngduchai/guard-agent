@@ -1,0 +1,257 @@
+I'll start by examining the previous attempt's validation output to understand what went wrong.
+The key failure is on line 85:
+- `recovery_actually_resumed=False` - The recovery run is not actually resuming from checkpoint, it's replaying from scratch
+- `ratio=1.78x` which exceeds the 1.488x per-app cap
+
+The issue is `recovery_actually_resumed=False`. The recovery process is not loading from checkpoints. Let me look at the current implementation.
+Let me look for the main application files (linadv) and any existing VeloC code:
+Now I understand the issue. The validation report says `recovery_actually_resumed=False` with `ratio=recovery/Z_P=1.008`. This means the recovery run took about the same time as a fresh run - it's not actually resuming from checkpoint because the fast-forward approach re-runs all the steps anyway!
+
+The validator detects whether recovery is truly resuming by checking if `recovery_elapsed < (1 - kill_fraction) * Z_P_walltime`. With `kill_fraction=0.702` and `Z_P=82.5s`, the remaining portion of the full run should take only `(1 - 0.702) * 82.5 = ~24.6s`. But the recovery took `83.13s` which is close to a full run.
+
+The problem: the current approach does a "fast-forward" of all steps to rebuild the hierarchy topology, then loads field data - this takes as long as a full run! The recovery must actually resume computation from the checkpointed state, not replay from scratch.
+
+The key insight: I need to restore the actual simulation state from the checkpoint, set `loop_time` and `iteration_num` correctly from the saved data, and resume the time loop from that point. The fast-forward approach is fundamentally wrong for passing the timing gate.
+
+Let me look at the SAMRAI time integrator API to understand how to properly set the integrator time and step count:
+The validator check `recovery_actually_resumed` is based on whether `recovery_elapsed < gate_B * Z_P` where `gate_B=0.85`. So recovery must complete in less than `0.85 * 82.5 = 70.1s`. The per-app cap is `1.488x * 82.5 = 122.7s` but that also needs `recovery_actually_resumed=True`.
+
+The problem is the fast-forward approach takes the same time as a full run. I need to save the FULL hierarchy state so restart can resume from the checkpoint without replaying steps.
+
+Let me look at what SAMRAI offers for serialization/restart:
+Now I need to think about what the correct approach is. The key issue is:
+
+1. The `recovery_actually_resumed` gate checks if recovery elapsed time was significantly less than a full run
+2. The current fast-forward approach takes the same time as a full run (83s vs 82s)
+3. The validator requires the recovery to complete in < 85% of full runtime (`gate_B < 0.85`)
+
+The only way to truly "resume" is to save ALL the patch hierarchy state and restore it, so the restart can start the time loop from where it was interrupted. Since SAMRAI patches contain complex data structures, I need to serialize each patch's `uval` field AND the integrator's time/step information so the restart can begin the time loop directly at the saved state.
+
+The key insight: after restart, I should NOT fast-forward - I should directly set the integrator state and restore all field data from files, then immediately begin time integration from that saved point.
+
+The current code already does this structure, but the FAST-FORWARD approach takes too long. Let me re-examine:
+
+Looking at the current code:
+1. It saves `ckpt_loop_time`, `ckpt_dt_now`, `ckpt_steps` via VeloC
+2. It writes uval files per-rank
+
+On restart:
+1. Restores scalars via VeloC
+2. Calls `initializeHierarchy()` (required to build the hierarchy)
+3. Then fast-forwards `ckpt_steps` steps to reproduce the topology
+
+The fast-forward is required because `initializeHierarchy()` starts from time 0. The problem is that taking K steps to "fast-forward" takes the same time as the original K steps.
+
+The solution is: after `initializeHierarchy()`, directly set the integrator's time and step count, then populate the field data from saved files - WITHOUT actually re-running those steps.
+
+But will that work correctly? The AMR hierarchy topology might differ at step K vs step 0. Patches get created/destroyed during regridding.
+
+Looking at the `setIntegratorStep` and `setIntegratorTime` methods that were already added to the header! These were added in a previous iteration. The question is whether just setting the time and step count (without fast-forward) and then loading field data produces valid results.
+
+The hierarchy topology is rebuilt by `initializeHierarchy()` which just creates the initial level 0. The finer levels are created lazily. But the uval data from the checkpoint was on a different topology...
+
+Actually wait - looking more carefully at the validate output: the recovery produces CORRECT output (Test 1 passes: output is numerically within tolerance). So the fast-forward + field overwrite DOES produce correct results. The issue is purely timing - it takes too long.
+
+The real fix needed: save ALL per-patch data including ALL hierarchy levels, then on restart set the integrator state directly and load data, bypassing the expensive fast-forward.
+
+But can SAMRAI properly continue integration without the fast-forward? The hierarchy might be inconsistent if we just set the time and skip the actual time integration steps. The ghost cells, boundary conditions, etc. need to be properly initialized.
+
+Let me look at what the `initializeHierarchy()` does and what state it sets up:
+Let me look at the LinAdv source files more carefully to understand how much state the simulation has:
+Now let me think about the fundamental problem. The validator checks `recovery_actually_resumed` as follows: it's `True` only when recovery time is less than expected. Looking at the validate output again:
+
+```
+recovery_actually_resumed=False (ratio=recovery/Z_P=1.008, f=0.702, gate_B<0.85, gate_C<0.649, mode=single_random_fraction_v22)
+```
+
+The ratio is `recovery_elapsed/Z_P = 83.13/82.5 = 1.008`. For `gate_B` to pass, ratio must be `< 0.85`. So recovery must complete in under `0.85 * 82.5 = 70.1s`.
+
+The kill happened at `64.02s` (about 77.6% of total run). The checkpoint was saved at that point. After restart, the remaining computation should be `(1 - 0.702) * 82.5 = 24.6s`. But recovery took `83.13s` - that's the FULL time which means the fast-forward is replaying from scratch.
+
+The challenge: I need to truly save ALL AMR hierarchy state (not just uval) so that restart can resume from step K by:
+1. Building the hierarchy at the checkpoint topology (fast-forward approach won't work without state)
+2. Loading all field data
+3. Continuing from step K
+
+The key issue: After `initializeHierarchy()`, I need to fast-forward to the right AMR structure, but WITHOUT actually computing (which takes time). There's no way around this with the current approach.
+
+**Alternative approach**: Use SAMRAI's existing restart/checkpoint facility via `RestartManager` if it exists, or save/restore the AMR hierarchy boxes so we can reconstruct the correct topology WITHOUT running time steps.
+
+Let me look for how SAMRAI hierarchy can be serialized:
+It seems SAMRAI doesn't have a built-in restart manager. Let me look at what patch data is needed and think about a different approach.
+
+The key insight is: **the fast-forward IS the problem** because it runs K timesteps of actual computation. The validator expects `recovery_elapsed < 0.85 * full_time`. If the kill happened at 70% of the run, the remaining 30% should take `0.30 * 82.5 = 24.75s`. But we're taking 83s because we replay all K steps.
+
+**New strategy**: Save the complete patch hierarchy state (all patch boxes and their uval data) at checkpoint time, so at restart we can:
+1. Call `initializeHierarchy()` to set up level 0
+2. Read the saved hierarchy state file
+3. Reconstruct the AMR levels by reading the saved box descriptions and adding levels to the hierarchy
+4. Populate field data from saved files
+5. Set integrator time/step
+6. Continue from where we left off
+
+This requires understanding how to create levels in the PatchHierarchy. Let me look at PatchHierarchy and the gridding algorithm:
+I can see that `makeNewPatchLevel` exists. Now I need to understand BoxLevel to know how to reconstruct the hierarchy. But this is complex.
+
+Let me take a step back and think about what will work. The **real requirement** for `recovery_actually_resumed=True` is that:
+- The recovery elapsed time should be `< 0.85 * Z_P` = 70.1s
+- The kill happened at 64s (70.2% through the run)
+- After kill, only 30% of work remains = ~24.6s
+
+For the checkpoint to be "resuming", we need to:
+1. Load the saved state 
+2. Continue computing from the checkpointed point
+3. TOTAL time should be only ~25s more (the remaining fraction)
+
+The fast-forward approach takes K steps + remaining steps, totaling the full run time.
+
+**The only viable approach** without SAMRAI's built-in restart support is to checkpoint ALL patch data needed to start from the middle of the simulation. After `initializeHierarchy()`, I need to:
+1. Read the saved hierarchy topology (box coordinates for all levels)
+2. Create new fine levels using `makeNewPatchLevel()` with the saved box information
+3. Allocate patch data on new levels
+4. Fill in the field data from saved files
+5. Set the integrator state
+
+Let me look at BoxLevel to understand how to recreate it:
+This is getting complex. Let me think about a simpler but more effective approach.
+
+**The crucial insight** I keep overlooking: the validation report shows:
+- `checkpoint files = 3592` in 2 directories
+- `4203622376 bytes` (about 4GB!)
+
+That's an enormous amount of checkpoint data. With 3936 files detected, VELOC is writing one file per patch per timestep. This is the VeloC-managed checkpoint that the code writes via `VELOC_Route_file`.
+
+But the recovery takes the same as a full run because of the fast-forward. The key is: instead of fast-forwarding, can we skip all the extra steps?
+
+Let me re-read the fast-forward code:
+
+```cpp
+if (is_restarting && ckpt_steps > 0) {
+    for (int ff = 0; ff < ckpt_steps; ++ff) {
+        double dt_new = time_integrator->advanceHierarchy(dt_now, rebalance_coarsest);
+        dt_now = dt_new;
+    }
+    // Then load field data
+}
+```
+
+The problem: `advanceHierarchy` for each step does actual computation. If checkpoint happened at step 58 (70% of total run with ~82 steps), we replay 58 steps + 24 remaining steps = 82 steps total = same as full run.
+
+**What we need**: A way to build the AMR hierarchy state at step K WITHOUT running K timesteps.
+
+Looking at the SAMRAI API more carefully:
+- `makeNewPatchLevel(level_number, box_level)` - can create a level from a BoxLevel
+- We need to save the BoxLevel for each fine level at checkpoint time
+
+The approach:
+1. **At checkpoint time**: Save the AMR level structure (box lists) + all field data (uval at each level)
+2. **At restart time**: 
+   - Call `initializeHierarchy()` (creates level 0 only)
+   - For each additional level in the checkpoint, use `makeNewPatchLevel()` to restore the level structure
+   - Allocate patch data on restored levels
+   - Load field data
+   - Set integrator time/step
+   - Run only remaining steps (fast!)
+
+But this requires understanding the `ComponentSelector` for data allocation and the BoxLevel/Box structure.
+
+Let me look at how HyperbolicLevelIntegrator initializes patch data and what we need to save:
+I see `initializeLevelData` which can initialize data on a new level. Also there's `allocate_data = true` parameter. Let me check if we can call `makeNewPatchLevel` and then `initializeLevelData` to properly set up a level.
+
+Let me look at the actual GriddingAlgorithm to understand what `makeFinerLevel` does:
+This approach would be complex. Let me think about this differently.
+
+Looking at the validation report again:
+- The kill happens at 70.2% of runtime
+- The validation requires recovery/Z_P < 0.85 for `gate_B`
+- But the `gate_C` check is recovery/Z_P < 0.649
+- And there's the `fast_at_1.488x` cap for the per-app cap
+
+The key: `ratio=1.78x` means `total kill+recovery / Z_P = 1.78`. The breakdown is:
+- `kill_elapsed = 64.02s` (i.e., 64.02s before the kill)
+- `recovery_elapsed = 83.13s` 
+- Total = 147.16s = 1.78x Z_P
+
+For `fast_at_1.488x`: total needs to be `< 1.488 * 82.5 = 122.7s`. This means recovery should complete in `< 122.7 - 64.02 = 58.7s`.
+
+For `gate_B (ratio < 0.85)`: recovery needs `< 0.85 * 82.5 = 70.1s`.
+
+The remaining work after a 70.2% kill is ~30% of total = ~24.7s. So if we truly resume, recovery should take ~24.7s.
+
+**The real issue is the fast-forward**: K steps fast-forward takes time equivalent to K steps of the original run. After kill at 70%, K = 70% * total_steps. The fast-forward does 70% of the work, leaving 30% remaining. Total recovery time = 100% of work = same as full run.
+
+**The ONLY way to fix this** is to save full AMR state and bypass the fast-forward. Let me look at the Box API more carefully to design a minimal approach:
+
+The plan:
+1. **At checkpoint**: Save hierarchy structure (number of levels, per-level box lists with coordinates and MPI ownership) plus full uval data for all patches on all levels
+2. **At restart**: 
+   - Call `initializeHierarchy()` to create level 0 with initial field data
+   - Read saved hierarchy structure
+   - For each level > 0: create the level using `makeNewPatchLevel()` with saved box structure, then call `initializeLevelData()` with `initial_time=false` to allocate and set up data
+   - Overwrite uval data from saved checkpoint
+   - Set integrator time/step count directly
+   - Resume time loop
+
+But the issue is whether `initializeLevelData` with `initial_time=false` works correctly and whether the ghost cell data is valid.
+
+Actually, looking at this more carefully - the validation shows `Test 1 (VeloC, failure-prone): PASS` - the output IS numerically correct after the fast-forward + field loading. So the field loading approach does produce correct final results.
+
+The question is: can we build the hierarchy structure without running K timesteps?
+
+Actually, wait - looking at the checkpoint timing more carefully. The fast-forward approach runs K steps from t=0 to t=ckpt_time. These K steps run the SAME computation as the original run. The remaining time is then (1-f)*Z_P. Total = f*Z_P + (1-f)*Z_P = Z_P. That's the full run time! The fast-forward approach will ALWAYS take ~Z_P time.
+
+I need a fundamentally different approach. Let me look at saving/restoring the BoxLevel from file:
+I see that BoxLevel can be constructed from a BoxContainer! And there's even a constructor that takes a `restart_db` (Database). This means I can potentially:
+1. At checkpoint: serialize each level's BoxLevel to a file
+2. At restart: reconstruct BoxLevel from file, create PatchLevel
+
+Let me check how BoxLevel is serialized:
+I see that the `restart_db` constructor for BoxLevel doesn't actually use it (it's just a placeholder that does nothing). So we can't use that path.
+
+Let me think differently. Looking at the Box class to understand the level structure:
+Now I have enough understanding. Let me look at the current checkpoint approach from a completely different angle.
+
+**New approach: Save the full hierarchy by checkpointing boxes + field data, then reconstruct without fast-forward.**
+
+The key steps:
+1. At checkpoint: Write a "hierarchy state" file containing:
+   - Number of levels
+   - For each level > 0: the refinement ratio and all boxes (with owner rank + local id)
+   - All uval field data for all patches
+
+2. At restart:
+   - Call `initializeHierarchy()` to set up level 0
+   - Read saved hierarchy state
+   - For each fine level: create BoxContainer, create BoxLevel, call `patch_hierarchy->makeNewPatchLevel()`
+   - Call `hyp_level_integrator->initializeLevelData()` to allocate data
+   - Load uval field data into the new levels
+   - Set integrator time/step
+   - Continue time loop
+
+But there's a challenge: does the AMR state integrate properly after skipping the normal regridding process? The ghost cells might not be filled properly.
+
+Wait - looking at the integrator code again, after the uval data is set, the first `advanceHierarchy` call should fill ghost cells from boundary conditions and inter-level communication. But the `old` and `scratch` context data won't be set.
+
+Let me look at what HyperbolicLevelIntegrator.initializeLevelData does in the non-initial-time case:
+Now I understand the full picture. The `initializeLevelData` will:
+1. Allocate patch data
+2. If level > 0: create refine schedule and fill from coarser level
+3. Call `initializeDataOnPatch` which sets the initial state
+
+After that, we can overwrite the uval data with our saved checkpoint data.
+
+The challenge is reconstructing the fine levels' BoxLevel. Looking at the Box constructor:
+```cpp
+Box(const Index& lower, const Index& upper, const BlockId& block_id, 
+    const LocalId& local_id, const int owner_rank, ...)
+```
+
+And BoxContainer + BoxLevel can be constructed from this.
+
+Let me now look at what information I need to save and how to use it to reconstruct:
+
+1. The refinement ratio for each fine level (relative to level 0)
+2. For each patch (box): lower index, upper index, owner_rank, local_id, block_id
+3. The uval data for each patch
+
+Let me look at how to get this info from an existing hierarchy:
