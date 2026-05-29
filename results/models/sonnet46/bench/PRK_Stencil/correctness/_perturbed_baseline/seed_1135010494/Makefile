@@ -1,0 +1,1 @@
+/home/ndhai/diaspora/guard-agent/tests/apps/vanillas/PRK_Stencil/Stencil/Makefile
