@@ -167,7 +167,37 @@ OPENCODE_START_MS=$(date +%s%3N)
 
 cd "$APP_DIR"
 
+# Per-launch opencode config: scope the global read-deny to OTHER apps only,
+# so this app's LLM can read its OWN workspace and its OWN past iter_logs.
+# The global ~/.config/opencode/opencode.json denies build/tests_baseline_*/**
+# universally — too coarse, also blocks the LLM from reading the workspace it
+# is currently working in.  ISSUES.md #58 captures the 2026-05-28 sonnet46
+# sweep symptoms (HyPar !-prefix workspace pollution at iter 14, every other
+# app's "rewrite from scratch" coping).  We keep the global file untouched
+# and pass a per-launch config via OPENCODE_CONFIG so the parallel orchestrator
+# can run --max-gen-workers helpers concurrently, each scoped to its own app.
+PER_LAUNCH_CFG="$ITER_LOG/opencode.json"
+OWN_WORKSPACE="$REPO_ROOT/build/tests_baseline${MODEL_TAG:+_$MODEL_TAG}/$APP_NAME/**"
+OWN_ITER_LOGS="$REPO_ROOT/build/iterative_logs/${APP_NAME}_baseline${MODEL_TAG:+_$MODEL_TAG}/**"
+jq --arg ws "$OWN_WORKSPACE" --arg logs "$OWN_ITER_LOGS" '
+  .permission.read = {
+    "/home/ndhai/.local/share/opencode/**": "deny",
+    "/home/ndhai/.opencode/**":             "deny",
+    "**/build/_cell_isolation/**":          "deny",
+    "**/build/validation_output/**":        "deny",
+    "**/build/baseline_cache/**":           "deny",
+    "**/build/_archives/**":                "deny",
+    "**/tests/apps/**":                     "deny",
+    "**/build/iterative_logs/**":           "deny",
+    "**/build/tests_baseline/**":           "deny",
+    "**/build/tests_baseline_*/**":         "deny",
+    ($ws):   "allow",
+    ($logs): "allow"
+  }' ~/.config/opencode/opencode.json > "$PER_LAUNCH_CFG"
+echo "[gen $APP_NAME iter $ITER] per-launch opencode config: $PER_LAUNCH_CFG (allow read: $OWN_WORKSPACE + $OWN_ITER_LOGS)"
+
 # Hard-timeout-wrapped opencode in the background.
+OPENCODE_CONFIG="$PER_LAUNCH_CFG" \
 timeout --kill-after=10 "$OPENCODE_TIMEOUT" \
   opencode run --dangerously-skip-permissions --model "$OPENCODE_MODEL" "$PROMPT" \
   > "$ITER_LOG/opencode_stdout.txt" 2> "$ITER_LOG/opencode_stderr.txt" &
