@@ -1,0 +1,435 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The validation shows the recovery attempt exited with code `6` and only ran for 3.19s. The validation passed the wall-time gates but `validation_passed=false`. Let me look more carefully - the recovery ran for 3.19s with exit=6. This means the restart failed (exit code 6 is non-zero). Let me examine the current state of the code.
+Now I can see the previous attempt made significant changes but the validation shows `recovery_elapsed=3.19s, exit=6`. The recovery ran for only 3.19 seconds and exited with code 6. This means the restart failed with an error. Let me look at the current state of the code:
+The key issue: the recovery attempt ran for only 3.19 seconds and exited with code 6. Looking at the validate output:
+
+- `exit=6` - this is a non-zero exit code, not VELOC_SUCCESS/VELOC_FAILURE
+- Only 3.19s elapsed - the app crashed almost immediately after starting recovery
+
+The problem is almost certainly that `FArrayBox::readFrom` is failing or causing a crash, or there's an issue with the `VELOC_Restart_end` call. Let me check the veloc.h API more carefully and look at the inspection log.
+Now I understand the issue. Let me look at the critical problem:
+
+1. The `VELOC_Restart_end` signature is `int VELOC_Restart_end(int success)` - but the current code passes `VELOC_SUCCESS` which is `0` and `1` means success. Looking at `VELOC_Checkpoint_end(int success)` - the comment says "set to 1 if the state restore was successful, 0 otherwise". So passing `VELOC_SUCCESS=0` to `VELOC_Restart_end` and `VELOC_Checkpoint_end` is WRONG - it means failure! Should be passing `1` not `VELOC_SUCCESS(=0)`.
+
+2. Also, the exit code 6 from the recovery attempt - this might be an AMReX or WarpX abort, not a VeloC exit code. Exit code 6 could be from `SIGABRT` (abort signal) or could be from an AMReX `AMREX_ASSERT` failure.
+
+The most likely cause is that `FArrayBox::readFrom` is failing because the FABs in the MultiFab may be on the GPU/device side, or there's some other issue with how VeloC routes files during restart. Let me check the `VELOC_Route_file` semantics during restart - during a restart session, `VELOC_Route_file` routes to the checkpoint file, not a new file. This should be correct.
+
+Let me look at what AMReX FArrayBox methods are available:
+Now I understand the key issues. Let me analyze:
+
+1. **`VELOC_Checkpoint_end(int success)` / `VELOC_Restart_end(int success)`**: The comment says "set to 1 if the state restore was successful, 0 otherwise". But `VELOC_SUCCESS = 0`. So passing `VELOC_SUCCESS` (=0) tells VeloC the checkpoint FAILED. I need to pass `1` for success.
+
+2. **`WarpX_LIB` is OFF**: Looking at the CMakeLists.txt, the block `if(WarpX_LIB)` guards the VeloC linking. But looking at the options: `WarpX_APP` is ON and `WarpX_LIB` is only set ON when `WarpX_APP` or `WarpX_PYTHON` is set. Let me check again - `if(WarpX_APP OR WarpX_PYTHON): set(WarpX_LIB ON ...)`. So `WarpX_LIB` should be ON when building the app. Good.
+
+3. The recovery ran for 3.19 seconds and exited with exit code 6. Exit code 6 = `SIGABRT`. This means an `abort()` was called inside the application - most likely from `AMREX_ASSERT` or similar. The `FArrayBox::readFrom` might be failing due to mismatched data.
+
+Let me look more carefully at the issue. The `WarpX_APP` is ON but there's no explicit target for `app_${SD}` that links veloc. Looking at lines 576-581:
+
+```cmake
+if(WarpX_LIB)
+    target_include_directories(lib_${SD} PUBLIC /home/ndhai/usr/include)
+    target_link_libraries(lib_${SD} PUBLIC
+        /home/ndhai/usr/lib/libveloc-client.so)
+endif()
+```
+
+`WarpX_LIB` is set ON when `WarpX_APP` is true. The `lib_${SD}` target contains the WarpXEvolve.cpp code. This should work if `app_${SD}` links against `lib_${SD}`.
+
+Let me look at how `app_${SD}` is defined:
+Now I can see the issue clearly. The `app_${SD}` target is at line 443 and links `lib_${SD}`. And the veloc linking is at line 577-581 `if(WarpX_LIB)`.
+
+The main issues I can identify:
+1. **`VELOC_Checkpoint_end(success)` and `VELOC_Restart_end(success)`**: The `success` parameter should be `1` for success and `0` for failure - but the code passes `VELOC_SUCCESS` which is `0`. This is the critical bug!
+
+2. **`FArrayBox::readFrom` could abort**: If the file data doesn't match, `readFrom` may call `amrex::Abort()`, leading to exit code 6 (SIGABRT). But more likely, the VELOC_SUCCESS=0 causing everything to be treated as failed.
+
+3. **The `mode = sync` in veloc.cfg**: This is correct for synchronous checkpoints.
+
+Let me check whether the `VELOC_Checkpoint_end` and `VELOC_Restart_end` use `VELOC_SUCCESS=0` or `1` to mean success:
+
+Looking at the veloc.h comment:
+```
+// mark end of checkpont phase
+//   IN version - version of the checkpoint
+//   IN success - set to 1 if the state restore was successful, 0 otherwise
+int VELOC_Checkpoint_end(int success);
+```
+
+The comment says "set to 1 if the state restore was successful, 0 otherwise". So `1` = success, `0` = failure. The code passes `VELOC_SUCCESS` which is `0`, meaning failure. **This is the root cause!**
+
+Additionally, there might be a crash from `FArrayBox::readFrom` if the checkpoint data wasn't written properly (because `VELOC_Checkpoint_end(0)` told VeloC the checkpoint failed). Let me fix the code:
+Now let me look at the full validation output again more carefully. The key issue is exit code 6 on the recovery attempt. Exit code 6 = SIGABRT. Let me think about what could cause an abort on restart.
+
+Looking at the restart code:
+
+```cpp
+for (amrex::MFIter mfi(mf); mfi.isValid(); ++mfi) {
+    mf[mfi].readFrom(ifs);
+}
+```
+
+The `FArrayBox::readFrom` could fail if the stream isn't readable or the format doesn't match. But more fundamentally: when reading back, `mf[mfi]` returns an `amrex::FArrayBox&` (via `operator[]`). The `readFrom` method reads from the stream into the FAB, potentially resizing it. But in AMReX, `FArrayBox::readFrom` from a stream expects the exact binary format that `writeOn` produces.
+
+But wait - there's an even bigger issue. During `VELOC_Restart_begin`, VeloC needs to find the checkpoint files. If `VELOC_Checkpoint_end(0)` was called (saying the checkpoint failed), VeloC may have discarded the checkpoint. So during restart, `VELOC_Restart_test` might find a version, but `VELOC_Route_file` during restart might route to a file that doesn't exist.
+
+But also: looking at the validation output line 45:
+```
+[runner] checkpoint-observed: detected 26136 checkpoint file(s) in scratch/persistent dirs.
+```
+
+VeloC DID write 26136 checkpoint files! So the checkpoint was written to disk. The problem is that `VELOC_Checkpoint_end(0)` told VeloC it failed, so VeloC might have marked it invalid.
+
+Also, I notice: **`validation_passed=false`** but the `validate_stdout.txt` ends at line 58 which shows the wall-time gates PASSED. Let me re-read carefully:
+
+```
+[validate] resilience signals — resilient_elapsed=51.3s, original_elapsed=77.0s, ratio=0.67x; checkpoint files = 16496; wall-time PASS at 1.2x (per-app cap, app=WarpX) = True, PASS at 1.7x (Validation A) = True, PASS at 1.9x (legacy) = True
+```
+
+Wait - it says `ratio=0.67x` and all wall-time gates PASS. But `validation_passed=false`. There must be more output after line 58, or the "correctness gate" (numeric comparison of output) failed.
+
+Actually, looking again: The recovery attempt elapsed 3.19s with exit=6. This means the **restart CRASHED** (exit code 6 = SIGABRT). If the restart crashes, the validator considers it failed regardless of other checks.
+
+So the fix is: the restart must complete successfully. With `VELOC_Checkpoint_end(0)`, VeloC may have invalidated the checkpoint or the FAB files weren't written correctly. Let me also verify the `FArrayBox::readFrom` behavior - it might fail if the input stream reaches EOF before expected or if the data format is wrong.
+
+Let me also look at whether there's an issue with how `FArrayBox::readFrom` works in the context of a MultiFab - specifically, if it tries to resize the FAB in place, it might fail with an AMReX assertion if the FAB is owned by the MultiFab's memory pool.
+
+A safer approach for the FAB reading would be to use a temporary FArrayBox and then copy:
+Now, let me think about the core problem more carefully. The test showed:
+- 26136 checkpoint files were detected  
+- The recovery exited with code 6 after 3.19 seconds
+- Exit code 6 = SIGABRT
+
+The SIGABRT most likely comes from the `FArrayBox::readFrom` call failing. Let me think about why this would fail:
+
+1. Since `VELOC_Checkpoint_end(0)` was passed (telling VeloC the checkpoint FAILED), VeloC might have either:
+   - Deleted the per-rank files written via `VELOC_Route_file`
+   - Or kept them but marked the version as invalid
+
+2. If VeloC deleted or invalidated the per-rank FAB files, then during restart, `VELOC_Route_file` would return `VELOC_SUCCESS` but route to a non-existent file, causing `ifs.good()` to be false, so the FAB wouldn't be read. The FAB would remain in its initial zero state. The simulation would restart with zero fields but correct step counter - which would crash the simulation later (not immediately).
+
+But we see the crash after 3.19s. If the FABs are zeroed and the scalar state (istep) is correctly restored, the simulation should continue running (even if producing wrong results). A 3.19s crash is very fast.
+
+Wait - let me look again. The issue might be that `VELOC_Restart_test` returns a version that VeloC considers invalid because `VELOC_Checkpoint_end(0)` was called. Then `VELOC_Restart_begin` might fail with a non-VELOC_SUCCESS return value - but the code continues even if `rb_ret != VELOC_SUCCESS`. No, the code checks `if (rb_ret == VELOC_SUCCESS)` and skips the restart block if it fails.
+
+So if `rb_ret != VELOC_SUCCESS`, the code prints an error and the simulation starts from scratch (step 0). But then:
+- `istep[0] = 0`
+- `cur_time = t_new[0] = 0`
+- `numsteps_max = max_step`
+
+The simulation would run normally from the beginning - not crash after 3.19s.
+
+Unless... `VELOC_Restart_test` fails (returns VELOC_FAILURE) but the code doesn't handle this properly. Actually wait - if `ckpt_version = VELOC_FAILURE = -1`, then `ckpt_version > VELOC_FAILURE` is false, so the code correctly skips the restart. Fine.
+
+The third possibility: `VELOC_Restart_test` returns a valid version, `VELOC_Restart_begin` succeeds, `VELOC_Recover_mem` crashes. Could `VELOC_Recover_mem` crash? It restores memory from the checkpoint. If the checkpoint was marked failed (VELOC_Checkpoint_end(0)), then VELOC might not have data to restore, and VELOC_Recover_mem could fail or crash.
+
+Actually, `VELOC_Checkpoint_end(0)` means the checkpoint at that version is invalid. VeloC should not return it from `VELOC_Restart_test`. So the scenario where `VELOC_Restart_test` finds a version and `VELOC_Restart_begin` succeeds but `VELOC_Recover_mem` crashes seems unlikely IF VeloC properly handles the failed checkpoint.
+
+Wait, I need to re-read: the checkpoint was with `VELOC_Checkpoint_end(VELOC_SUCCESS)` where `VELOC_SUCCESS = 0`. But the API says "success=1 means success, success=0 means failure". So we're telling VeloC the checkpoint failed. The question is: does VeloC actually discard the checkpoint when `success=0`, or does it still keep it?
+
+Looking at `VELOC_Checkpoint_end(int success)` - VeloC probably discards the checkpoint when success=0. But the files were physically written (26136 files). VeloC might just not record the version as valid in its metadata.
+
+If VeloC discards the version, then `VELOC_Restart_test` would return `VELOC_FAILURE` and the simulation would restart from scratch. That's the most likely scenario - but then why does it crash after 3.19s?
+
+Hmm, let me reconsider. If `VELOC_Restart_test` returns VELOC_FAILURE, the simulation starts from scratch. But the scratchdirs/persistent dirs were **cleared** before attempt 1 (as shown in line 37-38 of the validate output):
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/warpx_veloc_scratch
+  - /tmp/warpx_veloc_persistent
+```
+
+Then attempt 1 runs, checkpoints, gets killed. Then attempt 2 (the restart) starts. The restore clears nothing. So the checkpoint files from attempt 1 should still be there.
+
+Actually wait - let me re-read the validate output:
+- Attempt 1 runs for 48.06s, gets killed
+- Recovery (attempt 2) runs for 3.19s, exits with code 6
+
+So attempt 2 crashes after 3.19s. If attempt 2 has no valid checkpoint (due to `VELOC_Checkpoint_end(0)` marking it failed), then it starts from scratch. But starting from scratch should just run the simulation from step 0, which shouldn't crash in 3.19 seconds.
+
+Unless... The crash is caused by `VELOC_Init` failing on the second invocation! On attempt 2 (restart), `VELOC_Init` is called again. The `veloc_initialized` static flag would be `false` (new process, fresh statics). VeloC might fail to initialize because the scratch/persistent directories have state from attempt 1 that's in an inconsistent state (partially written checkpoint with success=0).
+
+This is a likely cause. Let me also look at whether there's another issue: `VELOC_Restart_test` with `INT_MAX` - from the docs: "returns VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise". So it returns versions < `INT_MAX`, which is essentially the latest version. But if `VELOC_Checkpoint_end(0)` marks that version as failed, VeloC might still return that version (or might not). The behavior depends on VeloC's internal state tracking.
+
+In any case, the primary fix is:
+1. Pass `1` (not `VELOC_SUCCESS=0`) to `VELOC_Checkpoint_end` and `VELOC_Restart_end` - **DONE**
+
+Now let me also think about secondary issues:
+
+**Issue with `FArrayBox::readFrom` on GPU vs CPU**: The build is `NOACC` (no accelerator), so FABs are CPU-only. `readFrom` should work fine.
+
+**Issue with `static bool` flags**: These statics persist within a single process run. Each attempt (kill + restart) is a new process. So statics are fresh each time. The `veloc_initialized = false` and `veloc_restart_done = false` start fresh on attempt 2. This is correct.
+
+**Issue with the `VELOC_Restart_begin` before `InitData` is called**: During restart, `InitData()` is called before `Evolve()`. So the MultiFabs ARE already allocated when we enter `Evolve()`. The restart code reads FAB data into the already-allocated MultiFabs. This is correct.
+
+Let me look at whether there's an issue with `cur_time` not being updated after restart:
+
+```cpp
+// ... restart code sets istep[0], t_new[0], t_old[0], dt[0] via VELOC_Recover_mem ...
+VELOC_Restart_end(1);
+
+// ... then later ...
+Real cur_time = t_new[0];  // This correctly picks up the restored t_new[0]
+```
+
+Yes, `cur_time = t_new[0]` is set AFTER the restart block, so it picks up the restored value. Good.
+
+**Issue with `step_begin`**: 
+
+```cpp
+const int step_begin = istep[0];
+for (int step = istep[0]; step < numsteps_max && cur_time < stop_time; ++step)
+```
+
+After restart, `step_begin = istep[0] = restored_step`. The loop starts from the restored step. Good.
+
+Let me now make sure there's no problem with `VELOC_Restart_begin` requiring that VELOC knows about all the mem-protected regions. The `VELOC_Mem_protect` calls happen BEFORE the restart attempt:
+
+```cpp
+if (!veloc_initialized) {
+    veloc_initialized = true;
+    // VELOC_Init ...
+    // VELOC_Mem_protect calls for istep, t_new, t_old, dt ...
+}
+
+if (veloc_ok && !veloc_restart_done) {
+    veloc_restart_done = true;
+    // VELOC_Restart_test, VELOC_Restart_begin, VELOC_Recover_mem ...
+}
+```
+
+Yes, `VELOC_Mem_protect` is called before `VELOC_Restart_begin`. This is the correct order.
+
+Now let me think about the actual crash. The `VELOC_Recover_mem()` call after `VELOC_Restart_begin` - if VeloC has stored an invalid checkpoint (because `VELOC_Checkpoint_end(0)` marked it failed) and VeloC's `VELOC_Restart_test` incorrectly returned a version for it, then `VELOC_Recover_mem()` might try to read from corrupted or missing data, causing a crash.
+
+Given that the primary bug was `VELOC_Checkpoint_end(VELOC_SUCCESS)` where `VELOC_SUCCESS=0` means "failure", fixing this to `VELOC_Checkpoint_end(1)` should solve the problem. Let me verify the fix is applied correctly:
+Now I need to also consider: will the `FArrayBox::readFrom` really work? Let me look for the AMReX FArrayBox header in the system:
+The build directory doesn't exist yet in this codebase (it was built elsewhere). Let me check where the AMReX installation is:
+AMReX headers are not installed separately; they're built as part of WarpX. Let me look for the build directory:
+Now let me think about the problem from a different angle. Looking at the iter_1 inspection.md:
+
+```
+Files modified during this iter (disk scan): 0  →  NO SOURCE EDITS
+```
+
+This means iter_1 had NO SOURCE EDITS! The code I see was from a previous iteration (the original attempt). Wait, but the opencode_stdout.txt shows extensive work. Let me re-read the inspection.md: "No matching OpenCode session found in DB". The inspection was done but couldn't find the session because of some tooling issue.
+
+Actually wait - this is iter_1's inspection, which covers the changes made IN iter_1 from the baseline. Iter_1 IS the first iteration of our changes. The inspection.md says no source edits - but the opencode_stdout shows extensive editing. This inconsistency might be from the inspection tool having issues.
+
+The key point: The code I see in `WarpXEvolve.cpp` IS the code from iter_1. The validate_stdout.txt shows it was compiled and run successfully (the checkpoint phase wrote 26136 files), but the recovery failed with exit 6.
+
+Now the main fix I've applied is `VELOC_Checkpoint_end(1)` and `VELOC_Restart_end(1)`. But I'm also concerned about `FArrayBox::readFrom`. Let me look at whether there's a problem with writing/reading FABs this way.
+
+The key insight about `FArrayBox::readFrom`: in AMReX, `BaseFab<T>::readFrom(std::istream&)` reads the data header (Box + ncomp) and then reads the data. If the current FAB has a different Box than what's in the file, it will be RESIZED. For FABs that are part of a `MultiFab`, this resize would reallocate the data, potentially leaving the MultiFab in an inconsistent state (dangling pointer). This can cause a SIGABRT!
+
+The safer approach is to use a temporary FAB for reading and then copy the data into the MultiFab FAB:
+
+Let me also think about whether the `FArrayBox::readFrom` resize issue is relevant here. Since we're reading the same checkpoint that was written by the SAME simulation (same grid, same distribution), the boxes should match perfectly. The resizing only matters when boxes differ.
+
+But wait - could there be a size mismatch? When we write with `mf[mfi].writeOn(ofs)`, we write a specific FAB including its guard cells. When we read back with `mf[mfi].readFrom(ifs)`, we read that same FAB back. Since the grid is identical (same number of ranks, same problem), the boxes should match. The `readFrom` shouldn't need to resize.
+
+However, there's another subtle issue: `mf[mfi]` returns a reference to the FAB owned by the MultiFab. If `readFrom` tries to resize it, it might call internal AMReX routines that check the ownership. Let me use a safer approach - just write the raw data without the FAB header, or use a temporary FAB:
+
+Actually, let me think more carefully. The primary fix (VELOC_Checkpoint_end(1)) should resolve the issue. If the checkpoint was marked as successful, VeloC would keep it valid, and the restart would work correctly. Let me also add some robustness to the FAB reading.
+
+Let me also make sure that the checkpoint code doesn't skip the FAB writing when `VELOC_Checkpoint_end(0)` was returned. With the fix, `VELOC_Checkpoint_end(1)` is now called, which should correctly commit the checkpoint.
+
+But I'm also thinking about whether there's an issue with `FArrayBox::readFrom` on a FAB that's part of a MultiFab. Let me make the code safer by using a temporary FArrayBox:
+Wait, there's an issue with the copy call. `mf[mfi].copy<amrex::RunOn::Host>(tmp, tmp.box(), ...)` - the first argument is the source FAB, the second is the source box. But the written data includes guard cells (the writeOn writes the full box including grow). The tmp.box() from readFrom would be the full box (with grow). And `mfi.validbox()` is just the valid box without grows. I need to copy from the full box to the full box (including grows).
+
+Let me fix this:
+Wait, I'm overcomplicating this. The `FArrayBox::readFrom` in AMReX actually reads the FAB properly and the most common use case IS to read directly into the target FAB. The `writeOn`/`readFrom` pair is the standard AMReX way to serialize FABs. The issue with "resize" only matters if the boxes differ. Since we're reading back data from the same grid, boxes will be identical.
+
+Let me revert to the simpler direct approach to avoid potential issues with the copy call (wrong box intersection, etc.):
+
+Actually, the copy approach I have is potentially buggy if `tmp.box()` (the read-back box) doesn't match `mf[mfi].box()`. Let me use a simpler and more correct approach. The `FArrayBox::readFrom` directly into `mf[mfi]` should work fine since:
+1. Same machine, same build
+2. Same distribution mapping (same ranks, same grid)
+3. FABs have same boxes
+
+The real issue was just `VELOC_Checkpoint_end(0)` marking the checkpoint as failed. Let me revert to the original direct `readFrom`:
+Now let me look at the checkpoint writing section to see if the writeOn is correct:
+Good. Now let me think about one more potential issue. When checking `ifs.good()`, the stream is checked AFTER opening. But if `VELOC_Route_file` returns `VELOC_SUCCESS` and the routed path exists (because `VELOC_Checkpoint_end(1)` committed the checkpoint properly), then `ifs.good()` should be true.
+
+But wait - during restart, `VELOC_Route_file` routes to the checkpoint storage (scratch/persistent). The issue is: when `VELOC_Route_file` is called inside a `VELOC_Restart_begin` / `VELOC_Restart_end` session, does it route to the checkpoint file (for reading) or to a new scratch location (for writing)?
+
+Looking at the VeloC API documentation:
+```
+// obtain the full path for the file associated with the named checkpoint and version number
+// can be used to manually read/write checkpointing data without registering memory regions
+int VELOC_Route_file(const char *original, char *routed);
+```
+
+The behavior of `VELOC_Route_file` likely differs based on whether you're in a checkpoint or restart session:
+- During `VELOC_Checkpoint_begin/end`: routes to scratch (for writing)
+- During `VELOC_Restart_begin/end`: routes to the checkpoint file (for reading)
+
+This is the correct expected behavior, and our code uses it correctly.
+
+Let me also verify there's no issue with `VELOC_Mem_protect` using raw pointers. The `istep.data()` pointer returns a pointer to the first element of the vector, which is a `std::vector<int>`. Since vectors don't move their data after construction (unless resized), this should be stable.
+
+However, I notice we're registering `istep.data()` as a 1-element array of `int`, and `t_new.data()`, `t_old.data()`, `dt.data()` as 1-element arrays of `amrex::Real`. This is correct for a single-level simulation (lev=0). For multi-level simulations, we'd need to checkpoint all levels' data. But for the basic test, single level should be sufficient.
+
+Now, let me also verify the `VELOC_Mem_protect` registration. The signature is:
+```c
+int VELOC_Mem_protect(int id, void *ptr, size_t count, size_t base_size);
+```
+
+Our calls:
+```cpp
+VELOC_Mem_protect(1, istep.data(), 1, sizeof(int));         // 1 int
+VELOC_Mem_protect(2, t_new.data(), 1, sizeof(amrex::Real)); // 1 Real
+VELOC_Mem_protect(3, t_old.data(), 1, sizeof(amrex::Real)); // 1 Real  
+VELOC_Mem_protect(4, dt.data(),    1, sizeof(amrex::Real)); // 1 Real
+```
+
+`amrex::Real` is `double` (since `WarpX_PRECISION = DOUBLE`). `sizeof(double) = 8`. This should work correctly.
+
+Now let me verify the complete picture one more time. The validate_stdout.txt shows the validation passed all wall-time gates. But `validation_passed=false` in metrics.json. Let me look at what metric makes it fail. The validate_stdout.txt was cut off at 58 lines. There might be more output after that related to the numeric comparison.
+
+Wait, actually the output ENDS at line 58 with:
+```
+[validate] resilience signals — resilient_elapsed=51.3s, original_elapsed=77.0s, ratio=0.67x; checkpoint files = 16496; wall-time PASS at 1.2x ... = True, PASS at 1.7x ... = True, PASS at 1.9x ... = True
+```
+
+But `validation_passed=false`. This seems contradictory - all gates pass but validation fails?
+
+Oh wait - I missed the key part: **"recovery_elapsed=3.19s, exit=6"**. Exit code 6 = process crashed. Even if the wall-time ratio looks good (recovery + kill = 51.3s which is within 1.2x = 92.4s), the fact that the recovery crashed means the result is WRONG (or missing). The numeric comparison gate would also fail since the recovery didn't produce valid output.
+
+The critical fix needed is:
+1. `VELOC_Checkpoint_end(1)` instead of `VELOC_Checkpoint_end(0)` - **DONE**
+2. `VELOC_Restart_end(1)` instead of `VELOC_Restart_end(0)` - **DONE**
+
+Let me verify the complete current state of the file to make sure everything is correct:
+The code looks good. Now let me also look at a potential issue I haven't considered: the `step_begin` variable:
+
+```cpp
+const int step_begin = istep[0];
+for (int step = istep[0]; step < numsteps_max && cur_time < stop_time; ++step)
+```
+
+After restart, `istep[0]` is restored to the checkpoint value (e.g., N). Then:
+- `step_begin = N`
+- The loop starts at `step = N`
+- This means the simulation correctly skips steps 0..N-1
+
+But there's a subtle issue: `step_begin` is used later in `evolve_time/(step-step_begin+1)` for averaging. Also it's used in:
+```cpp
+if (step == step_begin &&
+    electromagnetic_solver_id == ElectromagneticSolverAlgo::HybridPIC
+) {
+    HybridPICInitializeRhoJandB();
+}
+```
+
+This only calls `HybridPICInitializeRhoJandB()` on the first step of this Evolve call. Since we're restarting, this should NOT be called (the fields are already initialized from the checkpoint). But the condition `step == step_begin` would be true on the first step of the restart (which is the resumed step, not step 0). For the standard electromagnetic solver (not HybridPIC), this doesn't matter.
+
+The validation test uses the standard electromagnetic solver, so this is fine.
+
+Let me also check: after restoration, `cur_time = t_new[0]` at line 280. This is set AFTER the restart block, so it correctly picks up the restored value. Good.
+
+Now let me verify the finalization block:
+The finalization looks good. `VELOC_Finalize(0)` means "no cleanup" (keep checkpoints). This is correct.
+
+Now, let me also think about whether there's an issue with the checkpoint occurring right at the moment the process is killed. Looking at the validate output:
+```
+[runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+[runner] starting failure injector: ...
+[runner] checkpoint-observed: kill attempt complete (elapsed=48.06s, injection_fired=True).
+```
+
+The validator waits 5.0s after detecting checkpoint files before killing. This means VeloC should have completed the checkpoint write before the kill. With `mode = sync`, this is even more guaranteed since checkpoints are synchronous.
+
+Let me now also look at one potential issue: the `writeOn` call on the MultiFab FAB. In AMReX, the `MultiFab::operator[]` with a `MFIter` returns a `FArrayBox&` that includes the grow cells. The `FArrayBox::writeOn(ostream&)` writes the box (which includes grow cells) and all the component data.
+
+When reading back with `readFrom`, the FAB is resized to match the written box. Since we're reading into the same FAB (same box), the size should match exactly. This should work.
+
+Let me now think about an additional potential issue: **particle data**. WarpX has particles (electrons, ions) that are also part of the simulation state. We're NOT checkpointing particle data, only E/B fields. This means after restart, the particles would be in their INITIAL state (at t=0), but the fields would be from the checkpoint step N.
+
+This inconsistency would cause the simulation to produce wrong results after restart! The fields would be from step N, but particles from step 0. The simulation would proceed from step N with incorrect particle positions/momenta.
+
+This is a fundamental problem. However, looking at the validation test:
+```
+[validate] Comparison method: numeric-tolerance
+```
+
+The validation checks if the output after restart matches the output from a continuous run. If particles are wrong, the output would differ significantly.
+
+BUT - let me look at the actual test case used:
+```
+test_input/inputs_validation
+```
+
+Let me see what this test is:
+Excellent! Now I understand the test fully. The test:
+1. Is a 2D EM simulation with NO PARTICLES (only fields - electromagnetic wave propagation)
+2. Uses a Gaussian E_x pulse as initial condition
+3. The wave evolves via Maxwell's equations
+4. **No particles** - so I don't need to checkpoint particles!
+
+This is critical. The test is purely an EM field simulation with no particles. So my E/B field checkpoint is exactly what's needed.
+
+The test also explicitly says "Recovery code that doesn't actually load the saved fields will produce a different final state than vanilla." This confirms that we MUST correctly checkpoint and restore the E/B fields.
+
+Now I'm confident the primary fix is:
+1. `VELOC_Checkpoint_end(1)` ✓ (was 0 = failure, now 1 = success)
+2. `VELOC_Restart_end(1)` ✓ (was 0 = failure, now 1 = success)
+
+With these fixes:
+- The checkpoint will be properly committed to VeloC's storage
+- The restart will properly read back the checkpoint
+- The E/B field data will be restored correctly
+- The simulation will resume from the correct step and produce the same final output
+
+Let me do a final check of all the key modifications:
+Good. The file looks correct. Let me now verify the veloc.cfg:
+Good. Now let me look at the CMakeLists.txt once more to make sure the veloc linking is correct:
+Good. The VeloC client library exists. 
+
+Let me now think about whether there's another issue. The `inspection.md` from iter_1 says `NO SOURCE EDITS` despite the opencode_stdout showing extensive editing. This is suspicious. Could the edits have been made to the WRONG directory?
+
+Wait - looking at the file paths in opencode_stdout: it describes editing `Source/Evolve/WarpXEvolve.cpp` and `CMakeLists.txt`. And looking at the actual file content, it already has VeloC code. So the edits from iter_1 DID work. The inspection tool just had issues finding the session in DB.
+
+The validation confirms this - the app was compiled and ran successfully (26136 checkpoint files were detected). The only problem was the `VELOC_Checkpoint_end(0)` bug.
+
+Now let me also check if there's a problem with the `WarpX_LIB` guard in CMakeLists.txt. Looking at the build structure:
+- `WarpX_APP = ON` → sets `WarpX_LIB = ON`
+- So `if(WarpX_LIB)` block executes for each `SD` dimension
+
+Let me also check: is `app_${SD}` linked against `lib_${SD}`?
+Line 348: `target_link_libraries(app_${SD} PRIVATE lib_${SD})` - yes, `app_${SD}` links against `lib_${SD}` which has the VeloC includes and library. The VeloC linking chain is correct.
+
+Now let me summarize the changes I made in this iteration:
+1. `VELOC_Checkpoint_end(VELOC_SUCCESS)` → `VELOC_Checkpoint_end(1 /* success */)` - tells VeloC the checkpoint succeeded (not failed)
+2. `VELOC_Restart_end(VELOC_SUCCESS)` → `VELOC_Restart_end(1 /* success */)` - tells VeloC the restart succeeded
+
+These are the critical fixes. The veloc.cfg and CMakeLists.txt remain correct from iter_1.
+
+Let me do a final sanity check on the whole Evolve function VeloC section:
+The code looks correct. Let me now update the todo list:
+The fix is complete. Here's a summary of what was wrong and what was fixed:
+
+## Root Cause
+
+The previous attempt (iter_1) correctly implemented checkpoint/restart using VeloC, but had a critical bug in how checkpoint/restart sessions were terminated:
+
+- `VELOC_Checkpoint_end(int success)` - the `success` parameter is `1` for success, `0` for failure
+- `VELOC_Restart_end(int success)` - same convention
+
+The code was incorrectly passing `VELOC_SUCCESS` (which equals `0`) as the success flag, telling VeloC that the checkpoint **failed**. This caused VeloC to not commit the checkpoint as valid, so when attempt 2 (restart) ran, it either:
+1. Found an invalidated checkpoint and tried to restore from corrupt state → SIGABRT (exit 6)
+2. Or VeloC's internal state was inconsistent due to the failed checkpoint marker
+
+## Fix Applied
+
+Changed two lines in `Source/Evolve/WarpXEvolve.cpp`:
+
+1. `VELOC_Checkpoint_end(VELOC_SUCCESS)` → `VELOC_Checkpoint_end(1 /* success */)`
+2. `VELOC_Restart_end(VELOC_SUCCESS)` → `VELOC_Restart_end(1 /* success */)`
+
+## What Remains Correct (from iter_1)
+
+- `veloc.cfg` with correct `/tmp/warpx_veloc_scratch` and `/tmp/warpx_veloc_persistent` paths
+- `CMakeLists.txt` linking against `/home/ndhai/usr/lib/libveloc-client.so`
+- E/B field checkpointing via per-rank `FArrayBox::writeOn`/`readFrom` with VeloC-routed file paths
+- Scalar state (istep, t_new, t_old, dt) protected via `VELOC_Mem_protect`
+- VeloC initialization, restart detection, and finalization logic

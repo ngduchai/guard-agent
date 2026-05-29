@@ -1,0 +1,336 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The key failure is:
+1. Recovery TIMEOUT - the app crashed with "double free or corruption" during recovery
+2. The output file wasn't produced during the failure-prone run (recovery timed out)
+
+Let me examine the current codebase to understand what was done in the previous attempt:
+Now I understand the problem. The recovery is failing with "double free or corruption" error. The issue is in the restart logic - specifically in how the mesh and state memory is managed after the checkpoint. Let me look at the relevant parts more carefully.
+Let me look at MallocPlus more carefully to understand the memory_delete_all function:
+Now let me look at what happens during mesh->terminate() and state->terminate() to understand if there's a double-free issue there:
+I can see the problem now. In the `veloc_do_restart` function, the code calls `mesh->mesh_memory.memory_delete_all()` and `state->state_memory.memory_delete_all()`, which frees all the memory tracked in those MallocPlus dictionaries. Then it calls `mesh->allocate(saved_ncells)` and `state->allocate(saved_ncells)` to reallocate.
+
+The problem is that `mesh->terminate()` is called later at the end of the run, which tries to call `mesh_memory.memory_delete(i)` etc. - but if those were already cleared via `memory_delete_all()` and then reallocated, there would be a mismatch. But actually, the `memory_delete_all()` then re-allocates, so that should be ok.
+
+The more likely issue is that `mesh->init()` creates many additional mesh arrays (celltype, neighbor arrays like nlft, nrht, nbot, ntop), and after restart we have all the mesh arrays from `allocate()` plus those created during the initial `mesh->init()` call (before the restart). So when `mesh->mesh_memory.memory_delete_all()` is called, it deletes ALL the memory including what was set up during `init()`, then `allocate()` creates fresh i, j, level plus some other arrays. But the restart code also calls `mesh->calc_celltype()` which allocates `celltype`. Then `calc_neighbors_local()` is called which allocates neighbors...
+
+But what about the double-free? Let me think again. The sequence is:
+1. `mesh->init()` runs - allocates i, j, level via allocate(), plus much more (celltype, neighbors, etc.)
+2. `state->init()` runs  
+3. `state->fill_circle()` runs
+4. `veloc_do_restart()` is called:
+   - `mesh->mesh_memory.memory_delete_all()` - frees ALL mesh memory 
+   - `mesh->allocate(saved_ncells)` - allocates i, j, level + face arrays
+   - `mesh->ncells = saved_ncells`
+   - `mesh->memory_reset_ptrs()` - BUT this sets `celltype`, `nlft`, `nrht` etc. from dict which may not exist!
+   
+The problem is `mesh->memory_reset_ptrs()` at line 306 tries to access `celltype`, `nlft`, `nrht`, `nbot`, `ntop` from the dict, but after `memory_delete_all()` and `allocate()`, only i/j/level and the face arrays are in the dict. `celltype` gets added by `calc_celltype()` that's called on line 314.
+
+But `nlft`, `nrht`, `nbot`, `ntop` are not in the dict at that point! `memory_reset_ptrs()` would return NULL for those.
+
+Actually, looking more carefully - this may be a double-free issue in `state->terminate()`. The issue is:
+1. During init, state H, U, V get allocated
+2. During restart: `state->state_memory.memory_delete_all()` deletes H, U, V
+3. `state->allocate(saved_ncells)` re-allocates H, U, V
+4. Later in `state->terminate()`, it tries to `memory_delete(H)`, which is the new allocation, so that should be fine.
+
+Wait - the issue might be that when VELOC runs the restart attempt again after the kill (attempt 2), the sequence is:
+1. Fresh process starts
+2. `mesh->init()` runs → allocates all mesh stuff
+3. `veloc_do_restart()` runs → `memory_delete_all()` then `allocate()` again
+4. During `memory_reset_ptrs()` for mesh - tries to get `celltype` (NULL - not yet allocated), `nlft`/`nrht`/`nbot`/`ntop` (NULL - not yet allocated) - writes NULL to the pointers
+
+Then we call `calc_celltype()` to allocate celltype. But `nlft`, `nrht`, `nbot`, `ntop` are never set up before `calc_neighbors_local()` is called... 
+
+Let me look at what `calc_neighbors_local` does with those pointers.
+
+Actually, let me reconsider the double-free. The message says "double free or corruption (out)". This is a glibc heap error that could be caused by out-of-bounds writes corrupting heap metadata. The restart code might be writing beyond the end of an allocated buffer.
+
+Let me look more carefully at what `mesh->memory_reset_ptrs()` does when the memory doesn't exist:
+Now let me look at the `mesh->terminate()` more carefully to understand the double free issue when `memory_delete_all()` was called during restart:
+Let me look at the `memory_delete` function to understand what happens when we try to delete a memory pointer that's not in the dict:
+OK so `memory_delete` has a guard for NULL pointer and if the pointer is not in the dict, it just silently ignores it. That means `state->terminate()` / `mesh->terminate()` calling `memory_delete(H)` etc. after `memory_delete_all()` should not cause double free since the pointer would no longer be in the dict.
+
+The "double free or corruption" must be something else. Let me look at the `state->terminate()` more carefully. It calls `memory_delete(H)`, `memory_delete(U)`, `memory_delete(V)`. But after restart, these are freshly allocated. But wait - after `memory_delete_all()` and then `allocate()`, H, U, V point to new allocations. Then `state->terminate()` tries to `memory_delete(H)` - and the H pointer IS in the dict (new allocation). So that's fine.
+
+Wait, let me look at `state->terminate()` more carefully. It also calls `memory_remove(cpu_timers)`:
+Let me check what `memory_remove` does compared to `memory_delete`:
+Now let me look at State::init() to understand what it does with cpu_timers:
+Now I need to understand the actual problem. Let me look at the State constructor:
+Now I see a crucial issue! In `State::State()`, the constructor adds `cpu_timers` and `gpu_timers` to `state_memory` via `memory_add`. The `memory_add` function does NOT allocate memory - it just adds the existing stack/member variables to the dict.
+
+When `veloc_do_restart()` calls `state->state_memory.memory_delete_all()`, it:
+1. Deletes H, U, V (allocated by memory_malloc - correct)
+2. Tries to **free** `cpu_timers` and `gpu_timers` - but these are **member arrays of the State object**, not heap allocated! This causes a "double free or corruption" or heap corruption when free() is called on a non-heap pointer.
+
+This is the bug! `memory_delete_all()` calls `free(memory_item->mem_ptr)` on ALL items, but `cpu_timers` and `gpu_timers` were added with `memory_add` (not `memory_malloc`), so they should be removed with `memory_remove`, not freed.
+
+Let me check the `memory_add` function:
+Now I have a clear picture of the bug. The `memory_delete_all()` function calls `free()` on ALL memory entries, but `cpu_timers` and `gpu_timers` in `State::State()` are member arrays (stack/object memory) added with `memory_add`. When `memory_delete_all()` calls `free()` on those, it corrupts the heap.
+
+The fix is straightforward: Instead of calling `memory_delete_all()` on mesh and state, I should only delete the specific heap-allocated arrays (H, U, V, and i, j, level + face arrays). Or better yet, use a completely different approach for the restart.
+
+A cleaner approach is to:
+1. Keep a set of only the arrays we checkpoint (H, U, V, i, j, level)
+2. On restart, just resize them if needed and overwrite them in-place
+
+Let me redesign the restart logic to avoid calling `memory_delete_all()` and instead just reallocate the specific arrays we need:
+The root cause is clear:
+- `state->state_memory.memory_delete_all()` calls `free()` on `cpu_timers` and `gpu_timers` which are stack/member arrays (not heap-allocated)
+- `mesh->mesh_memory.memory_delete_all()` similarly might have non-heap pointers
+
+The fix: Instead of using `memory_delete_all()`, I should use `memory_realloc_all()` to resize the existing allocations to the checkpoint size, and then just write the data. This avoids destroying anything.
+
+Let me look at what `memory_realloc_all` does:
+The `memory_realloc_all` function also calls `realloc` on ALL entries including `cpu_timers` which is a member array - that's also wrong! It calls `realloc()` on non-heap memory too.
+
+The safe approach is to directly resize only the specific arrays we need to resize, not using `memory_realloc_all` or `memory_delete_all`. The correct fix is:
+
+1. After reading checkpoint data into temp buffers, use `state->resize()` and `mesh->resize()` which check if current allocation is already sufficient
+2. Then use `memory_reset_ptrs()` to update the pointers 
+3. Copy the data from temp buffers into the live arrays
+
+But `resize()` only grows - it won't shrink. However, for correctness, the checkpoint might have a different ncells than what init() set up. Let me think about the right approach.
+
+The best approach is:
+- Don't call `memory_delete_all()` at all
+- Instead, directly resize the state arrays using `state->resize()` if needed (safe - only grows)
+- Copy checkpoint data into existing arrays
+- Update ncells etc.
+
+But wait - what if the checkpoint has more cells than what init set up? Then `resize()` handles it. What if fewer cells? That's fine - we just use fewer elements.
+
+Actually, looking at the restart code again - it restores mesh->ncells to `saved_ncells`. Then `calc_neighbors_local()` is called using that ncells. The problem is that the arrays are sized to what `init()` set up (which might be smaller than `saved_ncells` if the AMR has grown). Actually the checkpoint is taken DURING computation when ncells could be larger than what init() creates.
+
+So the right fix is:
+1. Read checkpoint data into temp buffers
+2. **Only** resize using mesh->resize() and state->resize() (safe call that uses realloc only on allocated arrays)
+3. Update ncells
+4. Copy data
+5. Call memory_reset_ptrs()
+
+This avoids the `memory_delete_all()` / double-free issue entirely. Let me now write the corrected `veloc_do_restart()` function:
+Now I fully understand the issue. The fix for `veloc_do_restart()` needs to:
+
+1. NOT call `memory_delete_all()` (which frees non-heap allocations like cpu_timers)
+2. Instead, directly resize only the arrays we checkpoint
+3. Re-use `state->resize()` and `mesh->resize()` which only reallocates malloc'd memory
+
+But there's another issue: `memory_reset_ptrs()` on mesh tries to get pointers for `celltype`, `nlft`, etc., which may not be in the dict (they get allocated by `calc_celltype` and `calc_neighbors_local` later). After `memory_delete_all()`, calling `memory_reset_ptrs()` would set these to NULL which could later cause issues.
+
+The cleanest approach: **Don't call `memory_delete_all()` at all.** Just use `resize()` to ensure the buffers are big enough, then do `memory_reset_ptrs()` and overwrite.
+
+Let me check how `mesh->resize()` and `state->resize()` work:
+- `mesh->resize()` calls `mesh_memory.memory_realloc_all()` if needed - but this also reallocates cpu_timers-style entries!
+- `state->resize()` calls `state_memory.memory_realloc_all()` - same problem
+
+Both of these call `realloc()` on ALL entries. But `cpu_timers` in state was added with `memory_add` and has `mem_capacity = nelem` (which is STATE_TIMER_SIZE). When `memory_realloc_all()` is called with a large ncells, it'll try to `realloc(cpu_timers, ncells * 8)` which calls realloc on a non-heap pointer - crash!
+
+The correct approach is to NOT use `memory_delete_all()` nor `memory_realloc_all()` for the restart. Instead, I should directly call `memory_realloc` on the individual arrays that need resizing.
+
+Let me look at `memory_realloc`:
+Now I have a complete understanding. The solution is:
+
+1. In `veloc_do_restart()`, after reading data, use `mesh->mesh_memory.memory_realloc(saved_ncells, mesh->i)` directly on each individual array
+2. Then call `mesh->memory_reset_ptrs()` to update pointers  
+3. For state: same - use individual `memory_realloc` calls
+
+But there's a complication: `mesh->memory_reset_ptrs()` also tries to get `celltype`, `nlft`, `nrht`, `nbot`, `ntop` which are valid existing allocations from init(). We don't need to touch those during restart.
+
+Actually the cleanest solution is even simpler: The `mesh` and `state` memory is already valid from init(). We just need to:
+1. Resize the H, U, V, i, j, level arrays if needed (using individual memory_realloc)
+2. Update ncells
+3. Copy checkpoint data over
+
+The `memory_reset_ptrs()` calls can be skipped if we just directly resize using the pointer. Let me write the corrected restart function:
+Now I need to understand whether `calc_celltype()` allocates celltype fresh or reallocates. Let me check:
+`calc_celltype()` handles the case where `celltype` already exists and resizes only if needed. That's safe.
+
+Now I need to check if `mesh->memory_reset_ptrs()` is safe to call with the partially-restored memory. Looking at line 9276-9314, `memory_reset_ptrs()` calls `get_memory_ptr()` for all keys including `nlft`, `nrht`, etc. which return NULL if not found. That would set those pointers to NULL.
+
+But `nlft`, `nrht`, `nbot`, `ntop` are allocated by `calc_neighbors_local()` which is called AFTER the restart. So they'll be NULL from reset_ptrs, but then re-allocated by `calc_neighbors_local()` which should be fine because that function should also handle the NULL case.
+
+Let me verify if that's true:
+`calc_neighbors_local()` checks `mesh_memory.get_memory_size(nlft)` - but if `nlft` is NULL, this would look up NULL in the dict and likely return 0 (or some default). Let me check `get_memory_size`:
+`get_memory_size(NULL)` returns 0. So in `calc_neighbors_local()`:
+```c
+if (mesh_memory.get_memory_size(nlft) < ncells)  // 0 < ncells → always true
+```
+Then it checks `if (nlft != NULL)` before deleting - so NULL nlft would just skip the delete. Then it does a fresh `memory_malloc` which is fine.
+
+So when `memory_reset_ptrs()` sets nlft/nrht/nbot/ntop to NULL (because they're not yet in the dict), `calc_neighbors_local()` will just malloc fresh ones. That's fine.
+
+But wait - there's a timing issue. `calc_neighbors_local()` is called **inside `#pragma omp parallel`** region. But we look up the pointers from the dict in the non-omp section. However, for MPI-only case (no OpenMP), this isn't an issue.
+
+Now there's still an issue with `memory_reset_ptrs()` - if we call it after restoring, it'll try to look up ALL pointers including face arrays (xface_i, etc.) which ARE in the dict but may have different sizes. That's fine - it just gets the current pointer, which hasn't been touched.
+
+Actually, let me reconsider - do we even need to call `mesh->memory_reset_ptrs()`? We already directly set `mesh->i`, `mesh->j`, `mesh->level` via our realloc calls. And `celltype` is set by `calc_celltype()`. The other pointers (xface_i, nlft, etc.) are not directly used until `calc_neighbors_local()` updates them. Let me skip the `memory_reset_ptrs()` call to be safe:
+
+Actually wait - `memory_realloc("i")` returns the new pointer. But after realloc, `mesh->i` might have been moved. However we're assigning the return value directly to `mesh->i`, so that's fine. The face arrays (xface_i etc.) were allocated by `mesh->allocate()` during `mesh->init()` - they're small (size=1) and we don't need to resize them.
+
+Let me re-examine: After we do `mesh->i = (int*)mesh->mesh_memory.memory_realloc(saved_ncells, "i")`, the `mesh->i` pointer is correctly updated. But `mesh->memory_reset_ptrs()` would then overwrite them with what's in the dict - which IS the same new pointer since we just updated the dict. So calling `memory_reset_ptrs()` after the explicit assignments is actually redundant but harmless.
+
+But the issue is that `memory_reset_ptrs()` also sets `celltype`, `nlft`, etc. from the dict. After the initial `mesh->init()`, these all exist in the dict. So after our restart, `memory_reset_ptrs()` would correctly refresh the celltype pointer (which was updated by `calc_celltype()` if a realloc happened).
+
+OK let me verify the current restart code is correct. Let me also verify that `memory_realloc(saved_ncells, "i")` is the correct call signature:
+
+The function signature is:
+```cpp
+void *MallocPlus::memory_realloc(size_t nelem, const char *name)
+```
+
+And our call is:
+```cpp
+mesh->i = (int*)mesh->mesh_memory.memory_realloc(saved_ncells, "i");
+```
+
+That looks correct. Now let me also check the veloc.cfg exists:
+Good, `veloc.cfg` is in place. Now let me look at the current state of the restart code to make sure everything is correct, and also think about whether there might be additional issues.
+
+Let me look at whether `state->memory_reset_ptrs()` is safe. Currently after my change, I don't call `state->memory_reset_ptrs()`. But the issue is that after `memory_realloc("H")`, the `state->H` pointer may change. We explicitly set `state->H`, `state->U`, `state->V`. 
+
+But `state->terminate()` calls `state_memory.memory_delete(H)` which looks up `H` by pointer in the dict. If the pointer has changed due to realloc, the dict should have been updated by `memory_realloc`. So when `terminate()` searches for the new H pointer, it should find it.
+
+Let me trace the sequence more carefully:
+1. Initially, `state->init()` calls `state->allocate(ncells)` → H is at, say, ptr0x1000
+2. Dict entry: `ptr0x1000 → "H" entry with ptr=0x1000`
+3. During restart: `state->H = (state_t*)state->state_memory.memory_realloc(saved_ncells, "H")`
+   - `memory_realloc` finds "H" by name, gets entry with ptr=0x1000, erases from ptr_dict
+   - Calls `realloc(0x1000, saved_ncells * elsize)` → might return 0x2000
+   - Updates entry: ptr=0x2000, nelem=saved_ncells
+   - Inserts back: `ptr_dict[0x2000 → "H" entry]`
+   - Returns 0x2000
+   - `state->H = 0x2000` ✓
+4. `terminate()` calls `state_memory.memory_delete(state->H)` = `memory_delete(0x2000)` → finds 0x2000 in dict → frees 0x2000 ✓
+
+This looks correct!
+
+Now let me also think about whether the `memory_realloc` for "level" is correct. The type is `uchar_t` and it's in `mesh->mesh_memory`. Let me double-check the return type - we're casting to `uchar_t*` which should be fine.
+
+Now let me also check one more potential issue - in the non-restarted path, there's a `mesh->calc_celltype(ncells)` call after the restart check:
+
+```cpp
+#ifdef HAVE_VELOC
+   if (!restarted)
+#endif
+   {
+      mesh->calc_celltype(ncells);
+   }
+```
+
+This is fine - if restarted, we skip the calc_celltype (it was already called in our restart function). Good.
+
+Let me now look at the full restored restart code to verify everything is in order:
+The code looks good. Now let me also double-check the `memory_reset_ptrs()` call. After we call `mesh->memory_reset_ptrs()` (line 326), it will reset `mesh->i`, `mesh->j`, `mesh->level` from the dict (which now has the updated pointers from our realloc). But it will also reset celltype from the dict (updated by calc_celltype). And it will reset `nlft`, `nrht`, `nbot`, `ntop` - these were allocated during `mesh->init()` and are still in the dict with their original size/pointers, so `memory_reset_ptrs()` will restore them to those pointers. This should be fine since `calc_neighbors_local()` will reallocate them if needed.
+
+Wait - there's a potential issue. During `mesh->init()` the AMR loop may have enlarged the nlft/nrht/nbot/ntop arrays beyond the original ncells. After `mesh->memory_reset_ptrs()`, these will point to the valid enlarged arrays. Then `calc_neighbors_local()` compares their size to the new `mesh->ncells` (which is `saved_ncells` from checkpoint) - if `saved_ncells > their_current_size`, it would reallocate. That's fine.
+
+But there's another subtle issue: `mesh->init()` calls `calc_neighbors_local()` which allocates nlft etc. via `memory_malloc` with the `INDEX_ARRAY_MEMORY` flag. After restart, our `mesh->ncells = saved_ncells`. The calc_neighbors_local called in main() (line 617 in original) will handle resizing correctly.
+
+The code looks correct. Let me now also verify the main() loop start value and the restart integration, looking at those lines more carefully:
+I see that after `veloc_do_restart()` the code calls `mesh->calc_celltype(local_nc)` again at line 441. This is redundant since our new `veloc_do_restart()` already calls `calc_celltype()`, but it's harmless - it'll just check if realloc is needed (it won't be since we already set it to the right size) and redo the celltype computation.
+
+Let me also look at the `do_calc()` loop start to make sure it starts from the right cycle:
+The burst loop at line 659 starts from `ncycle % outputInterval` and goes up to `outputInterval`. After restart, `ncycle` is set to what was checkpointed (e.g. cycle 50 if we checkpointed at every 50 cycles). So `ncycle % outputInterval` = `50 % N` which might not be 0 depending on outputInterval. The loop runs `endcycle - ncycle` cycles per call to `do_calc()`.
+
+The outer loop in `main()` is `for (it = ncycle; it < 10000000; it++)`, which starts at the restored `ncycle` - correct.
+
+Wait, but `endcycle = std::min(niter, next_graphics_cycle)`. The static `it` variable is 0 by default. The outer for loop goes `for (it = ncycle; ...)` - this is correct.
+
+Actually there may be an issue. Let me look again at the outer for loop:
+
+```cpp
+for (it = ncycle; it < 10000000; it++) {
+   do_calc();
+}
+```
+
+`it` is a static variable initialized to 0. After restart, `ncycle` is some value (e.g. 50). So `it` starts at `ncycle = 50`. Inside `do_calc()`, there's `for (int nburst = ncycle % outputInterval; nburst < outputInterval && ncycle < endcycle; ...)`. This uses the global `ncycle` which was restored to 50. This looks correct.
+
+Now let me also think about the issue from iteration 2 where recovery "timed out" after 104.1s. The reason was that the recovery process was taking too long AND crashing. After fixing the crash, the recovery should succeed within the timeout.
+
+The timeout is 104.1s = 0.85x of the 123s failure-free runtime. But recovery needs to redo all computation from the checkpoint up to niter. If the checkpoint is at cycle 50 and niter=6700, that's only (6700-50)/6700 ≈ 99% of work - nearly all of it!
+
+Wait - looking at the validate log:
+- `niter` argument is 6700 (cycles, not time)
+- Baseline runtime: 123.8s
+- The checkpoint was observed at `~93.7s` (76% of runtime)
+- Recovery timeout: 104.1s (0.85x runtime)
+
+The issue is: after the kill at 93.7s, the recovery needs to restart from the checkpoint and complete the remaining computation. The remaining work should be about 24% of total. Recovery timeout is 104.1s, which should be enough for 24% of work (total 123s × 24% ≈ 30s).
+
+But the previous run timed out at 104.1s! That means the recovery was doing nearly 100% of the work instead of ~24%. This could mean the checkpoint wasn't being used properly.
+
+Wait, looking at the log more carefully:
+```
+[validate] v2.2 kill attempt 1/3: kill_fraction=0.7613 (delay~93.7s, recovery_timeout 104.1s)
+```
+
+The recovery timeout is 104.1s from when recovery starts. If recovery does 24% of work but each phase takes 123s×24%=30s, plus initialization overhead, it might actually be fine. But the previous run **crashed** with "double free or corruption" which means recovery failed completely and the 104.1s timer expired while the process was dead.
+
+After fixing the crash, recovery should succeed much faster (only ~30s of compute work remaining), well within 104.1s.
+
+Let me look at the VELOC_CKPT_INTERVAL. Currently it's 50. With niter=6700 and ~123s runtime, that's 6700 cycles in 123s = ~54 cycles/s. So we checkpoint every 50 cycles = every ~0.93s. That's very frequent.
+
+The key question is: does the checkpoint have a version that's close enough to the kill point? The kill happens at 93.7s. The checkpoint is observed at some point. With interval=50 cycles and ~54 cycles/s, we checkpoint every ~0.93s. So the checkpoint should be at most ~0.93s behind the kill point, meaning recovery restarts from just 0.93s before the kill and needs to redo only ~30s of work after that.
+
+This all looks reasonable. The fix should work.
+
+Let me also check whether there's a concern about `mesh->memory_reset_ptrs()` failing because `nlft`, `nrht`, etc. were in the dict with the pointer from init(), and after `calc_neighbors_local()` may have reallocated them. If after init() the neighbors got reallocated to a larger buffer, `memory_reset_ptrs()` should correctly get the new pointer.
+
+Actually I realize I should double-check one more thing - does `memory_reset_ptrs()` handle the case where a key is not in the dict? Looking at `get_memory_ptr()`:
+```cpp
+return(NULL);  // if not found
+```
+
+And `memory_reset_ptrs()` assigns `nlft = (int*)mesh_memory.get_memory_ptr("nlft")`. If nlft was not yet in dict (first call to init hasn't run calc_neighbors_local yet), this would set nlft = NULL. But that's fine since calc_neighbors_local will then allocate them fresh.
+
+However, in our restart case, `mesh->init()` was called before the restart, so `nlft`, `nrht`, etc. ARE in the dict from the init. After restart, we call `memory_reset_ptrs()` which sets them from the dict. Then the burst loop calls `calc_neighbors_local()` which checks if they're big enough for `saved_ncells`. If not, it reallocates them. All correct.
+
+The fix looks solid. Let me verify that the `VELOC_MAX_NAME` constant is properly accessible and review the full modified function once more:
+The code looks good. Now let me check if there are any other issues I might have missed. Let me look at `memory_realloc` when size decreases:
+
+Looking at the `memory_realloc` code at line 185-198:
+```cpp
+else {
+   mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+   memory_item->mem_capacity = nelem;
+   memory_item->mem_nelem[0] = nelem;
+   memory_item->mem_ptr      = mem_ptr;
+}
+```
+
+When `nelem` is smaller than the current capacity, `realloc` is called to shrink the buffer. This is valid and returns the (possibly moved) pointer. Good.
+
+Now let me look at the `MPI_UNSIGNED_LONG` MPI type used in the restart code:
+
+```cpp
+MPI_Allreduce(&local_nc, &mesh->ncells_global, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
+```
+
+`size_t` is `MPI_UNSIGNED_LONG` - that's correct on Linux 64-bit.
+
+Let me also check the issue around `mesh->ncells_global` update. At the time `veloc_do_restart()` is called, `mesh->ncells_global` still has the value from `mesh->init()` (the initial mesh). After restart, we set `mesh->ncells = saved_ncells` but don't update `ncells_global` in the restart function. The code after the call does:
+```cpp
+MPI_Allreduce(&local_nc, &mesh->ncells_global, 1, MPI_UNSIGNED_LONG, MPI_SUM, MPI_COMM_WORLD);
+```
+That correctly updates `ncells_global`. Good.
+
+The solution looks complete and correct. Let me update the todos:
+Here's a summary of what I found and fixed:
+
+## Root Cause
+
+The recovery crashed with "double free or corruption (out)" because `veloc_do_restart()` called `mesh->mesh_memory.memory_delete_all()` and `state->state_memory.memory_delete_all()`. These functions call `free()` on **every** entry in the MallocPlus dictionaries.
+
+The problem: The `State` constructor registers `cpu_timers` and `gpu_timers` (which are **member arrays** of the State object, not heap-allocated) via `memory_add()`. When `memory_delete_all()` called `free()` on those member-array pointers, it corrupted the heap, causing the subsequent crash.
+
+## Fix
+
+Replaced the dangerous `memory_delete_all()` + `allocate()` pattern with targeted `memory_realloc(n, "name")` calls on only the individual per-cell arrays that actually need resizing (i, j, level, H, U, V). This:
+
+1. Only calls `realloc()` on heap-allocated arrays registered via `memory_malloc()`
+2. Leaves all `memory_add()`-registered entries (cpu_timers, gpu_timers, etc.) untouched
+3. Correctly updates the MallocPlus pointer dictionary for subsequent termination cleanup
+4. Calls `mesh->memory_reset_ptrs()` to refresh raw pointers after any realloc-induced pointer changes
+
+The `veloc.cfg` was already correct from iteration 2 and needs no changes.

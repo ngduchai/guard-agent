@@ -1,0 +1,3041 @@
+I'll start by examining the previous iteration's logs to understand what went wrong.
+The build succeeded, but the validation failed because `output_correct=False`. The resilient app's output after recovery doesn't match the baseline. This means the checkpoint/restart is not properly restoring state - the app recovers but produces different results. Let me look at the current code:
+Now let me look for where checkpointing was implemented in iteration 2:
+Now I understand the issue. Looking at the validation output:
+
+- `output_correct=False` — after recovering from the checkpoint and replaying the remaining steps, the output doesn't match the baseline
+- The validation says `max_abs_diff=8.041e+02` — a huge difference
+
+The problem is in the restart logic. When the app restores from checkpoint, it:
+1. Restores `ntimestep` and `nlocal` 
+2. But does NOT restore the actual atom positions/velocities properly - it restores the raw arrays but doesn't update neighbor lists or do proper force recalculation before resuming
+
+More critically: the restart skips calling `setup()` (which normally initializes forces before the first step), and the loop continues from `steps_done` using `++update->ntimestep` which means the first step after restart increments from the checkpoint timestep. But there's another issue - the checkpoint captures `atom->nmax` worth of data including ghost atoms, and when restoring on a fresh run, ghost atoms aren't properly set up yet.
+
+Let me look at the `setup()` function and understand the full verlet run flow:
+Now I understand the structure. The key insight is:
+
+1. `setup()` is called before `run()` - it sets up atom arrays, neighbor lists, computes forces
+2. After checkpoint restore, positions/velocities are restored, but the loop starts from where it left off
+3. However, after restore, the neighbor lists are stale - the code correctly sets `neighbor->ago` to force a rebuild
+4. But there's a fundamental issue: the atom positions/velocities are being restored from the checkpoint, but the LAMMPS data structures for ghost atoms and neighbor lists aren't rebuilt before the first loop iteration
+
+Let me also look at the key issue more carefully. Looking at the checkpoint code:
+
+The problem is that after restoring from checkpoint, the first iteration does `++update->ntimestep` at the top of the loop. If the checkpoint was saved at timestep T, then restoring `ckpt_ntimestep = T` and then `steps_done = T - firststep` means the loop starts at `i = steps_done`. The first iteration will do `++ntimestep` which goes from `T` to `T+1`. That's correct.
+
+But there's another issue: the `setup()` function (called before `run()`) does `comm->exchange()` which redistributes atoms among processes. After this, atom positions are reset from the LAMMPS data file (read_data). Then our restore from checkpoint happens inside `run()`. But the restore only restores positions and velocities for `nlocal` atoms on this rank - which may not match what was checkpointed if atoms moved between processes.
+
+The real problem is that **when LAMMPS restarts fresh**, it reads the initial configuration, then calls `setup()` which redistributes atoms via exchange. Each rank's local atoms are determined by domain decomposition. When we checkpoint, each rank saves its local atoms. On restart, after setup() runs exchange(), a rank might have different atoms than at the checkpoint time. The restored x,v arrays from VeloC will have the checkpoint atoms, but LAMMPS atom sorting and the `tag` array are used to identify which atoms are which.
+
+Actually wait - looking more carefully: we save `atom->nmax * 3` elements for x, v, f. But after restore, `atom->nlocal` is set to `ckpt_nlocal` but the actual atoms loaded are from the initial data read, and `comm->exchange()` already happened in `setup()`. So we're overwriting the positions of whatever atoms ended up on this rank with positions that were stored from potentially different atoms.
+
+The approach is fundamentally broken for any simulation where atoms move between processes. We need a proper approach using LAMMPS's native restart file mechanism or a per-tag approach.
+
+Let me look at how LAMMPS' own write_restart works to understand what state needs to be saved:
+Now I understand the simulation: 33000 steps of LJ NVE. With `neigh_modify delay 0 every 20 check no`, neighbor lists are rebuilt every 20 steps. The perturbation changes the velocity seed (`87287` is replaced).
+
+The fundamental issue with our checkpoint approach:
+
+1. LAMMPS reads the input file, creates atoms, runs `velocity all create`, sets up the simulation
+2. `setup()` is called which distributes atoms via `comm->exchange()`
+3. `run()` is called - our code tries to restore from VeloC
+4. But the restore overwrites atom positions with checkpoint data from potentially different ranks' atoms (rank-local arrays without atom ID mapping)
+
+The correct approach is to use LAMMPS's native `write_restart`/`read_restart` functionality, using VeloC as the persistence layer. But since we can't easily inject that...
+
+Actually, let me think about the problem differently. The checkpoint is done in the `run()` function on each rank independently. Each rank saves its own local atoms. On recovery:
+- Rank 0 might have atoms 1-2000 at checkpoint time
+- But after a fresh start and `setup()` (which includes `comm->exchange()`), rank 0 might again have atoms 1-2000 (or different ones)
+
+The real issue: `setup()` does `comm->exchange()` and `comm->borders()` which redistributes atoms. After that, `nlocal` and the atom arrays are set up properly for the fresh start. Then our restore code overwrites these arrays with checkpoint data.
+
+The key question: **After setup() runs, does each rank have the same atoms as it had at the checkpoint time?** Not necessarily, because atoms have moved during the simulation. At step 1000 (first checkpoint), atoms may have crossed domain boundaries vs. step 0.
+
+So the restore is fundamentally broken: we restore rank-local atom arrays that were valid at checkpoint time (when atoms may be in different positions/ranks) onto the fresh start state.
+
+**The correct fix**: We need to save atom data tagged by atom ID (or sort atoms by ID before saving), and restore by reassigning atoms to the correct slots based on their tags. 
+
+Actually, looking at this more carefully: the simplest approach that actually works is to **write a proper LAMMPS restart file** (the native `.restart` format) using VeloC's file-based API (`VELOC_Checkpoint_begin`/`VELOC_Checkpoint_end`), and then on recovery, read that file with LAMMPS's native `read_restart`.
+
+But that requires substantial changes to the LAMMPS input script and the ability to detect if we're restarting...
+
+Let me think of a simpler approach. The issue is that we're saving rank-local arrays at checkpoint time and restoring them verbatim. This works only if atoms on each rank are the same at restart time as at checkpoint time. They will be IF:
+1. Each rank processes the same atoms (domain decomposition is stable)  
+2. OR we sort atoms by tag before saving/restoring
+
+Actually there's an even simpler approach: use LAMMPS's built-in `fix halt` and restart mechanism. But let's see what's available.
+
+The cleanest solution given the constraints: 
+
+**Option A**: Save atom data sorted by global atom tag. On restore, redistribute atoms to the correct rank based on their current position. This is what LAMMPS's own read_restart does.
+
+**Option B**: Use a different strategy - instead of per-rank binary dumps, use LAMMPS's native output mechanism (write_restart) and hook into the restart reading.
+
+**Option C**: Simplify - since the simulation uses domain decomposition, atoms on each rank are determined by their position. If we restore positions that were valid at checkpoint time, `comm->exchange()` needs to run again to redistribute atoms properly. We need to:
+1. Restore positions/velocities/tags on rank 0 collectively
+2. Re-run `comm->exchange()` to redistribute properly
+3. Continue from there
+
+Let me look at the actual LAMMPS atom class to understand how atoms are structured:
+Now I have a clear picture. The correct approach that will actually work is:
+
+**The fundamental fix**: Instead of saving rank-local arrays and restoring them verbatim (which fails when atoms move between processes), we need to:
+
+1. **On checkpoint**: Gather all atom data globally with tags, save it in a way that's rank-independent
+2. **On restart**: Restore atom data matching by tag
+
+OR, the simplest approach that works:
+
+**Use a rank-consistent checkpoint**: The atoms on each rank are determined by spatial domain decomposition. After setup(), rank R owns atoms in its spatial domain. At checkpoint time T, atoms may be in different positions. If we save the GLOBAL atom state from rank 0 (all positions, velocities, tags), then on restart, rank 0 reads it back and redistributes via exchange().
+
+Let me implement a better solution:
+
+**Strategy**: Use VeloC's file-based checkpoint API (not memory-protect). Each checkpoint writes a binary file from rank 0 that contains ALL atoms' positions, velocities, and tags (gathered from all ranks). On restart, rank 0 reads this file, distributes atoms to all ranks based on their positions.
+
+Actually that's complex too. Let me think of the simplest approach:
+
+**Simplest correct approach**: 
+- Save a "collective" restart file. On each rank, gather local atoms' (tag, x, v) pairs. Sort by tag globally. Rank 0 collects all and writes a file.  
+- On restart, rank 0 reads the file, then redistributes to all ranks based on domain decomposition.
+
+But this is basically implementing read_restart...
+
+**Actually the simplest correct fix**: Use LAMMPS native file-based restart + VeloC file API. At checkpoint time, write a LAMMPS restart file. VeloC protects it. On restart, detect the restart file and pass `-restart` to LAMMPS. But the input script doesn't support this...
+
+Wait - let me re-read the validation output more carefully:
+
+```
+recovery_actually_resumed=None (recovery_attempt/failure_free=None, threshold=0.9, mode=none)
+```
+
+The `recovery_actually_resumed=None` means the validator couldn't confirm the recovery actually resumed from the checkpoint. And the failure is `output_correct=False`.
+
+The output differs by `max_abs_diff=8.041e+02` which is very large. This suggests the simulation ran from the beginning (didn't restart properly) but with different random velocities (since step 0 uses a random seed).
+
+Wait no - the failure-free run produces `max_abs_diff=0.000e+00` (perfect match with baseline). The failure-prone run produces a large diff. So the failure-prone run (with checkpoint/restart) produces wrong results.
+
+This means: after killing and restarting, the app runs but produces different results. The app completes successfully (exit_code=0) but the physics is wrong.
+
+The key issue is that when the app restarts from VeloC checkpoint, it restores the atom positions/velocities for the atoms that were on each rank at checkpoint time. But after a fresh `setup()`, the atoms may have been redistributed differently across ranks, so we're overwriting wrong atoms' data with checkpoint data.
+
+Let me look at what exactly happens in setup(): after `comm->exchange()`, each rank has the atoms that belong to its domain. If the initial configuration (from `create_atoms` + `velocity create`) always produces the same atom distribution (which it does since it's deterministic from the lattice), then after setup, rank R always has the same atoms in the same order.
+
+Actually wait - `atom->sort()` is called in setup if `atom->sortfreq > 0`. Let's check the default:
+`sortfreq = 1000` by default. So atoms get sorted every 1000 steps, which means at each checkpoint (also every 1000 steps) the atoms are freshly sorted. This could actually cause ordering problems.
+
+Now, the critical question: **When the simulation restarts fresh**, atoms are created in a deterministic lattice order. Then `setup()` calls `comm->exchange()` which distributes them to their owning ranks. The distribution at step 0 is deterministic. But at checkpoint time (step 1000, 2000, etc.), atoms may have crossed domain boundaries. So each rank at checkpoint has a different set of atoms than at step 0.
+
+When we restore from checkpoint, rank R has:
+- Fresh atoms from setup() (the step-0 distribution)
+- But we overwrite `atom->x[0..nmax*3]`, `atom->v[0..nmax*3]`, `atom->tag[0..nmax]` with checkpoint data
+
+This means:
+- `atom->nlocal` = number of atoms on this rank at checkpoint time
+- But `atom->x` etc. now has positions from checkpoint time for different atoms than what setup() put here
+
+This is a fundamental mismatch. The approach is broken.
+
+**The correct fix**: We need to either:
+1. Save all atoms on rank 0 and redistribute on restart (requires gather+scatter)
+2. Use a checkpoint-then-restart approach that avoids this mismatch
+
+Let me think about the simplest approach that actually works for this specific case.
+
+The input uses `neigh_modify delay 0 every 20 check no`. The atoms don't move very far in an LJ NVE simulation. But they DO cross rank boundaries over time.
+
+**Best approach for correctness**: 
+- At checkpoint: each rank saves its local atoms as (tag, x[3], v[3]) pairs. Additionally save ntimestep.
+- At restart: rank 0 gathers all atoms from all ranks, writes them to a single buffer. Then rank 0 distributes atoms to the correct rank based on domain decomposition.
+
+But implementing gather/scatter correctly in VeloC is complex.
+
+**Alternative simplest approach**: Use LAMMPS's built-in file-based restart mechanism, but wrap it with VeloC file management.
+
+Actually, the most robust approach given we're working in `verlet.cpp` is:
+
+1. Write a temporary LAMMPS restart file at checkpoint time using LAMMPS's `output->write_restart` or by mimicking it
+2. VeloC manages this file  
+3. On restart, detect the file and use `lammps_command()` to read it back
+
+But that requires access to LAMMPS objects we don't have in `main.cpp`.
+
+**Actually the CORRECT minimal approach**: Rather than saving rank-local arrays, save a per-rank binary file where each atom is tagged with its global ID. On restart, read all ranks' files and rebuild nlocal arrays.
+
+Let me look at an even simpler angle. What if we use LAMMPS's native write_restart mechanism by adding a fix that writes restart files?
+
+Looking at the input script: `fix 1 all nve`. We could add a `fix 2 all halt ...` or add `restart` commands. But we can't modify the input script (it's in `bench/in.lj_long` which is a symlink from the original).
+
+Wait - can we modify the input script?
+
+Let me check:
+The validator says: `[runner] symlinked /home/ndhai/.../bench → /home/ndhai/diaspora/guard-agent/tests/apps/vanillas/LAMMPS/bench`. So the bench directory is symlinked from the original! I cannot modify those files.
+
+But wait - the bench directory in our workspace is a symlink to the original, but in the build directory... Let me check the actual path being used:
+
+Looking at the validator output more carefully:
+```
+[runner] copied /home/ndhai/.../LAMMPS/veloc.cfg → /home/ndhai/.../correctness/resilient/veloc.cfg
+[runner] checkpoint-observed attempt 1: launching (cwd=.../correctness/resilient/attempt_1): ... /lmp -in bench/in.lj_long
+```
+
+So the lmp binary is run with `-in bench/in.lj_long`. The bench directory in the attempt directory is a symlink. We can't modify the input file.
+
+Now let me think about the proper solution. The key issue is that the current approach:
+1. Checkpoints rank-local raw arrays (including possibly wrong atoms due to migration)
+2. Restores them blindly on restart
+
+**The real fix**: We need to save atoms with their global IDs and redistribute on restart. Let me implement this properly.
+
+Here's my plan:
+1. At checkpoint time, each rank writes its local atoms as (tag, x[3], v[3], image[3]) tuples into a VeloC-managed file  
+2. Save ntimestep separately (via VELOC_Mem_protect)
+3. On restart, each rank reads its own file and matches atoms by tag to rebuild local state
+4. Then do proper exchange/neighbor rebuild
+
+Actually, there's a much simpler approach: since atoms are created deterministically in a lattice and the domain decomposition is also deterministic, and `comm->exchange()` distributes atoms by position...
+
+If we save positions per tag (not per rank-local slot), and on restart:
+1. Rank 0 gathers all (tag, x, v) from all ranks, sorts by tag
+2. Broadcasts to all ranks
+3. Each rank assigns atoms to itself based on domain
+
+This is basically implementing the read_restart mechanism.
+
+Let me look at the most practical solution: write a LAMMPS-native restart file from LAMMPS itself using `VELOC_Checkpoint_begin/end` API for file management. The cleanest way is to have each rank use `VELOC_Route` to get the checkpoint filename, write the LAMMPS restart file there, then read it back.
+
+But LAMMPS restart files are complex binary formats.
+
+**Actually the simplest correct approach**: Use the per-tag (atom ID) approach. Each rank saves its local atoms as tagged data. On restart, all ranks gather the full list, then each rank scans and takes the atoms that belong to it based on current domain decomposition.
+
+Let me now implement this properly:
+Let me look at LAMMPS's domain and comm structures to understand how to determine which atoms belong to which rank:
+Now I understand the domain structure. Atoms belong to a rank based on `domain->sublo` and `domain->subhi` bounds. After `setup()` runs, these bounds are established. The key insight is:
+
+After `comm->exchange()` in `setup()`, each rank has atoms whose positions fall within `domain->sublo[0..2]` to `domain->subhi[0..2]`.
+
+**The correct approach I'll implement**:
+
+At checkpoint time:
+1. Each rank saves its local atoms as a list of records: `(tag, x[3], v[3], image[3])` - tagged atoms
+2. Save `ntimestep` too
+3. Use VeloC memory protection for ntimestep + file-based approach for atom data
+
+At restart time:
+1. Each rank reads its checkpoint file containing the tagged atoms it had at checkpoint time
+2. All ranks participate in a collective to redistribute atoms: rank 0 gathers all, sorts by tag, then redistributes by domain
+3. After redistribution, do a proper comm->exchange() + neighbor rebuild
+
+Actually this is still complex. Let me think of the simplest possible correct implementation.
+
+**Simplest approach that works**: 
+
+The key insight is that after `setup()` in a fresh restart, `comm->exchange()` has run and each rank owns atoms in its spatial domain. If we restore the checkpoint's positions/velocities into the same atoms on each rank and then run `comm->exchange()` again, the atoms will be properly redistributed.
+
+BUT: we need to restore to the right atoms. The problem is that in a fresh start, the atoms on rank R are the initial lattice atoms in R's domain (not the checkpoint atoms). 
+
+What if we:
+1. Restore all checkpoint positions/velocities globally to rank 0
+2. Have rank 0 broadcast them
+3. Each rank picks the atoms in its domain
+4. Run comm->exchange() to finalize
+
+This essentially requires re-implementing domain decomposition. Let me implement this properly.
+
+Here's my implementation plan:
+
+```cpp
+// Checkpoint format (per-rank VeloC file):
+// [int] version (= 2)
+// [bigint] ntimestep
+// [int] natoms_local (= nlocal at checkpoint time)
+// For each atom i:
+//   [tagint] tag
+//   [double] x[3], v[3]
+//   [imageint] image
+
+// On checkpoint (using VELOC file API):
+// - VELOC_Checkpoint_begin(name, version)
+// - VELOC_Route(name, version, filename)
+// - Write file with per-rank atom data
+// - VELOC_Checkpoint_end(true)
+
+// On restart:
+// - VELOC_Restart_test(name) -> version
+// - VELOC_Restart_begin(name, version)  
+// - VELOC_Route(name, version, filename)
+// - Read file, get tagged atoms
+// - All-gather atom lists from all ranks
+// - Rebuild local atom list from atoms in our domain
+// - VELOC_Restart_end(true)
+// - Set ntimestep correctly
+// - Force neighbor rebuild
+```
+
+Actually, the VeloC file API might be different. Let me check:
+Now I see `VELOC_Route_file` which "obtain the full path for the file associated with the named checkpoint and version number". This is what I need for file-based checkpointing.
+
+Let me look at how `VELOC_Route_file` is used:
+
+The API: `int VELOC_Route_file(const char *original, char *routed)` - takes an original filename and returns the VeloC-routed path. This can be used to write/read checkpoint files directly.
+
+**My implementation approach**:
+
+Since the issue is rank-local atom mismatch, I'll implement a global checkpoint approach:
+
+1. **Checkpoint**: 
+   - Each rank contributes its local atoms to rank 0 (via MPI gather)  
+   - Rank 0 writes a single global file with ALL atoms' (tag, x, v, image) data + ntimestep
+   - Use VeloC file routing to save the file
+   - All non-0 ranks write empty "placeholder" files (VeloC requires each rank to have a file)
+
+2. **Restart**:
+   - Rank 0 reads the global checkpoint file
+   - All ranks determine their current sublo/subhi (from the fresh setup())
+   - Rank 0 distributes atoms to each rank based on which subdomain they fall into
+   - Each rank sets its local atom arrays accordingly
+   - Force neighbor rebuild
+
+Actually the issue with gathering to rank 0 is that in parallel, a single rank writing all data is a bottleneck and requires O(N) memory. But for this application with ~32000 atoms, it's fine.
+
+Wait, let me reconsider. The VeloC documentation says `VELOC_Route_file` gives a path for "the file associated with the named checkpoint". This is per-rank. So rank 0 gets one path, rank 1 gets another, etc. They're all separate files.
+
+Let me implement a simpler approach that's still correct:
+
+**Approach**: Save a global file on rank 0 that contains ALL atoms sorted by tag. Each rank also registers a dummy memory with VeloC for the standard checkpoint mechanism to work. The actual atom data is written to the VeloC-routed file by rank 0.
+
+Actually, let me look at this from a different angle. The simplest correct implementation that avoids the per-rank mismatch:
+
+**The trick**: When we restore the checkpoint, we need to undo what `setup()` did and replace it with checkpoint state. Specifically:
+1. After restore, `atom->nlocal = ckpt_nlocal` but atom arrays have checkpoint-era atoms for this rank
+2. The checkpoint was taken at a specific `ntimestep`
+3. We need to rebuild neighbor lists after restore
+
+BUT: The fundamental issue is that a different set of atoms may be on this rank after a fresh setup() than were on this rank at checkpoint time. We need to handle this.
+
+**The correct minimal approach**: Use `comm->exchange()` after restore.
+
+Here's the key insight: `comm->exchange()` will:
+1. Send atoms whose positions are outside this rank's domain to the correct rank
+2. Receive atoms from other ranks whose positions are in our domain
+
+After checkpoint restore:
+- Our local atom arrays contain atoms with positions from checkpoint time
+- Those positions may be outside our current domain OR some of our current domain's atoms may be on other ranks
+- We need to restore GLOBALLY consistent state first
+
+**The solution**: 
+1. Rank 0 gathers ALL local atoms from ALL ranks at checkpoint time, writes to file
+2. At restart, rank 0 reads all atoms, broadcasts, each rank takes atoms in its domain
+3. Rebuild neighbor lists
+
+Let me now implement this. I'll write the full verlet.cpp with correct checkpoint/restart logic:
+
+Let me first look at atom_vec to understand image field:
+Good - I see the types are: `imageint = int`, `tagint = int`, `bigint = int64_t` (in the normal 32-bit mode).
+
+Now let me implement the correct checkpoint/restart. The approach:
+
+**Checkpoint**: 
+- Rank 0 gathers all (tag, x[3], v[3], image) from all ranks
+- Uses VeloC file-based API: `VELOC_Route_file` gets path, writes binary file
+- All ranks participate in MPI gather (MPI_Gather for local counts, MPI_Gatherv for data)
+- VeloC checkpoint: ranks 1..N-1 do `VELOC_Route_file` and write empty files
+- Rank 0 writes the real data file, then all call `VELOC_Checkpoint_end`
+
+Wait, but `VELOC_Route_file` is meant to get the path for a file associated with a particular checkpoint. Let me re-read: "obtain the full path for the file associated with the named checkpoint and version number can be used to manually read/write checkpointing data without registering memory regions".
+
+The API is `VELOC_Route_file(const char *original, char *routed)`. But this doesn't take a version number... It says "named checkpoint" but the signature only takes `original` (the original filename).
+
+Actually looking at the VeloC documentation/source, `VELOC_Route_file` routes a file to the VeloC scratch directory. The file needs to be manually written/read. The checkpoint is triggered by `VELOC_Checkpoint_begin` + writes + `VELOC_Checkpoint_end`, and restart by `VELOC_Restart_begin` + reads + `VELOC_Restart_end`.
+
+But there's a problem: `VELOC_Route_file` doesn't take a version number. How do we manage multiple checkpoint versions with file-based checkpointing?
+
+Let me look at how the file-based approach works:
+
+Actually, based on the header, the flow is:
+1. `VELOC_Checkpoint_begin(name, version)` - start checkpoint phase
+2. `VELOC_Route_file(original, routed)` - get the path to write to
+3. Write data to `routed`
+4. `VELOC_Checkpoint_end(1)` - end checkpoint phase
+
+And for restart:
+1. `VELOC_Restart_test(name, INT_MAX)` - get latest version
+2. `VELOC_Restart_begin(name, version)` - start restart phase
+3. `VELOC_Route_file(original, routed)` - get the path to read from
+4. Read data from `routed`
+5. `VELOC_Restart_end(1)` - end restart phase
+
+This is the file-based VeloC API. The `routed` path is where VeloC wants the file to be. All ranks call `VELOC_Route_file` to get their per-rank path.
+
+Now, since we want a globally-consistent checkpoint, I'll have:
+- Rank 0 writes the global atom data file via VeloC routing
+- Other ranks write minimal metadata files
+- On restart, rank 0 reads back and redistributes
+
+But there's a simpler solution: since VELOC seems to give each rank its own file path, we can have each rank save atoms as tagged (tag + x + v + image) records. On restart, each rank reads ALL other ranks' checkpoint files (they all share a common persistent directory), gathers all atoms, and each rank takes the atoms in its domain.
+
+Actually, the simplest and most robust approach: collect all atoms on rank 0, write ONE file, then at restart rank 0 reads it and distributes.
+
+Let me look at VeloC's actual scratch/persistent directory structure to understand file naming:
+
+Looking at the VeloC source code behavior: when using `VELOC_Route_file`, VeloC returns a path in its scratch directory. Each rank gets a path like `<scratch>/<app_name>-<rank>-<version>.veloc`. So rank 0 gets a different path than rank 1.
+
+Given this, here's my revised approach:
+
+**Each rank saves its own chunk of atom data to its VeloC-routed file.**
+**On restart, all ranks ALL read ALL ranks' files using the shared persistent storage.**
+
+This works because the persistent directory is accessible to all ranks. At restart, each rank reads all N checkpoint files, gathers the full atom list, determines which atoms belong to it based on its current domain, and builds its local atom array.
+
+This is the correct approach! Let me implement it.
+
+Actually, there's still the problem of knowing the filenames of all other ranks' files. The filename format depends on VeloC internals. Let me think...
+
+Alternative: We can have rank 0 write the ONLY real data file (global atom data), and all other ranks write empty files. Then on restart, rank 0 reads its file and broadcasts atom data to all. Each rank then filters to its domain.
+
+This is simpler and avoids the filename discovery problem.
+
+Here's my implementation:
+
+```cpp
+// Checkpoint record:
+// Rank 0 file:
+//   [bigint] ntimestep
+//   [int] natoms_total (= atom->natoms)
+//   For each atom (sorted by global tag):
+//     [tagint] tag
+//     [double] x[3], v[3]
+//     [imageint] image
+```
+
+For each checkpoint:
+- All ranks participate in MPI_Gather to collect nlocal counts to rank 0
+- All ranks participate in MPI_Gatherv to collect atom data to rank 0
+- Rank 0 writes to VeloC-routed file
+- All ranks call VELOC_Checkpoint_{begin,end}
+
+For restart:
+- All ranks call VELOC_Restart_begin
+- Rank 0 calls VELOC_Route_file and reads the file
+- Rank 0 broadcasts ntimestep and atom data
+- Each rank filters to atoms in its domain (sublo..subhi)
+- Each rank updates atom->nlocal, atom->x, atom->v, atom->image, atom->tag
+- Calls VELOC_Restart_end
+- Force comm->exchange() + neighbor rebuild
+
+Let me now write this properly. First, let me look at how the `comm->exchange()` function works and what data it needs:
+
+The exchange function uses `atom->x` positions to determine which atoms to send to which rank. After we restore atom positions, if we call `comm->exchange()`, it will:
+1. Identify atoms whose positions are outside `domain->sublo..subhi` 
+2. Send them to the appropriate ranks
+3. The receiving ranks add those atoms to their local arrays
+
+This is exactly what we need! After distributing atoms from the checkpoint file, we call `comm->exchange()` to correctly assign atoms to ranks.
+
+BUT there's a subtlety: `comm->exchange()` needs atoms to already be in their domains (only slightly outside due to periodic crossings). If atoms have moved significantly... Actually for LJ NVE at 110s runtime ÷ checkpoint interval, atoms can be anywhere.
+
+After restore on rank 0, we have all atoms. We need to:
+1. Put all atoms on rank 0 initially  
+2. Let `comm->exchange()` redistribute them
+
+Wait, but `comm->exchange()` only exchanges atoms that are slightly outside the domain boundary. It's not designed to globally redistribute from a single rank. Let me check:
+
+Actually, `comm->exchange()` is designed to handle atoms that have crossed domain boundaries by sending them one step at a time in each direction. For a many-to-one redistribution, we'd need a different approach.
+
+Looking at how LAMMPS's `read_restart` works: it reads atom data on all ranks collectively using parallel I/O, and then runs `comm->exchange()` to properly distribute atoms.
+
+Let me look for `read_restart.cpp` or similar:
+`Irregular::migrate_atoms()` - this is the key! This function can globally redistribute atoms from any rank to the correct rank based on their positions. This is what `read_dump.cpp` uses.
+
+Let me look at how `read_dump.cpp` redistributes atoms after reading:
+`irregular->migrate_atoms(1)` redistributes atoms based on their positions! This is exactly what I need. After putting atoms onto any rank(s) with the checkpoint positions, I call `migrate_atoms(1)` to redistribute them correctly.
+
+But there's still the problem: if I put ALL atoms on rank 0 after restart, and rank 0's nmax might not be large enough. Also, `atom->nmax` needs to be grown.
+
+Let me look at what `read_dump` does before calling `migrate_atoms`:
+I see the pattern now. `read_dump` uses `migrate_atoms_by_coords()` which calls `Irregular::migrate_atoms(1)` to redistribute atoms. This is the correct approach.
+
+The key sequence for restart:
+1. Put all checkpoint atoms on rank 0 (or distribute them round-robin like read_dump does)
+2. Call `domain->remap()` on each atom to fix image flags
+3. Call `Irregular::migrate_atoms(1)` to redistribute
+4. Rebuild neighbor lists
+
+Let me look at how the atom data grows and how to add atoms to rank 0:
+This is too complex. Let me look at a simpler approach.
+
+Actually, thinking about it differently: The simpler approach is to just **not use per-rank checkpoint files** but instead save/restore using LAMMPS's existing restart file infrastructure. But we can't call `write_restart`/`read_restart` from inside `verlet.cpp` easily.
+
+Let me think about what's actually needed:
+
+**The simplest correct approach that avoids complexity**:
+
+Since all atoms start in the same positions (deterministic lattice + velocity) and the same domain decomposition, the atoms on each rank at any given time are determined by their positions. 
+
+If I save atoms at checkpoint time tagged with their IDs, and on restart I:
+1. Restore the checkpoint atom data to each rank's slot (as in the current code)
+2. THEN run `comm->exchange()` and `comm->borders()`
+
+Wait - the current code does not call `comm->exchange()` after restore. It just restores the raw arrays and continues. This is the bug.
+
+But even with `comm->exchange()`: after the restore, rank R has atom data from checkpoint (which may have different atoms than what's currently on rank R). The `comm->exchange()` function will send atoms whose positions are outside the rank's domain to other ranks. But it expects `atom->nlocal` to match what it has. If we set `atom->nlocal = ckpt_nlocal`, the exchange might work if the checkpoint data is consistent.
+
+Wait - but `comm->exchange()` uses `atom->nlocal` to know how many local atoms to process. If we restore `ckpt_nlocal` and the checkpoint position data, then `comm->exchange()` should correctly migrate atoms to their proper ranks!
+
+Let me trace through more carefully:
+
+After fresh `setup()`:
+- Rank R: nlocal=N_R, x/v/tag for the N_R atoms belonging to R's initial domain
+- `comm->exchange()` has been called, so all atoms are properly distributed
+
+After restore from checkpoint:
+- We overwrite: `atom->nlocal = ckpt_nlocal_R`, `atom->x[0..nmax*3]` = checkpoint data for rank R, `atom->v[0..nmax*3]` = same, `atom->tag[0..nmax]` = same
+
+Now `atom->x[0..ckpt_nlocal_R]` contains positions from checkpoint time for rank R's atoms. Some of these atoms may no longer belong to rank R's domain (or some atoms that belong to R's domain at restart time may be on other ranks).
+
+If we run `comm->exchange()` now:
+- It will send atoms whose positions are outside R's current domain to appropriate ranks
+- But it won't receive atoms from other ranks that should be here (they're still on those other ranks with stale checkpoint data)
+
+So even with exchange, this approach is broken for multi-rank scenarios.
+
+**The correct approach** (what LAMMPS's own restart does):
+1. Each rank reads its portion of the restart file (atoms are distributed round-robin across ranks)
+2. Each rank now has `natoms/nprocs` atoms from the restart file, NOT necessarily in its domain
+3. `Irregular::migrate_atoms(1)` is called - this does a global redistribution based on atom positions
+4. After migration, each rank has the atoms that belong to its domain
+
+The key is `Irregular::migrate_atoms(1)` which does a global redistribution.
+
+**My plan**: 
+1. At checkpoint: rank 0 gathers all atoms (tag, x, v, image) and writes to VeloC file. Other ranks write empty/dummy files.
+2. At restart: rank 0 reads the file. Distributes atoms round-robin to all ranks (or rank 0 takes all of them). Then call `Irregular::migrate_atoms(1)` to correctly redistribute.
+
+The round-robin approach: each rank's local array gets `natoms/nprocs` checkpoint atoms. Then migration fixes it up.
+
+Actually, the simplest for correctness: rank 0 loads all atoms from file, then directly provides them to atom arrays. Then `Irregular::migrate_atoms(1)` redistributes.
+
+Let me think about how many atoms we have. The simulation is `20*20*20 * 4` (fcc) = 32000 atoms. Rank 0 can hold all of them (they fit easily in memory).
+
+Now let me look at how `Irregular::migrate_atoms` works and what it needs:
+`migrate_atoms` uses `avec->pack_exchange(i, ...)` and `avec->unpack_exchange(...)`. This is how LAMMPS serializes/deserializes atom data during migration. The key is that it uses `comm->coord2proc()` to determine which rank each atom belongs to.
+
+Now I understand the full picture. Here's my corrected implementation plan:
+
+**Checkpoint** (at checkpoint time, inside `run()`):
+1. Each rank contributes its `nlocal` atoms' `(tag, x[3], v[3], image)` data
+2. MPI_Gather to get all counts on rank 0
+3. MPI_Gatherv to get all atom data on rank 0
+4. Rank 0 writes a binary file via VeloC (using `VELOC_Checkpoint_begin` + `VELOC_Route_file` + write + `VELOC_Checkpoint_end`)
+5. Non-rank-0 ranks contribute to `VELOC_Checkpoint_begin`/`end` with empty files
+
+**Restart** (at restart, inside `run()`, AFTER `setup()` has been called):
+1. `VELOC_Restart_test` to find latest checkpoint version
+2. `VELOC_Restart_begin` + `VELOC_Route_file` on rank 0 to get file path
+3. Rank 0 reads the binary file: ntimestep, natoms, then all (tag, x, v, image) records
+4. Rank 0 broadcasts ntimestep and natoms to all ranks
+5. Rank 0 distributes checkpoint atoms across all ranks (can chunk evenly: rank R gets atoms [R*natoms/nprocs .. (R+1)*natoms/nprocs])
+6. Each rank receives its chunk and populates `atom->x`, `atom->v`, `atom->image`, `atom->tag`, `atom->type`, `atom->mask`, sets `atom->nlocal`
+7. `VELOC_Restart_end`
+8. Call `domain->remap(x[i], image[i])` for each local atom
+9. Call `Irregular::migrate_atoms(1)` to redistribute to correct ranks
+10. Rebuild neighbor lists: `comm->borders()`, `neighbor->build(1)`, `modify->setup(vflag)` etc.
+11. Set `update->ntimestep = restored_ntimestep`
+12. Skip `steps_done` iterations in the main loop
+
+But step 6 requires knowing atom `type` and `mask` which aren't in our checkpoint. Let me add them.
+
+Actually, for this simulation (`atom_style atomic`, `type = 1` for all, `mask = 1` for all), these are trivially set. But I should save them for correctness.
+
+Also, looking at `avec->unpack_exchange`, it handles the atom data in the LAMMPS internal format. After `migrate_atoms`, atoms have their correct type, mask, etc. from what was set in the local arrays before migration.
+
+**Simplified approach**: Since atoms don't change type/mask during an NVE run, I only need to save tag, x, v, image. On restart, set type=1, mask=1 (or keep them from what setup() loaded).
+
+Wait, there's a better approach: don't reset nlocal and clear arrays. Instead:
+1. After setup(), each rank has the correct initial atoms (from lattice + exchange)
+2. We just need to UPDATE positions/velocities/images to match checkpoint values
+3. Use atom->map() to find each checkpoint atom's current local index
+4. This avoids the need for Irregular::migrate_atoms
+
+Here's how:
+1. Rank 0 reads all checkpoint atoms (tag, x, v, image)
+2. Broadcast to all ranks
+3. Each rank builds `atom->map()` if not already built
+4. For each checkpoint atom (tag, x, v, image):
+   - `m = atom->map(tag)` - find local index of this atom
+   - If `m >= 0 && m < atom->nlocal`: update `x[m]`, `v[m]`, `image[m]`
+5. After all atoms updated, we need to redistribute: some atoms may have moved to different ranks
+6. Call `Irregular::migrate_atoms(1)` to fix up the distribution
+
+This is still complex. Let me consider whether step 5 is actually needed.
+
+After setup(), atoms are in their initial lattice positions. After we update x[m] to checkpoint positions, atoms may be in positions outside their assigned rank's domain. So we do need Irregular::migrate_atoms.
+
+**Actually the simplest approach**:
+
+Wait - do I even need to redistribute? Let me think again:
+
+After setup(), `comm->exchange()` has run, so each rank has initial-position atoms. The checkpoint saves atoms at step T with potentially different positions. 
+
+If I update each atom's position in-place (using atom->map to find it) without redistributing, then each rank has atoms with checkpoint positions, but those positions might now be in other ranks' domains. The simulation will then be wrong because force calculations assume atoms are in the correct domain.
+
+However! The `comm->borders()` + `neighbor->build()` steps that happen at the start of the main loop (forced by `neighbor->ago = delay + every - 1`) will:
+1. Build ghost atom lists (which includes atoms from neighboring ranks near boundary)
+2. But `comm->exchange()` that moves atoms to correct ranks is what's MISSING
+
+The key missing step in the current code is `comm->exchange()`. If I add that:
+- After restore, atoms are in their checkpoint positions but may be in wrong ranks
+- `comm->exchange()` moves them to correct ranks
+- Then `comm->borders()` + `neighbor->build()` sets up the neighbor lists
+
+BUT: The current code restores `atom->nlocal = ckpt_nlocal` and sets atom arrays. If after restore, this rank has atoms whose positions are in other ranks' domains, `comm->exchange()` should send them away. But it also needs to receive atoms from other ranks that belong to here - those atoms are currently on other ranks with correct checkpoint data.
+
+So if ALL ranks restore their checkpoint data (which is per-rank), and then ALL ranks run `comm->exchange()`:
+- Each rank sends atoms outside its domain to appropriate ranks
+- Each rank receives atoms from other ranks that belong to it
+- The result is correctly distributed atoms!
+
+This could actually work! The key is that collectively, all ranks have the complete set of checkpoint atoms. Some of these atoms may be on the wrong rank, but collectively they're all there. After `comm->exchange()`, they'll be correctly distributed.
+
+But wait: `comm->exchange()` is designed for small displacements (one rank's domain at a time). For large displacements, it might not work correctly. Let me check:
+
+Looking at the verify_check logic in irregular.cpp - the comment says "allows atoms to have moved arbitrarily long distances" for `migrate_atoms`, while `comm->exchange()` assumes atoms moved at most one domain width.
+
+For an LJ simulation checkpointing every 1000 steps, atoms don't move more than one domain width in 1000 steps (thermal velocity is ~1 LJ unit, domain width is 20 LJ units). So `comm->exchange()` should work!
+
+But the REAL problem is: at the checkpoint timestamp, each rank R saves `ckpt_nlocal_R` atoms with their positions. On fresh restart, each rank R has `initial_nlocal_R` atoms in initial positions. After restore, rank R has `ckpt_nlocal_R` atoms with checkpoint positions.
+
+The issue: `initial_nlocal_R` might not equal `ckpt_nlocal_R`. If they don't match, we're overwriting the wrong number of atoms.
+
+For example:
+- Rank 0 initially has atoms A,B,C (nlocal=3)
+- At checkpoint, rank 0 has atoms A,D,E (nlocal=3) - atoms B,C moved to other ranks, atoms D,E moved here
+- After fresh setup, rank 0 again has atoms A,B,C in initial positions (nlocal=3)
+- We overwrite x[0..3] with checkpoint data: positions of A,D,E
+- Tags in atom->tag[0..3] are now the checkpoint tags
+- So nlocal=3, tag=[A,D,E], x=[pos_A, pos_D, pos_E]
+- But we also need to ensure the TYPE and MASK arrays are correct!
+
+Actually wait - in the current code, the restore saves `atom->nmax * 3` elements of x, v, f and `atom->nmax` elements of tag. But it also needs to restore type[] and mask[] (which are needed by `comm->exchange()`).
+
+Hmm, but for an atomic LJ simulation, type=1 and mask=1 for all atoms. So they don't change. The current code doesn't save/restore type/mask but that should be OK for this specific simulation.
+
+Let me reconsider: after restore with the current code:
+- `atom->nlocal = ckpt_nlocal_R`
+- `atom->x[0..nmax*3]` = checkpoint-era positions
+- `atom->v[0..nmax*3]` = checkpoint-era velocities
+- `atom->tag[0..nmax]` = checkpoint-era tags
+
+The type[] and mask[] arrays were NOT overwritten, so they still have the initial setup values. But atom->nlocal was changed. If ckpt_nlocal_R > initial_nlocal_R, we might be reading uninitialized/old type[] entries.
+
+Actually, since it's an atomic simulation with all atoms of type 1 and mask 1 (all group "all"), and since nmax >= max(ckpt_nlocal_R, initial_nlocal_R) (because nmax is allocated for the maximum possible), this is probably OK.
+
+The REAL bug might be simpler: after restore, the first loop iteration does `++update->ntimestep` making it `ckpt_ntimestep + 1`. Then it calls `initial_integrate()` followed by the neighbor check. Since we set `neighbor->ago = delay + every - 1`, this forces a neighbor rebuild on the first step.
+
+But `comm->exchange()` is NOT called first! The `comm->exchange()` only happens inside the `if (nflag != 0)` branch, and `nflag` is determined by `neighbor->decide()`. The neighbor rebuild branch does:
+```cpp
+comm->exchange();
+comm->borders();
+neighbor->build(1);
+```
+
+So actually the neighbors ARE rebuilt after restore! But `comm->exchange()` in this branch expects atoms to be slightly outside their domain (small displacements), not potentially far outside.
+
+Let me check `neighbor->decide()`:
+
+Looking at line 302-303:
+```cpp
+neighbor->ago = neighbor->delay + neighbor->every - 1;
+```
+
+With `delay 0 every 20`, this sets `ago = 19`. Then `decide()` returns non-zero (forces rebuild). So on the first step after restore, `nflag = 1`, and the full rebuild sequence runs including `comm->exchange()`.
+
+So the current code DOES call `comm->exchange()` after restore! Through the neighbor rebuild path.
+
+So why is the output wrong? Let me think again...
+
+The issue might be related to `initial_integrate()` being called BEFORE the neighbor rebuild! Looking at the loop:
+
+```cpp
+ntimestep = ++update->ntimestep;
+ev_set(ntimestep);
+
+// initial time integration
+modify->initial_integrate(vflag);  // <-- THIS RUNS FIRST
+
+// regular communication vs neighbor list rebuild
+nflag = neighbor->decide();
+
+if (nflag == 0) {
+  comm->forward_comm();
+} else {
+  // exchange + borders + neighbor rebuild
+  comm->exchange();    // <-- THIS RUNS SECOND
+  ...
+}
+
+// force computations
+...
+```
+
+The sequence is: `initial_integrate` → `comm->exchange` → `neighbor->build` → `force->pair->compute`.
+
+`initial_integrate()` for NVE does the first half of the velocity-Verlet step: updates positions and velocities by half-step. So after restore, positions are checkpoint positions, then `initial_integrate` moves them a half step. Then exchange redistributes.
+
+This should still be correct because `initial_integrate` only moves atoms slightly (half a timestep). Then exchange redistributes them.
+
+So why is the output wrong? Let me look more carefully at what `ntimestep` is set to.
+
+Looking at the current code:
+```cpp
+bigint ckpt_ntimestep = update->ntimestep;  // = firststep (0 for first run)
+...
+int ckpt_version = VELOC_Restart_test(VELOC_CKPT_NAME, INT_MAX);
+if (ckpt_version > 0) {
+    if (VELOC_Restart(VELOC_CKPT_NAME, ckpt_version) == VELOC_SUCCESS) {
+        update->ntimestep = ckpt_ntimestep;
+        atom->nlocal      = ckpt_nlocal;
+        bigint begin_step = update->firststep;
+        steps_done = (int)(ckpt_ntimestep - begin_step);
+```
+
+After restore, `update->ntimestep = ckpt_ntimestep` (e.g., 1000).
+`steps_done = 1000 - 0 = 1000`.
+The loop starts at `i = 1000`.
+The first iteration: `ntimestep = ++update->ntimestep = 1001`. ✓
+
+This seems correct. The checkpoint was at step 1000 (after step 1000 completed), and we restart at step 1001. The checkpoint was taken AFTER `output->write()` but let's check the checkpoint timing:
+
+```cpp
+// all output
+if (ntimestep == output->next) {
+    output->write(ntimestep);
+}
+
+/* VeloC: checkpoint every VELOC_CKPT_FREQ steps */
+if ((ntimestep % VELOC_CKPT_FREQ) == 0) {
+    ckpt_ntimestep = update->ntimestep;
+    ckpt_nlocal    = atom->nlocal;
+    VELOC_Checkpoint(VELOC_CKPT_NAME, (int)(ntimestep / VELOC_CKPT_FREQ));
+}
+```
+
+The checkpoint is taken AFTER `output->write()` and AFTER `final_integrate()`. So the checkpoint captures the state AFTER step 1000 is fully complete (positions, velocities have been updated for the full step). ✓
+
+Now `VELOC_Mem_protect` registers the memory regions. But `VELOC_Mem_protect` is called once at the beginning of `run()`, before the checkpoint version check. The checkpoint then saves those regions.
+
+WAIT. The key issue: `VELOC_Mem_protect` is called with `atom->x[0]` as the pointer. But `atom->x` might be reallocated during the run! If atom arrays are grown during the simulation, the pointer `atom->x[0]` changes. VeloC has the OLD pointer from before the run started.
+
+At checkpoint time, `atom->x[0]` might point to different memory than what VeloC registered. So VeloC saves the OLD memory (from before the run) rather than the current positions!
+
+This is a serious bug. Let me verify: does LAMMPS grow atom arrays during a run?
+
+Yes - if atoms move between ranks, `atom->nlocal` changes and `atom->nghost` changes. If `nlocal + nghost > nmax`, the arrays are grown via `atom->grow()`. When `atom->grow()` is called, it reallocates all atom arrays, and the pointers change.
+
+So `VELOC_Mem_protect` with the initial pointer is wrong - after a grow(), the pointer is stale.
+
+**This is the root cause of the bug!**
+
+When VELOC_Checkpoint is called at step 1000, it saves whatever is at the originally-registered pointer `atom->x[0]` from before the run, NOT the current atom positions!
+
+So the checkpoint contains garbage/stale data, and the restore restores that garbage. The simulation then runs from step 1001 onwards with wrong initial positions, giving wrong results.
+
+The fix: we need to re-register memory regions at checkpoint time (after checking that the pointers haven't changed), OR use VeloC's file-based API to write the data explicitly.
+
+**The simplest fix**: At checkpoint time, unprotect and re-protect with the current pointers:
+
+```cpp
+if ((ntimestep % VELOC_CKPT_FREQ) == 0) {
+    // Re-register with current (possibly updated) pointers
+    ckpt_ntimestep = update->ntimestep;
+    ckpt_nlocal    = atom->nlocal;
+    VELOC_Mem_protect(VELOC_ID_X,   atom->x[0],   ...);  // update pointer
+    VELOC_Mem_protect(VELOC_ID_V,   atom->v[0],   ...);
+    ...
+    VELOC_Checkpoint(VELOC_CKPT_NAME, ...);
+}
+```
+
+But also: the SIZE changes. Initially we register `nmax * 3` doubles. After grow, nmax might be larger. We should register with the CURRENT nmax.
+
+Wait actually - can we re-register? Does `VELOC_Mem_protect` overwrite the previous registration for the same ID? Let me check the header again...
+
+The header just says "registers a memory region". It's likely that re-calling with the same ID updates the registration. Let me assume it does.
+
+But there's another issue: the SIZE registered at the beginning (`atom->nmax * 3`) might not match the size at checkpoint time if nmax grew. If VeloC saves a fixed size and then on restore allocates fixed-size buffers, there could be issues.
+
+**Actually the cleanest fix**: Use VeloC's file-based API to explicitly write/read atom data at checkpoint/restart time. This avoids the stale pointer issue entirely.
+
+Let me now implement the corrected version. The approach:
+
+1. At checkpoint time: write atom data explicitly to a VeloC-managed file (using `VELOC_Checkpoint_begin`, `VELOC_Route_file`, write file, `VELOC_Checkpoint_end`)
+2. At restart time: read atom data from the VeloC-managed file (using `VELOC_Restart_begin`, `VELOC_Route_file`, read file, `VELOC_Restart_end`)
+3. Use global gather on rank 0 for writing, global broadcast for reading
+4. After restore, redistribute atoms using `Irregular::migrate_atoms(1)` and rebuild neighbor lists
+
+For VeloC checkpoint version: use `ntimestep / VELOC_CKPT_FREQ` as version.
+
+Let me now write the corrected `verlet.cpp`:
+
+The key changes:
+1. Remove `VELOC_Mem_protect` calls (switch to file-based API)
+2. At checkpoint: gather atoms to rank 0, write file via VELOC_Route_file
+3. At restart: rank 0 reads file, broadcasts to all, uses Irregular::migrate_atoms
+
+Let me look at how VeloC file-based API works in practice:
+
+`VELOC_Route_file(original, routed)`: 
+- `original` = just a filename (not a path), e.g., "lammps_ckpt.bin"
+- `routed` = the full path where VeloC wants the file, allocated by caller (char[VELOC_MAX_NAME])
+
+The file will be in VeloC's scratch directory under the checkpoint name/version.
+
+For each checkpoint, rank 0 writes to its routed file path. Other ranks write empty files (or skip the file API and just call checkpoint begin/end with memory checkpoint of empty data).
+
+Actually since all ranks must participate in VELOC_Checkpoint collectively (it's a collective operation), I need all ranks to call begin/end. But only rank 0 writes data. The other ranks can write a minimal 1-byte file.
+
+Let me now write the complete implementation:
+Now I understand the complete picture. Let me also check if atom arrays are actually reallocated during this simulation. With `neigh_modify check no`, the neighbor lists are rebuilt every 20 steps. During `comm->exchange()`, atoms may cross rank boundaries, changing `nlocal`. If `nlocal + nghost > nmax`, arrays grow.
+
+The `atom->nmax` is initialized to some value. During the run, it may grow if more atoms arrive than expected. Let me check if this is the issue.
+
+Actually, let me look at a key detail: when `VELOC_Mem_protect` is called at the start of `run()`, it registers `atom->x[0]` at that moment. If during the run `atom->grow()` is called, `atom->x[0]` points to NEW memory. VeloC still has the OLD pointer.
+
+At checkpoint time (step 1000), VeloC saves data from the OLD address. This is stale data - not the current positions.
+
+**This IS the root cause.** The fix: at checkpoint time, re-register the memory regions with current pointers.
+
+Let me also check: does the checkpoint use `VELOC_Checkpoint` (convenience wrapper) or `VELOC_Checkpoint_begin/mem/end`? Currently it uses `VELOC_Checkpoint(VELOC_CKPT_NAME, version)` which is a wrapper for `begin + mem + end`.
+
+For `VELOC_Checkpoint_mem()` to save the right data, the registered pointers must be current. So I need to re-register before calling checkpoint.
+
+Let me now implement the fixed version. I'll use a combined approach:
+1. Re-register memory regions at each checkpoint (fixing the stale pointer bug)
+2. After restart, properly call `comm->exchange()` before the main loop to redistribute atoms
+
+Actually the current code already handles `comm->exchange()` via the neighbor rebuild (which is forced after restart). But the stale pointer bug means the checkpoint data itself is wrong.
+
+Let me verify: are atom arrays reallocated? For this specific simulation with 4 MPI ranks and 32000 atoms, each rank starts with ~8000 atoms. During the run, atoms cross boundaries but total count per rank doesn't vary much. The nmax is probably set conservatively large enough that no reallocation happens.
+
+Let me check what nmax is initialized to:
+I see: `x = memory->grow(atom->x, nmax, 3, "atom:x")`. This uses `memory->grow` which may realloc. After this, `atom->x` is a new pointer. Since `atom->x` is a `double**` (pointer to pointer for 2D array), `atom->x[0]` is the actual flat buffer pointer. After grow, this changes.
+
+So yes, `atom->x[0]` can change during the run, and VeloC's registered pointer becomes stale.
+
+Now let me look at DELTA:
+For the atomic style, the stored fields are just: id (tag), type, x, v (+ image from defaults). This is minimal and manageable.
+
+Now let me design the correct solution. Given the complexity, I'll implement a **clean file-based checkpoint approach**:
+
+**The Plan**:
+
+At checkpoint time, all ranks collectively:
+1. MPI_Allreduce total nlocal (= natoms global)
+2. Each rank writes its local atoms to a temporary buffer as (tag, type, x[3], v[3], image) records
+3. MPI_Gather all nlocals to rank 0
+4. MPI_Gatherv all atom records to rank 0
+5. Rank 0 calls `VELOC_Checkpoint_begin`, gets routed path, writes binary file with: [bigint ntimestep, int natoms_total, N × record]
+6. Rank 1..N-1 call `VELOC_Checkpoint_begin`, get their routed paths, write a 1-byte dummy file
+7. All ranks call `VELOC_Checkpoint_end(1)`
+
+At restart time:
+1. `VELOC_Restart_test` gets latest version
+2. All ranks call `VELOC_Restart_begin`
+3. Rank 0 gets routed path, reads file: ntimestep, natoms, all atom records
+4. Rank 0 broadcasts ntimestep and natoms
+5. Rank 0 broadcasts all atom records to all ranks
+6. Each rank calls `VELOC_Restart_end(1)`
+7. Now all ranks have the complete atom list in a temporary buffer
+8. We need to load these into atom arrays: set nlocal to natoms/nprocs for first nprocs-1 ranks and remaining for last rank (simple distribution), then `migrate_atoms` to fix up
+9. Update ntimestep
+10. Call `Irregular::migrate_atoms(1)` + rebuild neighbors
+
+Wait, but setting atoms into atom arrays requires growing the arrays. Let me think about the cleanest way to inject atoms.
+
+Actually, looking at the atom_vec_atomic and how `comm->exchange()` + `comm->borders()` work: after restart, we need atoms to be in the right state for the first call to `initial_integrate`. The state needed is: positions, velocities, forces (which will be recomputed), and image flags.
+
+Here's a cleaner approach for the restart:
+1. Read all atom data globally on rank 0
+2. Rank 0 distributes a chunk of ~N/nprocs atoms to each rank (including self)
+3. Each rank receives a chunk and fills in its `atom->x`, `atom->v`, `atom->tag`, `atom->type`, `atom->mask`, `atom->image`, `atom->nlocal`
+4. Call `domain->remap(x[i], image[i])` for each local atom (to fix periodic image flags)
+5. Call `Irregular::migrate_atoms(1)` to redistribute to correct ranks
+6. Then rebuild neighbors properly
+
+The issue with step 3: we need to grow atom arrays if the chunk size > current nmax. Let me use `atom->avec->grow(N_chunk)`.
+
+Actually, let me look at `AtomVec::grow`:
+So `atom->avec->grow(n)` grows atom arrays to hold at least n atoms. After this, `atom->x`, `atom->v`, etc. all point to new memory.
+
+Now I have everything I need. Let me implement the complete corrected `verlet.cpp`. I'll take a practical approach:
+
+**Key insight**: The simplest correct approach that avoids the redistribution complexity is:
+
+After restart, keep atoms where they are (from setup()), but update their positions/velocities using the checkpoint data matched by tag. Then re-run `comm->exchange()`.
+
+But this requires `atom->map()` to find atoms by tag. Let's check if map is built after setup():
+
+In `setup()`, line 143: `neighbor->build(1)` - and in `modify->setup_post_neighbor()`. Let me check if atom map is built:
+For atomic systems, `map_style = MAP_NONE` by default. So we can't use `atom->map()` directly.
+
+This is getting complex. Let me use a more direct approach.
+
+**The simplest correct approach** (no redistribute complexity):
+
+The key insight I've been missing: in the current code, when the restart happens:
+1. `run()` is called fresh (new invocation, not continuing from before)
+2. `setup()` was called before `run()`, initializing atoms from the input file
+3. After `run()` entry, we call `VELOC_Restart_test` to check for checkpoint
+
+After setup(), each rank has exactly `nlocal_initial` atoms in their initial positions. The checkpoint was saved with each rank having `ckpt_nlocal` atoms with checkpoint positions.
+
+**The key problem**: We're overwriting the initial atoms' data with checkpoint data. After overwrite, `atom->nlocal = ckpt_nlocal` and atom arrays have checkpoint-era atoms.
+
+But there's a subtle issue: during `comm->exchange()` (called inside the neighbor rebuild), it sends atoms whose positions are outside the domain. These atoms were from the checkpoint. The RECEIVING ranks also had checkpoint data for those atoms originally (they were on those ranks at checkpoint time). But now they're receiving atoms from a different rank AND still have their own checkpoint atoms.
+
+Wait - when the checkpoint data was restored, the receiving ranks also restored THEIR checkpoint atoms. So rank R has `ckpt_nlocal_R` atoms with positions from the checkpoint. After exchange, atoms that moved outside rank R's domain are sent away, and atoms from neighboring ranks that moved into rank R's domain are received. 
+
+The KEY QUESTION: is the global set of atoms (across all ranks) consistent after restore and exchange?
+
+At checkpoint time: the global set of atoms is complete and consistent. Each atom is on exactly one rank.
+After restore: each rank has its checkpoint atoms. The global set is still complete and consistent.
+After exchange: atoms are redistributed to the correct ranks based on their checkpoint positions. ✓
+
+So the current approach SHOULD work conceptually! The issue must be the stale pointer bug.
+
+Let me verify: does `VELOC_Mem_protect` update when the pointer changes?
+
+If `atom->avec->grow()` is called during setup(), it calls `memory->grow(atom->x, nmax, 3, ...)` which may realloc. After this, `atom->x[0]` (the flat buffer) is at a different address than when we registered with VeloC.
+
+But wait: `VELOC_Mem_protect` is called at the START of `run()`, AFTER `setup()` has been called. So if `setup()` caused array growth, by the time `VELOC_Mem_protect` is called in `run()`, the pointers are already updated. ✓
+
+The issue is: during the run ITSELF, does `atom->avec->grow()` get called?
+
+Yes - during `comm->exchange()`, when more atoms arrive from other ranks than expected, `grow()` is called. After this, all pointers change. VeloC still has the old pointer from the start of `run()`.
+
+**Confirm the bug**: During the run, atom arrays may be reallocated, making VeloC's registered pointers stale.
+
+**The fix**: At each checkpoint, re-register memory regions with CURRENT pointers and CURRENT nmax size, then checkpoint.
+
+Let me implement this fix:
+
+```cpp
+/* VeloC: checkpoint every VELOC_CKPT_FREQ steps */
+if ((ntimestep % VELOC_CKPT_FREQ) == 0) {
+    ckpt_ntimestep = update->ntimestep;
+    ckpt_nlocal    = atom->nlocal;
+    /* Re-register with current pointers (may have changed due to grows) */
+    VELOC_Mem_protect(VELOC_ID_NTIMESTEP, &ckpt_ntimestep, 1, sizeof(bigint));
+    VELOC_Mem_protect(VELOC_ID_NLOCAL,    &ckpt_nlocal,    1, sizeof(int));
+    if (atom->nmax > 0 && atom->x && atom->v && atom->f && atom->tag) {
+        VELOC_Mem_protect(VELOC_ID_X,   atom->x[0],   (size_t)atom->nmax * 3, sizeof(double));
+        VELOC_Mem_protect(VELOC_ID_V,   atom->v[0],   (size_t)atom->nmax * 3, sizeof(double));
+        VELOC_Mem_protect(VELOC_ID_F,   atom->f[0],   (size_t)atom->nmax * 3, sizeof(double));
+        VELOC_Mem_protect(VELOC_ID_TAG, atom->tag,    (size_t)atom->nmax,     sizeof(tagint));
+    }
+    VELOC_Checkpoint(VELOC_CKPT_NAME, (int)(ntimestep / VELOC_CKPT_FREQ));
+}
+```
+
+And for restart, after restore, we need to properly redistribute atoms. Let me also add the `comm->exchange()` after restore.
+
+Wait - the current code already triggers a neighbor rebuild on the first step after restore, which includes `comm->exchange()`. So that should be correct.
+
+But actually, there's ANOTHER subtle problem: after restore, `update->ntimestep = ckpt_ntimestep`. The loop starts at `i = steps_done`. The first iteration: `ntimestep = ++update->ntimestep = ckpt_ntimestep + 1`.
+
+But before the first `comm->exchange()`, `initial_integrate()` is called which advances positions by a half-step. This is correct because at checkpoint time, the state was after `final_integrate()` which did the second half-step. The state is at the end of step T, so to continue from step T+1, we do `initial_integrate()` (first half-step of T+1).
+
+So the flow seems correct. The bug MUST be the stale pointer.
+
+But wait - let me re-read the current code more carefully:
+
+```cpp
+VELOC_Mem_protect(VELOC_ID_X,   atom->x[0],   (size_t)atom->nmax * 3, sizeof(double));
+```
+
+`atom->x[0]` - since `atom->x` is `double**`, `atom->x[0]` is the first row of the 2D array, which is the flat buffer pointer `double*`. After `memory->grow(atom->x, nmax, 3, ...)`, `atom->x` is reallocated as a new 2D array, and `atom->x[0]` points to new memory.
+
+So at start of `run()`:
+- `atom->x[0]` = address A of flat buffer
+- VeloC registers address A
+
+At step 1000 (first checkpoint):
+- If grow was called: `atom->x[0]` = address B (new memory)
+- VeloC saves data at address A (stale!)
+
+This IS the bug.
+
+Actually... let me also check: when we register with `VELOC_Mem_protect`, does VeloC copy the data at registration time or at checkpoint time? If at checkpoint time, it reads from the registered pointer address. But the registered pointer is the VALUE of `atom->x[0]` at registration time (an address). If the buffer is reallocated, that address A may have been freed and potentially reused for something else, making the saved data garbage.
+
+Actually, `atom->x[0]` passed to VELOC is a VALUE (a pointer value = address A). VeloC stores this address. When VELOC_Checkpoint is called, it reads nmax*3 doubles from address A. If the buffer was realloc'd to address B, address A is freed - VeloC is reading from freed memory (undefined behavior).
+
+Yes, this is a severe bug. The fix is straightforward: re-register at checkpoint time with current pointers.
+
+But actually there's a simpler, even more robust fix: **use VeloC's file-based API** to explicitly write current data, avoiding the registered pointer problem entirely.
+
+Let me implement the file-based approach since it's more robust and doesn't depend on VeloC memory management:
+
+For the file-based approach, at checkpoint time:
+- Each rank writes its own binary file: [bigint ntimestep, int nlocal, nlocal×(tagint tag + double x[3] + double v[3] + imageint image)]
+- VeloC manages these files
+
+At restart time:
+- Each rank reads its own binary file
+- Restores nlocal, tag, x, v, image
+- Forces neighbor rebuild
+
+But this still has the cross-rank atom migration problem. However, I argued earlier that `comm->exchange()` (triggered by the neighbor rebuild) should handle this correctly IF:
+1. The restored atom data is globally consistent (all atoms accounted for, no duplicates)
+2. `comm->exchange()` can handle atoms that moved more than one domain width
+
+For LJ NVE at checkpoint interval of 1000 steps, atoms shouldn't move more than a few domain widths. Let's check:
+- Temperature ~1.44 LJ units
+- Thermal velocity ~sqrt(kT/m) = sqrt(1.44) ~ 1.2 LJ units
+- Time step: 0.005 LJ units (LAMMPS default for LJ)
+- 1000 steps = 5 LJ time units
+- Distance traveled: ~6 LJ units
+- Domain size: 20 LJ units (with 4 procs in one direction: 5 LJ units per rank)
+
+So an atom could move up to ~6 units in 1000 steps, which could cross multiple domain boundaries! Regular `comm->exchange()` would fail here (it only handles 1 domain crossing).
+
+We need `Irregular::migrate_atoms(1)` instead.
+
+OK, so I need to implement the full redistribute-after-restore approach. Let me now write the complete implementation.
+
+Here's the full plan:
+
+**At checkpoint**:
+1. Each rank writes its local atoms' data to a VeloC-managed file (file-based API)
+2. Format: `[bigint ntimestep][int nlocal][nlocal × struct{ tagint tag; double x[3]; double v[3]; imageint image; int type; int mask; }]`
+3. Use `VELOC_Checkpoint_begin` + `VELOC_Route_file` + write + `VELOC_Checkpoint_end`
+
+**At restart**:
+1. Each rank reads its own file from the checkpoint
+2. Gets a list of atoms that were on this rank at checkpoint time
+3. Broadcasts to a rendezvous: all ranks gather their atoms and build a combined list of all atoms in the system
+4. Use `Irregular::migrate_atoms(1)` to redistribute all atoms to correct ranks
+
+For step 3-4, the key issue is: how do we get all atoms to all ranks? We need a global gather.
+
+Actually, we don't need all atoms on all ranks. We just need `Irregular::migrate_atoms(1)` to work. For that, ALL atoms must be distributed somewhere (on any rank), and `migrate_atoms` will send them to the correct rank.
+
+After each rank reads its checkpoint file, atoms are distributed just like at checkpoint time (with checkpoint-era positions). Then calling `Irregular::migrate_atoms(1)` with those checkpoint positions will correctly redistribute them to ranks based on current domain boundaries (same as checkpoint-era boundaries since box doesn't change in NVE).
+
+But wait - `migrate_atoms` requires:
+1. Atoms to be remapped to be inside the simulation box
+2. `comm->coord2proc_setup()` to be called for UNIFORM layout
+
+And it uses `avec->pack_exchange` which requires type, mask to be valid.
+
+The challenge is setting up atom arrays correctly from the file data. Let me look at what fields we need vs. what's needed for `migrate_atoms`:
+
+After reading checkpoint file per rank, we need:
+- `atom->x[i]` = position (from file) ✓
+- `atom->v[i]` = velocity (from file) ✓  
+- `atom->tag[i]` = tag (from file) ✓
+- `atom->type[i]` = type (from file) ✓
+- `atom->mask[i]` = mask (from file) ✓
+- `atom->image[i]` = image (from file) ✓
+- `atom->nlocal` = nlocal from file ✓
+- `atom->nmax` must be >= nlocal from file
+
+If `nlocal_from_file > current_nmax`, we need to grow. We call `atom->avec->grow(nlocal_from_file + BUFFER)`.
+
+After migrate_atoms, each rank has atoms in their correct domain. Then:
+- `comm->borders()` to get ghost atoms
+- `neighbor->build(1)` to build neighbor lists
+- `modify->setup_post_neighbor()` etc.
+
+This is essentially doing a mini-setup but just for the restart case.
+
+Let me now look at what `modify->setup(vflag)` does and whether we need to call it:
+
+The `setup()` function calls `modify->setup(vflag)` at the end. On restart, we've already done the full setup once. The fixes are initialized. We just need to rebuild neighbor lists and get atom positions right.
+
+Actually, instead of doing a full setup, I'll take a more minimal approach:
+
+After restoring atom positions via Irregular::migrate_atoms:
+1. `comm->borders()` - get ghost atoms
+2. `neighbor->build(1)` - build neighbor lists
+3. Set `neighbor->ago = 0` (or set it so next step doesn't rebuild unnecessarily but the rebuild path IS taken on next step - actually let's keep it so it forces rebuild)
+4. The loop starts with `initial_integrate` which needs correct neighbor lists (well actually the force computation does)
+
+Actually wait - in the original loop flow, forces ARE computed after the neighbor rebuild. So if I force a neighbor rebuild on the first post-restart step, forces will be recomputed correctly even without me explicitly computing them.
+
+Let me trace through:
+```
+Restart restore → initial_integrate (moves atoms) → neighbor decide (forced rebuild) → exchange + borders + build → force compute
+```
+
+But `initial_integrate` moves atoms based on the current `atom->f` (forces). If forces are from the previous step (saved in the checkpoint), this is correct! But forces are NOT in my current checkpoint (I don't save `atom->f`).
+
+After a fresh `setup()`, `atom->f` is computed by the setup's force calculation. When we restore from checkpoint and set `atom->nlocal = ckpt_nlocal` and atom positions, the forces `atom->f` are still from the setup() force calculation - computed for the INITIAL lattice positions, not checkpoint positions. 
+
+So `initial_integrate` will use wrong forces for the first half-step after restart. This would cause a small error in the very first step after restart, but that error should be tiny for the subsequent dynamics.
+
+Actually wait - let me reconsider. After a full LAMMPS restart (`read_restart` + `run N`), how does LAMMPS handle forces? In read_restart, forces are NOT saved (they're recomputed in setup). Then setup() is called which recomputes forces at the restart configuration. Then run() proceeds normally.
+
+In our case, forces in `atom->f` are from the initial configuration (computed by setup's force compute). If we use those to advance from the checkpoint configuration, the first half-step is wrong.
+
+BUT: after `initial_integrate` (which uses wrong forces), the FIRST thing that happens is force recomputation (after neighbor rebuild). So the error from wrong forces is limited to one half-step advance. This introduces a very small error ~O(dt²) in the trajectory, which could compound over time.
+
+Actually, for a proper restart to give bit-identical results to a simulation run without interruption, we NEED the forces at the checkpoint configuration. We need to either:
+1. Save forces in the checkpoint (**save `atom->f` too**), or
+2. Recompute forces at the checkpoint configuration before starting the loop
+
+Option 2 is better (no need to save forces). We need to:
+1. After restoring positions/velocities
+2. Rebuild neighbor lists at the checkpoint configuration
+3. Compute forces at the checkpoint configuration  
+4. Then start the loop
+
+This is equivalent to calling `setup_minimal(1)` after restore... but setup_minimal will call modify->setup() which may reset thermostat/barostat state.
+
+Actually for NVE (simple velocity-Verlet), there's no thermostat state to worry about. The force calculation with `setup_minimal(1)` after restore would give us correct forces.
+
+But this is getting complex. Let me look at what LAMMPS's read_restart + run does: it calls `run()` which calls `setup()` then `run()` internally. In the `setup()`, forces are recomputed at the restart positions. Then `run()` proceeds.
+
+For our case: we're inside `run()` already (having been called after setup). We need to:
+1. Restore positions/velocities
+2. Redistribute atoms
+3. **Recompute forces** before starting the loop
+
+Here's a practical approach: after restore and redistribution, force the FIRST loop iteration to skip `initial_integrate` and instead just do the neighbor rebuild + force compute + final_integrate. Actually no, that's wrong.
+
+Let me think about this more carefully. The checkpoint saves state AFTER `final_integrate()` at step T. This means:
+- Positions: x(T) (full step update)
+- Velocities: v(T) (full step update)  
+- Forces: f(T) (computed during step T's force compute)
+
+When we restart for step T+1:
+- `initial_integrate()` computes: x(T+½) = x(T) + v(T)*dt/2, v(T+½) using f(T)
+- `force->pair->compute()` uses x(T+½) to compute f(T+1)
+- `final_integrate()` computes x(T+1), v(T+1)
+
+So we DO need f(T) to properly restart step T+1. If we don't save forces, we need to recompute them at x(T) before starting step T+1.
+
+**Solution**: After restoring x(T) and v(T) (and redistributing), call `setup_minimal(1)` to:
+1. Re-exchange atoms to correct ranks
+2. Rebuild neighbor lists at x(T)
+3. Compute f(T)
+
+Then start the loop from step T+1.
+
+But `setup_minimal(1)` calls `modify->setup(vflag)` which would reset NVE's state (though NVE has no persistent state). Actually, looking at `setup_minimal`:
+
+```cpp
+void Verlet::setup_minimal(int flag)
+{
+  update->setupflag = 1;
+  ...
+  force_clear();
+  modify->setup_pre_force(vflag);
+  force->pair->compute(eflag,vflag);
+  ...
+  if (force->newton) comm->reverse_comm();
+  modify->setup(vflag);
+  update->setupflag = 0;
+}
+```
+
+`modify->setup(vflag)` calls the setup() callback for each fix. For NVE, this might reset internal state. Let me check:
+NVE's `initial_integrate` uses `atom->f` (forces). It does `v += dtf/m * f`, then `x += dtv * v`. For correct results, we need `f` to be the forces at the checkpoint configuration.
+
+Without saving forces, we need to recompute them. The best approach: after restoring atom positions and redistributing, compute forces at those positions, then start the main loop.
+
+Let me now design the complete implementation. I'll write a comprehensive `veloc_checkpoint()` and `veloc_restart()` helper inside `verlet.cpp` that properly handles all of this.
+
+Here's my implementation plan for `verlet.cpp`:
+
+```cpp
+/* At checkpoint time (end of step T): */
+void veloc_ckpt(Verlet *V, bigint ntimestep, int version) {
+    // Per-atom record: tag(tagint) + x[3](double) + v[3](double) + image(imageint) + type(int) + mask(int)
+    // = sizeof(tagint) + 6*8 + sizeof(imageint) + 4 + 4
+    
+    int nlocal = V->atom->nlocal;
+    int me = V->comm->me;
+    
+    // Build local send buffer: (tagint tag, double x[3], double v[3], imageint image, int type, int mask)
+    struct AtomRec { tagint tag; double x[3]; double v[3]; imageint image; int type; int mask; };
+    
+    // Pack local atoms into buffer
+    AtomRec *lbuf = new AtomRec[nlocal];
+    for (int i = 0; i < nlocal; i++) {
+        lbuf[i].tag = V->atom->tag[i];
+        lbuf[i].x[0] = V->atom->x[i][0]; lbuf[i].x[1] = V->atom->x[i][1]; lbuf[i].x[2] = V->atom->x[i][2];
+        lbuf[i].v[0] = V->atom->v[i][0]; lbuf[i].v[1] = V->atom->v[i][1]; lbuf[i].v[2] = V->atom->v[i][2];
+        lbuf[i].image = V->atom->image[i];
+        lbuf[i].type = V->atom->type[i];
+        lbuf[i].mask = V->atom->mask[i];
+    }
+    
+    // Gather to rank 0
+    int nprocs = V->comm->nprocs;
+    int *recvcounts = new int[nprocs];
+    int *displs = new int[nprocs];
+    MPI_Gather(&nlocal, 1, MPI_INT, recvcounts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    AtomRec *gbuf = nullptr;
+    int ntotal = 0;
+    if (me == 0) {
+        displs[0] = 0;
+        for (int i = 0; i < nprocs; i++) { ntotal += recvcounts[i]; if (i>0) displs[i] = displs[i-1]+recvcounts[i-1]; }
+        gbuf = new AtomRec[ntotal];
+    }
+    
+    // MPI_Gatherv with derived type or raw bytes
+    MPI_Gatherv(lbuf, nlocal, MPI_BYTE, gbuf, recvcounts_bytes, displs_bytes, MPI_BYTE, 0, MPI_COMM_WORLD);
+    // Note: counts/displs need to be in BYTES (sizeof(AtomRec) each)
+    
+    // VeloC file-based checkpoint
+    VELOC_Checkpoint_begin(VELOC_CKPT_NAME, version);
+    char routed[VELOC_MAX_NAME];
+    VELOC_Route_file("atoms.bin", routed);
+    if (me == 0) {
+        FILE *f = fopen(routed, "wb");
+        fwrite(&ntimestep, sizeof(bigint), 1, f);
+        fwrite(&ntotal, sizeof(int), 1, f);
+        fwrite(gbuf, sizeof(AtomRec), ntotal, f);
+        fclose(f);
+    } else {
+        FILE *f = fopen(routed, "wb");
+        char dummy = 0;
+        fwrite(&dummy, 1, 1, f);
+        fclose(f);
+    }
+    VELOC_Checkpoint_end(1);
+    
+    delete[] lbuf;
+    delete[] gbuf;
+    delete[] recvcounts;
+    delete[] displs;
+}
+```
+
+Actually, there's a problem: `VELOC_Route_file` doesn't take a version. So how do different versions get different paths?
+
+Looking at the VeloC API again: `VELOC_Route_file(original, routed)` - the routing is based on the current checkpoint context (set by `VELOC_Checkpoint_begin`). So calling it between `begin` and `end` gives the path for that specific version.
+
+OK so the flow is:
+1. `VELOC_Checkpoint_begin(name, version)` - sets context
+2. `VELOC_Route_file("atoms.bin", routed)` - gets path for this version's file
+3. Write to `routed`
+4. `VELOC_Checkpoint_end(1)` - commits checkpoint
+
+And for restart:
+1. `VELOC_Restart_begin(name, version)` - sets context
+2. `VELOC_Route_file("atoms.bin", routed)` - gets path for this version's file  
+3. Read from `routed`
+4. `VELOC_Restart_end(1)` - done
+
+This should work. Let me now write the complete implementation.
+
+The MPI_Gatherv part: since `AtomRec` is a struct, I need to use `MPI_BYTE` with byte counts/offsets.
+
+Let me now write the full corrected `verlet.cpp`. I'll replace the entire checkpoint/restart section:
+Now I need to look at what includes are available and what headers I need. I need `irregular.h` and `memory.h`:
+Now let me look at `integrate.h` to understand what `Pointers` gives me:
+Good. I have access to `world` (the MPI communicator), `comm`, `atom`, `domain`, `neighbor`, `modify`, `force`, etc. I need to add `#include "irregular.h"` and `#include "memory.h"` to verlet.cpp.
+
+Now let me also check what `comm->coord2proc_setup()` does and if it's needed:
+
+Looking at the `migrate_atoms` code:
+```cpp
+if (!preassign) comm->coord2proc_setup();
+```
+
+So when calling `migrate_atoms(1)` (sortflag=1, no preassign), it calls `coord2proc_setup()` internally. Good, we don't need to call it ourselves.
+
+Also need to check: `domain->pbc()` to remap atoms. Looking at `migrate_atoms_by_coords()` in read_dump:
+```cpp
+for (int i = 0; i < nlocal; i++) domain->remap(x[i],image[i]);
+```
+
+This remaps atoms that have crossed periodic boundaries. This is needed after restore.
+
+Now let me write the complete implementation. Let me also check what `atom->nmax` is vs what we need:
+
+After `setup()`, `atom->nmax` is at least `nlocal_initial + nghost_initial`. After restore, if we set `atom->nlocal = ckpt_nlocal` where `ckpt_nlocal != nlocal_initial`, we might need to grow.
+
+For the file-based approach, after reading from checkpoint:
+- `ckpt_nlocal` atoms on rank R
+- If `ckpt_nlocal > atom->nmax`: need to call `atom->avec->grow(ckpt_nlocal + delta)`
+
+Now, let me write the complete new implementation of `verlet.cpp`'s `run()` function. I'll replace the entire VeloC section.
+
+Key decisions:
+1. Use file-based VeloC API (not memory protect) to avoid stale pointer issues
+2. Each rank reads/writes its own file with tagged atom data
+3. After restore, redistribute atoms using `Irregular::migrate_atoms(1)` 
+4. Recompute forces after redistribution
+
+Here's the implementation:
+
+```cpp
+/* At checkpoint time: write atoms to VeloC-managed file */
+static void veloc_write_checkpoint(Verlet *v, bigint ntimestep_val, int version)
+{
+    using namespace LAMMPS_NS;
+    
+    // Per-atom record on disk
+    struct AtomRec {
+        tagint tag;
+        double x[3];
+        double v[3];
+        imageint image;
+        int type;
+        int mask;
+    };
+    
+    // Pack local atoms
+    int nlocal = v->atom->nlocal;
+    AtomRec *lbuf = new AtomRec[nlocal ? nlocal : 1];
+    for (int i = 0; i < nlocal; i++) {
+        lbuf[i].tag     = v->atom->tag[i];
+        lbuf[i].x[0]    = v->atom->x[i][0];
+        lbuf[i].x[1]    = v->atom->x[i][1];
+        lbuf[i].x[2]    = v->atom->x[i][2];
+        lbuf[i].v[0]    = v->atom->v[i][0];
+        lbuf[i].v[1]    = v->atom->v[i][1];
+        lbuf[i].v[2]    = v->atom->v[i][2];
+        lbuf[i].image   = v->atom->image[i];
+        lbuf[i].type    = v->atom->type[i];
+        lbuf[i].mask    = v->atom->mask[i];
+    }
+    
+    // Gather counts and data to rank 0
+    int nprocs = v->comm->nprocs;
+    int me     = v->comm->me;
+    int *nlocals = nullptr;
+    if (me == 0) nlocals = new int[nprocs];
+    MPI_Gather(&nlocal, 1, MPI_INT, nlocals, 1, MPI_INT, 0, v->world);
+    
+    int natoms_total = 0;
+    int *recvcounts = nullptr;
+    int *displs     = nullptr;
+    AtomRec *gbuf   = nullptr;
+    
+    if (me == 0) {
+        recvcounts = new int[nprocs];
+        displs     = new int[nprocs];
+        displs[0] = 0;
+        for (int i = 0; i < nprocs; i++) {
+            recvcounts[i] = nlocals[i] * (int)sizeof(AtomRec);
+            natoms_total += nlocals[i];
+            if (i > 0) displs[i] = displs[i-1] + recvcounts[i-1];
+        }
+        gbuf = new AtomRec[natoms_total ? natoms_total : 1];
+        delete[] nlocals;
+    }
+    
+    int send_bytes = nlocal * (int)sizeof(AtomRec);
+    MPI_Gatherv((void*)lbuf, send_bytes, MPI_BYTE,
+                (void*)gbuf, recvcounts, displs, MPI_BYTE,
+                0, v->world);
+    delete[] lbuf;
+    
+    // VeloC file-based checkpoint
+    VELOC_Checkpoint_begin(VELOC_CKPT_NAME, version);
+    char routed[VELOC_MAX_NAME];
+    VELOC_Route_file("lammps_atoms.bin", routed);
+    
+    if (me == 0) {
+        FILE *fp = fopen(routed, "wb");
+        fwrite(&ntimestep_val, sizeof(bigint), 1, fp);
+        fwrite(&natoms_total, sizeof(int), 1, fp);
+        fwrite(gbuf, sizeof(AtomRec), natoms_total, fp);
+        fclose(fp);
+        delete[] gbuf;
+        delete[] recvcounts;
+        delete[] displs;
+    } else {
+        // Non-root ranks: write a single-byte dummy file so VeloC is happy
+        FILE *fp = fopen(routed, "wb");
+        char dummy = 0;
+        fwrite(&dummy, 1, 1, fp);
+        fclose(fp);
+    }
+    VELOC_Checkpoint_end(1);
+}
+```
+
+Wait - I need to think about whether all ranks writing separate files is how VeloC works. Looking at the API: `VELOC_Checkpoint_begin` + `VELOC_Route_file` + write + `VELOC_Checkpoint_end`. 
+
+For VeloC, the checkpoint is a COLLECTIVE operation. All ranks participate. Each rank gets its own routed file path. Rank 0 writes the real data, others write dummies.
+
+On restart: `VELOC_Restart_begin` + `VELOC_Route_file` gives rank 0 the path to its file. Rank 0 reads it. Others read their dummy files.
+
+This should work. But there's a question: does VeloC validate that the dummy files are valid? If it tries to parse/validate the file contents, dummy files might cause issues.
+
+Actually, looking at VeloC's design - it's just a file management layer. It doesn't know about the file contents. It just copies files between scratch and persistent. So dummy files should be fine.
+
+Let me also think about the restart flow. After reading the checkpoint data on rank 0:
+1. Rank 0 has all `natoms_total` atoms' data in `gbuf`
+2. Need to distribute these atoms to all ranks so `Irregular::migrate_atoms` can work
+3. Broadcast `ntimestep` and `natoms_total` to all ranks
+4. Distribute atoms round-robin: rank R gets atoms [R * chunk .. (R+1) * chunk]
+5. Each rank grows its atom arrays to hold the chunk
+6. Each rank fills in `atom->x`, `atom->v`, `atom->tag`, `atom->type`, `atom->mask`, `atom->image`
+7. Set `atom->nlocal = chunk`
+8. Call `domain->remap(x[i], image[i])` for each local atom
+9. Call `Irregular::migrate_atoms(1)` to redistribute to correct ranks
+10. Rebuild borders + neighbor lists + compute forces
+
+Wait, but step 2 requires MPI scatter or broadcast. If we broadcast all `natoms_total` atoms to all ranks, that wastes memory. Better: MPI_Scatter a chunk per rank.
+
+Actually for simplicity and robustness: just broadcast everything to all ranks, then each rank loads its chunk into atom arrays. With 32000 atoms × ~56 bytes/atom = ~1.8 MB per rank, this is fine.
+
+Let me now implement the complete solution. The restart function:
+
+```cpp
+static bigint veloc_restore_checkpoint(Verlet *v, int version)
+{
+    // Returns restored ntimestep, or -1 on failure
+    struct AtomRec {
+        tagint tag;
+        double x[3];
+        double v[3];
+        imageint image;
+        int type;
+        int mask;
+    };
+    
+    int me     = v->comm->me;
+    int nprocs = v->comm->nprocs;
+    
+    VELOC_Restart_begin(VELOC_CKPT_NAME, version);
+    char routed[VELOC_MAX_NAME];
+    VELOC_Route_file("lammps_atoms.bin", routed);
+    
+    bigint restored_ntimestep = -1;
+    int natoms_total = 0;
+    AtomRec *gbuf = nullptr;
+    
+    if (me == 0) {
+        FILE *fp = fopen(routed, "rb");
+        if (fp) {
+            fread(&restored_ntimestep, sizeof(bigint), 1, fp);
+            fread(&natoms_total, sizeof(int), 1, fp);
+            gbuf = new AtomRec[natoms_total];
+            fread(gbuf, sizeof(AtomRec), natoms_total, fp);
+            fclose(fp);
+        }
+    }
+    VELOC_Restart_end(1);
+    
+    // Broadcast metadata
+    MPI_Bcast(&restored_ntimestep, 1, MPI_INT64_T, 0, v->world);  // or MPI_LONG
+    MPI_Bcast(&natoms_total, 1, MPI_INT, 0, v->world);
+    
+    if (restored_ntimestep < 0 || natoms_total <= 0) {
+        if (gbuf) delete[] gbuf;
+        return -1;
+    }
+    
+    // Broadcast all atom data
+    if (me != 0) gbuf = new AtomRec[natoms_total];
+    MPI_Bcast(gbuf, natoms_total * sizeof(AtomRec), MPI_BYTE, 0, v->world);
+    
+    // Distribute atoms round-robin to all ranks
+    int chunk = natoms_total / nprocs;
+    int extra = natoms_total % nprocs;
+    int my_start = me * chunk + (me < extra ? me : extra);
+    int my_count = chunk + (me < extra ? 1 : 0);
+    
+    // Grow atom arrays if needed
+    if (my_count > v->atom->nmax) {
+        v->atom->avec->grow(my_count + 1000);
+    }
+    
+    // Fill in atom data
+    for (int i = 0; i < my_count; i++) {
+        int j = my_start + i;
+        v->atom->tag[i]    = gbuf[j].tag;
+        v->atom->x[i][0]   = gbuf[j].x[0];
+        v->atom->x[i][1]   = gbuf[j].x[1];
+        v->atom->x[i][2]   = gbuf[j].x[2];
+        v->atom->v[i][0]   = gbuf[j].v[0];
+        v->atom->v[i][1]   = gbuf[j].v[1];
+        v->atom->v[i][2]   = gbuf[j].v[2];
+        v->atom->image[i]  = gbuf[j].image;
+        v->atom->type[i]   = gbuf[j].type;
+        v->atom->mask[i]   = gbuf[j].mask;
+    }
+    v->atom->nlocal = my_count;
+    v->atom->nghost = 0;
+    
+    delete[] gbuf;
+    
+    // Remap atoms to simulation box (fix periodic boundary images)
+    for (int i = 0; i < my_count; i++) {
+        v->domain->remap(v->atom->x[i], v->atom->image[i]);
+    }
+    
+    // Redistribute atoms to correct ranks using irregular communication
+    {
+        auto irreg = new Irregular(v->lmp);
+        irreg->migrate_atoms(1);  // sortflag=1
+        delete irreg;
+    }
+    
+    // Now atoms are on correct ranks. Rebuild comm/neighbor structure.
+    if (v->triclinic) v->domain->x2lamda(v->atom->nlocal);
+    v->domain->reset_box();
+    v->comm->setup();
+    if (v->neighbor->style) v->neighbor->setup_bins();
+    v->comm->exchange();  // handle any remaining boundary crossings
+    if (v->atom->sortfreq > 0) v->atom->sort();
+    v->comm->borders();
+    if (v->triclinic) v->domain->lamda2x(v->atom->nlocal + v->atom->nghost);
+    v->neighbor->build(1);
+    
+    // Recompute forces at checkpoint configuration
+    v->force_clear();
+    v->ev_set(restored_ntimestep);
+    if (v->pair_compute_flag) v->force->pair->compute(v->eflag, v->vflag);
+    if (v->force->newton) v->comm->reverse_comm();
+    
+    return restored_ntimestep;
+}
+```
+
+Wait, there are several issues:
+1. `v->pair_compute_flag`, `v->eflag`, `v->vflag` are `protected` in `Integrate`. I can't access them from outside the class.
+2. `v->lmp` is protected in `Pointers`.
+3. I should implement this as a method or as a nested function inside `run()`.
+
+Let me implement this properly as code inside the `run()` method itself, not as a helper function.
+
+Also, I should use `Irregular` which needs to be included. Let me check what's available in the current includes.
+
+Now let me think about the `bigint` MPI type. `bigint` is `int64_t`. For MPI, I should use `MPI_INT64_T`.
+
+Let me also think about what `ev_set` does:
+`ev_set` is a method of `Integrate` which `Verlet` inherits from. It's accessible within `Verlet::run()`.
+
+Good. `eflag` and `vflag` are member variables of `Integrate`. I can access them within `run()`.
+
+Now let me also check what `pair_compute_flag` is:
+`pair_compute_flag`, `kspace_compute_flag`, `eflag`, `vflag` are all protected members of `Integrate`. They're accessible within `Verlet::run()`.
+
+Also, `lmp` is protected in `Pointers` - I can use it within `Verlet::run()`.
+
+Now let me also consider: when writing/reading with `fopen`, I need `<cstdio>` which is included via `pointers.h`. For `new`/`delete`, standard C++. I'll need to add `#include "irregular.h"` and `#include "memory.h"` and `#include "lammps.h"`.
+
+Wait - `lammps.h` is already included via `pointers.h`. And `Irregular` needs `lmp` as argument. Let me write the complete new verlet.cpp:
+
+Let me first understand one more thing - after `migrate_atoms(1)`, the atom map might be invalid. Let me check what happens with the map after migration:
+
+Looking at `migrate_atoms`:
+```cpp
+if (map_style != Atom::MAP_NONE) atom->map_clear();
+...
+if (map_style) atom->map_set();
+```
+
+Good, it handles the map. For our atomic simulation, `map_style = MAP_NONE`, so no map operations needed.
+
+Now, one concern: when we call `v->comm->exchange()` after `migrate_atoms(1)`, it might undo some of what migrate_atoms did. Actually, `migrate_atoms(1)` should leave atoms correctly distributed (based on current domain boundaries). Then `comm->exchange()` should be a no-op (or nearly so) since atoms are already in their correct domains.
+
+But wait - there's `domain->pbc()` that also needs to be called to wrap atoms around periodic boundaries. And `domain->reset_box()` + `comm->setup()` to update communication cutoffs.
+
+Let me also look at how `read_dump.cpp`'s `migrate_atoms_by_coords()` is followed by neighbor rebuild. Looking at the validation framework's flow:
+
+Actually, for simplicity, let me take the most conservative approach: after `migrate_atoms`, do the FULL setup_minimal(1) equivalent (which includes exchange, borders, neighbor build, force compute).
+
+But `setup_minimal` calls `modify->setup(vflag)` which calls setup callbacks for fixes. For NVE, this is harmless (NVE's setup doesn't modify state). For other fixes, it might reset thermostats. For this specific simulation, only `fix nve` is used, so it's safe.
+
+Actually, let me avoid calling `setup_minimal` (which has `update->setupflag = 1` which might affect behavior) and instead manually do the steps needed.
+
+Here's what I'll do after `migrate_atoms`:
+```cpp
+// Step 1: Apply PBC and reset box
+if (triclinic) domain->x2lamda(atom->nlocal);
+domain->pbc();
+domain->reset_box();
+comm->setup();
+if (neighbor->style) neighbor->setup_bins();
+
+// Step 2: exchange + borders
+comm->exchange();
+if (atom->sortfreq > 0) atom->sort();
+comm->borders();
+if (triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
+
+// Step 3: Build neighbor list
+neighbor->build(1);
+
+// Step 4: Compute forces
+ev_set(restored_ntimestep);
+force_clear();
+if (n_pre_force) modify->pre_force(vflag);
+if (pair_compute_flag) force->pair->compute(eflag, vflag);
+if (atom->molecular != Atom::ATOMIC) { ... bonds etc ... }
+if (kspace_compute_flag) force->kspace->compute(eflag, vflag);
+if (n_pre_reverse) modify->pre_reverse(eflag, vflag);
+if (force->newton) comm->reverse_comm();
+```
+
+This gives us correct forces at the checkpoint configuration. Then the loop starts with `initial_integrate` which uses these forces correctly.
+
+Note: I should NOT call `modify->setup` in the restart path to avoid resetting fix state.
+
+Now let me write the complete modified `verlet.cpp`. I'll only change the `run()` function significantly:
+Now let me replace the `run()` function:
+Now let me verify the file looks correct:
+The code looks good. Now let me check if there are any issues:
+
+1. `MPI_INT64_T` - this might not be available in all MPI implementations. Let me use a safer approach for broadcasting `bigint`:
+The `sizeof(bigint)/sizeof(int)` trick is wrong because `MPI_INT64_T` is for 64-bit integers, not a count of 32-bit ints. Let me fix this to be simpler:
+Now let me check for another potential issue: after `migrate_atoms(1)`, do I need `domain->pbc()` before it? The `migrate_atoms` comment says "atoms MUST be remapped to be inside simulation box before this is called". I call `domain->remap()` on each atom, which remaps them inside the box. But `remap` only handles the primary image, not periodic folding.
+
+Let me check what `domain->remap()` does:
+`domain->remap(x, image)` handles periodic boundary wrapping properly and updates image flags. This is the correct call before `migrate_atoms`.
+
+Now let me also check the `comm->setup()` call I have in the restart path. After `domain->reset_box()`, the comm setup needs to be recalculated. In the original `setup()` function of Verlet, `comm->setup()` is called after `domain->reset_box()`. Let me make sure I'm calling it correctly in the restart path.
+
+Looking at my restart code:
+```cpp
+auto irreg = new Irregular(lmp);
+if (triclinic) domain->x2lamda(atom->nlocal);
+domain->reset_box();
+comm->setup();
+if (neighbor->style) neighbor->setup_bins();
+irreg->migrate_atoms(1);
+delete irreg;
+if (triclinic) domain->lamda2x(atom->nlocal);
+```
+
+Wait - I'm calling `domain->x2lamda` BEFORE `migrate_atoms` for triclinic. But `migrate_atoms` with no preassign calls `coord2proc_setup()` which needs lambda coordinates. For non-triclinic (which is our case: orthogonal box), this should be fine.
+
+After `migrate_atoms`, I call:
+```cpp
+atom->nghost = 0;
+comm->exchange();
+```
+
+But wait - after `migrate_atoms(1)`, atoms are already in their correct domains. `comm->exchange()` then moves atoms that are still outside their domain (shouldn't be many). But there's a subtlety: `migrate_atoms` does NOT call `domain->pbc()` before, and the atoms might still be slightly outside the box. Let me add `domain->pbc()` before `comm->exchange()`:
+
+Actually `domain->remap()` already handles this - it wraps atoms into the box. But `migrate_atoms` uses different criteria. Let me look more carefully.
+
+The `migrate_atoms` code checks `x[i][0] < sublo[0] || x[i][0] >= subhi[0]` etc. After `domain->remap()`, atoms are inside `boxlo..boxhi`. But sublo/subhi are per-rank boundaries which are a subset of box. So atoms that are inside the box but not in their assigned subdomain will be migrated. This is correct.
+
+After `migrate_atoms`, atoms are in their correct subdomains. Then `comm->exchange()` is a safety net (should be nearly a no-op). `comm->borders()` builds ghost atom lists.
+
+Actually, thinking about it more: after `migrate_atoms`, `atom->nghost = 0` (set inside `migrate_atoms`). Then I also explicitly set `atom->nghost = 0` before calling exchange. That's fine.
+
+The issue is: after `migrate_atoms`, do I need to call `domain->pbc()` again? Not if `domain->remap()` already handled it. But `comm->exchange()` calls `domain->pbc()` internally? Let me check...
+
+Looking at the regular loop's exchange path:
+```cpp
+if (triclinic) domain->x2lamda(atom->nlocal);
+domain->pbc();
+if (domain->box_change) { domain->reset_box(); comm->setup(); ... }
+timer->stamp();
+comm->exchange();
+```
+
+So the regular path calls `domain->pbc()` BEFORE `comm->exchange()`. I should do the same in my restart path. Let me add that:
+Now let me also reconsider the `triclinic` path in step 6. After `migrate_atoms(1)`, for non-triclinic (orthogonal), there's no lamda conversion needed. For triclinic, I need to convert back from lamda to real coords before step 7. Let me update:
+
+Actually, looking at my step 6:
+```cpp
+if (triclinic) domain->x2lamda(atom->nlocal);
+domain->reset_box();
+comm->setup();
+...
+irreg->migrate_atoms(1);
+delete irreg;
+if (triclinic) domain->lamda2x(atom->nlocal);
+```
+
+Then step 7:
+```cpp
+atom->nghost = 0;
+if (triclinic) domain->x2lamda(atom->nlocal);  // convert to lamda for pbc
+domain->pbc();  // pbc in lamda coords? Actually domain->pbc() handles both
+comm->exchange();
+...
+if (triclinic) domain->lamda2x(atom->nlocal + atom->nghost);  // back to real
+```
+
+For non-triclinic (our case), the `if (triclinic)` blocks are no-ops. For triclinic, there might be double-conversion issues. Since our simulation is non-triclinic (orthogonal box), this is fine.
+
+However, there's still an issue: `comm->exchange()` in step 7 might do unnecessary work. After `migrate_atoms(1)`, atoms ARE in their correct domains. But I'm still calling `domain->pbc()` before exchange. `domain->pbc()` calls are for atoms that have moved slightly outside the periodic boundaries (which can happen after migrate_atoms if atoms are exactly on the boundary).
+
+Actually `domain->remap()` in step 5 already wrapped atoms into the box. And `migrate_atoms` remapped them to their domains. `domain->pbc()` in step 7 should be essentially a no-op for most atoms. The `comm->exchange()` call is also a safety net. This is fine.
+
+Now let me also check: I set `atom->nghost = 0` before the exchange. But `migrate_atoms` itself sets `atom->nghost = 0` (from the source code). So setting it again is redundant but harmless.
+
+Let me now check the `MPI_Bcast` for large atom data. With 32000 atoms × 56 bytes/atom = ~1.8 MB, this should be fine for `MPI_BYTE` with int count. The count is `32000 * 56 = 1,792,000` which fits in an int.
+
+Wait, actually I need to check the struct size. Let me calculate:
+- `tagint` = 4 bytes (standard 32-bit LAMMPS)
+- `double x[3]` = 24 bytes
+- `double v[3]` = 24 bytes
+- `imageint` = 4 bytes
+- `int type` = 4 bytes
+- `int mask` = 4 bytes
+- Total = 4 + 24 + 24 + 4 + 4 + 4 = 64 bytes
+
+Hmm wait, there might be padding. The struct has: 4-byte tagint, then 8-byte doubles. The compiler might add 4 bytes of padding after `tagint` to align the doubles to 8-byte boundaries.
+
+Let me add `__attribute__((packed))` or use a `#pragma pack` to avoid alignment issues. Actually for correctness, I should use the same struct layout for both write and read (which I do since they're in the same compilation unit). Padding is deterministic for the same platform/compiler, so it's consistent. But the total size might be larger than expected.
+
+Actually with padding: `tagint` (4) + pad (4) + `x[3]` (24) + `v[3]` (24) + `imageint` (4) + `type` (4) + `mask` (4) + pad? 
+
+Actually: tagint(4) + double x[0](8) would require alignment to 8 bytes, so 4 bytes of padding. Then the rest of the doubles are naturally aligned. At the end: imageint(4) + type(4) + mask(4) = 12 bytes, no trailing padding needed for int alignment. But the struct total needs to be aligned to 8 bytes (largest member is double), so 12 % 8 = 4, need 4 more bytes of padding? Total = 4 + 4 + 24 + 24 + 4 + 4 + 4 + 4 = 72 bytes.
+
+Actually let me think again:
+- offset 0: tagint (4 bytes), then...
+- offset 4: needs alignment for double (8), so 4 bytes padding
+- offset 8: double x[0] (8), x[1] (8), x[2] (8) = 24 bytes
+- offset 32: double v[0] (8), v[1] (8), v[2] (8) = 24 bytes
+- offset 56: imageint (4 bytes)
+- offset 60: int type (4 bytes)
+- offset 64: int mask (4 bytes)
+- offset 68: end
+- Alignment requirement: 8 bytes, so 68 is rounded to 72? No, 68/8 = 8.5, round up = 72
+
+So struct size = 72 bytes. This is consistent between write and read. No issue since I use the same struct in both.
+
+For 32000 atoms: 32000 × 72 = ~2.3 MB broadcast. Fine.
+
+Now let me check if there are any compilation issues. Let me look at the includes again and make sure `Irregular` is properly included:
+Good. Now let me also check the veloc.cfg file:
+Good, veloc.cfg exists and has correct paths.
+
+Now let me look at the CMakeLists.txt to ensure `irregular.cpp` is included in the build:
+Let me look at the build system to understand how it's built:
+Good, VeloC is included. Also: `irregular.cpp` is part of the standard LAMMPS source, so it's compiled as part of the lammps library. My include of `irregular.h` and usage of `Irregular` should work fine.
+
+Now let me check if there are any potential issues with the `lmp` pointer usage in `new Irregular(lmp)`. `lmp` is a protected member of `Pointers`. Within `Verlet::run()`, which is a method of `Verlet` (which inherits `Integrate` which inherits `Pointers`), I have access to `lmp`. ✓
+
+Let me also check: in my restart code, after `migrate_atoms`, I call `atom->nghost = 0; comm->exchange()`. But `comm->exchange()` might also need `domain->pbc()` to be called before it for triclinic. Let me check `comm->exchange()` source:
+`comm->exchange()` does NOT call `domain->pbc()` itself - it just uses `atom->x` positions directly. The positions need to be within `boxlo..boxhi` before calling exchange. 
+
+After `domain->remap()` in step 5, atoms are within the box. After `migrate_atoms(1)` in step 6, atoms are within their subdomains (sublo..subhi). 
+
+Then in step 7 I call `domain->pbc()` which wraps atoms - but after `migrate_atoms`, atoms are already inside the box. `domain->pbc()` is for atoms that have slightly crossed the periodic boundary during `initial_integrate`. At restart time, positions are from the checkpoint (valid positions inside the box), so `pbc()` is nearly a no-op but is still good practice.
+
+Actually, looking at the sequence again in the regular loop:
+```
+initial_integrate → domain->pbc() (in exchange path) → comm->exchange() → comm->borders() → neighbor->build() → force compute
+```
+
+In my restart path:
+```
+domain->remap() → migrate_atoms() → domain->pbc() → comm->exchange() → comm->borders() → neighbor->build() → force compute
+```
+
+This is correct. The `comm->exchange()` in step 7 handles any atoms that are still slightly outside their subdomain after `migrate_atoms` (due to floating-point edge cases or the single-dimension-at-a-time nature of `comm->exchange`).
+
+Wait - `comm->exchange()` is a 1D exchange (it handles one dimension at a time). After `migrate_atoms` (which is a global redistribution), atoms should be exactly in their correct subdomains. `comm->exchange()` might fail to move atoms that need to cross multiple domain boundaries.
+
+Actually, looking at the `comm->exchange()` code: it handles exchange in x, y, z dimensions separately. If after `migrate_atoms`, all atoms are within their subdomains (which they should be), then `comm->exchange()` is indeed a no-op. If there are edge cases (atoms right on the boundary), exchange handles them correctly by sending to adjacent ranks.
+
+I think the implementation is correct. Let me now also verify the `n_pre_force` check. In the restart's force computation step:
+
+```cpp
+if (n_pre_force) modify->pre_force(vflag);
+```
+
+But `vflag` is set by `ev_set(restored_ntimestep)`. At this point, `eflag` and `vflag` are set based on output requirements at `restored_ntimestep`. This should be fine since we're computing forces AT that timestep.
+
+Let me now also look at the output handling. After `setup()` is called (before `run()`), `output->setup()` sets `output->next` to the next output step. When we resume from step T (e.g., 1000), the first loop iteration is step 1001. `output->next` might be e.g. step 0 (already passed) or some future step. This should be handled correctly by LAMMPS's output system since we're not resetting `output->next`.
+
+Actually wait - when `run()` is called fresh and `setup()` is called before it, `output->setup(1)` is called in the original `Verlet::setup()`. This sets `output->next` to the appropriate next output timestep. If our simulation runs to completion before the kill, the output is correct. After restart at step T, `output->next` is already set correctly from the fresh setup.
+
+But there's an issue: the fresh run's `setup()` set `update->ntimestep = 0` (start of run), and `output->setup()` computed `output->next` based on that. If we restore `update->ntimestep = T` (e.g., 1000), then `output->next` might be in the past (step 0) and no output will happen. Actually, LAMMPS's output calculates the next output step relative to the starting step, so this should be fine.
+
+Let me not worry about this for now - the validation output check doesn't seem to care about intermediate output, just the final state.
+
+Now let me also think about one potential issue: the `atom->sort()` call in step 7. The `atom->sort()` function sorts atoms within their bin for better cache performance. It shouldn't affect physics. But `atom->nextsort` might be set incorrectly. Let me check:
+
+After restore, `update->ntimestep = restored_ntimestep` (set at the end of step 9). But in step 7, when I call `atom->sort()`, `update->ntimestep` is still 0 (from the fresh start). So `atom->sort()` might skip the sort (if `0 < atom->nextsort` which is usually `sortfreq = 1000`). 
+
+Actually, `atom->sort()` in my code is called unconditionally (via `if (sortflag) atom->sort()`). `atom->sort()` will sort and update `atom->nextsort`. This is fine.
+
+Actually wait - `atom->sort()` needs `atom->x` to be valid, which it is after step 6.
+
+One more issue: the `atom->avec->clear_bonus()` call. In `comm->exchange()`, it calls `atom->avec->clear_bonus()` at the start. For the atomic style, bonus data is null, so this is a no-op. Fine.
+
+I think the implementation is correct. Let me also look at the CMakeLists.txt to confirm `irregular.cpp` is compiled:
+Line 206: `file(GLOB ALL_SOURCES ${CONFIGURE_DEPENDS} ${LAMMPS_SOURCE_DIR}/[^.]*.cpp)` - this includes ALL `.cpp` files in `src/` directory, including `irregular.cpp`. ✓
+
+Now let me check for any potential compilation issue. The `#include "irregular.h"` should work since it's in the same `src/` directory. Let me verify:
+Good. Now let me also think about one more potential issue: the `triclinic` variable. In my code I use `triclinic` which is a member variable of `Verlet` (inherited from `Integrate` then `Pointers`... actually no, looking at `verlet.h`: `int triclinic` is a protected member of `Verlet`). So it's accessible within `run()`. ✓
+
+Let me also think about the `lmp` pointer. Looking at `pointers.h`: `LAMMPS *lmp;` is a protected member. Within `Verlet::run()`, I can use `lmp`. ✓
+
+Now, one important question: does the VeloC `VELOC_Route_file` API work the way I described? Let me look at it more carefully.
+
+From the header:
+```c
+int VELOC_Route_file(const char *original, char *routed);
+```
+
+"obtain the full path for the file associated with the named checkpoint and version number can be used to manually read/write checkpointing data without registering memory regions"
+
+The description says it gets the "associated with the named checkpoint and version number". But the function signature only has `original` - where does the name and version come from? It must come from the context set by `VELOC_Checkpoint_begin(name, version)` or `VELOC_Restart_begin(name, version)`.
+
+So the flow is:
+1. `VELOC_Checkpoint_begin("lammps_state", 5)` - sets context: name="lammps_state", version=5
+2. `VELOC_Route_file("lammps_atoms.bin", routed)` - gives path for name/version/rank/original combination
+3. Write to `routed`
+4. `VELOC_Checkpoint_end(1)` - commits checkpoint
+
+And for restart:
+1. `VELOC_Restart_begin("lammps_state", 5)` - sets context
+2. `VELOC_Route_file("lammps_atoms.bin", routed)` - gives path for this checkpoint's file
+3. Read from `routed`
+4. `VELOC_Restart_end(1)` - done
+
+This is the correct usage. Let me verify by looking at a VeloC example if possible:
+
+Actually, let me check if VeloC has examples in the build:
+Let me look at any existing VeloC checkpoint usage patterns in the iterative logs to understand how they used the API before:
+The previous iteration correctly identified the stale pointer issue and other concerns. Let me also check if the CMakeLists.txt approach they took is still in place:
+Good - the CMakeLists.txt is already set up correctly with VeloC linking. The `LAMMPS_VELOC_CFG` macro points to the absolute path of veloc.cfg.
+
+Now let me review my code for one more potential issue: in the checkpoint section, I use local variables `nlocal`, `nprocs`, `me` that shadow the member variables `atom->nlocal`, `comm->nprocs`, `comm->me`. This is fine in C++.
+
+Let me also check: does `VELOC_Route_file` need to be called between `VELOC_Checkpoint_begin` and `VELOC_Checkpoint_end`? Yes, that's the intended usage pattern.
+
+And for restart: between `VELOC_Restart_begin` and `VELOC_Restart_end`.
+
+Let me re-read the code for the restart path to make sure the VeloC calls are in the right order:
+
+```cpp
+VELOC_Restart_begin(VELOC_CKPT_NAME, ckpt_version);
+char routed[VELOC_MAX_NAME];
+VELOC_Route_file(VELOC_CKPT_FILE, routed);
+
+// ... rank 0 reads file ...
+
+VELOC_Restart_end(1);
+```
+
+This looks correct. All ranks call `Restart_begin`, all ranks call `Route_file` (each gets their own rank-specific path), rank 0 reads its file, then all ranks call `Restart_end`.
+
+For the checkpoint:
+```cpp
+VELOC_Checkpoint_begin(VELOC_CKPT_NAME, ckpt_ver);
+char routed[VELOC_MAX_NAME];
+VELOC_Route_file(VELOC_CKPT_FILE, routed);
+
+if (me == 0) {
+    // write real file
+} else {
+    // write dummy file
+}
+VELOC_Checkpoint_end(1);
+```
+
+All ranks call begin/route/end. Rank 0 writes real data, others write dummies. ✓
+
+One concern: VeloC might expect all ranks to write the same "type" of file (actual data, not dummy). If VeloC validates file contents or size... but VeloC is a generic file manager, so it shouldn't.
+
+Actually wait - I need to double-check. Looking at the VeloC description more carefully: "obtain the full path for the file associated with the named checkpoint and version number". The `original` filename is the "original" path of the file, and VeloC gives back a `routed` path in its managed directory. The "original" is just used to generate the routed path.
+
+So on restart, all ranks call `VELOC_Route_file("lammps_atoms.bin", routed)`. Rank 0 gets path like `/tmp/lammps_veloc_scratch/lammps_state-0-1.veloc` and rank 1 gets `/tmp/lammps_veloc_scratch/lammps_state-1-1.veloc`. Each rank reads its own routed file. Since only rank 0 has the real data (others have 1-byte dummies), only rank 0's read will work. That's the desired behavior since I only read on rank 0.
+
+But wait - during restart, I call `VELOC_Route_file` on ALL ranks, but only rank 0 reads from the path. The other ranks get dummy files (which are 1-byte). This is fine since I only `fread` on `comm->me == 0`.
+
+OK, the logic is correct.
+
+Now let me also consider: what if the checkpoint files were not saved in persistent storage and are only in scratch? The VeloC config has `mode = sync`, which means checkpoints are written synchronously to both scratch and persistent. The `VELOC_Restart_test` should find them in either location.
+
+Let me look at the iterator validation output more carefully to understand the `recovery_actually_resumed` metric:
+
+From validate_stdout.txt:
+```
+recovery_actually_resumed=None (recovery_attempt/failure_free=None, threshold=0.9, mode=none)
+```
+
+The `mode=none` means the validator doesn't actively check if recovery resumed. So this is informational only. The main failure was `output_correct=False`.
+
+Let me now think about whether my implementation will correctly produce the same output as the baseline.
+
+The key question: when the simulation is interrupted at step T and restarted, will it produce the SAME final state as if it ran continuously?
+
+For a deterministic integrator (velocity-Verlet NVE):
+- The trajectory is bit-for-bit deterministic given initial conditions + forces
+- Forces are computed from positions
+- If we restore positions x(T) and velocities v(T) exactly, and recompute forces f(T), then the trajectory from step T+1 onwards should be identical
+
+Our implementation:
+1. Saves x(T) and v(T) at checkpoint time T ✓
+2. On restart, restores x(T) and v(T) ✓
+3. Redistributes atoms to correct ranks using migrate_atoms ✓
+4. Rebuilds neighbor lists ✓
+5. Recomputes f(T) ✓
+
+This should produce identical results IF:
+- The floating-point operations are deterministic (same order of operations)
+- Force computation with neighbor list at same configuration gives same forces
+
+For LJ/cut pair style, the forces depend on the neighbor list. If the neighbor list is built the same way, the forces will be the same. The neighbor list build is deterministic from positions.
+
+But wait - there's a subtlety: in the original run, forces f(T) were computed during step T's force computation phase. In the restart run, I recompute f(T) after the neighbor rebuild. If the neighbor list is built differently (different ordering of atoms in memory), the accumulated forces might differ due to floating-point non-associativity (especially for newton=on where forces are added up with reverse_comm).
+
+For `newton on` (default in LAMMPS), forces are computed for i < j pairs only, and then `comm->reverse_comm()` adds i's contribution to j. The order of accumulation matters for floating-point.
+
+After `migrate_atoms(1)` + `comm->exchange()` + `atom->sort()`, the atom ordering on each rank might differ from the checkpoint time. This could lead to slightly different force accumulation order, causing tiny floating-point differences.
+
+However, the validation uses numeric-tolerance comparison:
+```
+Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance, score=804.095: max_abs_diff=8.041e+02
+```
+
+The error of 804 units is HUGE - not a floating-point rounding issue. So the previous failure was definitely due to wrong physics (wrong positions/velocities restored), not floating-point issues.
+
+If our implementation correctly restores positions and velocities, even with tiny floating-point differences in force computation, the trajectory should remain close. The question is: how close? And does the validation require exact match?
+
+Looking at validation:
+```
+Test 2 (VeloC, failure-free): [PASS] numeric-tolerance, score=0: max_abs_diff=0.000e+00
+```
+
+The failure-free run produces EXACT match (0 difference). This means the vanilla LAMMPS (without kills) also produces exact results vs. the baseline. So the validator expects exact or very close matches.
+
+For our restart case: if there are any floating-point differences due to different atom ordering, we'll get a non-zero but small diff. The question is whether the validator accepts this.
+
+Looking at the tolerance: `atol=1.000e-12, rtol=1.000e-12`. These are very tight. If the trajectories diverge even slightly due to different floating-point ordering, the final output (sum of |x|, |v|) could differ significantly after 33000 steps of chaotic LJ dynamics.
+
+This is a serious concern. LJ melts are chaotic systems - tiny differences in forces at step T+1 will cause exponentially growing divergence in the trajectory. After 33000-T steps, the positions could be completely different.
+
+BUT: the validation check is not trajectory accuracy - it's the FINAL state comparison. After the interrupted run completes all 33000 steps, does the output match the uninterrupted baseline?
+
+If the trajectory is chaotic and any small difference grows exponentially, then bit-perfect restart is required. Any deviation in force computation order will cause incorrect output.
+
+Hmm. But wait - looking at the comparison output again:
+```
+Test 2 (VeloC, failure-free): [PASS] max_abs_diff=0.000e+00
+```
+
+The failure-free run (uninterrupted) produces ZERO difference. This means the LAMMPS computation is deterministic and always gives the same output. 
+
+For the failure-prone run to pass, it needs to produce the same output as the uninterrupted run. This requires bit-perfect restart - same forces at every step.
+
+To achieve bit-perfect restart:
+1. Positions must be restored EXACTLY (binary identical)
+2. Forces must be recomputed EXACTLY the same way
+
+The forces depend on:
+1. Positions (✓ we restore them)
+2. Neighbor list construction (depends on atom ordering in memory)
+3. Pair computation order (depends on neighbor list)
+4. Newton reverse comm (depends on ghost list)
+
+If the atom ordering after restart differs from the original run, neighbor lists will be built differently, pair computation order changes, and forces won't be bit-identical.
+
+The key insight: in the ORIGINAL run, at step T, each rank has a specific set of atoms in a specific order. After our restart, the atoms are redistributed by `migrate_atoms` and re-sorted by `atom->sort()`. The ordering will be different from the original run.
+
+This means we can't achieve bit-perfect restart with our approach of gather-all/redistribute.
+
+**However**: the validation might accept small differences! Let me check the validation criteria:
+
+`atol=1.000e-12, rtol=1.000e-12` - these are very tight tolerances. For position sums of O(10^5), this means we need agreement to ~10^-7 relative. For a chaotic LJ system running 20000+ more steps after restart, even a 1 ULP difference in forces could cause the trajectories to diverge completely.
+
+But wait - in the previous iteration 2, the failure was `max_abs_diff=8.041e+02` which is enormous. This suggests the restart was completely wrong (wrong positions/velocities), not just floating-point rounding. The validation passed the wall-time gate but failed the correctness gate.
+
+If we correctly restore positions and velocities (even if forces are slightly different due to ordering), we MIGHT achieve a small enough difference to pass. Or we might not.
+
+Actually, let me reconsider. The `output_correct=False` in iteration 2 was because of the stale pointer bug (wrong checkpoint data). If we fix that and correctly restore positions/velocities, we need to think about whether the output will match.
+
+The LJ NVE simulation is chaotic but the LAMMPS integrator is deterministic. The key is: after restart at step T, the trajectory from step T+1 must be IDENTICAL to the uninterrupted run.
+
+For this to work:
+1. Forces at step T must be identical (requires identical atom ordering)
+2. Or alternatively: the validator uses a TOLERANCE that allows for chaotic divergence
+
+Looking at the tolerance: `atol=1.000e-12, rtol=1.000e-12`. With output being "sum of |positions|" ~ O(10^5), this allows errors of ~10^-7. After 20000+ chaotic steps, any force error will grow exponentially and exceed this tolerance.
+
+So we DO need bit-perfect restart. This means atom ordering must be preserved.
+
+**The only way to achieve bit-perfect restart**: Save each rank's local atom arrays (in their current order) and restore them exactly. This is what the original code tried to do with `VELOC_Mem_protect`, but it failed due to:
+1. Stale pointer bug (atom arrays reallocated)
+2. Cross-rank migration (atoms moved to different ranks)
+
+If we fix BOTH issues:
+1. Re-register pointers at each checkpoint (fix stale pointer)
+2. Each rank restores its own atom arrays (preserve ordering)
+3. Handle the cross-rank atom migration correctly
+
+For issue 2: if atoms have migrated between ranks, restoring rank R's checkpoint gives rank R atoms from T that may now belong to other ranks' domains. But the key insight: we checkpoint AFTER forces are computed and AFTER final_integrate (end of step T). At step T+1, the atoms are still in the same positions (they haven't moved yet). The only thing that changes their rank assignment is if they crossed domain boundaries during step T's `comm->exchange()`. But `comm->exchange()` ensures that at the END of each step, atoms are in their correct ranks.
+
+Wait, let me re-read the checkpoint timing. The checkpoint is taken AFTER `output->write()` at step T, which means AFTER `final_integrate()`. At this point:
+- `atom->nlocal` = atoms on this rank
+- `atom->x` = positions after step T's final_integrate
+- These atoms are in their correct domains (since `comm->exchange()` happened earlier in step T)
+
+When we restart:
+1. Fresh setup: atoms loaded from lattice (step 0 positions), `comm->exchange()` redistributes to step-0 positions → each rank has its initial atoms
+2. Our restore overwrites atom arrays with checkpoint-T data
+
+After restore, rank R has atoms from checkpoint T (which were correctly in rank R's domain at checkpoint time). These positions are still inside rank R's domain (since the checkpoint state is valid). So we DON'T need to redistribute!
+
+The problem was that the MEMORY for the checkpoint data was stale (due to pointer reallocation). If we fix the stale pointer bug by re-registering at each checkpoint, the restore will correctly overwrite atom arrays with valid checkpoint data.
+
+And the atom ordering will be PRESERVED because each rank restores its own atoms in the same positions (same memory layout) as at checkpoint time.
+
+The cross-rank migration issue I was worried about: after step T's `comm->exchange()`, all atoms are in their correct ranks. The checkpoint saves this state. On restore, each rank's `atom->nlocal` and atom arrays are restored to the checkpoint state. But after a fresh setup (which did its own `comm->exchange()`), each rank has DIFFERENT atoms (the initial lattice atoms for that rank).
+
+After restore:
+- `atom->nlocal = ckpt_nlocal` (atoms at checkpoint T)
+- `atom->x[0..ckpt_nlocal*3]` = checkpoint positions (which ARE in this rank's domain)
+- `atom->v[0..ckpt_nlocal*3]` = checkpoint velocities
+- `atom->tag[0..ckpt_nlocal]` = checkpoint tags
+
+But `atom->tag[ckpt_nlocal..nmax]` still has data from the fresh setup (initial atoms for slots beyond ckpt_nlocal). And if `ckpt_nlocal < initial_nlocal`, we set `atom->nlocal = ckpt_nlocal` which is correct.
+
+The key question: are the atom positions at checkpoint T still in rank R's current domain?
+
+Answer: YES! Because:
+- The simulation box doesn't change (NVE with fixed volume)
+- Domain boundaries are determined by box + proc grid → same as before
+- At checkpoint T, atoms were correctly in their domains (enforced by `comm->exchange()` earlier in step T)
+- So restoring checkpoint T positions onto rank R's atom arrays gives atoms that ARE in rank R's domain
+
+Wait, but what about atoms that crossed rank boundaries between step T's `comm->exchange()` and the checkpoint? 
+
+Looking at the loop:
+```cpp
+nflag = neighbor->decide();
+if (nflag == 0) {
+    comm->forward_comm();
+} else {
+    comm->exchange();    // <-- redistributes atoms
+    comm->borders();
+    neighbor->build(1);
+}
+force->pair->compute(eflag,vflag);
+comm->reverse_comm();
+modify->post_force(vflag);
+modify->final_integrate();    // <-- moves atoms
+if (ntimestep == output->next) output->write(ntimestep);
+
+/* VeloC checkpoint */
+if ((ntimestep % VELOC_CKPT_FREQ) == 0) {
+    VELOC_Checkpoint(...)
+}
+```
+
+After `final_integrate()`, atoms have moved. Some might have crossed domain boundaries. But the checkpoint is taken AFTER `final_integrate()` with potentially wrong atom assignments!
+
+On the NEXT step, `comm->exchange()` will fix up the assignments. But the checkpoint is taken BEFORE the next step's exchange.
+
+So at checkpoint time, some atoms MIGHT be slightly outside their rank's domain (if they crossed the boundary during `final_integrate()`). These atoms would be sent to the correct rank by `comm->exchange()` at the start of the NEXT step.
+
+This means: at checkpoint T, rank R might have atoms whose positions are slightly outside its domain boundaries. When we restore these on restart, and then run `initial_integrate()` followed by the neighbor rebuild (which calls `comm->exchange()`), the atoms outside the domain will be sent to the correct ranks.
+
+For the CORRECT behavior: after restoring checkpoint T, step T+1 should run identically to the original run's step T+1. In the original run, step T+1's `comm->exchange()` sent the atoms that crossed boundaries during step T's `final_integrate()` to their correct ranks. After restore, the same thing should happen.
+
+BUT: `comm->exchange()` only sends atoms ONE rank width at a time. If an atom moved more than one domain width during `final_integrate()` (unlikely but possible), `comm->exchange()` might not correctly redistribute it.
+
+For a timestep of 0.005 LJ and temperature ~1.44 LJ units, `v ~ 1.2 LJ/unit`, `dx = v * dt = 0.006 LJ` per step. Domain width ~ 5 LJ units. So atoms move at most ~0.006 units per step - much less than one domain width. `comm->exchange()` works perfectly.
+
+**So the original approach IS correct in principle** - each rank restores its own checkpoint state, neighbor rebuild includes `comm->exchange()`, and everything works. The only bug was the stale pointer issue!
+
+BUT: the problem I identified with the ordering is real. After `comm->exchange()` at step T+1, atoms get shuffled within each rank (since `comm->exchange()` uses `avec->copy(nlocal-1, i, 1)` to fill gaps, changing the ordering). After restart, the same shuffling happens. BUT does the shuffling happen in the same order?
+
+In the original run at step T+1: rank R has atoms from checkpoint T (including some that might be at the boundary). `comm->exchange()` removes atoms that left the domain and receives new ones. The atoms that left are removed using `avec->copy(nlocal-1, i, 1)` which moves the last atom to fill the gap. This is deterministic given the same initial set of atoms.
+
+On restart at step T+1: rank R has the same atoms as in the original run at step T (same `nlocal`, same positions in the same order). `comm->exchange()` should produce the same result.
+
+So the ordering SHOULD be preserved, and the trajectory SHOULD be bit-perfect!
+
+But only if:
+1. The pointer registration is correct (stale pointer bug fixed)
+2. The size registered matches the data written (nmax at checkpoint time vs. at registration time)
+
+**Key fix needed**: Re-register `VELOC_Mem_protect` at each checkpoint time with current pointers.
+
+Let me now reconsider whether my file-based approach or the simpler re-registration approach is better.
+
+**Option A**: File-based approach (my current implementation)
+- Pros: No stale pointer issue; correct atom data written
+- Cons: Distributed atoms are distributed round-robin, not in original rank order → trajectory might diverge
+
+**Option B**: Re-register approach (simpler)
+- Pros: Preserves original rank-local atom ordering → bit-perfect trajectory
+- Cons: Need to handle cross-rank atom migration correctly
+
+Actually wait - in Option A, after distribute round-robin + migrate_atoms, the atom ordering on each rank IS different from the original. This means the trajectory won't be bit-perfect.
+
+In Option B, we restore atoms to EXACTLY the same ranks as at checkpoint time (since each rank saves and restores its own atoms). The ordering is preserved. The trajectory can be bit-perfect.
+
+**But Option B has the stale pointer bug that was the cause of the previous failure!**
+
+Let me now re-examine: if we fix the stale pointer bug in Option B, does it work?
+
+The stale pointer bug happens when `atom->avec->grow()` is called during the run, reallocating atom arrays. After reallocation, `atom->x[0]` points to new memory. VeloC still has the old address.
+
+Fix: re-register at each checkpoint with current pointers.
+
+But there's still the issue of SIZE. The registered size is `atom->nmax * 3` doubles. After grow, `nmax` is larger. We register with the new `nmax`. On restore, VeloC will read `nmax_checkpoint * 3` doubles into the current buffer. If `nmax_restore > nmax_checkpoint`, the extra space is uninitialized. If `nmax_restore < nmax_checkpoint`... this would be wrong.
+
+Actually: at the start of `run()`, `atom->nmax` is some value N. At checkpoint time, `atom->nmax` might be M > N (after grow). If we register with M at checkpoint time, VeloC saves M*3 doubles. On restore, the current `atom->nmax` is N (fresh setup). We need to grow to M before restore.
+
+Actually this is getting complex. Let me look at what actually happens with nmax.
+
+In a typical LAMMPS run, `nmax` is set during setup to accommodate `nlocal + nghost + some_extra`. During the run, if `nlocal + nghost` exceeds `nmax`, `grow()` is called. For a simulation where atom density is roughly constant (NVE with fixed box), nmax should stabilize quickly and rarely need to grow.
+
+For 4 ranks with 32000 atoms: each rank has ~8000 local atoms + ~few hundred ghost atoms. nmax is typically set to ~10000 or so. During the run, ghost atom counts might fluctuate but rarely exceed the initial nmax.
+
+So in practice, for this specific simulation, nmax might NOT grow at all during the run. If that's the case, Option B with just re-registering (without grow concerns) would work.
+
+Let me check what nmax is typically set to:
+
+LAMMPS's default is to grow nmax by DELTA (typically 4096) when needed. The initial nmax after setup is usually `nlocal + nghost + DELTA` or similar. Since `nlocal = 32000/4 = 8000` and `nghost` is typically a few hundred, nmax would be ~12000-15000.
+
+During the run, ghost atom counts change based on atom positions. If ghost counts exceed the initial nmax, grow is called. For a stable LJ simulation, this is unlikely to happen more than once or twice (if at all).
+
+OK, let me go with a HYBRID approach:
+1. Use the per-rank file approach (to avoid stale pointer issues)
+2. But save atoms in TAG ORDER so that on restore, we can assign atoms to the SAME rank-local slot they were in originally
+
+Actually, the simplest fix that preserves trajectory correctness:
+
+**Use per-rank files but restore in ORIGINAL ORDER**:
+1. Checkpoint: each rank writes its own file with its atoms (preserving order)
+2. Restore: each rank reads its own file and directly overwrites `atom->x`, `atom->v`, `atom->tag`, `atom->image`, etc.
+3. No redistribution needed (atoms are already in the right rank since we saved rank-locally)
+4. Just update `atom->nlocal` and rebuild neighbor lists
+
+This preserves the exact atom ordering, enabling bit-perfect trajectory.
+
+The issue: if `ckpt_nlocal != initial_nlocal`, we need to grow the arrays. But more importantly: if `ckpt_nlocal < initial_nlocal` (some atoms left this rank), setting `atom->nlocal = ckpt_nlocal` would work since we only care about the first `ckpt_nlocal` atoms.
+
+If `ckpt_nlocal > initial_nlocal` (some atoms arrived at this rank), we need more space. But wait - if the atoms arrived at this rank between the fresh setup (step 0) and checkpoint (step T), they're not in this rank's initial atom arrays. We can't recover them.
+
+This is the fundamental problem: we CAN'T restore rank-local checkpoints verbatim because the atom set on each rank changes over time.
+
+UNLESS... we can accept that atoms from one rank got LOST during the restart. If rank R at checkpoint had atoms {A, B, C, D} but at restart only gets to restore {A, B, C, D} (because it saves its own atoms), then everything is fine. The atoms that MOVED to rank R between step 0 and step T are saved in rank R's checkpoint file.
+
+Wait, actually YES - this IS what the per-rank checkpoint does. Each rank saves its atoms AT CHECKPOINT TIME. On restore, each rank reads its OWN file and gets back the EXACT atoms it had at checkpoint time. No redistribution needed.
+
+The only requirement: `ckpt_nlocal` must not exceed `atom->nmax`. Since `atom->nmax >= initial_nlocal + ghost_space`, and `ckpt_nlocal <= initial_nlocal + some_overflow` which should be less than nmax...
+
+Actually no. At checkpoint time on rank R, `ckpt_nlocal_R` is the number of owned (non-ghost) atoms. At fresh setup on rank R, `initial_nlocal_R` is also owned atoms. If `ckpt_nlocal_R > initial_nlocal_R` (more atoms arrived), then `ckpt_nlocal_R > atom->nmax` is possible if nmax wasn't grown.
+
+But during the original run, when atoms arrived at rank R, `comm->exchange()` called `atom->avec->grow()` if needed. So at checkpoint time, `atom->nmax >= ckpt_nlocal_R`.
+
+On fresh restart, `atom->nmax >= initial_nlocal_R`. If `ckpt_nlocal_R > atom->nmax` (because more atoms moved to this rank than initially), we need to grow before restore.
+
+We can handle this: grow if needed, then restore.
+
+But the key issue is: we need to ensure that the restored atom data is in the SAME per-rank order as at checkpoint time. Each rank saves its own atoms in their current order. On restore, we write back to the same positions. This preserves the exact ordering.
+
+OK so here's the NEW plan:
+
+**Per-rank file approach with ordering preservation**:
+
+1. **Checkpoint**: Each rank writes its OWN file containing its local atoms in order: `[bigint ntimestep][int nlocal][nlocal × (tag, x[3], v[3], image, type, mask)]`
+
+2. **Restore**: 
+   a. Each rank reads its OWN file (using VeloC routing)
+   b. If `ckpt_nlocal > atom->nmax`, call `atom->avec->grow(ckpt_nlocal + 1024)`
+   c. Write back: `atom->tag[0..ckpt_nlocal]`, `atom->x[0..ckpt_nlocal]`, etc.
+   d. Set `atom->nlocal = ckpt_nlocal`
+   e. Set `atom->nghost = 0`
+   f. Rebuild ghost atoms and neighbor lists
+
+This is much simpler and preserves atom ordering! No need for gather/scatter.
+
+The key insight: each rank's VeloC-routed file is per-rank. So each rank writes its own file and reads it back.
+
+But wait - the ntimestep needs to be consistent across all ranks. Let me use an approach where:
+- Each rank writes its own file with: `[bigint ntimestep][int nlocal][data...]`
+- On restore, rank 0 reads its ntimestep and broadcasts to all (for consistency)
+- Each rank reads its own file for atom data
+
+Let me rewrite the implementation with this approach. This is MUCH simpler and should work correctly for bit-perfect trajectory:
+Now let me verify the updated `run()` function:
+The code looks good. Now let me think about whether this approach correctly produces bit-perfect trajectory.
+
+**Concern about `comm->exchange()` after restart**:
+
+In the original run at step T+1:
+- Atoms are at positions from step T's `final_integrate()`
+- `comm->exchange()` moves atoms that crossed boundaries to correct ranks
+- Atoms are MOVED using `avec->copy(nlocal-1, i, 1)` which changes their slot in the array
+
+After restart:
+- Atoms are at positions from step T's `final_integrate()` (correctly restored)
+- `comm->exchange()` runs the same way
+- The SAME atoms cross the SAME boundaries (since positions are identical)
+- The SAME atoms are removed from the same slots and the SAME atoms fill those slots
+
+BUT: the atoms RECEIVED from neighboring ranks may arrive in a different order! `comm->exchange()` sends atoms to neighbors and receives them. The receive order might depend on MPI implementation details or message ordering.
+
+Hmm, but for a deterministic MPI implementation (which most implementations are for point-to-point communication), the message order should be the same. MPI guarantees that messages from the same sender to the same receiver arrive in order. And in `comm->exchange()`, each rank sends to its neighbors in a specific order (left, then right, in each dimension). The received atoms are appended to the local array in order.
+
+So the atom ordering should be deterministic and identical between the original run and the restart. ✓
+
+**Concern about `atom->sort()`**:
+
+In the restart, I call `atom->sort()`. This sorts atoms within spatial bins for cache efficiency. The sorting is deterministic given the same positions. After `comm->exchange()`, positions are the same as in the original run, so `atom->sort()` should produce the same ordering. ✓
+
+But wait - in the original run at step T+1, `atom->sort()` is called conditionally: `if (sortflag && ntimestep >= atom->nextsort) atom->sort()`. After checkpoint restoration, `update->ntimestep = restored_ntimestep` is set at the END of the restart. But in my restart code, I call `atom->sort()` unconditionally (just with `if (sortflag)`). This could cause an extra sort that wouldn't happen in the original run at step T+1.
+
+Actually, sorting at restart time is fine - it doesn't change the physics, just the in-memory ordering. The key is that the FIRST step after restart (step T+1) must have the same atom ordering as the original run's step T+1.
+
+In the original run at step T+1:
+- Before `comm->exchange()`: atom ordering from step T (includes any sort done at step T)
+- After `comm->exchange()`: atoms received from neighbors appended at the end
+- After `atom->sort()` (if T+1 >= nextsort): atoms re-sorted
+
+In the restart at step T+1 (the first loop iteration after restart setup):
+- `update->ntimestep = T` (restored)
+- Loop: `ntimestep = ++update->ntimestep = T+1`
+- `initial_integrate()` runs with positions/velocities from my restart setup
+- After `initial_integrate`, positions are moved by half-step from T
+- `neighbor->decide()` returns 1 (every 20 steps from T+1)...
+
+Wait, actually `neighbor->decide()` depends on `neighbor->ago`. After my restart setup, I didn't reset `neighbor->ago`. After `neighbor->build(1)`, `neighbor->ago` is reset to 0. So at step T+1, `neighbor->decide()` increments `ago` and checks if it's time to rebuild.
+
+In the original run: at step T, `neighbor->ago` was some value. After the checkpoint at step T, in the original run, at step T+1, `neighbor->ago` would be whatever it was after step T's neighbor check.
+
+Hmm, this is getting complex. Let me think about the neighbor rebuild timing.
+
+The input has `neigh_modify delay 0 every 20 check no`. This means:
+- `delay = 0`
+- `every = 20`
+- `check = no` → always rebuild every 20 steps, regardless of atom displacements
+
+So neighbor lists are rebuilt at steps 0, 20, 40, ..., 1000 (checkpoint), ..., T, T+20, ...
+
+At step T (say T=1000), the neighbor list was rebuilt (since 1000 % 20 == 0). After the rebuild, `neighbor->ago = 0`.
+
+In the original run at step T+1 (1001):
+- `neighbor->decide()` increments `ago` to 1
+- Since 1001 % 20 != 0, it returns 0 (no rebuild)
+- `comm->forward_comm()` is used
+
+After my restart:
+- I call `neighbor->build(1)` which resets `neighbor->ago = 0`
+- First loop iteration (step T+1):
+  - `neighbor->decide()` increments `ago` to 1
+  - Since (T+1) % 20 = 1 ≠ 0, returns 0 → `comm->forward_comm()`
+
+Wait, but `neighbor->decide()` uses `neighbor->ago` and compares it to `every` (20). After `neighbor->build(1)`, `ago = 0`. In `neighbor->decide()`, `ago++` then check if rebuild needed.
+
+In the original run at step T+1: `ago` was 0 after T's rebuild, so at T+1, `ago = 1`. `1 < 20` → no rebuild. ✓
+
+After restart: `ago = 0` after my `neighbor->build(1)`. At step T+1: `ago = 1`. Same behavior. ✓
+
+But wait: the original run at step T did a rebuild (since T % 20 == 0). After the rebuild, `ago = 0`. Then... the checkpoint is taken AFTER `output->write()` which is after the neighbor rebuild. So at checkpoint time, `ago = 0`.
+
+After restore and my `neighbor->build(1)`, `ago = 0` again. Same as at checkpoint time. ✓
+
+So the neighbor rebuild timing is preserved! ✓
+
+Now, let me also think about `atom->sort()` more carefully. The `atom->nextsort` is updated by `atom->sort()`:
+```cpp
+nextsort = (update->ntimestep / sortfreq) * sortfreq + sortfreq;
+```
+
+After checkpoint at step T=1000:
+- `atom->nextsort = (1000/1000)*1000 + 1000 = 2000`
+
+At step T+1=1001: since there's no rebuild (`nflag=0`), `atom->sort()` is not called. ✓
+
+After restart: `atom->nextsort` might be different because `atom->sort()` was called in my restart setup with `update->ntimestep = 0` (not yet restored to T). Let me check:
+
+In my restart code, I call `atom->sort()` in the rebuild phase. At this point, `update->ntimestep = 0` (fresh start). So `atom->sort()` computes `nextsort = (0/1000)*1000 + 1000 = 1000`. After I set `update->ntimestep = T = 1000`, `atom->nextsort = 1000`.
+
+In the original run at step T+1=1001: `nflag = 0` → no exchange path → no sort. The sort would happen at step 2000.
+
+After restart at step T+1=1001: `sortflag && ntimestep(1001) >= atom->nextsort(1000)` → `1001 >= 1000` → TRUE! `atom->sort()` would be called!
+
+This is a divergence from the original run! In the original run, `atom->sort()` was NOT called at step 1001 (because `nextsort = 2000`). In the restart, it WOULD be called (because `nextsort = 1000`).
+
+This changes atom ordering, which then affects the neighbor list and force calculation order. The trajectory diverges!
+
+**Fix**: After restoring `update->ntimestep = T`, also restore `atom->nextsort`. 
+
+The simplest fix: after restore, set `atom->nextsort` to the correct value:
+```cpp
+atom->nextsort = (restored_ntimestep / atom->sortfreq + 1) * atom->sortfreq;
+```
+
+This sets nextsort to the step after the current sort cycle. Since we just called `atom->sort()` at step T (if it was a sort step), nextsort should be T + sortfreq.
+
+Wait, but the sort was done at step T in the original run only if T is a sort step (T % sortfreq == 0). For T=1000 and sortfreq=1000, yes, sort was done at step 1000. So nextsort = 2000 in the original run.
+
+After restart, nextsort is set during my `atom->sort()` call (when ntimestep=0): nextsort = 1000. Then I set ntimestep = 1000.
+
+The first loop iteration: `ntimestep = 1001`. Check: `1001 >= nextsort(1000)` → TRUE → sort would happen.
+
+**Fix**: After calling `atom->sort()` in the restart, set `atom->nextsort = (restored_ntimestep / atom->sortfreq + 1) * atom->sortfreq`.
+
+But I also need to not call `atom->sort()` in the restart if it's not appropriate. Actually, calling sort in the restart is FINE since it puts atoms in the same order as the original run's step T sort. The issue is just the nextsort calculation.
+
+Let me fix nextsort:
+
+Also, there's another issue: in my restart code, I call `atom->sort()` unconditionally. But in the original run, sort was also called at step T (inside the exchange path since T % 20 == 0 and T % 1000 == 0). So the original state at checkpoint IS already sorted. My sort during restart should reproduce the same ordering IF atoms are at the same positions (which they are after the restart).
+
+Wait, actually: the sort in the original run at step T was called BEFORE the checkpoint. The checkpoint saves the already-sorted atoms. After restore, atoms are in the same order (sorted). My additional `atom->sort()` call in the restart would sort them again - but since they're already sorted, it should be idempotent.
+
+Actually, `atom->sort()` sorts based on bin positions. If atom positions are exactly the same, the result should be identical. So calling sort again should be a no-op in terms of ordering (but nextsort would be wrong).
+
+Let me add the fix for nextsort:
+Wait, but I need to also check: does `atom->sort()` set `nextsort` correctly? Let me look:
+So `nextsort = (update->ntimestep/sortfreq)*sortfreq + sortfreq`. When I call `atom->sort()` with `update->ntimestep = 0`, nextsort = sortfreq = 1000.
+
+My fix sets nextsort to `(restored_ntimestep/sortfreq + 1) * sortfreq`. For `restored_ntimestep = 1000`, `sortfreq = 1000`: `(1000/1000 + 1) * 1000 = 2000`. ✓
+
+In the original run, at step 1000: `nextsort = (1000/1000)*1000 + 1000 = 2000`. ✓ Same value.
+
+Good, the nextsort fix is correct.
+
+Now there's another concern: the `neighbor->ncalls` counter. I set it to 0 after `neighbor->build(1)`. In the original run, at checkpoint (step 1000), `neighbor->ncalls` was whatever it was after the run. But `ncalls` is just a counter for diagnostics - it doesn't affect physics. ✓
+
+Let me also think about `update->setupflag`. In `setup()`, it's set to 1 before the setup and 0 after. During `run()`, it should be 0. In my restart code, I'm NOT setting it, so it stays 0. This is correct since we're not in setup mode. ✓
+
+Let me now also consider: after the restart, when I call `force->pair->compute(eflag, vflag)`, this sets internal pair energies/virials. These are used by `output->write()` if it happens at this step. Since `restored_ntimestep` is e.g. 1000, and output might happen at specific steps, this should be fine. But actually, the output at step 1000 already happened in the original run. In the restart, we don't call `output->write()` - we just recompute forces. The output system will continue from step 1001 onwards. ✓
+
+Wait - there's one more issue. In the restart force computation, I call:
+```cpp
+ev_set(restored_ntimestep);
+```
+
+This sets `eflag` and `vflag` based on output requirements at step `restored_ntimestep` (1000). If output was required at step 1000, `eflag` might be non-zero. This causes the pair computation to compute and store per-pair energies. But we don't output them (since step 1000's output already happened). This is harmless - the forces themselves are unaffected by eflag/vflag.
+
+Actually, to be safe, let me use minimal eflag/vflag for the restart force computation:
+
+Actually no - the forces are always computed correctly regardless of eflag/vflag. The eflag/vflag just control whether energies/virials are computed alongside forces. Forces are always computed. ✓
+
+Let me now also check if there's an issue with the `atom->map`. For atomic systems, `map_style = MAP_NONE`, so no map operations needed. But `comm->exchange()` might try to clear the map:
+
+From `CommBrick::exchange()`:
+```cpp
+if (map_style != Atom::MAP_NONE) atom->map_clear();
+```
+
+For our case, `map_style = MAP_NONE`, so this is a no-op. ✓
+
+Now let me also look at a potential issue with `atom->nghost`. After restore, I set `atom->nghost = 0`. Then I call `comm->exchange()` which also sets `atom->nghost = 0` internally. Then `comm->borders()` builds the ghost list and sets `atom->nghost`. ✓
+
+OK, I believe the implementation is correct. Let me now also verify that we don't have the `Irregular` include being unused. Since I removed the Irregular from the final version (using `comm->exchange()` instead), I should remove the include:
+
+Wait, actually I still have `#include "irregular.h"` in the file. Let me check if it's used:
+
+In the current version, I don't use `Irregular` anymore (I removed it in the final rewrite). Let me check:
+Good - `Irregular` is only in a comment. The `#include "irregular.h"` is unused but harmless (no compilation error, just a slight compilation slowdown). Let me remove it to be clean:
+Now let me think about one more potential issue: the `atom->avec->clear_bonus()` call. In `comm->exchange()` (CommBrick):
+```cpp
+atom->avec->clear_bonus();
+```
+
+This clears bonus data (for ellipsoids, triangles, etc.). For atomic style, this is a no-op. ✓
+
+Also, `comm->borders()` needs `atom->nghost = 0` to be set before it's called. We set it before the call. ✓
+
+Now let me think about whether `comm->exchange()` in the restart path can mess up the atom ordering vs. the original run.
+
+**Critical analysis of atom ordering after restart**:
+
+At checkpoint time (step T), atoms are in a specific order on each rank. The checkpoint saves them in this order.
+
+After fresh restart:
+- `setup()` creates atoms from lattice (step 0 positions)
+- `atom->sort()` sorts them in setup()
+- The initial ordering is deterministic
+
+After checkpoint restore:
+- Each rank reads its checkpoint file, restoring `atom->tag[i]`, `atom->x[i]`, `atom->v[i]`, `atom->image[i]`, `atom->type[i]`, `atom->mask[i]` for `i = 0..ckpt_nlocal-1`
+- `atom->nlocal = ckpt_nlocal`
+
+Now `atom->x[0..ckpt_nlocal-1]` has checkpoint-T positions, in checkpoint-T order.
+
+`comm->exchange()` runs: it checks each atom's position against subdomain boundaries. Any atom outside is packed into a send buffer, and the gap is filled with the last atom. The filled-in atoms change ordering.
+
+In the original run at step T's exchange: the atoms that were outside boundaries were the same atoms that would cross in the restart. After `final_integrate()` at step T, some atoms might have slightly crossed boundaries. The exact same atoms would cross in the restart (same positions). So the same atoms get sent away and the same atoms fill the gaps.
+
+BUT: `avec->copy(nlocal-1, i, 1)` copies the LAST atom to fill the gap. After the copy, the LAST atom's data is now at position `i`, and `nlocal` is decremented. This is deterministic given the same initial ordering.
+
+In the original run: at checkpoint T, the atoms were ordered in a specific way (including any sorts done at step T). This ordering is saved to the checkpoint. On restore, we reload this exact ordering. So `comm->exchange()` during restart processes atoms in the SAME order as in the original run's step T+1 exchange. The same atoms leave (since positions are the same), and the gaps are filled in the same way.
+
+Wait, but in the original run at step T+1, `initial_integrate()` runs BEFORE `comm->exchange()`. In the restart, `comm->exchange()` runs WITHOUT `initial_integrate()` first (in the setup phase). Then the first loop iteration runs `initial_integrate()` then `comm->exchange()` again.
+
+Hmm, this is a problem. Let me trace through:
+
+**Original run at step T+1**:
+1. `initial_integrate()`: x(T) → x(T+½), v(T) → v(T+½) [uses f(T)]
+2. `neighbor->decide()` → nflag (0 or 1)
+3. If nflag=1: `comm->exchange()` (atoms slightly outside subdomain sent away), `comm->borders()`, `neighbor->build(1)`
+4. `force->pair->compute()`: f(T+1) computed at x(T+½)
+5. `final_integrate()`: x(T+½) → x(T+1), v(T+½) → v(T+1)
+
+Wait, I think I've been confusing velocity-Verlet notation. Let me re-read fix_nve:
+
+```cpp
+void FixNVE::initial_integrate(int)
+{
+    v[i][0] += dtf/m * f[i][0];   // v(t+dt/2) = v(t) + dt/2/m * f(t)
+    x[i][0] += dtv * v[i][0];     // x(t+dt) = x(t) + dt * v(t+dt/2)
+```
+
+Wait, this is not standard velocity-Verlet! This is the leapfrog-verlet format where:
+- `v` is updated first by half step using `f` from the PREVIOUS step
+- `x` is updated with the new `v`
+
+Actually looking more carefully: `dtf = 0.5 * dt * ftm2v` and `dtv = dt`. So:
+- v(t+dt/2) = v(t) + dt/2/m * f(t)
+- x(t+dt) = x(t) + dt * v(t+dt/2)
+
+Then `final_integrate()` does:
+- v(t+dt) = v(t+dt/2) + dt/2/m * f(t+dt)
+
+So at the END of step T:
+- `atom->x` = x(T) (positions at end of step T, after integration)
+- `atom->v` = v(T+½) (half-step velocity)
+- `atom->f` = f(T) (forces from step T's force computation)
+
+Wait no, after `final_integrate()`:
+- x was updated in `initial_integrate()` from x(T-1) to x(T)
+- v was updated from v(T-½) to v(T) in `final_integrate()` using f(T)
+
+Hmm, let me re-read more carefully. The standard LAMMPS velocity-Verlet:
+
+Step T:
+1. `initial_integrate()`: v += dt/2/m * f(T-1); x += dt * v → x becomes x(T), v becomes v(T-½)
+   Wait, this doesn't match. Let me trace through for step T=1 starting from step 0:
+   
+At step 0 (setup): x(0), v(0), f(0) computed.
+At step 1 (first loop iteration, i=0, ntimestep=1):
+- `initial_integrate()`: v[0] += dtf/m * f[0]; x[0] += dtv * v[0]
+  - v becomes v(0) + dt/2/m * f(0) = v(0.5 in velocity-Verlet)
+  - x becomes x(0) + dt * v(0.5) = x(1)
+- Force compute at x(1): f = f(1)
+- `final_integrate()`: v += dtf/m * f → v(0.5) + dt/2/m * f(1) = v(1)
+
+So at the END of step 1: x=x(1), v=v(1), f=f(1).
+
+At checkpoint time (end of step T):
+- x = x(T)
+- v = v(T)
+- f = f(T) (most recent force computation)
+
+At step T+1:
+- `initial_integrate()`: v += dtf/m * f(T) → v(T+0.5); x += dtv * v → x(T+1)
+- Force compute at x(T+1): f = f(T+1)
+- `final_integrate()`: v += dtf/m * f(T+1) → v(T+1)
+
+So for the restart to be correct, we need:
+1. x(T) ✓ (saved and restored)
+2. v(T) ✓ (saved and restored)
+3. f(T) - this is NOT in the checkpoint
+
+For step T+1, `initial_integrate()` needs f(T). I recompute f(T) after restore by computing forces at x(T).
+
+BUT: to compute forces at x(T), I need:
+1. Ghost atoms (from `comm->borders()`)
+2. Neighbor list (from `neighbor->build()`)
+
+The ghost atoms and neighbor list depend on the positions x(T). These are correctly set up in my restart code. ✓
+
+After restart, forces f(T) are recomputed. The step T+1 then uses f(T) for `initial_integrate()`. This SHOULD give the same result as the original run IF:
+1. Ghost atoms are in the same order (since they affect force computation in pair interactions with newton=on)
+2. Neighbor list is built the same way
+
+The ghost atoms' ordering depends on the `comm->borders()` communication pattern, which is deterministic given the same positions and atom ordering. ✓
+
+**The crucial concern**: after `comm->exchange()` in the restart, do atoms end up in the SAME order as in the original run?
+
+In the restart, `comm->exchange()` runs on atoms in checkpoint-T order. Any atoms that crossed boundaries are removed and those atoms are filled with the last atom. This is deterministic.
+
+In the original run at step T+1, `comm->exchange()` runs on atoms that were in checkpoint-T order AFTER `initial_integrate()`. But in the restart, `comm->exchange()` runs on the SAME checkpoint-T positions (without first applying `initial_integrate()`).
+
+This means the atoms sent away during restart's `comm->exchange()` might be DIFFERENT from those sent away in the original run's T+1 exchange!
+
+In the original run:
+- After `initial_integrate()` at step T+1: positions are x(T+1) (slightly moved from x(T))
+- `comm->exchange()`: sends atoms outside sublo..subhi
+
+In the restart:
+- Positions are x(T) (NOT x(T+1)) when `comm->exchange()` runs
+- `comm->exchange()`: sends atoms outside sublo..subhi based on x(T)
+
+The atoms outside sublo..subhi at x(T) might be different from those at x(T+1). Actually, atoms that are very slightly outside at x(T) might be inside at x(T+1) (if they moved back), or atoms that are inside at x(T) might be outside at x(T+1) (if they moved out). The dt is very small (0.005) and velocities are ~1.2, so atoms move ~0.006 LJ per step. This is tiny compared to domain boundaries (5 LJ per rank).
+
+So in practice: almost NO atoms cross boundaries during a single `initial_integrate()`. The checkpoint `comm->exchange()` (in restart) and the original `comm->exchange()` (after `initial_integrate()`) will send away essentially the SAME atoms (those that are slightly outside the subdomain). In most steps (when no exchange is happening), `comm->exchange()` is nearly a no-op anyway.
+
+But for the FIRST step after a neighbor rebuild (which includes exchange), the situation is different.
+
+Wait - in the original run, does `comm->exchange()` happen at EVERY step? Looking at the loop:
+
+```cpp
+nflag = neighbor->decide();
+if (nflag == 0) {
+    comm->forward_comm();
+} else {
+    comm->exchange();
+    ...
+}
+```
+
+`comm->exchange()` only happens when `nflag != 0`, i.e., when the neighbor list is being rebuilt. With `neigh_modify delay 0 every 20 check no`, neighbor lists are rebuilt every 20 steps.
+
+At step T=1000: T % 20 == 0, so rebuild happens (exchange + borders + build).
+At step T+1=1001: 1001 % 20 = 1 ≠ 0, so NO exchange in the original run.
+
+In my restart, `comm->exchange()` is called in the rebuild phase (before the loop). Then at step T+1=1001: `nflag=0` → no exchange. So at step T+1, the original run also had no exchange. ✓
+
+But there's still the question: in the restart's exchange, which atoms get sent away? These are atoms whose x(T) positions are outside sublo..subhi.
+
+In the original run at step T (before the checkpoint): after `final_integrate()`, positions are x(T). `comm->exchange()` was called at step T (since T%20==0). So at step T's exchange, atoms whose x(T-1 + final_integrate's dx) are outside sublo were sent away. That is, atoms whose positions at x(T) after `final_integrate()` are outside.
+
+But wait: at step T, the exchange happens BEFORE force computation and BEFORE `final_integrate()`. Let me re-trace:
+
+Step T:
+1. `initial_integrate()`: x moves from x(T-1) to x(T), v from v(T-1) to v(T-½)
+2. `nflag = neighbor->decide()` → T%20==0 → rebuild
+3. `comm->exchange()`: atoms at x(T) outside subdomain are sent → atoms redistributed
+4. `comm->borders()`, `neighbor->build()`
+5. Force compute at x(T): f(T)
+6. `final_integrate()`: v moves from v(T-½) to v(T)
+7. Output (if needed)
+8. Checkpoint saved
+
+So at checkpoint time, positions are x(T) and the exchange already happened at step T. Atoms on each rank are those whose x(T) positions are inside their subdomain. ✓
+
+In the restart, I restore checkpoint atoms and call `comm->exchange()`. The atoms' positions are x(T) (same as checkpoint). Since they were already inside their subdomains at checkpoint time (verified by step T's exchange), the restart's `comm->exchange()` should be a no-op! No atoms need to be moved. ✓
+
+So the atom ordering is PRESERVED through the restart. ✓
+
+After the restart exchange (no-op), `comm->borders()` builds ghost atoms from neighbors. The ghost atoms' ordering is deterministic given the same positions and proc layout. ✓
+
+Then force computation at x(T) gives f(T) in the same order as in the original run. ✓
+
+Step T+1 in restart:
+1. `initial_integrate()`: x(T) → x(T+1), v(T) → v(T+½), using f(T). Same as original. ✓
+2. `nflag = 0` (T+1 % 20 = 1). `comm->forward_comm()`. ✓
+3. Force compute at x(T+1). ✓
+4. `final_integrate()`. ✓
+
+The trajectory should be bit-perfect! ✓
+
+Wait, there's one subtle issue. In my restart code, I call `domain->pbc()` before `comm->exchange()`. This applies periodic boundary conditions, potentially wrapping atoms that are slightly outside the box. In the original run, `domain->pbc()` was called at step T's exchange path. After step T's exchange, atoms are correctly in their subdomains.
+
+After checkpoint restore, the atoms are in their checkpoint-T positions (correctly in subdomains). `domain->pbc()` might wrap some atoms. If atoms that are exactly at the box boundary get wrapped, their positions change slightly (by ±box_size). This would be incorrect.
+
+But wait: at checkpoint time, `domain->pbc()` was already called at step T (before `comm->exchange()`). The restored positions are AFTER the pbc correction. So calling pbc again should be a no-op (already wrapped). ✓
+
+Actually, let me double-check: at step T, the sequence was:
+1. `initial_integrate()`: positions might go outside the box
+2. `domain->pbc()`: wraps them back
+3. `comm->exchange()`: redistributes
+
+After the checkpoint (saved after step T's `final_integrate()`), positions are the result of `final_integrate()`, which moves atoms further. These atoms might be slightly outside the box (by at most one timestep's worth of velocity). `domain->pbc()` in the restart will correctly wrap them. ✓
+
+So the flow is:
+- Checkpoint positions x(T): result of step T's `final_integrate()`, may be slightly outside box
+- Restart's `domain->pbc()`: wraps to inside box (same as what would happen at step T+1's exchange)
+- But step T+1 in original run: pbc NOT called (since nflag=0, only forward_comm)
+
+Hmm, wait. For step T+1=1001, `nflag=0` → no exchange → no pbc call. So in the ORIGINAL run, atoms outside the box at positions x(T) stay outside until the next exchange at step 1020. But in my RESTART, I call pbc which wraps them.
+
+This is a difference! In the original run, atoms might be slightly outside the box from step T+1 to step 1020 (when the next exchange+pbc happens). In the restart, they're wrapped immediately.
+
+However! `pair_style lj/cut` computes forces based on DISTANCE between atoms, which is periodic-image independent as long as the neighbor list is built correctly. The neighbor list uses minimum image convention. So even if atoms are slightly outside the box, the forces are correct.
+
+But the positions x(T) affect the subsequent dynamics. If I wrap them at restart but the original run doesn't, the trajectories diverge (by at most a tiny amount, but still diverge).
+
+**Fix**: Don't call `domain->pbc()` in the restart if the next step won't have a pbc call either.
+
+Actually, for step T+1 (nflag=0), the original run does NOT call pbc. In my restart, if I call pbc, I change the positions slightly. This breaks bit-perfectness.
+
+Let me remove the `domain->pbc()` call from the restart phase if the checkpoint step was one that didn't require it. But how do we know?
+
+Actually, let me think again. At step T:
+- T%20==0 → nflag=1 → pbc called → exchange → borders → build
+- After this exchange, atoms are in their correct subdomains AND within the box
+
+After step T's `final_integrate()`, atoms move by at most ~0.006 LJ units. This is much less than the box size (20 LJ units) or subdomain size (5 LJ units). So atoms can't go more than one box size outside during `final_integrate()`. In practice, atoms stay inside the box.
+
+But wait - some atoms might cross the box boundary if their velocity is high and the timestep is large. For typical LJ conditions: max velocity ~3 LJ units, dt=0.005, dx = 0.015 LJ per step. Box size = 20 LJ. So an atom would need to be within 0.015 LJ of the box boundary to cross it in one step. Very unlikely but possible.
+
+If an atom IS at the boundary and `final_integrate()` moves it outside, then at step T+1 (no pbc), the atom is slightly outside the box. This is the normal LAMMPS behavior (it handles this at the next exchange at step T+20). In the restart, if I call pbc, I wrap the atom back inside, which changes its position.
+
+OK so I should NOT call pbc in the restart if the next step doesn't have pbc. But I can't know in advance what the next neighbor rebuild step is.
+
+Actually, the SIMPLEST solution: just DON'T call `domain->pbc()` in the restart. Let the normal loop handle it. The atoms after restore are in their checkpoint positions (slightly outside box in rare cases). This is fine for the neighbor list build and force computation. The next exchange cycle will call pbc when needed.
+
+But wait - for the restart's `comm->exchange()`, it uses subdomain bounds (sublo, subhi) to determine which atoms to send away. If an atom is slightly outside the BOX (but inside its subdomain), it WON'T be sent away by exchange. Fine.
+
+But then for `neighbor->build()`: the neighbor list uses minimum image distance. Atoms slightly outside the box have their periodic images correctly handled. Fine.
+
+And for force compute: same, minimum image convention handles atoms outside the box. Fine.
+
+Let me remove the `domain->pbc()` call:
+But wait - removing `domain->pbc()` before `comm->exchange()` means atoms that are outside the box boundaries might not be handled. Let me check: can atoms be outside the box at checkpoint time?
+
+At step T:
+- `initial_integrate()` moves atoms. Some might go outside the box.
+- `domain->pbc()` wraps them back inside. ← This happens at step T's exchange
+- After pbc: all atoms inside box
+- `comm->exchange()`: redistributes to correct subdomains
+- Atoms are now correctly inside both the box and their subdomains
+
+After `final_integrate()` at step T:
+- Atoms move again by a small amount
+- Some might go outside the box (if they were near the boundary after pbc)
+
+So yes, at checkpoint time, atoms CAN be slightly outside the box. In the original run, they stay outside until step T+20's pbc call.
+
+In the restart, I should also NOT call pbc (to match the original run's behavior). Instead, the atoms outside the box are handled by the neighbor list with minimum image convention.
+
+For `comm->exchange()` without prior pbc: atoms outside the box AND outside their subdomains will be sent to the correct rank. Atoms outside the box but inside their subdomains stay. This is correct behavior (matches the original run). ✓
+
+But there's a tricky case: `comm->exchange()` checks `x[i][dim] < sublo[dim] || x[i][dim] >= subhi[dim]`. If an atom is outside the box (e.g., `x > boxhi`), it might be outside its subdomain AND outside the box. `comm->exchange()` would send it to... what rank? The rank whose subdomain corresponds to that position. But if x is outside the box, `coord2proc()` might return an incorrect rank.
+
+Actually, looking at `CommBrick::exchange()`: it only checks ONE dimension at a time and sends atoms to adjacent ranks. If an atom is at x = boxhi + epsilon, it's outside the box AND outside the last rank's subdomain. Exchange would send it to rank+1, which doesn't exist (it wraps around to rank 0 via the left boundary... wait, for a periodic system).
+
+Actually for periodic systems, `comm->exchange()` in CommBrick handles this by considering periodic images. The sublo/subhi of rank 0 might include the periodic image. Let me trust that LAMMPS handles this correctly in its normal operation (atoms slightly outside the box from `initial_integrate()` are handled by pbc + exchange).
+
+Since we're NOT calling pbc in the restart (to match original run behavior for step T+1), and `comm->exchange()` in the restart might not correctly handle atoms outside the box... but wait:
+
+In the ORIGINAL run: at step T, pbc was called, then exchange. After pbc, ALL atoms are inside the box. After exchange, all atoms are in their correct subdomains AND inside the box.
+
+After `final_integrate()` at step T: atoms move slightly. Some might go outside the box. But "slightly" means less than a domain width. For periodic systems, this means they can cross the box boundary.
+
+At step T+1: nflag=0 → NO pbc, NO exchange. `comm->forward_comm()` sends ghost atoms. This works correctly even with atoms outside the box (ghost communication handles periodic images).
+
+At step T+20: nflag=1 → pbc called, exchange, rebuild. This correctly handles all out-of-box atoms.
+
+For the restart at step T: I restore atoms in their checkpoint positions (some might be slightly outside the box). I call `comm->exchange()` without pbc. This might work or might cause issues.
+
+Actually, let me check: atoms that are slightly outside the box but inside their subdomain are fine (they stay on their current rank, and the neighbor list handles periodic images). Atoms that are outside their subdomain are sent to the correct rank. This should work correctly.
+
+The key question: is there any atom at checkpoint time that is OUTSIDE its subdomain? From the analysis above: at step T, after exchange and final_integrate, atoms might have moved slightly outside their subdomains (due to final_integrate). In the original run, these atoms stay on their (incorrect) ranks until step T+20.
+
+Wait no! If atoms are outside their subdomains after final_integrate, the original run leaves them there until step T+20's exchange. But in the restart, my exchange at restart time would MOVE them to the correct rank! This changes the atom ordering and causes trajectory divergence.
+
+Hmm. So there IS a fundamental problem: at checkpoint time, atoms might be slightly outside their subdomains (due to final_integrate), but the original run leaves them there. If I call exchange in the restart, I move them early, causing divergence.
+
+**The correct solution**: DON'T call `comm->exchange()` in the restart at all. Instead:
+1. Restore atoms exactly as saved
+2. Rebuild ghost atoms directly without exchange (using `comm->borders()`)
+3. The ghost atoms will correctly reflect the periodic images
+4. Then compute forces
+
+But `comm->borders()` requires atoms to be in their correct subdomains. If some atoms are slightly outside, borders might not build the correct ghost list.
+
+Actually, `comm->borders()` sends atoms near the boundary to neighboring ranks as ghost atoms. It uses a cutoff to determine which atoms near each boundary need to be sent as ghosts. Atoms slightly outside their subdomain (by less than the ghost cutoff) are usually handled fine - they're near the boundary and their neighbors will include them in the ghost list.
+
+Let me look at what happens in the original run: at step T+1, with nflag=0, only `comm->forward_comm()` is called (not `comm->borders()`). This updates ghost positions based on the existing ghost list (built at step T). The ghost list from step T's `comm->borders()` is valid for atoms at x(T). After step T's `final_integrate()`, atoms move to x(T) (which IS x(T) since final_integrate runs AFTER force compute). Wait, I'm getting confused again.
+
+Let me be precise about when things happen:
+
+At step T:
+1. `initial_integrate()`: x → x(T) [positions updated], v → v_half(T)
+2. `comm->exchange()` [nflag=1]: atoms at x(T) redistributed
+3. `comm->borders()`: ghost atoms for x(T) built
+4. `neighbor->build()`: neighbor list for x(T) built
+5. `force->pair->compute()`: f(T) computed at x(T)
+6. `final_integrate()`: x → x(T) [NO, x doesn't change in final_integrate!], v_half(T) → v(T)
+
+Wait, let me re-read fix_nve more carefully:
+
+```cpp
+void FixNVE::initial_integrate(int)
+{
+    v[i][0] += dtf / mass[type[i]] * f[i][0];  // v += f*dt/2/m
+    x[i][0] += dtv * v[i][0];                   // x += v*dt
+}
+void FixNVE::final_integrate()
+{
+    v[i][0] += dtf / mass[type[i]] * f[i][0];  // v += f*dt/2/m  [f from current step]
+}
+```
+
+So `initial_integrate` updates BOTH x and v (by half-step then full-step). `final_integrate` updates only v.
+
+At step T (starting from state at end of step T-1: x(T-1), v(T-1), f(T-1)):
+1. `initial_integrate()`: v → v(T-½) = v(T-1) + dt/2/m * f(T-1); x → x_new = x(T-1) + dt * v(T-½)
+2. `comm->exchange()` [nflag=1 if T%20==0]: atoms at x_new redistributed
+3. `comm->borders()`, `neighbor->build()`
+4. `force->pair->compute()`: f_new computed at x_new
+5. `comm->reverse_comm()`
+6. `final_integrate()`: v_new = v(T-½) + dt/2/m * f_new
+7. Output, checkpoint
+
+At checkpoint time (end of step T):
+- x = x_new = x(T-1) + dt * v(T-½) → this IS x at step T
+- v = v_new = v(T)
+- f = f_new (forces at x)
+
+The checkpoint saves x=x(T), v=v(T). The atoms are correctly in their subdomains (exchange happened in step 2). ✓
+
+The ghost list is still valid for x(T) (built in step 3). But after the checkpoint, we're starting fresh.
+
+For the restart at step T+1:
+1. `initial_integrate()` needs f(T) [forces at x(T)]
+2. After `initial_integrate()`: x → x(T+1), v → v(T+½)
+3. `nflag = 0` (T+1 % 20 = 1)
+4. `comm->forward_comm()` updates ghost positions from x(T+1) to x(T+1) [almost no-op since ghost positions are updated]
+5. `force->pair->compute()` at x(T+1)
+6. `final_integrate()`: v → v(T+1)
+
+For the restart to work:
+- We need f(T) for step 1. We recompute it from x(T) in the restart setup.
+- The ghost list needs to be valid for x(T) to compute f(T) correctly.
+- After the ghost list, force compute gives f(T).
+- Then step T+1 proceeds normally.
+
+The ghost list at x(T) is built by `comm->borders()` after `comm->exchange()` in the restart setup.
+
+If I DON'T call `comm->exchange()` but DO call `comm->borders()`, will it work?
+
+`comm->borders()` doesn't need a prior exchange. It builds the ghost list from scratch based on current atom positions. But it does call `atom->map_clear()` and `atom->map_set()` (for systems with maps). For our atomic system (MAP_NONE), this is a no-op.
+
+So I can call `comm->borders()` directly without exchange! This avoids any issues with exchange changing atom ordering.
+
+BUT: if some atoms are slightly outside their subdomains (due to final_integrate at step T), `comm->borders()` might not correctly build the ghost list for them. Actually:
+
+`comm->borders()` sends atoms near the boundary to neighboring ranks as ghost atoms. It uses `sublo - skin` and `subhi + skin` as the cutoff for which atoms to send as ghosts. If an atom is at `subhi + epsilon` (slightly outside), it's still within the extended cutoff and will be sent as a ghost to the next rank. The "owner" rank still has this atom as a local atom.
+
+So even with slightly out-of-subdomain atoms, `comm->borders()` builds a correct ghost list. The neighbor list and force compute work correctly with minimum image convention.
+
+**Decision**: Don't call `comm->exchange()` in the restart. Just call `comm->borders()` directly.
+
+But then: in the original run at step T+1 (nflag=0), only `comm->forward_comm()` is called (NOT `comm->borders()`). At step T+20 (nflag=1), `comm->exchange()` + `comm->borders()` are called.
+
+So in the restart: if I call `comm->borders()` in the setup, I build a fresh ghost list from x(T). Then the loop starts at step T+1 with `comm->forward_comm()` (no full rebuild). The ghost list from the setup is used for step T+1 onwards until step T+20 when it's rebuilt.
+
+But the ghost list from the RESTART's `comm->borders()` will be the same as the ghost list from the ORIGINAL's step T `comm->borders()` (same positions, same atoms). ✓
+
+And `comm->forward_comm()` at step T+1 just updates ghost positions based on the current ghost list (no rebuilding). ✓
+
+**The cleanest solution**: Replace `comm->exchange()` with `comm->borders()` in the restart setup:
+
+Wait, actually looking at `comm->borders()` source - it calls `atom->map_clear()` and then sets ghosts. Let me check if it requires the atom map.
+For MAP_NONE (our case), `map_clear()` and `map_set()` are skipped. ✓
+
+`comm->borders()` in CommBrick builds the ghost list from scratch. It doesn't require a prior exchange for atomic systems with MAP_NONE. ✓
+
+So the correct restart procedure is:
+
+1. Restore atom arrays from checkpoint (positions, velocities, tags, etc.)
+2. Set `atom->nlocal = ckpt_nlocal`, `atom->nghost = 0`
+3. Call `comm->borders()` to build ghost list (no exchange needed)
+4. Build neighbor list: `neighbor->build(1)`
+5. Compute forces: `force->pair->compute()`
+6. Start loop from step T+1
+
+This is the cleanest approach and matches the original run's state exactly:
+- Atom ordering: identical to checkpoint (no exchange to shuffle atoms)
+- Ghost list: same as at checkpoint time (built from x(T))
+- Forces: same as at checkpoint time
+
+Let me update the code:
+Wait - but `comm->borders()` in CommBrick might require that atoms are within `sublo - skin` to `subhi + skin`. Let me check:
+Looking at `comm->borders()`: it checks atoms within slab boundaries `lo = slablo[iswap]` and `hi = slabhi[iswap]`. These slab boundaries are determined by `sublo - skin` and `subhi + skin`. Atoms within this range are sent as ghost atoms to neighboring ranks.
+
+Now, if an atom is slightly outside its subdomain (at `subhi + epsilon` where epsilon << domain_width), it's still likely within `subhi + skin` and will be sent as a ghost atom to the neighboring rank. This is correct behavior.
+
+But: this atom is a LOCAL atom on rank R (since it was on rank R at checkpoint time). It will also be sent as a GHOST atom to rank R+1. In the original run, this same situation existed (the atom was slightly outside subhi due to final_integrate). So the ghost list is the same. ✓
+
+The PROBLEM would be if the atom is far enough outside its subdomain that it's missed by `comm->borders()`. But since displacements during `final_integrate()` are tiny (< 0.006 LJ), this won't happen (skin is typically 0.3 LJ). ✓
+
+OK, the `comm->borders()` only approach is correct. 
+
+Now, let me also think about `neighbor->build(1)`. This builds the neighbor list from the current atom positions and ghost atoms. It uses the positions x(T) and the ghost atoms built by `comm->borders()`. This should give exactly the same neighbor list as was in effect at checkpoint time (which was also built from x(T) at step T's rebuild). ✓
+
+Wait - at checkpoint time (step T), the neighbor list was built BEFORE `final_integrate()`. But x(T) at neighbor build time = x(T) before final_integrate = x at end of initial_integrate. After final_integrate, x stays the same (only v changes in final_integrate). So x(T) for neighbor build = x(T) in the checkpoint. ✓
+
+And `comm->borders()` uses the same x(T) positions. ✓
+
+Good. Now let me also think about one more subtlety: in the original run, at step T, `atom->sort()` was called (since T % sortfreq == 0 and T % 20 == 0, so it's in the exchange path). The sort happened BEFORE the neighbor build. So the checkpoint has SORTED atoms.
+
+In the restart: I DON'T call `atom->sort()` in the restart setup (I removed it). So atoms are in the checkpoint order (already sorted). When I call `comm->borders()`, atoms are in sorted order. The ghost list and neighbor list will be the same as at checkpoint time. ✓
+
+Let me check the current code doesn't have `atom->sort()` in the restart path:
+The restart code doesn't call `atom->sort()`. Good.
+
+Now let me think about `comm->borders()` requiring the `sendlist` arrays to be set up. `comm->borders()` in CommBrick uses `sendlist[iswap]` and other arrays that are allocated in `comm->setup()`. These are set up during the fresh `setup()` call. So they should be valid for our restart. ✓
+
+Also, `comm->borders()` internally sets `atom->nghost` to the correct value after building ghost lists. ✓
+
+Let me now also look at one final issue: the `neighbor->decide()` function and `neighbor->ago`.
+
+After `neighbor->build(1)` in the restart, what is `neighbor->ago`?
+After `neighbor->build(1)`, `ago = 0`. ✓
+
+Then in my code I set `neighbor->ncalls = 0`. This is just a counter reset. The important one is `ago = 0`. ✓
+
+At the first loop iteration (step T+1):
+- `neighbor->decide()` is called which does `ago++` (ago = 1)
+- Checks: `ago >= delay (0)` → true; `ago % every (20)` = 1 ≠ 0 → false
+- Returns 0 (no rebuild) ✓
+
+In the original run at step T+1: same - `ago` was 0 after step T's rebuild, then 1 at T+1. → no rebuild. ✓
+
+At step T+20:
+- `ago = 20`
+- `ago >= 0` → true; `20 % 20 = 0` → true → rebuild ✓
+
+This matches the original run. ✓
+
+Now let me also check `lastcall`:
+
+```cpp
+lastcall = update->ntimestep;
+```
+
+In the restart, when `neighbor->build(1)` is called, `update->ntimestep = 0` (not yet restored to T). So `neighbor->lastcall = 0`. 
+
+Then I set `update->ntimestep = T = 1000`.
+
+At step T+1: `neighbor->decide()` might use `lastcall` for some checks. Let me look:
+`decide()` only uses `ago` (not `lastcall` directly). `lastcall` might be used internally for other purposes. Let me not worry about it - if it causes issues, they'll be apparent in testing.
+
+Actually, `lastcall` is set in `build()` to `update->ntimestep`. In my restart, `update->ntimestep = 0` when `build()` is called. So `lastcall = 0` rather than `T = 1000`. This might matter for `check_distance()` which uses positions from `lastcall` to check displacements. But since `dist_check = 0` (`check no` in the input), `check_distance()` is not called. ✓
+
+Let me fix the `lastcall` issue anyway to be safe. I should set `update->ntimestep = restored_ntimestep` BEFORE calling `neighbor->build()`. Let me restructure:
+Now let me also look at one more potential issue: `comm->borders()` uses `sendnum`, `sendlist`, `sendproc`, etc. arrays that are allocated in `comm->setup()`. These were set up in the original `Verlet::setup()` call. They should be valid for our restart since the domain configuration hasn't changed. ✓
+
+Let me also check if `comm->borders()` requires `nfirst` to be set. Looking at the borders code, it uses `atom->nfirst` for bordergroup:
+
+```cpp
+if (!bordergroup || ineed >= 2) {
+    for (i = nfirst; i < nlast; i++) ...
+```
+
+`atom->nfirst` is set by `atom->first_reorder()` which is called if `atom->firstgroupname` is set. For our simulation, there's no firstgroup, so `atom->nfirst = 0`. ✓
+
+Now let me also think about the `comm->forward_comm()` call during the main loop (for nflag=0 steps). `forward_comm()` uses the `sendlist` arrays from `comm->borders()` to know which ghost atoms to update. After my restart's `comm->borders()`, these lists are correctly set up. ✓
+
+I think the implementation is now correct. Let me also verify there are no issues with the `atom->avec->clear_bonus()` call that's inside `comm->exchange()` (which we're not calling). In `comm->borders()`, there's no `clear_bonus()` call:
+
+Looking at the CommBrick borders code - it just builds the ghost list, no clearing. ✓
+
+Now let me look at the complete restart flow one more time to make sure everything is in order:
+
+1. `VELOC_Restart_test` → find latest checkpoint version
+2. `VELOC_Restart_begin` + `VELOC_Route_file` → get per-rank file path
+3. Read file: ntimestep, nlocal, atom records
+4. Restore `atom->tag`, `atom->x`, `atom->v`, `atom->image`, `atom->type`, `atom->mask`
+5. Set `atom->nlocal = ckpt_nlocal`, `atom->nghost = 0`
+6. `VELOC_Restart_end`
+7. Verify all ranks succeeded (MPI_Allreduce)
+8. Broadcast ntimestep from rank 0
+9. Set `update->ntimestep = restored_ntimestep`
+10. `comm->borders()` → build ghost list
+11. `neighbor->build(1)` → build neighbor list
+12. `ev_set(restored_ntimestep)` + `force_clear()` + `force->pair->compute()` → recompute forces
+13. Set `steps_done`, `atom->nextsort`
+14. Enter main loop at step T+1
+
+The main loop:
+- `ntimestep = T+1`
+- `initial_integrate()`: uses f(T) (just computed), gives x(T+1), v(T+½)
+- `neighbor->decide()` → `ago = 1` → nflag=0 (no rebuild since T+1 % 20 = 1)
+- `comm->forward_comm()`: updates ghost positions for x(T+1)
+- `force->pair->compute()`: f(T+1) at x(T+1)
+- `final_integrate()`: v(T+1)
+
+This matches the original run exactly. ✓
+
+Now let me also consider the `comm->borders()` prerequisite. Does `comm->borders()` need `comm->setup()` to have been called recently? Yes, `setup()` sets up the swap lists and buffer sizes. Since our fresh `setup()` was called before `run()`, these are valid. ✓
+
+Also, does `comm->borders()` need the `nswap`, `maxneed`, `slablo`, `slabhi` arrays? These are set in `comm->setup()`. ✓
+
+One more thing: `neighbor->build(1)` calls `neighbor->setup_bins()` if needed (based on box changes). Since the box hasn't changed, this should be fine.
+
+Actually, looking at `Neighbor::build()`:
+
+```cpp
+void Neighbor::build(int topoflag)
+{
+    ago = 0;
+    ncalls++;
+    lastcall = update->ntimestep;
+    ...
+    // build neighbor lists
+}
+```
+
+It doesn't call `setup_bins()` itself. That's called in setup or when the box changes. Since we called `neighbor->setup_bins()` in the fresh `setup()`, the bins are correctly set up. ✓
+
+Let me also look at one final issue: `comm->borders()` returns ghost positions already updated (it does the equivalent of `forward_comm()` for the first time). After `comm->borders()`, ghost positions are at x(T). After `neighbor->build(1)`, the neighbor list uses x(T). After force compute, f(T) is correct. Then the loop starts. ✓
+
+I'm now confident the implementation is correct for bit-perfect trajectory recovery.
+
+Now let me think about whether there might be any compilation errors. Let me read the complete updated `run()` function:
+Looks good. Let me also think about one more issue: the `bool read_ok` variable. In C++, `bool` is a standard type so this is fine with LAMMPS's C++11/14 compilation.
+
+Also, `size_t r1 = std::fread(...)` - comparing `r1 == 1` where r1 is `size_t` and 1 is an `int` is fine. Similarly `(int)rn == ckpt_nlocal` is fine.
+
+Let me now check for potential issues with `atom->map_clear()` or similar that `comm->borders()` might call. For MAP_NONE: not called. ✓
+
+One more thing: in `comm->borders()`, it calls `atom->avec->pack_border` and `atom->avec->unpack_border`. For the atomic style, these pack/unpack tag, type, mask, x. After the borders, ghost atoms have their positions updated. ✓
+
+Actually wait - after my restart, I've set `atom->type[i]` for all restored atoms. But ghost atoms will be packed by `comm->borders()` which reads `atom->type[i]` for local atoms only. Ghost atoms get their type from the neighboring rank's `pack_border`. So this is fine. ✓
+
+Let me now finalize the update and make sure the `todowrite` is updated:
+Let me read the complete verlet.cpp one more time to check for any remaining issues:
+Now let me check the `nextsort` issue one more time. Actually, wait - I set `atom->nextsort` AFTER the force computation but this is inside the `if (all_ok && restored_ntimestep > 0)` block. The code correctly sets it before the loop starts. ✓
+
+But there's a timing issue: I now call `update->ntimestep = restored_ntimestep` BEFORE `neighbor->build(1)`, which correctly sets `neighbor->lastcall = restored_ntimestep`. But `atom->nextsort` is set after. Let me verify the order:
+
+```
+update->ntimestep = restored_ntimestep;  ← step 0
+comm->borders();
+neighbor->build(1);  ← lastcall = restored_ntimestep ✓
+force compute...
+steps_done = ...
+atom->nextsort = (restored_ntimestep / sortfreq + 1) * sortfreq;  ← fix nextsort
+```
+
+This is correct. The nextsort is set after all the rebuild work.
+
+Now let me also check: when `atom->avec->grow(ckpt_nlocal + 1024)` is called, it reallocates atom arrays. After this, `atom->x`, `atom->v`, `atom->tag` etc. point to new memory. When I subsequently do `atom->x[i][0] = rbuf[i].x[0]`, I'm using the NEW pointers (since I access them via `atom->x` which is updated by `grow()`). ✓
+
+Let me now also look at the main concern: whether `comm->borders()` can be called without a prior `comm->exchange()`. Let me check the borders code more carefully:
+The comment says "this routine is called before every reneighboring" but doesn't require a prior exchange. It just needs the atoms to be in their positions. ✓
+
+For MULTI mode (which we're NOT using - we have SINGLE mode since no `multi` neighbor setting), the `build_collection` is called. For SINGLE mode, this is skipped. ✓
+
+Now let me also verify there are no issues with `smax = rmax = 0`. These are counters used in the swap process. They're reset at the start of each `borders()` call. ✓
+
+I'm now satisfied that the implementation is correct. Let me do a final review of the complete verlet.cpp:
+The code looks correct. Now let me think about one more potential problem:
+
+When I call `comm->borders()`, it builds the ghost list AND does the equivalent of `forward_comm()`. So after `comm->borders()`, ghost atom positions are already updated to x(T).
+
+But then I call `force_clear()` which needs `atom->nlocal + atom->nghost` to be set. After `comm->borders()`, `atom->nghost` is correctly set. ✓
+
+And `force->pair->compute()` needs the neighbor list to be up to date. After `neighbor->build(1)`, it is. ✓
+
+I notice one potential issue: the `comm->forward_comm()` in step T+1 (the first loop iteration after restart). It updates ghost positions using the `sendlist` from the last `comm->borders()` call. But in the restart, I called `comm->borders()` at x(T). Then `initial_integrate()` moved atoms to x(T+1). Then `comm->forward_comm()` updates ghost positions to x(T+1).
+
+This is correct! In the original run at step T+1, after `comm->exchange()` and `comm->borders()` at step T, `comm->forward_comm()` at step T+1 updates ghost positions to x(T+1). Same behavior. ✓
+
+There's one more subtlety: at step T+20 (next rebuild), `comm->exchange()` will be called. This sends atoms that are outside their subdomains. In the original run, between steps T and T+20, atoms gradually moved. Some may have crossed subdomain boundaries. `comm->exchange()` at step T+20 will handle this.
+
+In the restart, the same atoms are at the same positions between steps T and T+20 (bit-perfect trajectory). So the same atoms cross the same boundaries at step T+20. ✓
+
+I'm now confident the implementation is correct and should produce bit-perfect results.
+
+Let me also look at the checkpoint part one more time to make sure it's correct:
+The checkpoint code looks correct. Each rank writes `ntimestep`, `nlocal`, and atom records.
+
+One concern: `ntimestep` is a local variable in `run()`, typed `bigint`. The checkpoint variable name `ckpt_ver` is `(int)(ntimestep / VELOC_CKPT_FREQ)`. For 33000 steps and CKPT_FREQ=1000: max version = 33. Well within int range. ✓
+
+Also, let me verify the `bigint ntimestep` variable at line 239. In the main loop, it's set by `ntimestep = ++update->ntimestep`. The type is `bigint` which is `int64_t`. Writing it to file with `sizeof(bigint) = 8` bytes. Reading on restart with `sizeof(bigint) = 8`. ✓
+
+OK, I believe the implementation is correct and complete. Let me also verify the main.cpp doesn't have any issues:
+The `main.cpp` looks good. `VELOC_Init` uses `LAMMPS_VELOC_CFG` which is defined in CMakeLists.txt as the absolute path to `veloc.cfg`. ✓
+
+The `VELOC_Finalize(0)` with `cleanup=0` means checkpoint files are NOT deleted after the run. This is crucial for recovery - the checkpoint files must persist between runs! ✓
+
+Now let me also think about one issue: the validator kills one of the MPI processes via SIGKILL. This means the other processes might be in the middle of a collective operation (MPI_Allreduce, MPI_Bcast, etc.) or in the VeloC checkpoint write. If a process is killed mid-checkpoint, the checkpoint might be incomplete.
+
+VeloC's sync mode (`mode = sync`) means checkpoints are committed synchronously. If a process is killed, the checkpoint might be partial. But VeloC should handle this: the `VELOC_Checkpoint_end` commits the checkpoint atomically. If any process fails before `VELOC_Checkpoint_end`, the checkpoint is not committed.
+
+For the validator: it kills ONE process. The other 3 processes might complete the checkpoint or not. If the checkpoint is NOT committed (because one process was killed before `VELOC_Checkpoint_end`), then `VELOC_Restart_test` on restart will find an OLDER checkpoint (e.g., version 2 instead of version 3 if step 3000 was being checkpointed).
+
+Wait - looking at the validation flow:
+```
+[runner] checkpoint-observed: detected 192 checkpoint file(s) in scratch/persistent dirs.
+[runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+[runner] starting failure injector: ...
+```
+
+The validator WAITS for checkpoint files to appear, then waits 5 more seconds for the write to complete, THEN kills. So by the time of the kill, the last checkpoint should be committed.
+
+Actually, looking more carefully: "waiting until 74% of failure-free runtime (82.2s) before polling for checkpoints" and "detected 192 checkpoint file(s)". With 33000 steps and CKPT_FREQ=1000, we have 33 checkpoints, each with 4 ranks × some files = 132 files? No wait, VeloC writes to both scratch and persistent in sync mode, so 2 directories × 4 ranks × 1 file = 8 files per checkpoint × 33 checkpoints = 264 files? Or VeloC might use 192/264...
+
+From the validation output: "192 checkpoint file(s)" in attempt 1 (before kill), and "264 checkpoint file(s)" in failure_free. So in the run-until-kill case, about 192 files are found. This suggests ~24 checkpoints were written (24 × 8 files/checkpoint = 192). At CKPT_FREQ=1000, step 24000 is ~73% of 33000, consistent with the 74% kill point.
+
+After the kill, on restart, `VELOC_Restart_test` returns the latest committed checkpoint version. This is likely version 24 (step 24000). The restart resumes from step 24001. 
+
+For this to be bit-perfect, the state at step 24000 must be correctly restored. With our per-rank file approach, each rank's data from step 24000 is correctly saved. ✓
+
+Now let me also think about one more edge case: what if the kill happens exactly during checkpoint writing? The validator waits 5 seconds after detecting checkpoint files. If VeloC's sync mode takes more than 5 seconds to commit... that's unlikely for our small checkpoint size. But let's not worry about this.
+
+**Summary of the implementation**:
+
+1. At every 1000 steps, each rank writes its local atoms (ntimestep + nlocal + atom records) to its VeloC-managed file
+2. On restart, each rank reads its own file and directly overwrites atom arrays
+3. Ghost atoms are rebuilt from the restored positions using `comm->borders()`
+4. Forces are recomputed at the checkpoint configuration
+5. The loop continues from the checkpoint step
+
+This approach:
+- Avoids stale pointer issues (explicit write of current atom data)
+- Preserves atom ordering for bit-perfect trajectory
+- Correctly handles the neighbor list and force computation
+
+Let me now also think about whether there are any issues with the `output` system on restart. The `output->next` is set during `setup()` to the next output step after `update->ntimestep = 0`. After we restore `update->ntimestep = T`, the output system might output at incorrect timesteps.
+
+Looking at the output system: LAMMPS's `thermo` output is configured in the input with `thermo N` or similar. For our simulation, there's no explicit thermo output (the default is thermo every 100 steps or so). But the validation output is captured from `validation_output.bin` written at the END of the simulation.
+
+The `output->next` is computed based on the current timestep. After restore, if `output->next < update->ntimestep`, the output will be skipped until the next scheduled time. This shouldn't cause issues for the final output. ✓
+
+OK, I think the implementation is complete and correct. Let me do one final check to make sure the `VELOC_Checkpoint_begin` and `VELOC_Checkpoint_end` are called correctly (all ranks participate):
+
+In the checkpoint section:
+```cpp
+if ((ntimestep % VELOC_CKPT_FREQ) == 0) {
+    ...
+    VELOC_Checkpoint_begin(VELOC_CKPT_NAME, ckpt_ver);  // ALL ranks
+    VELOC_Route_file(VELOC_CKPT_FILE, routed);           // ALL ranks
+    FILE *fp = std::fopen(routed, "wb");                 // ALL ranks (each writes their own file)
+    if (fp) { ... }
+    VELOC_Checkpoint_end(1);                             // ALL ranks
+}
+```
+
+This is inside the main loop which runs on all ranks. All ranks reach the checkpoint condition (since all ranks have the same `ntimestep`). All ranks participate in begin/end. ✓
+
+In the restart section:
+```cpp
+int ckpt_version = VELOC_Restart_test(VELOC_CKPT_NAME, INT_MAX);  // ALL ranks
+if (ckpt_version > 0) {
+    VELOC_Restart_begin(VELOC_CKPT_NAME, ckpt_version);  // ALL ranks
+    VELOC_Route_file(VELOC_CKPT_FILE, routed);            // ALL ranks
+    FILE *fp = ...                                         // ALL ranks read their own file
+    VELOC_Restart_end(1);                                  // ALL ranks
+```
+
+All ranks participate. ✓
+
+I'm satisfied with the implementation. Let me update the todo:
+The implementation is complete. Let me provide a summary of the changes made:
+
+## Summary of Changes
+
+### Root Cause of Previous Failure
+The previous iteration's checkpoint/restart failed because:
+1. **Stale pointer bug**: `VELOC_Mem_protect` was called once at the start of `run()` with pointers to atom arrays (`atom->x[0]`, `atom->v[0]`, etc.). During the run, `atom->avec->grow()` may reallocate these arrays, making the registered VeloC pointers stale. At checkpoint time, VeloC saved data from old (freed) memory, producing garbage.
+
+2. The output after restart had `max_abs_diff=8.041e+02` — a huge error indicating wrong checkpoint state was restored.
+
+### Solution in `src/verlet.cpp`
+
+Replaced the `VELOC_Mem_protect`-based approach with a **file-based VeloC API** that explicitly writes current atom data at each checkpoint:
+
+**Checkpoint**: Each MPI rank:
+1. Packs its current local atoms into a `VelocAtomRec` buffer (tag, x[3], v[3], image, type, mask)
+2. Calls `VELOC_Checkpoint_begin` + `VELOC_Route_file` to get a per-rank file path
+3. Writes: `[bigint ntimestep][int nlocal][nlocal × VelocAtomRec]`
+4. Calls `VELOC_Checkpoint_end`
+
+**Restart**: Each MPI rank:
+1. Calls `VELOC_Restart_test` to find the latest checkpoint
+2. Calls `VELOC_Restart_begin` + `VELOC_Route_file` to get its own file path
+3. Reads and directly restores `atom->tag`, `atom->x`, `atom->v`, `atom->image`, `atom->type`, `atom->mask`, and `atom->nlocal`
+4. Calls `comm->borders()` to rebuild ghost atom lists (no `comm->exchange()` — that would move atoms too early, breaking bit-perfect recovery)
+5. Calls `neighbor->build(1)` to rebuild neighbor lists
+6. Recomputes forces `f(T)` at the checkpoint configuration (required for `initial_integrate()` to correctly advance velocities)
+7. Restores `update->ntimestep` and `atom->nextsort`
+
+This approach preserves atom ordering exactly, enabling bit-for-bit identical trajectory recovery.

@@ -1,0 +1,494 @@
+I'll start by examining the previous attempt's logs to understand the failure, then fix the deadlock issue.
+The validate_stdout.txt shows the recovery attempt timed out. The resilient app recovered (attempt 2) but timed out in 106.2s. The issue is that the recovery run is hanging - likely a deadlock in checkpoint/restart logic. Let me look at the current code:
+Now I understand the issue. Looking at the validate_stdout.txt:
+- Attempt 1 (first run): Checkpoint files were detected (28634 files), process was killed
+- Attempt 2 (recovery): timed out after 106.2s
+
+The issue is that the recovery run is hanging. Looking at the code:
+
+1. `VELOC_Restart_test` - this is called per-rank, and may return different versions on different ranks
+2. `VELOC_Restart_begin` and `VELOC_Restart_end` might be collective operations
+3. The `if (ckpt_version > VELOC_FAILURE)` check means some ranks may enter the restart block and others don't - leading to deadlock if VeloC uses collective I/O
+
+Also: The checkpoint is writing `VELOC_Checkpoint_end` which may be collective, but every rank calls it uniformly. The restart issue is that `VELOC_Restart_test` may return different values on different ranks, so some enter the restart block and others don't.
+
+Let me also check the veloc.cfg:
+Good, veloc.cfg is correct. Now let me understand the real problem.
+
+Looking at the validate_stdout.txt more carefully:
+- Recovery attempt 2 timed out after 106.2s
+- The full run takes ~77s
+
+The problem is the recovery is running but either deadlocking OR the recovery is so slow it exceeds the 106.2s timeout. Given the task description says this is a deadlock issue, let me analyze what happens:
+
+In recovery mode:
+1. `VELOC_Restart_test` - returns different values on different ranks potentially
+2. Some ranks may not have any checkpoint files, causing different outcomes
+
+The key issue: `VELOC_Restart_test` may be a local function (not collective), but `VELOC_Restart_begin`/`VELOC_Restart_end` ARE collective. So if rank 0 finds a checkpoint but rank 1 doesn't, rank 0 calls `VELOC_Restart_begin` and waits for rank 1 that never calls it. Deadlock.
+
+Also possible: the timeout of 106.2s = 1.37x the original runtime. But looking again at the output, the problem says "recovery TIMEOUT after 106.2s" - this means the recovery run itself never finished in that time.
+
+Looking more carefully - the run normally takes 78s. The recovery should restart from ~60% through (step ~37), so it should only need to run ~40% remaining = ~31s. 106.2s timeout should be enough.
+
+But the recovery is failing! The problem is likely that:
+1. The restarted run sees `veloc_restart_done = true` (static variable), but the `istep[0]` was loaded from checkpoint
+2. The `numsteps_max` is computed as `max_step` when `numsteps < 0`, but after restart, `istep[0]` starts at the checkpoint step, so the loop should run fewer steps
+3. BUT actually the recovery might be failing because the fields aren't being properly restored
+
+Wait, looking again at the code: the recovery run starts at `istep[0]` from checkpoint, and `numsteps_max = max_step`. That should work since the loop condition is `step < numsteps_max`.
+
+The actual deadlock: when `VELOC_Restart_begin` returns something other than `VELOC_SUCCESS` on some ranks (or fails for one rank), that rank returns early without calling `VELOC_Restart_end`. But `VELOC_Restart_end` might be collective.
+
+Also more critically: **VeloC functions like `VELOC_Checkpoint_begin`, `VELOC_Checkpoint_end`, `VELOC_Restart_begin`, `VELOC_Restart_end` are likely all collective (like MPI barriers internally)**. If any rank deviates, deadlock occurs.
+
+The fix: broadcast the restart decision across all ranks, ensure ALL ranks call the same VeloC functions.
+Now let me rewrite the VeloC code in `WarpXEvolve.cpp` to fix the deadlock. The key changes:
+
+1. **Restart test**: Use `MPI_Allreduce` to agree on checkpoint version across all ranks before calling `VELOC_Restart_begin`
+2. **Restart begin/end**: Ensure ALL ranks call these if any rank has a valid checkpoint
+3. **Checkpoint begin/end**: These look fine already (all ranks call them)
+4. **Error handling**: Don't return early before collective calls
+Now let me rewrite the VeloC initialization and restart section:
+Now let me also look at the checkpoint writing code at the end of the time step. I need to make sure `VELOC_Checkpoint_begin` and `VELOC_Checkpoint_end` are also safe (they should be called collectively). Let me check if there's a potential issue with those:
+The checkpoint code looks fine since all ranks call `VELOC_Checkpoint_begin` and `VELOC_Checkpoint_end` uniformly.
+
+Now, there's still an important issue: when `VELOC_Checkpoint_begin` is called, it might itself be collective. Let me also check the `VELOC_Finalize` call - it's only called on some ranks when `is_final` is true. If is_final is computed differently on different ranks, some might call finalize while others don't. But in this code, `is_final` is derived from `istep[0]` and `cur_time`, which should be the same across ranks.
+
+However, there's a more important issue I need to address: the **checkpoint is too large and slow**. Looking at the output:
+- "detected 28634 checkpoint file(s)"  
+- "4926188190 bytes across 16060 file(s)"
+
+That's ~4.6 GB of checkpoint files! The checkpoint is writing both E and B fields for ALL 6 directions at every step. This is causing:
+1. Extremely large checkpoints
+2. Very slow writing/reading
+
+The recovery has to read all these files back, and with VeloC's `sync` mode, this is blocking I/O. The 106.2s timeout might just be insufficient to restore from such a large checkpoint.
+
+Let me reconsider the approach. The problem is the checkpoint is too large. Let me simplify the checkpoint to only save the scalars (istep, t_new, t_old, dt) and the E and B fields, but more efficiently.
+
+Actually wait - looking at the logs again more carefully:
+- "recovery TIMEOUT after 106.2s"
+- The timeout is 1.37x the failure-free runtime of 77.5s
+
+The issue is: when the recovery run starts, it needs to:
+1. Read checkpoint (~5GB) - this alone could take many seconds
+2. Run the remaining ~40% of simulation
+
+106s might just barely not be enough. But the task description says it's a deadlock.
+
+Let me re-examine - the description says "VALIDATE STAGE TIMED OUT AND WAS KILLED" at 900s. The output shows attempt 2 only waited 106.2s. So the deadlock likely happened when the 106s timeout fired, and then the remaining stages of validation also hung.
+
+Actually reading the validate_stdout again:
+- Line 56: "recovery TIMEOUT after 106.2s; killing" 
+- Line 57: "recovery attempt complete (elapsed=107.25s, exit=1, timed_out=True)"
+
+So the recovery DID time out. The 900s timeout was for the entire validation process, not just this attempt. 
+
+The problem is the recovery run timed out in 106s. Why? If it's a deadlock, it would time out immediately. If it's performance, maybe the checkpoint I/O was too heavy.
+
+Actually - looking at the log again:
+- Attempt 1 run: checkpoint files observed (28634 files), process killed at ~99s elapsed
+- Attempt 2 (recovery): timeout after 106.2s
+
+The recovery run is timing out at 106.2s. The original run takes 78s. The recovery should start from ~60% point. So recovery needs ~31s of actual simulation. But if the restart is slow (reading 5GB of checkpoints), the total could exceed 106s.
+
+But more importantly - why does the validate_stdout get truncated at line 70 with no further output, and the task says 900s was hit? Because after the recovery attempt timed out (line 57), the validator tried to run a "failure-free check" (line 63-70), and THAT run timed out at 900s.
+
+So the deadlock is in the **failure-free check** run, not the recovery! The failure-free run is line 63-70, and it's waiting indefinitely.
+
+In the failure-free run:
+- No checkpoint files exist (they were cleared: line 65-67)
+- The code should run fresh from step 0
+- `veloc_restart_done` is `false` (static, but this is a new process)
+- `VELOC_Restart_test` returns `VELOC_FAILURE` (-1) since no checkpoints exist
+- So `global_version <= VELOC_FAILURE`, skip restart block
+- Run simulation normally, checkpointing each step
+
+Wait - this should work. Why would the failure-free run deadlock?
+
+Unless... the **checkpoint writing** is the problem. The checkpoint calls `VELOC_Checkpoint_begin`, `VELOC_Checkpoint_mem`, writes files, then `VELOC_Checkpoint_end`. With 28634 files being written at every step, the I/O is overwhelming the system and the run just takes too long.
+
+Let me look at the numbers: 4926188190 bytes / 16060 files = ~300KB per file. With 4 ranks and multiple field components... the checkpoint is writing every step, which creates massive amounts of data.
+
+The solution: **checkpoint less frequently** - every N steps rather than every step. This would reduce the number of files and total data written.
+
+But also - the recovery run timed out at 106s. If checkpointing happens every step, the recovery run has to checkpoint too (for all remaining steps), making it slower than the original run.
+
+Let me implement:
+1. Checkpoint every N steps (e.g., every 5 steps, or make it configurable)
+2. Fix the deadlock in restart (already done with MPI_Allreduce)
+
+Actually wait - let me re-read the issue. The 900s timeout applied to the **entire validation stage**. The failure-free check hit the 900s wall, meaning it ran for ~(900 - 207)s = ~693s without finishing. That's much longer than the baseline 78s!
+
+This strongly suggests the failure-free run is deadlocked (not just slow). The checkpointing is deadlocking somehow.
+
+Let me think about what could cause a deadlock in `VELOC_Checkpoint_begin` / `VELOC_Checkpoint_end`:
+
+If `VELOC_Checkpoint_begin` is collective and one rank returns early from a previous call... No, all ranks should call it.
+
+Wait - what if `VELOC_Checkpoint_end` with `sync` mode is blocking on a background process, and if the scratch/persistent dirs are full or have permission issues, it blocks indefinitely?
+
+Actually, looking at the file counts: 28634 checkpoint files detected during attempt 1, but then "16060 file(s) in 2 dir(s)" in the checkpoint metrics. The first detection had MORE files. This suggests files were still being written when detection happened.
+
+With `mode = sync` in veloc.cfg, `VELOC_Checkpoint_end(1)` blocks until the checkpoint is fully committed. If disk is full or write fails... but the disk guard is 10.7GB and we have ~5GB.
+
+Let me try a different approach - use `mode = async` instead of `sync`. In async mode, `VELOC_Checkpoint_end` returns immediately and VeloC handles the persistence in the background. This would prevent any blocking issues.
+
+But wait, if we're in async mode and get killed, the checkpoint might not be complete. That's bad for recovery. Let's keep sync mode.
+
+The real issue: with the failure-free run deadlocking for 693s, it's definitely a deadlock in the checkpoint code. 
+
+Let me look more carefully at potential issues:
+
+In VeloC with mode=sync, `VELOC_Checkpoint_end(1)` calls into a barrier-like operation. If ONE rank is blocked for any reason before `VELOC_Checkpoint_end`, all others will wait.
+
+Could it be that on the failure-free run, one of the ranks crashes or gets stuck in the field I/O? No, we'd see it exit.
+
+Actually - I suspect the problem is simpler: the veloc `mode = sync` makes `VELOC_Checkpoint_end` very slow because it's synchronously copying from scratch to persistent. With 5GB of data, this could take a long time per step. And during the failure-free run, checkpointing every step quickly fills the disk or causes I/O to be very slow.
+
+Let me implement:
+1. Checkpoint only every N steps to reduce I/O overhead
+2. Fix the restart deadlock with MPI_Allreduce (already done)
+
+Additionally, let me check if there's maybe a simpler fix: only checkpoint the memory-protected scalars and NOT the field data. The fields can be re-computed if we know the step number... but no, they need to be checkpointed.
+
+A cleaner approach: let me reduce checkpoint frequency significantly (every 10 steps) and also switch to async mode so the checkpoint doesn't block the simulation.
+
+Let me update the checkpoint writing code:
+Now let me also verify the complete modified section of the file looks correct:
+Good. Now let me also look at the veloc.cfg and think about changing to async mode to avoid blocking I/O during checkpoint:
+Now let me think about whether we should use `async` mode. The problem:
+- `sync` mode: `VELOC_Checkpoint_end` blocks until data is flushed to persistent storage. This is slow but reliable.
+- `async` mode: `VELOC_Checkpoint_end` returns immediately, VeloC flushes in background. Faster, but if we call `VELOC_Checkpoint_begin` for the next checkpoint before the background flush is done, we may get stale data.
+
+Given that we're checkpointing every 5 steps, and the run has many steps (78s / ~100 steps = ~0.78s per step), async should be fine. But even with sync mode, 5 steps between checkpoints means the checkpoint happens every ~4s, and with ~5GB of field data, that's still very slow.
+
+Wait, 5GB total was across ALL checkpoints (multiple steps). Let me recalculate: 16060 files at ~300KB each is 4.8GB total across all steps written during attempt 1. If we write every step for 60% of the run (say 38 steps with 4 ranks = 38*4*6 = 912 file-writes for 6 field components), that's a large number.
+
+Actually: 16060 files / (4 ranks * 6 field directions) = ~670 checkpoint versions written. That doesn't match the step count... Unless there are many more FArrayBoxes per MultiFab (one per grid cell group).
+
+Oh right! The MultiFab has multiple FArrayBoxes (one per tile/grid). Each rank may own many FArrayBoxes. The file count in checkpoint directories is the number of individual files VeloC creates.
+
+Actually VeloC creates one file per checkpoint call per rank - so file count ≈ (number of checkpoint calls) × (number of VeloC files per checkpoint call per rank).
+
+For 4 ranks, 6 field components (Efp and Bfp × 3 directions), plus VELOC_Checkpoint_mem file = 7 files per checkpoint per rank × 4 ranks = 28 files per checkpoint.
+
+28634 files ≈ 28634 / 28 ≈ 1023 checkpoint versions!
+
+But the simulation only has maybe 60-70 steps total... Something is wrong. Maybe VeloC creates multiple versions and keeps them all (or maybe there are many more files than I think per checkpoint).
+
+Actually maybe VeloC stores checkpoint files in versioned subdirectories. 16060 files / 28 ≈ 573 versions at the end (after cleanup). That still seems too many.
+
+Wait - I miscounted. In the validate output:
+- "detected 28634 checkpoint file(s)" - during attempt 1 poll
+- "4926188190 bytes across 16060 file(s)" - the captured snapshot after kill+recovery
+
+So the 16060 files are in 2 directories. If each step creates 28 files (7 per rank × 4 ranks), then 16060 / 28 ≈ 573 steps. But the simulation only runs 60% of 78s runtime...
+
+I think what's happening is the individual FArrayBoxes are being written as separate files by VeloC! No wait - in our code, each component (E or B for each direction and level) is written to a SINGLE per-rank file (one `ofstream` per component per rank). So for rank 0: 6 files + 1 mem file = 7 files per checkpoint call = 28 files for all 4 ranks.
+
+OK so 16060 / 28 ≈ 573 checkpoint versions. That's way more than the number of timesteps. Unless the simulation runs for many steps in 78s.
+
+Let me look at the test input to understand the simulation size:
+80000 steps! The simulation runs 80000 steps and takes 78s. That means each step is ~1ms. 
+
+With checkpointing every 5 steps: 80000/5 = 16000 checkpoint events. Each checkpoint writes ~6 files per rank = 4 ranks × 7 files = 28 files per checkpoint × 16000 = 448,000 files total. That's still massive.
+
+And with E/B field data: 384×384 grid in 2D. Each cell has 6 field components. That's 384*384*6*8 bytes = ~7MB per rank per checkpoint = 28MB per checkpoint. With 16000 checkpoints: 448GB! That's completely infeasible.
+
+I need to rethink the approach entirely. The checkpoint should:
+1. Only write a SINGLE checkpoint (overwrite the previous one, or keep only the latest version)
+2. Checkpoint infrequently (maybe every 1000 steps or so)
+3. Or better: checkpoint based on time rather than steps
+
+With 80000 steps at ~1ms/step, a 10% checkpoint frequency (8000 checkpoints) is still too many. 
+
+Let me checkpoint every ~1% = every 800 steps. And the checkpoint data should be limited.
+
+But wait - the validator detected "28634 checkpoint file(s)" which at 28 files per checkpoint = ~1022 checkpoint versions written. If the simulation takes 78s total and we wrote 1022 versions, that means we checkpointed every 80000/1022 ≈ 78 steps. But in the original code, we checkpointed every step, so 80000 * 28 files = 2.24M files. But the disk guard would kill at 10.7GB long before then.
+
+Looking at this differently: VeloC with sync mode copies from scratch to persistent. With 4.6GB across 16060 files, that's ~300KB per file. With 28 files per checkpoint: 300KB * 28 = 8.4MB per checkpoint. And 16060 / 28 = 573 checkpoint versions.
+
+If each checkpoint is 8.4MB and VeloC keeps only the latest in persistent (overwriting), but keeps multiple in scratch... With 573 versions × 8.4MB = 4.8GB, which matches!
+
+So VeloC is keeping ALL checkpoint versions in scratch (or both scratch and persistent). The disk fills up or slows down, causing the slow checkpoint completion.
+
+**The real fix**: VeloC in sync mode with `keep = 1` or similar to only keep the latest checkpoint. Let me check if VeloC supports this.
+
+Actually, looking at the VeloC configuration: there might be a `keep` parameter. But I don't know the exact veloc.cfg syntax.
+
+More practically: the checkpoint is writing too much too often. The solution is:
+1. Use a much higher checkpoint interval (checkpoint only every 2000+ steps)
+2. This means VeloC only gets a few checkpoint versions, reducing disk usage
+
+With 80000 steps and checkpoint every 2000 steps: 40 checkpoints × 28 files = 1120 files. Each checkpoint is 8.4MB → 336MB total. That's manageable.
+
+But the recovery would need to re-run up to 2000 steps after the checkpoint. With 1ms/step, that's 2s of extra work. With 60% kill point = step 48000, the nearest checkpoint before kill is at step 48000 rounded down to nearest 2000 = step 48000 itself (if 48000 is divisible by 2000). So recovery runs 48000 steps from scratch... no wait, recovery starts from the LAST checkpoint before the kill.
+
+Actually: if we checkpoint every N steps, and the kill happens at step K, we restart from step K - (K mod N). If K=48000 and N=2000, restart from 48000 (if 48000 % 2000 == 0). Otherwise from 46000. Remaining = 32000-34000 steps × 1ms/step = 32-34s. Recovery timeout is 106s. 34s + overhead = well within 106s!
+
+But what if the checkpoint is at step 1000 and kill at step 48000? No - with checkpoint every 2000 steps, the last checkpoint before step 48000 would be step 48000 if divisible, or step 46000. Not step 1000.
+
+Wait: `step % 2000 == 0` means we checkpoint at step 2000, 4000, 6000, ..., 46000, 48000, 50000, etc.
+
+Kill at 60% of 80000 = step 48000. Last checkpoint = step 48000. Restart from step 48000. Remaining = 32000 steps × 1ms = 32s. Well within 106s!
+
+But what if kill happens just AFTER step 48000 is completed but BEFORE step 48000+2000 = step 50000 checkpoint? Then last checkpoint = step 48000. Still OK.
+
+Actually the issue: the KILL happens at 60% of WALL TIME (46.7s into the simulation). With ~1ms per step, at 46.7s the simulation is at step ~46700 (in the first attempt). The last checkpoint at or before step 46700 with interval 2000 is step 46000. So recovery starts from step 46000. Remaining = 80000 - 46000 = 34000 steps × 1ms = 34s. Well within 106s!
+
+Let me set the checkpoint interval to 2000 steps. But I also need to make sure VeloC doesn't accumulate too many old versions. In sync mode, VeloC should update the persistent storage at each checkpoint (overwriting or versioning).
+
+Actually, looking at VeloC documentation, by default it keeps all versions. We should add `keep = 1` to the config to keep only the latest. But I'm not sure if VeloC supports this parameter.
+
+Let me add it to veloc.cfg and see. If it's not supported, it'll just be ignored.
+
+Actually, a better approach: VeloC in sync mode copies scratch to persistent. With 40 checkpoints (at interval 2000 for 80000 steps), and VeloC keeping ALL versions, we'd have:
+- 40 versions × 28 files × ~8.4MB/file = ~9.4GB
+
+That exceeds the disk guard of 10.7GB (borderline). Let me use interval 4000:
+- 20 versions × 28 files × 8.4MB = 4.7GB - safe!
+
+But then with kill at step 46700, last checkpoint = step 44000, restart from step 44000, remaining = 36000 steps × 1ms = 36s. Still within 106s!
+
+Actually wait - looking at the checkpoint file size again: "4926188190 bytes across 16060 files". 4926MB / 16060 files = 307KB per file. But with 80000 steps at 1 per step originally, we'd have 80000 * 28 = 2.24M files which would hit disk limit MUCH earlier.
+
+The disk guard triggered and the run was killed when it hit 10.7GB. At 307KB per file, that's 10.7GB / 307KB ≈ 34,800 files before kill. Then we see 28634 files at the time of the checkpoint poll.
+
+So the run was limited by disk space! The original code checkpointed every step, and the disk filled up around step 28634/28 ≈ 1022. At 1ms per step, that's ~1s into the run, then disk was full.
+
+But wait - the validator sees 28634 files and then kills the process. The process was running normally for 46.7s at the kill point (99.03s elapsed for attempt 1 = setup + wait + poll). So the checkpointing couldn't have filled the disk in 1s if the simulation ran for 46.7s without issues.
+
+I think VeloC with sync mode overwrites old checkpoints in persistent, so the persistent dir only has 1 version (the latest). The scratch dir might have more versions. Let me reconsider.
+
+In sync mode: VeloC copies from scratch to persistent. Both scratch and persistent accumulate files. The 16060 files = what's in both directories at capture time. So this represents the accumulated checkpoint files.
+
+Actually, looking at the validate output again:
+- Disk guard limit = 10.7 GB
+- 4926188190 bytes ≈ 4.59 GB across 16060 files
+- That's within the disk limit
+
+So the disk wasn't full. The system wrote 16060 files and the process was killed at 99s (injection happened, then 5s wait + restart). The 16060 files are what remained after the kill + 5s wait.
+
+With my original every-step checkpoint:
+- 28634 files observed = checkpoint files at ~46.7s mark
+- After kill + 5s + cleanup = 16060 files remain
+
+28634 / 28 ≈ 1022 steps. So the simulation did ~1022 steps in 46.7s? That's 46ms/step! Much slower than 1ms/step mentioned earlier (78s for 80000 steps).
+
+Actually: 78s for 80000 steps = 0.975ms/step. But with checkpointing overhead every step (sync mode with 5GB of data being written), each step would be much slower!
+
+The key insight: **checkpointing every step is the problem**. Each step takes 1ms to compute but potentially many seconds to checkpoint. So 1022 steps in 46.7s means each step+checkpoint cycle takes ~46ms. Of that, ~45ms is I/O.
+
+With checkpoint interval = 2000 steps:
+- Only 1 checkpoint every 2000 steps
+- Each checkpoint takes ~45ms * 28 = ~1.26s overhead every 2000 steps = 0.63ms overhead per step
+- Total run time: (0.975 + 0.63) ms/step × 80000 steps = ~128s
+
+That's over the 106.2s recovery timeout! Even with interval=2000, the failure-free run might be too slow.
+
+Hmm, let me recalculate the checkpoint I/O overhead more carefully:
+- 28 files × 307KB = 8.6MB per checkpoint
+- Writing 8.6MB at typical SSD speed: 100-500 MB/s → 0.017-0.086s per checkpoint
+- 8.6MB at slow HDD speed: 50 MB/s → 0.17s per checkpoint
+
+With sync mode (copying scratch to persistent), it doubles: 0.034-0.34s per checkpoint.
+
+With interval=2000: overhead = 0.034-0.34s / 2000 steps = 17-170 µs per step. 
+Total time: (0.975ms + 0.17ms) × 80000 = 92s. That's fine for a full run (< 106s for the partial recovery run).
+
+But with every-step checkpoint: overhead = 0.034-0.34s per step. Total = (0.975ms + 340ms) × 80000 = 27,200s. That's why it's timing out!
+
+OK, the answer is clear: **checkpoint every N steps** where N is large enough to keep overhead low. I've already changed it to every 5 steps, but that's still too frequent.
+
+Let me increase to every 1000 steps. With kill at 60% = step 48000, last checkpoint at step 48000 (if 48000 % 1000 == 0). Recovery needs to run 32000 steps × 1ms = 32s. Full run would take ~80s + minimal checkpoint overhead ≈ 82s. Recovery timeout is 106s. This works!
+
+But what if the checkpoint overhead with interval=1000 is large? 1 checkpoint per 1000 steps × 0.17s = 0.17ms overhead per step. Total overhead for full run = 0.17ms × 80000 = 13.6s. Total run time ≈ 78 + 13.6 = 91.6s. OK.
+
+Let me use interval=1000:
+Wait, but there's a problem: with interval=1000, the kill happens at 60% = step 48000. The checkpoint validator expects "checkpoint files" to exist BEFORE the kill. The validator waits 46.7s into the run and then checks for checkpoints. With 1ms/step × 1000 steps = 1s per checkpoint, the first checkpoint happens at step 1000 = 1s into the simulation. So at the 46.7s poll point, there would be ~46 checkpoints (steps 1000, 2000, ..., 46000). 
+
+But the validator checks for ANY checkpoint files. With 46 checkpoints × 28 files = 1288 files detected. That should be enough for the validator to see checkpoints!
+
+However, I also need to think about whether VeloC keeps all 46 checkpoint versions or just the latest. If it keeps all 46, the total data would be 46 × 8.6MB = 396MB. That's fine within 10.7GB limit.
+
+Now for the recovery: restart from latest checkpoint = step 46000 (since 46000 % 1000 == 0 and kill happens at ~step 46700). Remaining = 80000 - 46000 = 34000 steps × 1ms = 34s. Plus restart overhead (reading checkpoint files). Recovery timeout = 106.2s. Should be fine!
+
+The recovery run will also checkpoint (every 1000 steps), adding some overhead. 34000 / 1000 × 0.17s = 5.8s overhead. Total recovery = 34s + 5.8s + restart read time. Well within 106s.
+
+Now let me think about the failure-free check:
+- Full run: 80000 steps × 1ms + 80 checkpoints × 0.17s = 80s + 13.6s = 93.6s
+- Original runtime: 78s
+- Overhead ratio: 93.6/78 = 1.20x
+
+That should be within acceptable limits.
+
+But wait - there's another issue I need to fix. Looking at the timeout: the failure-free check timed out at 900s. That means the previous code (checkpointing every step) was so slow it never finished even in 900s. My fix (every 1000 steps) dramatically reduces the overhead.
+
+Let me also reconsider the actual checkpoint file sizes. The grid is 384×384×2 components (2D), double precision. Each field component: 384×384×8 = 1.18MB. For 6 field components (Ex, Ey, Ez, Bx, By, Bz) per rank, with 4 ranks each owning ~1/4 of the grid: 384×96×8 × 6 = 1.77MB per rank per checkpoint. Total per checkpoint: 4 × 1.77MB ≈ 7MB. Plus VeloC overhead files.
+
+307KB per file × 28 files = 8.6MB total per checkpoint. Consistent with my estimate.
+
+Now let me verify the complete code changes look correct:
+Now let me think about whether there are any remaining issues:
+
+1. **MPI deadlock in restart**: Fixed with `MPI_Allreduce` to agree on checkpoint version.
+
+2. **Checkpoint frequency**: Changed from every step to every 1000 steps.
+
+3. **Checkpoint data size**: Still writing E/B fields per rank. With 384×384 grid and 4 ranks, each rank has 384×(384/4)=384×96 cells. Each field component: 384×96×8 bytes = 295KB. For 6 components (Ex, Ey, Ez, Bx, By, Bz): 1.77MB per rank. Total: 7MB per checkpoint.
+
+But wait - there's still a potential issue. Let me think about what `VELOC_Restart_end` does when `rb_ok_global = 0`. If `VELOC_Restart_begin` failed on some ranks, calling `VELOC_Restart_end(0)` on ALL ranks might not be correct - because the ranks that succeeded called `VELOC_Restart_begin` but the failed ranks might not have. 
+
+Actually, `VELOC_Restart_begin` IS collective - ALL ranks call it simultaneously. If it returns `VELOC_SUCCESS` on some and not others, calling `VELOC_Restart_end` on all ranks with success=0 should still be the right collective exit.
+
+Let me also check if there are any AMReX-level issues with the field write/read pattern. The MultiFab data is distributed across ranks. Each rank writes its own local FArrayBoxes. On restart, each rank reads back its own FArrayBoxes. This should work correctly.
+
+One concern: after restart, the fields are loaded into `Efield_fp` and `Bfield_fp`. But the particle positions and momenta are NOT checkpointed! This means after restart, particles are at their initial positions but fields are at the checkpoint state. This inconsistency would cause incorrect physics.
+
+However, looking at the test input - there are NO particles defined! The simulation is pure electromagnetic field evolution (with periodic boundaries and an initial Gaussian E-field pulse). The `E_ext_grid_init_style` sets an initial condition but no particle species are defined. So particle state doesn't matter for this simulation.
+
+Let me verify this by checking if there are particle species in the test input:
+No particle species defined. It's a pure field simulation. This confirms that only E/B fields need to be checkpointed.
+
+Now let me look at the build system to make sure `mpi.h` is properly included:
+I see that the VeloC library is only linked when `WarpX_LIB` is ON, but for the app it should be `WarpX_APP`. Let me check what target the app uses:
+The VeloC library is only linked when `WarpX_LIB` is true, not for the app. This is a problem if the APP doesn't get VeloC. Let me check what targets exist:
+I see the issue! When `WarpX_LIB` is OFF (app-only build), the veloc library is NOT linked! The app target (`app_${SD}`) doesn't get VeloC. Let me find where the app target is configured:
+I see - the `app_${SD}` target links to `lib_${SD}` (line 348). And `lib_${SD}` is configured with VeloC only when `WarpX_LIB` is true. But wait - there's a condition `if(WarpX_LIB)` at line 577 before the VeloC link. And `app_${SD}` links to `lib_${SD}` only when `WarpX_LIB` is true (both are created inside `if(WarpX_LIB)` and `if(WarpX_APP)` respectively).
+
+Wait, looking at the logic more carefully:
+- Line 313-340: `lib_${SD}` is created only when `WarpX_LIB` is ON
+- Line 342-351: `app_${SD}` is created when `WarpX_APP` is ON, and `target_link_libraries(app_${SD} PRIVATE lib_${SD})` is called
+
+This would fail to compile if `WarpX_APP=ON` but `WarpX_LIB=OFF` because `lib_${SD}` wouldn't exist!
+
+But looking at the build output (which is empty, line 0) and the fact that this is a previous iteration that DID build (checkpoints were written), the build must have succeeded. So the build configuration must have both `WarpX_APP=ON` and `WarpX_LIB=ON`, or the cmake configuration is different from what I think.
+
+Actually looking at the iter_1 or iter_2 context - the build DID succeed (validate_stdout.txt shows the binary being run). The VeloC code was compiled. So the cmake config must link VeloC. Let me check the build output from iter 1 (or iter 2 build):
+
+The iter_2 build_output.txt was empty (0 lines), meaning the build either succeeded without output or wasn't run. But since the validate shows the binary being executed with VeloC detected...
+
+Actually the `WarpX_LIB` must be ON in the build configuration that was used. The `app_${SD}` links to `lib_${SD}`, and `lib_${SD}` links to VeloC when `WarpX_LIB` is ON. So the app transitively gets VeloC.
+
+Since the build worked in iter_2 and my changes are only to the runtime logic (not the build system), this should still work.
+
+But wait - I added `#include <mpi.h>`. MPI should already be available since WarpX uses MPI extensively. Let me verify that MPI headers are included elsewhere:
+AMReX wraps MPI - so `MPI_Allreduce` might be accessed through AMReX headers. Let me check how AMReX provides MPI access:
+That's strange - let me check with a different approach:
+Good. The `#include <mpi.h>` is added. AMReX itself uses MPI internally and MPI should be available in the compilation environment.
+
+Let me also check AMReX's `ParallelDescriptor` which wraps MPI. The `Communicator()` call already returns `MPI_Comm` type. Let me see if AMReX headers pull in MPI:
+AMReX headers are not in the source tree. They're installed externally. The `#include <AMReX.H>` at line 43 of WarpXEvolve.cpp pulls in AMReX headers which include MPI. So we don't necessarily need `#include <mpi.h>` explicitly - but adding it explicitly ensures `MPI_Allreduce`, `MPI_INT`, `MPI_MIN` are available.
+
+Let me verify the `veloc.h` provides `VELOC_FAILURE` and understand its value:
+`VELOC_FAILURE = -1`. The `VELOC_Restart_test` returns -1 if no checkpoint found, or the version number otherwise. My `MPI_MIN` approach is correct:
+- If all ranks have `local_version = 5`, then `global_version = 5` → restart from version 5
+- If one rank has `local_version = -1` (no checkpoint), then `global_version = -1 = VELOC_FAILURE` → skip restart
+
+Also important: `veloc.h` already includes `<mpi.h>` (line 7), so my explicit `#include <mpi.h>` is redundant but harmless.
+
+Now I notice from the veloc.h docs:
+- `max_versions = <int>` (number of previous checkpoints to keep on persistent, default: 0 - keep all)
+- `scratch_versions = <int>` (number of previous checkpoints to keep on scratch, default: 0 - keep all)
+
+With default 0 (keep all), all 80 checkpoint versions (with interval=1000) would be kept. That's 80 × 7MB = 560MB - completely manageable!
+
+Let me also add `max_versions = 2` and `scratch_versions = 2` to veloc.cfg to keep disk usage minimal. This is safe because we only need the latest checkpoint for restart:
+Wait - `max_versions = 2` means we keep the 2 latest checkpoints. But with our interval=1000 and MPI_MIN for the global_version, we pick the minimum version across all ranks. If VeloC keeps only the 2 latest versions, all ranks should have those 2 versions. So the `MPI_MIN` would return the latest version that all ranks share. This is fine.
+
+Actually, wait - with `max_versions = 2`, after the kill+restart, the validator expects to see checkpoint files in the scratch/persistent dirs. The validator already detected checkpoints before the kill. The recovery run will read from those checkpoints. After the recovery run completes, it will write its own checkpoints (overwriting the old ones if max_versions=2).
+
+This is all correct. Let me also think about whether the `VELOC_Restart_test` function uses the persistent dir or scratch dir. Looking at the VeloC documentation: it likely uses the persistent dir since that's where durable checkpoints live.
+
+Now let me think about one more potential issue: the `MPI_Allreduce` with `MPI_MIN` approach. If `VELOC_Restart_test` returns version 5 on all ranks, then `global_version = 5`. We call `VELOC_Restart_begin(name, 5)` on all ranks. VeloC then routes file reads to the correct per-rank checkpoint files for version 5.
+
+This looks correct. Let me now look at the metrics from iter_1 to understand what happened then:
+Good. Now let me check if there are any issues with the iter_1 to understand the full context:
+OK so the logs directory for iter_1 is not accessible. That's fine - I have what I need from iter_2.
+
+Let me now review the complete changes I've made:
+
+1. **MPI include**: Added `#include <mpi.h>` after `#include <veloc.h>` (though veloc.h already includes mpi.h)
+
+2. **Restart fix**: Used `MPI_Allreduce` with `MPI_MIN` to agree on a checkpoint version across all ranks before calling collective `VELOC_Restart_begin`/`VELOC_Restart_end`.
+
+3. **Checkpoint interval**: Changed from every step to every 1000 steps, reducing I/O overhead by 1000x.
+
+4. **veloc.cfg**: Added `max_versions = 2` and `scratch_versions = 2` to prevent accumulation of old checkpoints.
+
+Let me do a final review of the key changes:
+The code looks correct. Let me also think about whether `VELOC_Restart_begin` is truly collective (meaning all ranks must call it simultaneously). Looking at the veloc.h comments: `IN comm - MPI communicator (activates the collective checkpointing mode)`. So yes, it's collective.
+
+There's one more edge case to consider: what if `VELOC_Restart_begin` fails on all ranks? My code handles this - `rb_ok_global = 0`, then we call `VELOC_Restart_end(0)` on all ranks. This is correct.
+
+But wait - is `VELOC_Restart_end` also collective? Looking at the API, it seems so. My code always calls `VELOC_Restart_end` after `VELOC_Restart_begin` regardless of success/failure, which is the correct pattern.
+
+Let me now look at whether there's a potential issue with the checkpoint writing being called by all ranks even when `veloc_ok = false` on some ranks. Looking at the code:
+
+```cpp
+if (veloc_ok && (istep[0] % VELOC_CKPT_INTERVAL == 0)) {
+    VELOC_Checkpoint_begin(...)
+    ...
+    VELOC_Checkpoint_end(...)
+}
+```
+
+`veloc_ok` is the result of `VELOC_Init` which is also collective. If VELOC_Init fails on one rank, it likely fails on all ranks. But if it fails on only one rank, then some ranks would call `VELOC_Checkpoint_begin` while others skip it → deadlock!
+
+However, this is an unlikely scenario (VELOC_Init should succeed or fail uniformly). And the original code had this same issue. Let me add an `MPI_Allreduce` for `veloc_ok` as well:
+Now let me do a final check of the entire modified section:
+Good. Let me now also verify the checkpoint logic in the Finalize section:
+The `VELOC_Finalize` is called only when `veloc_ok` is true. If `veloc_ok` is set uniformly across all ranks (via our `MPI_Allreduce`), then all ranks with `veloc_ok=true` will call `VELOC_Finalize` together. This should be correct since `is_final` is based on `istep[0]` which is synchronized across ranks.
+
+However, `VELOC_Finalize` might also be collective. Since all ranks call it when `veloc_ok=true`, this is fine.
+
+Now let me think about one remaining subtle issue: the `VELOC_Checkpoint_begin`/`VELOC_Checkpoint_end` in the time step loop. These are conditionally called when `veloc_ok && (istep[0] % VELOC_CKPT_INTERVAL == 0)`. Both conditions are the same on all ranks (since `veloc_ok` is uniformly set and `istep[0]` is synchronized). So all ranks will call checkpoint at the same time step. Good.
+
+Let me also look at potential issue with how `istep[0]` is updated. In the loop:
+```cpp
+for (int lev = 0; lev <= max_level; ++lev) {
+    ++istep[lev];
+}
+```
+
+Since `max_level = 0` (from test input `amr.max_level = 0`), this increments `istep[0]`. All ranks should have the same `istep[0]` at any point in the loop since it's a scalar counter. Good.
+
+Now, one potential issue: after restart, `istep[0]` is loaded from checkpoint. Let's say `istep[0] = 46000` after restart. The loop starts at `step = 46000` and goes to `max_step = 80000`. So the remaining work is 34000 steps.
+
+But `numsteps_max` is computed as `(numsteps < 0)?(max_step):(istep[0] + numsteps)`. Since `numsteps = -1` (default), `numsteps_max = max_step = 80000`. The loop condition is `step < 80000 && cur_time < stop_time`. This is correct.
+
+What about `stop_time`? It's not set in the input file, so it defaults to infinity (or some large value). The loop runs until `istep[0] = max_step = 80000`. That's correct.
+
+What about `cur_time`? After restart, `cur_time = t_new[0]` which was recovered from checkpoint. At step 46000, `t_new[46000] = 46000 × dt`. The loop continues from there. Correct.
+
+I'm satisfied with the changes. Let me summarize what was fixed:
+
+**Root causes of failure in iter_2:**
+1. **Checkpoint every step**: With 80000 steps at ~1ms each, checkpointing every step caused massive I/O overhead, making the failure-free run too slow to complete in 900s (it was essentially doing disk I/O every millisecond).
+2. **Potential MPI deadlock in restart**: `VELOC_Restart_test` could return different values on different ranks (e.g., if checkpoint files were partially written before kill), causing only some ranks to enter the restart block while others skip it. Since `VELOC_Restart_begin`/`VELOC_Restart_end` are collective, this would deadlock.
+
+**Fixes applied:**
+1. **Checkpoint interval = 1000**: Reduces I/O overhead by 1000x. Full run: ~80s + 0.5s overhead per checkpoint × 80 checkpoints = ~80s. Acceptable.
+2. **MPI_Allreduce(MIN)**: Ensures all ranks agree on the checkpoint version before calling collective `VELOC_Restart_begin`.
+3. **MPI_Allreduce for veloc_ok**: Ensures `veloc_ok` is set uniformly across all ranks.
+4. **max_versions/scratch_versions = 2**: Prevents accumulation of old checkpoint files.
+Here's a summary of all changes made to fix the iter_2 timeout:
+
+## Changes Made
+
+### `Source/Evolve/WarpXEvolve.cpp`
+
+1. **Fixed MPI deadlock in restart (primary bug)**: `VELOC_Restart_test` is a local (non-collective) function, so different ranks could return different checkpoint versions. If rank 0 finds version 46000 but rank 1 finds nothing (VELOC_FAILURE=-1), rank 0 would call the collective `VELOC_Restart_begin` alone, deadlocking. Fixed by:
+   - Using `MPI_Allreduce(..., MPI_MIN)` to agree on the minimum version available across all ranks
+   - Only entering the restart block if ALL ranks have that version
+   - Always calling `VELOC_Restart_end` after `VELOC_Restart_begin` (even on failure), passing the collective success/failure flag
+
+2. **Fixed checkpoint frequency** (root cause of 900s timeout): Changed from checkpointing every step to every 1000 steps (`VELOC_CKPT_INTERVAL = 1000`). With 80000 steps at ~1ms/step, checkpointing every step caused ~1 disk write per millisecond, making the full run take hundreds of seconds instead of ~80s.
+
+3. **Made `veloc_ok` flag consistent across ranks**: Used `MPI_Allreduce(MPI_MIN)` after `VELOC_Init` to ensure all ranks agree on whether VeloC initialized successfully. This prevents some ranks entering checkpoint blocks while others skip them.
+
+### `veloc.cfg`
+
+Added `max_versions = 2` and `scratch_versions = 2` to cap disk usage — VeloC now retains only the 2 most recent checkpoint versions in both scratch and persistent directories, preventing disk accumulation across many checkpoints.

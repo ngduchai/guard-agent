@@ -1,0 +1,558 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+Now I can see the key issue. The build passed, the checkpoints were created (4 files), and the recovery ran with exit_code=0. But the output is **incorrect** - the recovered run produces wrong results (`max_abs_diff=1.021e+03`). This means the recovery is not properly resuming from the checkpoint state - it's likely restarting from scratch instead.
+
+Let me examine the current code:
+Now I understand the problem well. Let me analyze the failure:
+
+1. **Checkpoints ARE created** (4 files, 176 bytes total)
+2. **Recovery runs** (exit_code=0) 
+3. **But the output is WRONG** - `max_abs_diff=1.021e+03`
+
+The key issue is: **The recovery run is not actually resuming from the checkpoint**. Looking at the code, the restart check uses `VELOC_Restart_test("athena_ckpt", INT_MAX)` which should find the checkpoint, but there's likely a problem with how the restart is implemented.
+
+The critical problem I see: After `Initialize(0, pinput)` (which sets up ICs from scratch), the restart recovery happens. But **after the restart**, when `pouts->MakeOutputs(pmesh, pinput)` is called (Step 7), it will write an initial output at the restored time. And then the time loop resumes from the restored time. This might be working...
+
+But wait - the checkpoint only saves `u` (conserved variables at the time step), but **does not save `u1` and `u2`** (the Runge-Kutta stage arrays), nor does it save anything related to the output state. More critically, after restart the output system needs to be told to resume from the right output file counter.
+
+Let me look at what data exists in the checkpoint (176 bytes / 4 ranks = 44 bytes per rank). That seems very small - just the header (4 doubles/ints) + block data. But with 4 ranks doing 4 blocks, each block would be very small.
+
+Actually, 176 bytes across 4 files = 44 bytes per file. A header is: `double(8) + double(8) + int(4) + int(4) = 24 bytes`. Then per-block: `int64(8) + int64(8) + int64(8) + int(4) + int(4) = 32 bytes` + actual data. That doesn't add up to just 44 bytes. So maybe the checkpoint files only contain the memory-protected sentinel (3 doubles = 24 bytes per file).
+
+Wait - `VELOC_Checkpoint_mem()` is called after `veloc_write_state()`. The `VELOC_Route_file` creates a separate file. The 176 bytes / 4 = 44 bytes per rank might be just the VeloC memory checkpoint (3 doubles = 24 bytes + VeloC overhead). The routed state file might not be getting captured.
+
+The core problem: **`VELOC_Route_file` during checkpoint needs to be read back via `VELOC_Route_file` during restart** - but when `VELOC_Restart_begin` is active, `VELOC_Route_file` gives you the path to the restored file. However, the file path resolution might be different.
+
+Let me think about this more carefully. The real issue is likely that only the memory-protected `veloc_scalars` (which only contains time/dt/ncycle scalars) is being restored - but **the actual hydro `u` arrays** (the bulk simulation state) need to be recovered via `veloc_read_state()`.
+
+Looking at the restart logic again:
+1. `VELOC_Restart_begin` - starts restart
+2. `VELOC_Recover_mem()` - restores `veloc_scalars[3]` 
+3. `veloc_read_state()` - tries to read from `VELOC_Route_file`
+
+The issue is that `VELOC_Route_file` during a restart should return the path to the checkpoint file. But the checkpoint files stored are only 44 bytes each - that's just the memory region, not the routed file. The routed file (`athena_state_X.bin`) with the actual hydro data may not be getting captured in the checkpoint.
+
+Actually, looking more carefully at the checkpoint size: 176 bytes / 4 = 44 bytes. The VeloC memory format saves 3 doubles = 24 bytes. But VeloC also writes metadata. If the routed file contained actual data, it would be much larger.
+
+The most likely issue is that `VELOC_Route_file` is failing during checkpoint OR the routed file is not being properly included in the checkpoint. Let me look at how VeloC file routing works.
+
+With VeloC, `VELOC_Route_file` during checkpoint returns a path in the scratch directory where you write your data. Then `VELOC_Checkpoint_end(1)` causes VeloC to move/copy that to the persistent directory. During restart, `VELOC_Route_file` returns the path to the restored file.
+
+But there's a timing issue in the code: `VELOC_Checkpoint_mem()` is called AFTER `veloc_write_state()`. The `VELOC_Checkpoint_mem()` may be overwriting or replacing the memory-protected checkpoint. Also, `VELOC_Checkpoint_wait()` might be needed to ensure data is flushed.
+
+Let me look at the actual state size. The blast problem uses a 128x128 grid with 4 ranks. Each rank has a block. The hydro array `u` for a typical block would be: 5 vars × (n cells) × ... In a 2D problem with ghost zones, that's big. Something is wrong.
+
+Let me look at how `VELOC_Checkpoint_mem()` interacts with file routing. The issue might be that only the `VELOC_Checkpoint_mem()` part is being picked up by VELOC's checkpointing system, not the routed file.
+
+Let me look at the mesh structure to understand what's happening:
+The simulation uses AMR with 200×200 grid, 20×20 meshblocks = 100 blocks initially, 4 MPI ranks. Each block has 5 hydro variables × 20×20×1 = 2000 cells. So checkpoint data per block is large, not 44 bytes total.
+
+The key insight: checkpoint file = 176 bytes total / 4 files = 44 bytes per rank. That is ONLY the memory-protected sentinel data (3 doubles × sizeof(double) = 24 bytes + VeloC overhead). The `veloc_write_state()` routed file is NOT being included in the VeloC checkpoint size count.
+
+But more fundamentally, when the recovery runs, `VELOC_Route_file` during restart is supposed to give the path to the previously saved file. If the routed file was written outside VeloC's "attention" (i.e. VeloC isn't tracking it as part of its checkpoint), it might not persist or might not be found.
+
+Looking more carefully at the VeloC API: `VELOC_Route_file()` during a checkpoint should return a path in the scratch/persistent directory. `VELOC_Checkpoint_end(1)` flushes memory regions. But routed files are separate - they need to be handled by VeloC's file checkpointing mechanism, not just the memory API.
+
+The core bug: **The routed file approach with `VELOC_Route_file` + `VELOC_Checkpoint_mem()` + `VELOC_Checkpoint_end()` may not properly handle the routed files' persistence.** The routed file I write during checkpoint might not be in the right location for VeloC to find during restart.
+
+The better, simpler approach: **Use `VELOC_Mem_protect` to directly register the hydro `u` arrays**, one per block, with unique IDs. This avoids the file routing complications and directly uses VeloC's memory checkpointing which is known to work.
+
+However, with AMR the block layout changes. The number of blocks changes dynamically. We need a different strategy.
+
+**Better approach**: Use a simpler strategy - instead of AMR-aware complex state with file routing, use a comprehensive approach that:
+1. Saves ALL hydro data using VELOC memory protection on a flat buffer
+2. Allocates a fixed-size buffer that's large enough for the maximum expected state
+3. Actually uses `VELOC_Mem_protect` for real data
+
+But with AMR, block count varies. The best approach is: checkpoint a flat packed buffer of all block data and save the number of blocks + their logical locations. We use `VELOC_Mem_protect` with a large enough preallocated buffer.
+
+Actually, let me reconsider. The 176 bytes checkpoint is suspicious. Let me look at what the VeloC file-route approach actually does: During `VELOC_Restart_begin` + `VELOC_Route_file`, VeloC should point to the last checkpointed file. The issue might be that:
+
+1. `VELOC_Checkpoint_mem()` only checkpoints the 3-double sentinel
+2. `VELOC_Checkpoint_end(1)` flushes the memory checkpoint
+3. But the routed file (written to scratch/persistent by `veloc_write_state`) is NOT being tracked by VeloC
+
+During restart, `VELOC_Route_file("athena_state_X.bin", routed_path)` returns a path that might not exist (because VeloC didn't track it as its checkpoint).
+
+**The fix**: Don't use file routing. Instead, allocate a large flat buffer, pack ALL the hydro data into it, register it with `VELOC_Mem_protect`, and use the standard memory checkpoint API. This is the most reliable approach.
+
+Let me calculate the buffer size needed: With AMR up to level 2, the max number of blocks could be 4x the base 100 = 400 blocks. Each block: 5 vars × 20×20×1 = 2000 Reals = 16000 bytes. Plus a header per block. Total max: ~6.4 MB per rank with 4 ranks. That's manageable.
+
+Actually, I'll use a simpler approach: directly protect the hydro `u` arrays of all blocks at checkpoint time, BUT VeloC requires memory regions to be registered once and fixed. This doesn't work with dynamic AMR.
+
+The cleanest solution: **Use the VeloC file-route API correctly**. The key is that VeloC's file routing API (`VELOC_Route_file`) expects the file to be written IN THE SAME call flow as the checkpoint. Let me check if the issue is that `VELOC_Checkpoint_mem()` and `VELOC_Checkpoint_end()` need to come AFTER file routing.
+
+Actually I think the issue is different - with `mode = sync` and `max_versions = 1`, VeloC should be flushing files. Let me look at what VeloC actually stores. If the checkpoint has 176 bytes total, that's the VeloC memory checkpoint file, NOT the routed file.
+
+The routed file (written via `VELOC_Route_file` to scratch) should be in `/tmp/athena_veloc_scratch/` and then copied to `/tmp/athena_veloc_persistent/` by VeloC. The 176 bytes might be the VeloC metadata/header files, not the actual data files.
+
+Actually wait - the validator says "176 bytes across 4 file(s) in 2 dir(s)". That's 4 files in both scratch AND persistent dirs. If we have 4 ranks each creating 2 files (one memory checkpoint + one routed file), that would be 8 files. But we only see 4. This suggests either the routed files aren't being saved or only the memory checkpoint files are counted.
+
+**My conclusion**: The routed files (`athena_state_X.bin`) are being written to scratch but are NOT being properly tracked by VeloC as part of the checkpoint. During restart, `VELOC_Route_file` returns a path to a file that doesn't exist (since VeloC clears scratch dirs before each run, and the routed files weren't moved to persistent).
+
+The fix: I need to ensure VeloC tracks the routed files. In VeloC, `VELOC_Route_file` during checkpoint gives you a path in scratch where you write. Then VeloC's checkpoint flush process should move it. But `VELOC_Checkpoint_mem()` only handles the memory regions, not files. You need `VELOC_Checkpoint_wait()` after `VELOC_Checkpoint_end()`.
+
+Actually, looking at this again from the validator output line 38: "clearing VeloC scratch/persistent dirs before kill attempt". The validator clears both dirs. Then the app runs and checkpoints. After killing, the validator starts a new run. BUT the new run also clears the dirs first? No - looking at line 36: "checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt" - this is BEFORE the first run. Then at line 60: "cleared shared checkpoint dirs after capture" - this is AFTER capturing the checkpoint snapshot.
+
+So the flow is:
+1. Clear dirs
+2. Start first run
+3. Detect 8 checkpoint files in scratch/persistent - wait 5s 
+4. Kill 
+5. Start recovery (attempt_2) with veloc.cfg copied
+
+The "8 checkpoint files" detected during run 1 are the right files. The recovery (attempt_2) should find them. But the recovery produces wrong output.
+
+Wait - at step 3, "detected 8 checkpoint file(s)" - that's 2 files per rank (memory checkpoint + routed state file). That makes sense! So the routed files ARE being saved.
+
+But then at step 60: "cleared shared checkpoint dirs after capture". This is between attempt_1 and the failure_free check. The snapshot is taken. Then for attempt_2 (the recovery), the dirs contain the checkpointed data.
+
+But wait - attempt_2 IS the recovery. Let me re-read...
+
+Line 51: "starting recovery attempt (timeout 105.0s = 1.65x failure-free)"
+Line 52: veloc.cfg copied
+Line 53: "checkpoint-observed attempt 2: launching"
+Line 56: "recovery attempt complete (elapsed=64.97s, exit=0)"
+Line 58: "ratio=1.66x; checkpoint files = 4"
+
+So attempt_2 is the recovery, and it ran for 64.97s which is longer than the full 63.7s. The checkpoint files after recovery = 4 (not 8). This means:
+- The recovery RAN FOR THE FULL DURATION instead of resuming from checkpoint
+- It took ~65 seconds instead of the remaining ~33 seconds
+
+This confirms: **the recovery is NOT resuming from checkpoint** - it's running the full simulation from scratch. This makes the output wrong because it ran a full simulation with slightly different state (maybe due to restoring time/dt/ncycle but restarting physics from ICs).
+
+The root cause: `VELOC_Restart_test("athena_ckpt", INT_MAX)` is likely returning `VELOC_FAILURE` on the recovery run, causing the code to use initial conditions. OR the restart is found but `veloc_read_state()` fails.
+
+**Key insight**: The validator clears the VeloC dirs AFTER capturing (line 60). But wait - when does it clear for attempt_2? Line 36 says "clearing before kill attempt" (before attempt_1). Then after attempt_1 is killed, does it clear again before attempt_2? Looking at line 52: it just copies veloc.cfg but doesn't say it clears. So the checkpoint dirs should still have data from attempt_1.
+
+But wait - the checkpoint is written to `/tmp/athena_veloc_scratch` and then VeloC's persistence mechanism moves it to `/tmp/athena_veloc_persistent`. With `mode = sync`, the data should be in persistent. The recovery (attempt_2) starts fresh, calls `VELOC_Restart_test`, and should find it.
+
+Except... there could be a version number problem. The version used for checkpointing is `pmesh->ncycle`. On restart attempt_2, the code calls `VELOC_Restart_test("athena_ckpt", INT_MAX)` which should find any version ≤ INT_MAX. This should work.
+
+Let me think about what could cause `VELOC_Restart_test` to return `VELOC_FAILURE`: The VeloC memory checkpoint metadata file might only be in scratch, and if scratch is cleared... BUT the validator only clears before attempt_1. After the kill, scratch should still have data.
+
+Actually, re-reading line 36: "checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt" - this clear happens BEFORE attempt_1 starts. Then attempt_1 writes checkpoints. Gets killed. Then attempt_2 starts. The checkpoint data in both scratch and persistent should still be there.
+
+Unless... with `max_versions = 1` and `mode = sync`, VeloC might clear scratch after moving to persistent. Then if persistent has data, `VELOC_Restart_test` should find it.
+
+Let me look at the problem from a different angle. The restart ran for 64.97s (nearly the full 63.7s of the baseline). If restart truly resumed from ~50% through (kill at 40.73s), it should only need ~25-30 more seconds. But it ran for 65s, suggesting it started from the beginning.
+
+**Most likely cause**: The `VELOC_Restart_test` returns a valid version, but `VELOC_Restart_begin`/`veloc_read_state()` fails to actually restore the hydro arrays. Then the code continues from initial conditions (step 6's `pmesh->Initialize`) with just the time/dt/ncycle updated. This would cause the simulation to run the correct amount of time (from the restored ncycle to tlim) but with wrong physics state.
+
+Actually wait - if only time/dt/ncycle are restored (via `VELOC_Recover_mem()`) but NOT the hydro `u` arrays, then the simulation would restart at time=T_checkpoint with initial conditions density/pressure, which would be wrong. This could produce the observed large error.
+
+**The fix**: Ensure the actual hydro u data is properly saved and restored. Let me look at whether `VELOC_Route_file` works correctly in the context of a checkpoint, and whether the recovery reads back correctly.
+
+Actually, let me look at the VeloC API more carefully. The issue might be that `VELOC_Route_file` during RESTART needs `VELOC_Restart_begin` to have been called first. Let me check if that's the case in the code... yes it is (line 533). 
+
+But there's another issue: during `VELOC_Restart_begin`, `VELOC_Route_file` gives the path to the VERSION-specific checkpoint file. The `VELOC_Recover_mem()` call restores the memory-protected region. Then `veloc_read_state()` calls `VELOC_Route_file` to get the path of the saved file.
+
+The problem might be that VeloC stores routed files under version-specific paths in the persistent dir, and the path returned during restart is correct, but the file data might not match due to VeloC only preserving the memory checkpoint and not the routed file.
+
+Let me take a completely different approach. Instead of using `VELOC_Route_file` (which has this complexity), I'll use a **direct approach**:
+1. Save checkpoint data to a fixed path in `/tmp/athena_veloc_persistent/`
+2. On restart, read from that path
+3. Use `VELOC_Mem_protect` for a packed state buffer
+
+But we still need VeloC to track the checkpoint so that `VELOC_Restart_test` returns a valid version.
+
+**Simplest reliable approach**: 
+- Use `VELOC_Mem_protect` for the ENTIRE state including hydro data
+- Pre-allocate a large enough buffer, pack all data at checkpoint time
+- Restore at restart time and unpack into mesh blocks
+
+Let me check the hydro structure:
+Now I have a clear picture. The AMR blast problem with 200×200 mesh and 20×20 meshblocks starts with 100 blocks and can have up to 400 blocks with AMR. Each block has `u` with 5 vars × (20+2×NGHOST) × (20+2×NGHOST) × 1 = 5 × 24 × 24 = 2880 Reals. With 25 blocks per rank × 2880 × 8 bytes = 576KB per rank. That's a lot.
+
+The real question: why does the recovery run for the full duration (65s) instead of just the remaining portion (~25s)?
+
+This tells me either:
+1. `VELOC_Restart_test` returns VELOC_FAILURE → restarts from ICs with time/dt/ncycle not updated → runs full simulation with IC state → wrong output (but timing would be 63s not 65s... actually 65s is close)
+2. `VELOC_Restart_test` returns success but `veloc_read_state` fails and only scalars (time/dt/ncycle) are restored → runs from checkpoint time with IC physics → wrong output, and duration would be (tlim - time_checkpoint) ≈ half the time, NOT full duration
+
+The 65s recovery (similar to baseline 63.7s) strongly suggests option 1: **the restart fails silently and the code runs from IC start**. The code falls through to the full simulation.
+
+But then why does `pouts->MakeOutputs(pmesh, pinput)` at step 7 not cause a duplicate initial output? Actually it does run from the start so this makes sense.
+
+**Root cause**: `VELOC_Restart_test` is returning `VELOC_FAILURE` on the recovery run. This is likely because:
+- The checkpoint files exist in persistent/scratch dirs
+- But `VELOC_Restart_test` uses the VeloC memory checkpoint metadata to determine if a valid checkpoint exists
+- The memory checkpoint `VELOC_Checkpoint_mem()` might be failing or creating an invalid checkpoint
+
+Wait, I just realized something. The sequence in the code is:
+```cpp
+VELOC_Checkpoint_begin("athena_ckpt", ckpt_ver)  // ← only if rc == VELOC_SUCCESS
+veloc_write_state()  // writes file
+VELOC_Checkpoint_mem()  // checkpoints memory region
+VELOC_Checkpoint_end(state_ok ? 1 : 0)
+VELOC_Checkpoint_wait()
+```
+
+`VELOC_Checkpoint_mem()` - in some versions of VeloC, this function writes the protected memory regions to disk as part of the checkpoint. But the order matters: `VELOC_Checkpoint_mem()` should be called BEFORE `VELOC_Checkpoint_end()`. However, in the code `VELOC_Checkpoint_wait()` is called after `VELOC_Checkpoint_end()`. This might be correct.
+
+But there's another issue: `VELOC_Route_file` is called BEFORE `VELOC_Checkpoint_begin` (no, wait, it IS called inside `veloc_write_state()` which is called after `VELOC_Checkpoint_begin`). OK that's correct.
+
+Let me think about the VeloC semantics with `mode = sync`:
+- In sync mode, `VELOC_Checkpoint_end(1)` blocks until all checkpoint data is safely on disk
+- Both the routed files and memory checkpoints are flushed to persistent storage
+
+On restart:
+- `VELOC_Restart_test` scans persistent/scratch for available checkpoints
+- Returns the latest version number or VELOC_FAILURE
+
+The issue might be: with `mode = sync`, VeloC might not use a separate background thread, so `VELOC_Checkpoint_wait()` might not be necessary. But the real question is whether VeloC can find the checkpoint.
+
+Let me try a completely different, simpler approach. Instead of using `VELOC_Route_file` for the bulk data, I'll:
+1. Write the checkpoint to a well-known fixed path in persistent dir directly
+2. Use `VELOC_Mem_protect` with a packed buffer containing ALL state
+3. Use the full VeloC memory checkpoint API
+
+Here's my revised plan:
+- Pre-allocate a large static buffer
+- At checkpoint time: pack all block state into it
+- `VELOC_Mem_protect` that buffer
+- Use standard checkpoint sequence
+- At restart: restore buffer, unpack into blocks
+
+The maximum state size: 200×200 cells total, 5 vars, all ranks combined = 200×200×5 = 200K Reals = 1.6MB. Per rank = 400KB. Plus a header portion for block layout (400 blocks × 32 bytes = 12.8KB). Let's allocate 4MB per rank for safety.
+
+But there's a fundamental issue with this approach: `VELOC_Mem_protect` is called with a fixed pointer that must remain valid. The buffer must be allocated before `VELOC_Mem_protect` is called, and the same buffer is used throughout.
+
+Let me now write the corrected implementation:
+Now I have enough understanding. Let me redesign the checkpoint/restart system with a simpler, more reliable approach. The key insights:
+
+1. The AMR blast problem has dynamic block counts (up to 400 blocks from 100 initial)
+2. Each block's `u` array is 5×ncells1×ncells2×ncells3 with ghost zones
+3. We need to save: time, dt, ncycle, and all blocks' `u` arrays with their locations
+
+The most reliable approach: **Use a fixed persistent file path (independent of VeloC's memory API) for the bulk data, and use `VELOC_Mem_protect` with a small header buffer for VeloC versioning/detection**. The key issue with the previous approach is likely that `VELOC_Route_file` doesn't properly track the file.
+
+Actually, the cleanest solution: **Write checkpoint data directly to the VeloC persistent directory** and use VeloC only for version tracking. On restart, read from there.
+
+But even simpler: Use `VELOC_Mem_protect` with a large enough flat buffer. Let me calculate:
+- Max AMR: 2 levels, 200×200 base = 100 20×20 blocks. With numlevel=2, can have 4x finer blocks = max 400 blocks
+- Per block with ghost zones (NGHOST=2): (20+4)×(20+4)×1 = 576 cells × 5 vars = 2880 Reals
+- With 4 ranks, max 400/4=100 blocks per rank
+- State per rank: 100 blocks × 2880 × 8 bytes = 2.304 MB
+- Plus header: 100 blocks × (3 int64 + 2 int) = 100 × 32 bytes = 3.2 KB
+
+Let me allocate 8 MB per rank for safety. The buffer structure:
+```
+[int num_blocks][double time][double dt][int ncycle]
+[per block: int64 lx1, int64 lx2, int64 lx3, int level, int usize, Real u[usize]]
+```
+
+This goes into a static byte buffer protected by `VELOC_Mem_protect`. 
+
+Actually there's still an issue: `VELOC_Mem_protect` registers a pointer with VeloC. This pointer must be valid when `VELOC_Checkpoint_mem()` is called. And VeloC's memory checkpoint writes a snapshot of this buffer. On restart, `VELOC_Recover_mem()` restores this buffer.
+
+The key: we need the buffer to be packed before `VELOC_Checkpoint_mem()`. And on restart, after `VELOC_Recover_mem()`, we unpack the buffer into the mesh blocks.
+
+Let me write this clean implementation:
+Now I have a clear picture. Let me write the corrected `main.cpp`. The key problems I need to fix:
+
+1. **The checkpoint data is too small (176 bytes total / 4 files = 44 bytes/rank)** - the routed file with bulk hydro data is not being tracked/preserved by VeloC
+2. **The restart doesn't actually resume** - it runs from ICs
+
+My fix: Use a large preallocated static buffer for ALL state, protect it with `VELOC_Mem_protect`, pack/unpack before/after checkpoints.
+
+The critical detail: With AMR, the number of blocks changes. I need to handle this. The buffer needs to accommodate the maximum possible number of blocks per rank.
+
+Max blocks per rank calculation:
+- Base: 200×200 / (20×20) = 100 blocks total
+- With numlevel=2: up to 4x = 400 blocks total  
+- With 4 ranks: up to 100 blocks per rank
+- Each block u: 5×(20+4)×(20+4)×1 = 2880 Reals × 8 bytes = 23040 bytes
+- Total per rank: 100 × 23040 = 2.3 MB
+
+I'll allocate 16 MB per rank to be very safe.
+
+Here's the corrected approach:
+
+```
+Buffer layout:
+  [0..7]   : double time
+  [8..15]  : double dt
+  [16..19] : int ncycle
+  [20..23] : int num_blocks
+  per-block entries: [int64 lx1][int64 lx2][int64 lx3][int level][int usize][Real u[usize]]
+```
+
+I'll use a raw `char` buffer for flexibility.
+Now let me replace the entire VeloC state management section (memory registration, helpers, restart check, and checkpoint loop):
+Now update the checkpoint loop to use the new pack-then-checkpoint approach:
+Now I also need to remove the old `VELOC_Mem_protect(0, ...)` call that registered the `veloc_scalars`. Let me verify the current state of the file and check the `VELOC_Mem_protect` call I added doesn't conflict with anything:
+The code looks good. Now let me also check if there's a problem with the `static` declaration of the large buffer. A 32MB static array in a function is too large for the stack - but since it's declared `static`, it goes in BSS/data segment. That should be fine.
+
+Wait - there's actually a significant concern: `static unsigned char veloc_ckpt_buf[VELOC_BUF_SIZE]` where `VELOC_BUF_SIZE = 32MB`. Since this is a `static` local variable, it goes into BSS. That's fine.
+
+But there's a bigger concern: **The `VELOC_Mem_protect` call is made BEFORE the Mesh is constructed** (before step 2). The buffer is allocated but we're protecting it before we know what data will go in it. This is actually correct - VeloC needs the pointer registered before checkpointing, and we update the buffer content before each checkpoint call.
+
+However, there's another issue: `VELOC_Mem_protect` is called at line 150, before step 2 (command line parsing), before the mesh is initialized. This is fine - we're just registering the buffer location with VeloC.
+
+But there's a subtle problem with the large static buffer: the AMR situation is more complex than I thought. During AMR, blocks can be **different sizes at different levels**. The `u` array size depends on the block dimensions with ghost zones. At level 1 (refined), the blocks are the same physical size but at finer resolution... wait, no. In Athena++ AMR, refined blocks have the same nx1/nx2 (number of cells per block) but cover a smaller physical region. So each block `u` has the same array size regardless of level.
+
+Let me verify: `block_size.nx1 = 20`, so `u` is always `5 × (20+2*NGHOST) × (20+2*NGHOST) × 1`. With `NGHOST=2`, that's `5 × 24 × 24 = 2880` Reals.
+
+Now the critical issue: with AMR level 2, we can have up to 400 blocks total (4 ranks). But the distribution across ranks can be uneven. In worst case, one rank could have all 400 blocks. Let me recalculate:
+
+- 400 blocks max × 2880 Reals × 8 bytes = 9.216 MB per rank (in worst case)
+- Plus header: 400 blocks × 32 bytes = 12.8 KB
+- Total: ~9.23 MB per rank
+
+32 MB buffer is more than sufficient.
+
+Now let me also think about **what NGHOST is**. Let me check:
+Good, NGHOST=2 confirmed. Now let me also think about what happens after restart. The key concern:
+
+**After restart, `pouts->MakeOutputs(pmesh, pinput)` is called at step 7.** This happens AFTER the restart restores time/dt/ncycle and block data. The output system may try to output at time 0 (since the output time counter is based on wall time or cycle count). This could cause problems if `MakeOutputs` at step 7 produces an output when it shouldn't.
+
+Actually, looking at step 7: `pouts->MakeOutputs(pmesh, pinput)` is called unconditionally after the restart check. If we've restored ncycle=N and time=T, but the Outputs object was constructed assuming time=0, it might produce a spurious output. This shouldn't affect the final validation output though.
+
+The real validation output (`validation_output.bin`) is written at the END of the run (step 10), so any spurious intermediate outputs from `MakeOutputs` don't affect it.
+
+Now let me think about the **restart loop termination**. When restarting at ncycle=N, time=T:
+- The loop condition is `pmesh->time < pmesh->tlim`
+- If T is near tlim, the loop exits quickly (correct)
+- The final output is written
+
+This seems correct.
+
+But wait - there's another issue I noticed. The `VELOC_Checkpoint_wait()` call might cause issues with `mode = sync`. In sync mode, `VELOC_Checkpoint_end()` itself blocks until the data is persisted. `VELOC_Checkpoint_wait()` might try to wait for a background flush that doesn't exist in sync mode, potentially returning immediately or causing an error. Let me keep it but also consider removing it.
+
+Actually, `VELOC_Checkpoint_wait()` in sync mode should be a no-op or return immediately since there's nothing to wait for. So it's safe.
+
+Now let me also consider the **AMR block matching on restart**. During the first run, AMR creates new blocks at finer levels. At checkpoint time (say 50% through), the mesh has some AMR configuration. On restart, `pmesh->Initialize(0, pinput)` sets up the mesh from scratch with the INITIAL (coarse) block layout. Then our restart code tries to match blocks by `(lx1, lx2, lx3, level)`.
+
+The checkpoint had blocks at level 0 (coarse, from initial mesh) + level 1 (refined, from AMR). On restart, the initial mesh has only level 0 blocks. The level 1 blocks from the checkpoint won't match any current block!
+
+**This is a fundamental problem with the block-matching approach for AMR.** When we restore from checkpoint, the mesh structure doesn't match the checkpoint's mesh structure.
+
+However, looking at it more carefully: the initial blocks (level 0) ARE present in both the checkpoint and the restart mesh. They just need to be updated. The AMR blocks (level 1) are only in the checkpoint's mesh, not in the initial restart mesh.
+
+But wait - if the restart mesh only has level 0 blocks and we only restore those, we lose the AMR refinement state. The simulation would continue from time T with coarse block data, which would be wrong.
+
+Hmm, but actually, looking at the validation failure - the recovery runs for 65 seconds (almost the full simulation time), NOT the remaining 25 seconds. If only level 0 blocks were restored but AMR wasn't restored, the simulation would still take ~25 seconds from time T. The fact that it runs for 65 seconds strongly suggests the restart completely fails (VELOC_Restart_test returns VELOC_FAILURE).
+
+Let me reconsider. Maybe `VELOC_Restart_test` IS failing. Why would it fail?
+
+Looking at the checkpoint code flow:
+```
+VELOC_Checkpoint_begin("athena_ckpt", ckpt_ver)  // ckpt_ver = ncycle
+veloc_write_state()  // writes file via VELOC_Route_file
+VELOC_Checkpoint_mem()  // saves memory regions
+VELOC_Checkpoint_end(state_ok ? 1 : 0)  // commits
+VELOC_Checkpoint_wait()  // waits for async flush
+```
+
+`VELOC_Route_file` is called inside a checkpoint session (between `begin` and `end`). This should work. But `VELOC_Checkpoint_mem()` internally writes the memory-protected regions to the checkpoint. The checkpoint should contain BOTH the memory regions AND the routed file.
+
+Then on restart: `VELOC_Restart_test("athena_ckpt", INT_MAX)` should find the committed checkpoint. This should return a valid version.
+
+Unless... the VeloC version in the system doesn't support the API being used, or there's an initialization issue.
+
+Let me check if there are any previous build logs that show what actually happened:
+I can see from the previous stdout that the previous iterations found the checkpoint interval issue and fixed it to 10s wall-clock. The current code looks good for that.
+
+Now, the key insight from the stdout analysis: the previous iteration (iter_3) fixed the disk issue and got 8 checkpoint files (= 4 ranks × 2 files per rank for memory + routed file). Recovery ran but produced wrong output.
+
+The iter_3 analysis shows that the restart failure is due to wrong recovery output, not a crash. The recovery produced wrong physics results. This is likely the **AMR block matching problem**: the checkpoint saved AMR blocks (level 0 + level 1), but the restart mesh only has level 0 blocks. The level 0 blocks' data gets restored (from checkpoint at checkpoint time), but the physical state is wrong.
+
+Wait - but actually: the checkpoint happens at ~40 seconds into a 63-second run. By that time, AMR has been running for a while. The `u` arrays saved are at checkpoint time (mid-run state). After restart, the initial mesh has 100 base-level blocks. We try to match by (lx1, lx2, lx3, level). The checkpoint data has:
+- Some level 0 blocks (coarse)  
+- Some level 1 blocks (refined)
+
+The initial mesh only has level 0 blocks. We restore what we can. The simulation then proceeds from time T with coarse blocks only (no AMR). This means:
+1. The physics state starts wrong (AMR blocks' data is lost/not restored)
+2. The AMR refinement is re-triggered by the physics
+3. The final result differs from the expected output
+
+But wait - in Athena++, after `Initialize()`, the simulation starts with the initial mesh. If we restore only some block data, the simulation continues correctly for those blocks, but ANY AMR blocks that existed at checkpoint time won't have their data restored.
+
+However! Looking at the geometry: the blast problem has AMR triggered by high pressure gradient. The AMR blocks at checkpoint time (t≈7.5s simulated time) are near the blast radius. If we restore the level 0 (coarse) blocks but not the level 1 blocks, those coarse blocks' `u` arrays contain the coarse representation... actually wait.
+
+In Athena++ AMR: when a region is refined, the coarse block is REPLACED by 4 fine blocks (in 2D). The coarse block no longer exists as an active block. So at checkpoint time, if a region is refined, there are NO level 0 blocks in that region - only level 1 blocks.
+
+This means: when we restart with the initial coarse mesh and try to match level 0 blocks from the checkpoint, many of those level 0 blocks WON'T be in the checkpoint at all (because they were refined away). We'd be restoring a partial state.
+
+**The fundamental problem**: AMR changes the mesh structure during the run, and our checkpoint/restart doesn't handle the mesh structure change properly.
+
+**The solution**: Instead of trying to match blocks by LogicalLocation, we need to:
+1. **Checkpoint at a time when only coarse (level 0) blocks exist** (before AMR kicks in) - but this is hard to control
+2. **OR: save/restore the FULL mesh structure** including AMR block information
+
+Actually, looking at this problem differently: The validation validator detects 8 checkpoint files → the checkpoint IS being written. The recovery runs for 65 seconds (full duration). This strongly suggests the restart code IS finding the checkpoint, IS restoring time/dt/ncycle, but the hydro data restoration fails or is partial.
+
+**If time is restored but hydro data is wrong/partial, the simulation runs from time=T with wrong IC physics, producing wrong output but running to completion.**
+
+The 65s recovery time is suspicious. If time=T (checkpoint at ~40s into 63s run), the remaining time would be 15s worth of physics = maybe 25-30s wall time. But recovery ran 65s, which is close to the full 63.7s. This means either:
+1. The restart didn't restore time (started from 0) but restored some hydro data → wrong physics but full runtime
+2. Time restoration succeeded but something else is wrong
+
+Actually wait - recovery_elapsed=64.97s vs original_elapsed=63.7s (1.02x ratio, basically the same). This strongly confirms the recovery is running the FULL simulation from scratch (time=0 to time=tlim). This means `VELOC_Restart_test` is returning `VELOC_FAILURE`.
+
+So the root cause is: **`VELOC_Restart_test` fails on the recovery run**. The checkpoint is written (8 files observed), but VeloC can't find it on restart.
+
+Why would VeloC not find the checkpoint?
+
+Looking at the validator flow:
+1. First run (attempt_1): checkpoints written to `/tmp/athena_veloc_scratch` + `/tmp/athena_veloc_persistent` 
+2. Kill at 40.73s
+3. Recovery (attempt_2) starts with same veloc.cfg
+
+The 8 checkpoint files are detected in scratch/persistent dirs BEFORE the kill. After the kill, the dirs still contain those files. The recovery run should find them via `VELOC_Restart_test`.
+
+But! There's a subtle issue: In the code from iter_3, `VELOC_Checkpoint_wait()` is called which waits for async flush. In `mode = sync`, there is no async flush. But with `max_versions = 1` and `scratch_versions = 1`, VeloC may be trying to clean up old checkpoint versions. The first checkpoint creates version N. `VELOC_Checkpoint_wait()` returns. At this point the checkpoint should be in both scratch and persistent.
+
+Actually, I now suspect the issue is with the checkpoint version number. Let me re-read the iter_3 code:
+
+Looking at the iter_3 checkpoint:
+```cpp
+int ckpt_ver = pmesh->ncycle;
+```
+
+`ncycle` starts at 0 and gets incremented in each iteration. The checkpoint happens every 10 wall-clock seconds. VeloC requires **monotonically increasing version numbers**. With `ncycle` as the version, this should be fine.
+
+But wait - `VELOC_Restart_test("athena_ckpt", INT_MAX)` needs to find a checkpoint with version ≤ INT_MAX in either scratch or persistent. After `VELOC_Checkpoint_wait()`, the checkpoint should be persisted.
+
+Let me look at one more subtle detail. In VeloC with `mode = sync`:
+- `VELOC_Checkpoint_begin` creates checkpoint metadata
+- `VELOC_Checkpoint_mem()` writes memory regions to scratch
+- `VELOC_Checkpoint_end(1)` flushes/moves to persistent
+- `VELOC_Checkpoint_wait()` no-op in sync mode
+
+After the kill, both scratch AND persistent should have the checkpoint. But after the kill, `VELOC_Init` is called again in the recovery run. Does `VELOC_Init` clear the scratch directory? That would explain why the test fails!
+
+Looking at VeloC behavior: `VELOC_Init` in some implementations creates/clears the scratch directory. If it clears scratch but NOT persistent, then `VELOC_Restart_test` should still find the checkpoint in persistent. But if it clears both... 
+
+Actually, no - the validator explicitly keeps the checkpoint files. It only clears dirs at the START (before attempt_1), not between kill and recovery.
+
+Let me look at this from a completely different angle. The iter_3 code used `VELOC_Route_file` + `VELOC_Checkpoint_mem`. There are now two checkpointed things:
+1. Memory region: `veloc_scalars[3]` (24 bytes per rank)
+2. Routed file: `athena_state_X.bin`
+
+`VELOC_Restart_test` looks for the memory checkpoint metadata. If `VELOC_Checkpoint_mem()` succeeds, the metadata exists and `VELOC_Restart_test` should find it.
+
+My new approach ONLY uses `VELOC_Checkpoint_mem()` for the big buffer. This should be MORE reliable since it doesn't use file routing.
+
+But there's still the question: does the recovery run actually detect the checkpoint? Let me make sure the new implementation is correct and handles the AMR issue.
+
+Actually, wait. Let me re-examine the AMR issue with my new approach. In my new `veloc_pack_state`:
+- I save ALL local blocks (both level 0 and level 1)
+- On restart, `veloc_unpack_state` tries to match by (lx1, lx2, lx3, level)
+- The restart mesh has only level 0 blocks (initial mesh)
+- Level 1 blocks from checkpoint won't match anything
+
+So the level 1 blocks' data is lost. Level 0 blocks that were refined (and thus don't exist at checkpoint time) also won't be in the checkpoint.
+
+This is indeed a problem for correct recovery. Let me think about how to handle this.
+
+**Option A**: Disable AMR during restart recovery - but we can't easily do that without changing more code.
+
+**Option B**: At checkpoint time, if AMR has refined some regions, save both the refined data AND project it back to coarse resolution for recovery.
+
+**Option C**: Save all block data regardless of level, and on recovery, if the checkpoint had refined blocks and the restart mesh has coarse blocks covering that region, we need to coarsen/restrict the fine data to coarse.
+
+**Option D**: Accept that we only restore what we can match, and let the simulation re-evolve from the partially-restored state. The key insight: even if some blocks have IC data instead of checkpoint data, if we have the correct TIME, the simulation will complete in time (tlim - T_checkpoint) wall seconds, which passes the ratio test (1.66x observed < 1.7x threshold). But the OUTPUT will be wrong because the physics started wrong.
+
+Wait, looking at the validation requirements more carefully:
+
+```
+[validate] Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance [VeloC, failure-prone], score=1021: max_abs_diff=1.021e+03
+```
+
+The output comparison fails. This is the numeric comparison of the final state. If we restore the correct time but wrong hydro data (IC instead of checkpoint), the final output would be wrong.
+
+**Option E** (the right answer): Save the checkpoint ONLY at level 0 (coarse) states. But the coarse blocks may not exist at checkpoint time if they've been refined.
+
+**The cleanest solution**: At checkpoint time, regardless of AMR state, save the current `u` arrays. At restart time, restore ONLY the blocks that exist in both the checkpoint and the initial mesh (level 0 blocks that haven't been refined yet). The remaining blocks get IC data. The simulation then runs from time T - the AMR blocks will re-emerge naturally from the physics.
+
+This would work IF the level 0 blocks' `u` arrays are correct at checkpoint time. The issue is that in Athena++ AMR, when a level 0 block is refined, it gets REPLACED by 4 level 1 blocks. The level 0 block no longer exists and doesn't have updated `u` data.
+
+So we need to handle two cases:
+1. Level 0 block exists at checkpoint time (not refined): restore its data directly
+2. Level 0 block has been refined at checkpoint time: need to coarsen the fine block data
+
+For case 2, we need to access `coarse_cons_` arrays or do a restriction operation.
+
+This is getting complex. Let me look at how Athena++ handles its own restart mechanism:
+There's no `restart.cpp`. Athena++ has restart support via HDF5 input files, but not a built-in VeloC restart. 
+
+Let me look at the Mesh::Initialize function to understand the mesh initialization flow:
+Now I understand the flow better. After `Initialize(0, pinput)`, all blocks have their `ProblemGenerator` data (initial conditions). Our restart code then overwrites `u` arrays in the matching blocks.
+
+The issue with AMR: if the checkpoint has refined blocks that don't exist in the restart mesh, we just don't restore those. The coarse blocks in the restart mesh have IC data instead of checkpoint data.
+
+But here's the key point I was missing: **At the time of the first checkpoint** (which the validator detects at ~33-40s into the 63s run), how much AMR has happened? The blast wave starts at r=0.1 and expands. By simulated time ~7.5s (50% of tlim=15), the blast wave has expanded significantly and AMR would have created many refined blocks.
+
+The level 0 blocks in the refined regions NO LONGER EXIST as active blocks. They're replaced by level 1 blocks. So the checkpoint has:
+- Level 1 blocks in the blast region (many)
+- Level 0 blocks in the outer region (far from blast)
+
+On restart with initial mesh (all level 0):
+- We match level 0 blocks in the outer region (restored correctly)
+- Level 0 blocks in the blast region have IC data (NOT restored, because the checkpoint has level 1 blocks there)
+
+Then the simulation runs from time=T_checkpoint:
+- Outer regions have correct physics
+- Blast region has IC data → wrong physics (all pressure uniform instead of blast)
+
+This would produce wrong results. But the simulation completes in (tlim - T_checkpoint) additional physics time, which should take roughly half the wall time. So recovery wall time ≈ 30s, not 65s.
+
+The 65s recovery strongly suggests that **the restart detection fails** (VELOC_Restart_test returns VELOC_FAILURE) and the simulation runs from t=0 to t=tlim.
+
+Let me think about WHY VELOC_Restart_test would fail:
+
+In iter_3, `VELOC_Route_file` + `VELOC_Checkpoint_mem()` are used together. Maybe the issue is that after `VELOC_Checkpoint_begin`, when `VELOC_Checkpoint_mem()` is called, it writes the memory regions to the scratch path. When `VELOC_Checkpoint_end(1)` is called, it moves the data from scratch to persistent. But maybe the routed file (`athena_state_X.bin`) is NOT considered part of the checkpoint's memory region and thus isn't moved to persistent.
+
+Then `VELOC_Restart_test` looks for memory checkpoint metadata in persistent → finds it (because `VELOC_Checkpoint_mem()` + `VELOC_Checkpoint_end(1)` moved it). Returns valid version.
+
+`VELOC_Restart_begin` starts. `VELOC_Recover_mem()` reads the memory regions from persistent → restores `veloc_scalars[3]` (time, dt, ncycle). OK.
+
+`veloc_read_state()` calls `VELOC_Route_file("athena_state_X.bin", path)` → VeloC returns a path in the persistent dir. But the file doesn't exist there (it was in scratch but wasn't moved by VeloC because it was created via file routing, not as a memory region). `fopen(path, "rb")` returns NULL → `veloc_read_state()` returns false.
+
+Then the code falls back to sentinel values (time, dt, ncycle from veloc_scalars). Sets `pmesh->time = T_checkpoint`, `pmesh->dt = dt_checkpoint`, `pmesh->ncycle = ncycle_checkpoint`. The hydro arrays are NOT restored.
+
+Now the simulation runs from time=T_checkpoint with IC hydro data (all pressure uniform in blast region). The time loop exits when `time >= tlim`. Since `T_checkpoint ≈ tlim/2`, the remaining time is `tlim - T_checkpoint ≈ 7.5`, which takes ≈ 30s wall time. Not 65s.
+
+Unless `T_checkpoint = 0` (the VELOC_Recover_mem also fails)... but that seems unlikely if the memory regions were properly checkpointed.
+
+Actually, let me reconsider. Maybe VELOC_Restart_test itself fails (not just the read_state), and the code continues from ICs with t=0. In that case, the simulation runs tlim=15 from t=0, taking ~63s. That matches the observed 65s recovery (similar to baseline 63.7s + some overhead).
+
+The most likely scenario: **something about the checkpoint is incomplete/invalid, causing `VELOC_Restart_test` to return `VELOC_FAILURE`**.
+
+Possible reasons:
+1. `VELOC_Checkpoint_end(0)` is called when `state_ok = false` (file write failed) - this marks the checkpoint as invalid
+2. The checkpoint version ordering issue
+
+Wait! In iter_3's code:
+```cpp
+if (state_ok) {
+  (void)VELOC_Checkpoint_mem();
+}
+rc = VELOC_Checkpoint_end(state_ok ? 1 : 0);
+```
+
+If `veloc_write_state()` fails (which might happen if the file routing fails), `state_ok = false`, then `VELOC_Checkpoint_mem()` is NOT called, and `VELOC_Checkpoint_end(0)` is called. This tells VeloC the checkpoint is INVALID. VeloC should NOT record this version. So `VELOC_Restart_test` returns `VELOC_FAILURE` because there's no valid checkpoint.
+
+**This is the bug in iter_3!** The routed file writing might be failing (VELOC_Route_file returning an error or the file write failing), causing `veloc_write_state()` to return false, then `VELOC_Checkpoint_end(0)` is called (invalid checkpoint), and restart fails.
+
+In my new implementation, I use ONLY the memory buffer (no file routing). The `veloc_pack_state()` should work reliably. If it fails (buffer overflow), `VELOC_Checkpoint_begin` is never called, so no invalid checkpoint is written.
+
+But wait - in my new code:
+```cpp
+bool state_ok = veloc_pack_state();
+if (state_ok) {
+  int rc = VELOC_Checkpoint_begin("athena_ckpt", ckpt_ver);
+  if (rc == VELOC_SUCCESS) {
+    int rc_mem = VELOC_Checkpoint_mem();
+    rc = VELOC_Checkpoint_end(rc_mem == VELOC_SUCCESS ? 1 : 0);
+    ...
+  }
+}
+```
+
+If `VELOC_Checkpoint_mem()` fails (`rc_mem != VELOC_SUCCESS`), then `VELOC_Checkpoint_end(0)` is called → invalid checkpoint. But `VELOC_Checkpoint_mem()` should not fail if `VELOC_Mem_protect` was called correctly.
+
+This approach should be much more reliable. The key question is: does `VELOC_Checkpoint_mem()` work when the memory buffer contains the full packed state?
+
+Let me also verify the `VELOC_Mem_protect` signature to make sure I'm using it correctly:

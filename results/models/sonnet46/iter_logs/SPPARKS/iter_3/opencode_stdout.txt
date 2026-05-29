@@ -1,0 +1,301 @@
+I'll start by reading the validation logs from the previous attempt to understand what went wrong.
+The key issue is clear: the output is incorrect after recovery. The test shows:
+- Test 1 (failure-prone, after kill+recovery): **FAIL** - the output differs from baseline
+- Test 2 (failure-free): **PASS** - correct output without failures
+
+This means the checkpoint is being saved, but the **recovery/restart is not correctly restoring state**. Let me look at the current codebase to understand the implementation.
+Now let me look at the main.cpp and other key files to understand the full picture:
+The failure is: after a kill+recovery, the output is numerically different from the ground truth. The failure-free run passes. This means the **recovery path is not producing the correct result** - the simulation doesn't continue from exactly where it left off.
+
+Looking at the validation output:
+- 8 checkpoint files exist 
+- Recovery exits with code 0
+- But the output values differ (max_abs_diff=4.599e+17)
+
+The key issues:
+1. The validation output uses **spatial moments** (`sum(spin[i] * (i+1))` etc.) where `i` is the **rank-local index**. When checkpointing, we must be careful that the same sites end up in the same local indices.
+2. The **RNG state** (`ranapp`) is NOT being checkpointed, so after recovery the random number sequence is wrong.
+
+Let me look at the random number generator:
+Now I understand the problem. Looking at the validation output signature, it computes spatial moments using **rank-local indices** (`i+1`). The issue is that after recovery, the simulation produces a **different lattice state** than if it had run to completion without interruption.
+
+The key problem: **The RNG state is not being saved/restored**. When we checkpoint the site array `iarray[0]`, the spin state is saved. But when we restart, the `ranapp` RNG starts from a **new seed** (re-initialized from `ranmaster` in `init()`), not from the checkpointed state. This means the random decisions made after recovery differ from what would have happened in the uninterrupted run.
+
+Wait - actually, let me re-read the validation more carefully. The validator compares:
+- `resilient` (kill+recovery run) vs `perturbed_baseline` (Z_P = vanilla run with different seed)
+
+The perturbed baseline runs the entire simulation uninterrupted, while the resilient run is killed at ~55s and restarted. After recovery, the resilient run should produce the **same final state** as if it had never been killed - i.e., it needs to continue from the exact saved state.
+
+The problem is that the **RNG state** is not being checkpointed. After recovery:
+- The site state (`iarray[0]`) is restored correctly
+- But `ranapp->seed` is re-initialized fresh (via `ranmaster->uniform()` in `init()`)
+- So the subsequent random decisions diverge from what the uninterrupted run would have made
+
+I need to add `ranapp->seed` to the VeloC checkpoint.
+
+Let me also check `app_ising.cpp` to understand what's being simulated:
+Now let me look at the in.validation file to understand the simulation being run:
+Wait, line 14 says `run 18800.0.0` - that seems wrong but it's the validator's perturbed version. The actual run time is what the validator seeds.
+
+The key insight: The simulation uses `sweep random` with `sector yes`. In this mode, each sweep picks random sites from `ranapp`. After recovery, `ranapp` is re-seeded from scratch (via `init()`) with a DIFFERENT seed (since `ranmaster->uniform()` will produce a different value when called again).
+
+But wait - looking more carefully at the problem. The issue is that the recovered run must produce the **same final result** as if it had run without interruption. This means after restoring the spin state from checkpoint, the RNG needs to be in the same state as it was at the checkpoint point.
+
+The solution: **checkpoint the `ranapp->seed` value** along with the spin state.
+
+Let me add the RNG seed to the VeloC memory regions:
+Now I understand the full picture. Let me plan the fix:
+
+1. **Add `VELOC_ID_RANAPP_SEED`** to checkpoint `ranapp->seed` 
+2. **After restore**, apply the restored seed back to `ranapp->seed`
+3. The problem is that `veloc_protect()` is called **after** `ranapp` might be NULL (it's initialized in `init()`, but `iterate()` is called after `init()` and `setup()`)
+
+Looking at the code flow:
+- `run()` → `init()` → `ranapp = new RandomPark(ranmaster->uniform())` 
+- `run()` → `setup()` → propensities
+- `run()` → `iterate()` → `veloc_protect()` + `veloc_restart()`
+
+So `ranapp` should not be NULL when `veloc_protect()` is called. 
+
+But there's another issue: `veloc_protected` is a static global - if the application runs multiple times (or if it's called again), we might have issues. But for this case it should be fine.
+
+Let me now also think about whether `stoptime` needs to be saved. Looking at the iterate functions:
+
+```cpp
+void AppLattice::iterate_rejection(double stoptime)
+```
+
+`stoptime` is passed as a parameter from `app.cpp:run()` which computes `stoptime = time + atof(arg[0])`. After restart, `time` is restored from the checkpoint, so `stoptime` will be computed as `restored_time + run_duration` which is WRONG - it needs to be `original_run_duration` as the endpoint.
+
+Wait - let me re-read: 
+```cpp
+stoptime = time + atof(arg[0]);
+```
+
+If `time` was 0 initially and the run is for 18800, then `stoptime = 18800`. After restart, `time` is restored (say to `T_checkpoint`), and then `run()` is called again with the input file... but actually, the restart just re-reads the input file from scratch!
+
+So when SPPARKS restarts:
+1. It re-reads the input file
+2. `time = 0` initially (in `App::App()`)
+3. `init()` is called, `run()` is called
+4. `stoptime = time + 18800 = 0 + 18800 = 18800`  
+5. But in `iterate()`, we call `veloc_restart()` which restores `time` to `T_checkpoint`
+6. The iterate loop then runs from `T_checkpoint` to `stoptime = 18800`
+
+That's actually correct! The `stoptime` is computed before `iterate()`, and since it's based on the **original** time (before checkpoint restore), it correctly targets the original end time.
+
+Wait, actually no. Let me trace more carefully:
+- `app.cpp:run()`: `stoptime = time + atof(arg[0])` where `time` is `App::time`
+- Initially `time = 0`, so `stoptime = 18800`
+- `iterate()` is called with the iterate function using the member `stoptime`
+- Inside `iterate()`, we call `veloc_restart()` which restores `time` to, say, 9000
+- But `stoptime` was already set to 18800 before `iterate()` was called
+- The iterate loop: `while (time < stoptime)` → runs from 9000 to 18800 ✓
+
+Actually that IS correct - the stoptime is correctly set to the original end time, and the iterate loop picks up from the restored time.
+
+So the **only** missing piece should be the **RNG state**. Let me add `ranapp->seed` to the checkpoint:
+Now let me make the fix. I need to:
+1. Add a static variable to store the ranapp seed (since we can't directly protect `ranapp->seed` which might move)
+2. Add the seed to the protected regions
+3. After restore, copy the restored seed back to `ranapp->seed`
+Now update `veloc_protect()` to register the RNG seed:
+Now update `veloc_checkpoint()` to sync the seed before writing:
+Now update `veloc_restart()` to restore the seed back into `ranapp` after a successful restore:
+Now let me think more carefully about whether this is sufficient to produce **bit-for-bit identical** results.
+
+The validation expects the recovered run to produce the **same output** as a complete uninterrupted run. For the Ising model with `sweep random`, the sequence of random decisions is:
+
+1. `ranapp->irandom(nrange)` - to pick which site to sweep
+2. `random->uniform()` - to determine the spin flip direction  
+3. `random->uniform()` - to determine whether to accept (Boltzmann criterion)
+
+These all come from the same `ranapp` RNG. So if we save and restore `ranapp->seed` at the checkpoint moment, the stream will continue identically.
+
+BUT - there's an important subtlety. The `iterate_rejection` function has a structure where each "sweep" processes all sectors:
+
+```cpp
+while (!done) {
+  for (int iset = 0; iset < nset_loop; iset++) {
+    ...
+    for (i = 0; i < nselect; i++) 
+      sitelist[i] = site2i[ranapp->irandom(nrange) - 1];
+    (this->*sweep)(nselect,sitelist);
+    ...
+  }
+  nsweeps++;
+  time += dt_rkmc;
+  ...
+  if (nsweeps % VELOC_CKPT_INTERVAL == 0) {
+    veloc_checkpoint();
+  }
+}
+```
+
+The checkpoint is taken **at the end of a complete sweep** (after `nsweeps` is incremented). At that point, `ranapp->seed` reflects the state after all random decisions in that sweep. On restart, we restore `ranapp->seed` to that value, so the very next random call will produce exactly the same number as it would have in the uninterrupted run. ✓
+
+Wait, but there's another issue. After recovery, the `init()` function re-initializes `ranapp`:
+
+```cpp
+if (ranapp == NULL) {
+  ranapp = new RandomPark(ranmaster->uniform());
+  double seed = ranmaster->uniform();
+  ranapp->reset(seed,me,100);
+}
+```
+
+This only runs if `ranapp == NULL`. Since `ranapp` is allocated in `init()` and the app object is freshly created on restart, `ranapp` WILL be NULL on startup, so `init()` will allocate it with a fresh seed. But then `veloc_restart()` immediately overrides `ranapp->seed` with the checkpointed value. ✓
+
+Actually wait - `ranapp->reset()` doesn't just set the seed, it does more complex initialization. Let me check:
+The Park-Miller RNG is a **linear congruential generator** where the **entire state is just `seed`** (a single `int`). So restoring `ranapp->seed` is sufficient to fully restore the RNG state. ✓
+
+Now let me also think about whether the `nsweeps` restoration causes any issue. When we restart:
+- `nsweeps` is restored from checkpoint (say 100)
+- The next checkpoint condition is `nsweeps % 50 == 0` 
+- After the first sweep post-restore: `nsweeps = 101`, which is % 50 != 0
+- This is correct - no spurious checkpoint right after restart
+
+Now let me check if there are any issues with the `stoptime` being correctly set. Looking at `app.cpp:run()`:
+
+```cpp
+stoptime = time + atof(arg[0]);
+...
+if (stoptime > time) iterate();
+```
+
+On a restart:
+- `time = 0` (initial value from `App::App()`)
+- Input file has `run 18800.0.0` 
+- `stoptime = 0 + 18800 = 18800`
+- `iterate()` is called
+- Inside `iterate()`: `veloc_restart()` restores `time` to checkpoint value (say 9400)
+- Then `iterate_rejection(stoptime=18800)` runs from 9400 to 18800 ✓
+
+This is correct.
+
+But wait - I need to double check: is the `stoptime` member variable or a local? Looking at `app.h`:
+Good. `stoptime` is a public member of `App`. It's set in `run()` as `stoptime = time + atof(arg[0])`. Since `time` starts at 0, `stoptime = 18800`. This is correctly passed to the `iterate_rejection(stoptime)` function BEFORE `veloc_restart()` restores `time`. So `stoptime` is always 18800 regardless. ✓
+
+Now let me check if there's an issue with `nextoutput`. When `setup()` is called, it calls `output->setup(time,first_run)` to set `nextoutput`. After restart, `time` is later overwritten by the checkpoint. But `nextoutput` was set based on `time=0`. Let me check if this is a problem:
+
+After restart:
+- `nextoutput` was set by `output->setup(time=0, first_run=0)` = probably 100.0 (first stats interval)
+- Then `time` is restored to, say, 9400
+- The iterate loop: `if (done || time >= nextoutput) nextoutput = output->compute(time,done)`
+- Since `time=9400 > nextoutput=100`, the output will fire on the first pass
+
+This should be fine - output will produce stats at the appropriate time, which doesn't affect the simulation state or the final output.
+
+Now let me also check if there's a problem with the `first_run` flag. After restart:
+- `first_run = 0` (set in `run()` after `setup()`)
+- This prevents re-initialization in subsequent runs, but we only have one `run` command
+
+This all looks good. The fix should work. Let me verify the current state of the key sections of `app_lattice.cpp`:
+Good. The code looks correct. Now let me think about one more potential issue.
+
+The `dt_rkmc` calculation in `setup()`:
+```cpp
+dt_rkmc = ntotal/nglobal * dt_sweep;
+```
+
+This is computed from the initial state before any checkpoint restore. But `dt_rkmc` only depends on `nstop` and the number of sectors/sites per sector - it's deterministic given the input file configuration. It doesn't depend on the current spin state. So `dt_rkmc` will be the same on restart as it was originally. ✓
+
+Wait - but `dt_rkmc` is computed from `nselect` which depends on... the `nstop` value (= 1.0 by default). Looking at `setup()`:
+
+```cpp
+if (sweepflag == RANDOM) {
+  if (nstop > 0.0) {
+    for (int i = first; i < nset; i++) {
+      set[i].nloop = 0;
+      set[i].nselect = static_cast<int> (nstop*set[i].nlocal);
+    }
+  }
+```
+
+`set[i].nlocal` is the number of sites in the sector. This is determined by the domain decomposition - it's the same on restart. ✓
+
+Now let me think about one more issue: the validation output metric uses **rank-local indices**:
+```cpp
+for (int i = 0; i < nlocal; i++) {
+  double v = (double)iarr[i];
+  double idx = (double)(i + 1);
+  local_sums[0] += v * idx;  // 1st moment
+```
+
+So the spatial moments depend on which site is at which local index. The site assignment to local indices (and their ordering) is determined by the domain decomposition, which is the same both runs (same MPI decomposition). So after restoring `iarray[0]`, the spatial moments will match. ✓
+
+The fix looks correct. Let me also verify that the `Makefile.mpi` properly includes VeloC:
+Good, the Makefile properly includes VeloC. The build was succeeding in the previous iteration (since checkpoint files were being created), so the build infrastructure is fine.
+
+Now let me think about whether there are any other issues causing the output mismatch.
+
+Looking at the validate output again:
+```
+[validate] Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance [VeloC, failure-prone], score=4.59942e+17: max_abs_diff=4.599e+17, max_rel_diff=2.914e-02
+```
+
+The error is quite large (4.59e+17), which suggests the spin states are diverging significantly. This is consistent with the RNG state not being restored - without the correct seed, the simulation takes completely different random paths after recovery.
+
+Let me also check if the `run 18800.0.0` in `in.validation` could be an issue. It looks like the validation system perturbs the seed value in the file (line 1: `seed 56789` gets changed), and the run command may have been changed to `run 18800.0.0` by the perturbation (changing a value). But actually looking at the validator output:
+
+```
+[validate] Perturbation active for SPPARKS: method=regex_replace seed=277192631 (file=examples/ising/in.validation range=(1, 999999999))
+[validate] perturbed-baseline: seed=277192631 value=109803909
+```
+
+The perturbation changes the `seed` value in `in.validation` from 56789 to 109803909. The `run 18800.0.0` is probably a typo in the original in.validation file (extra `.0`). Let me verify that SPPARKS handles this:
+
+Actually, looking at `atof("18800.0.0")` - this would parse as 18800.0 (stops at the second decimal point). So `stoptime = 18800.0`. This is fine.
+
+Now let me look at whether there could be any issue with the `iterate_rejection` using `sweep random` with sectors. In `setup()`:
+
+```cpp
+if (sweepflag == RANDOM) {
+  if (nstop > 0.0) {
+    for (int i = first; i < nset; i++) {
+      set[i].nloop = 0;
+      set[i].nselect = static_cast<int> (nstop*set[i].nlocal);
+    }
+  }
+```
+
+With sectors, `first = nsector` (due to `bothflag`) or `first = 0`. With `sweep random` + `sector yes`, we have `nset = nsector = 4` (for 2D with default 4 sectors). `first = 0` since `bothflag = 0` (no colors).
+
+Each sector processes `set[i].nselect = nstop * set[i].nlocal` random site selections per sweep. With 4 sectors in 2D and 4 MPI ranks, each rank has 1 sector with ~62500 sites. `nselect ≈ 62500`.
+
+The `ranapp->irandom(nrange)` is called `nselect` times per sector per rank. In the checkpoint, we save the state AFTER all this is done. On restore, the exact same sequence continues. ✓
+
+I'm confident the fix is correct. Let me also check if there could be an issue with the `veloc_protected` being a static global. Since it persists across calls to `veloc_protect()`, if the function is called multiple times (e.g., if there are multiple `run` commands), it won't re-register the memory regions. But since `iarray[i]` is always the same pointer (it's only re-allocated when `grow()` is called, but not between runs), this is fine for the single-run case.
+
+Let me also make sure I'm not missing anything by checking the iter_1 logs:
+The fix I've made adds `ranapp->seed` to the VeloC checkpoint. This should make the recovery produce bit-for-bit identical results to the uninterrupted run.
+
+Let me do a final review of the critical sections to ensure correctness:
+The changes look good. Let me summarize what was done:
+
+## Summary
+
+**Root Cause**: The previous implementation correctly checkpointed the spin state (`iarray[0]`) and simulation time (`time`), but **did not save the RNG state** (`ranapp->seed`). 
+
+After a kill+restart, the `ranapp` random number generator was re-initialized with a fresh seed (from `ranmaster->uniform()` in `init()`). This caused the simulation to make completely different random decisions after recovery compared to what would have happened in an uninterrupted run, resulting in a diverging spin state and incorrect output.
+
+**Fix**: Added the `ranapp->seed` to the VeloC checkpoint:
+
+1. Added `VELOC_ID_RANAPP_SEED` (ID=5) for the RNG seed
+2. Added a static buffer `veloc_ranapp_seed` to hold the seed value stably (VeloC needs a stable pointer)
+3. In `veloc_protect()`: Register `veloc_ranapp_seed` with VeloC
+4. In `veloc_checkpoint()`: Sync `ranapp->seed` → `veloc_ranapp_seed` before checkpointing
+5. In `veloc_restart()`: After restore, copy `veloc_ranapp_seed` → `ranapp->seed`
+
+The Park-Miller RNG used by SPPARKS has its entire state in a single `int seed`, so restoring `seed` is sufficient for full RNG state recovery. After recovery, the simulation continues generating exactly the same random sequence it would have produced without interruption, yielding bit-for-bit identical output.
+The fix is complete. The change is minimal and targeted:
+
+**File modified**: `src/app_lattice.cpp`
+
+The key changes:
+- Added `veloc_ranapp_seed` static buffer and `VELOC_ID_RANAPP_SEED = 5` to the memory region IDs
+- `veloc_protect()`: registers `veloc_ranapp_seed` with VeloC (initialized from current `ranapp->seed`)
+- `veloc_checkpoint()`: syncs `ranapp->seed` into `veloc_ranapp_seed` before each checkpoint  
+- `veloc_restart()`: after restoring all memory regions, copies `veloc_ranapp_seed` back into `ranapp->seed`
+
+This ensures the random number stream resumes exactly where it stopped at the checkpoint, making the recovered simulation produce identical output to an uninterrupted run.

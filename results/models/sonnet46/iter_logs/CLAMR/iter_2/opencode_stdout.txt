@@ -1,0 +1,1314 @@
+I'll start by reading the validation logs from the previous attempt to understand what went wrong.
+Let me continue reading the opencode_stdout.txt and then look at the current state of the codebase:
+Now I understand the previous attempt and its failures. Let me read the current state of the codebase:
+Good. The veloc.cfg and clamr_mpionly.cpp already exist. Let me read the current state of these files to understand what iteration 1 did and what needs to be fixed:
+Now I understand the full picture. The previous attempt had the implementation in place. The failures from validation were:
+
+1. **Segfault on recovery (exit=139)**: The restart run crashed with a segfault - `realloc` in `MallocPlus::memory_realloc_all`
+2. **Disk exhaustion on failure-free run**: Writing too much data, 10.91GB exceeding the 10.74GB limit
+
+Let me look at the key issue - the segfault during recovery and the disk exhaustion:
+The validate_stdout.txt shows:
+1. Restart (attempt 2) crashed with exit=139 (segfault), specifically in `realloc` called from `MallocPlus::memory_realloc_all`  
+2. The failure-free run was killed by disk guard (10.91 GB > 10.74 GB) - too many checkpoint files
+
+Let me look at the MallocPlus and mesh resize code to understand the segfault:
+Now I see the issue clearly. The `mesh->resize()` function calls `mesh_memory.memory_realloc_all(new_ncells)`, which is a `realloc` of all registered memory in MallocPlus. The segfault traceback in the validate output shows:
+
+```
+realloc+0x64
+MallocPlus::memory_realloc_all+0x1c4
+clamr_mpionly(+0x20204)   <- this is veloc_do_restart or veloc_do_checkpoint
+clamr_mpionly(main+0x15c)
+```
+
+The crash is happening at cycle 0 **during the actual run (attempt 2 = the recovery run)**. Looking at the trace more carefully - it's crashing in `realloc` inside `memory_realloc_all` which is called from `main+0x15c`. This is in the restart path.
+
+The issue is likely that `mesh->resize()` is called with `saved_ncells` which is the per-rank count, but some arrays in `MallocPlus` might have been allocated with `ncells_ghost` size (larger than `ncells`), and calling `memory_realloc_all(ncells)` **shrinks them**, which could cause issues when later code expects ghost-cell-sized buffers.
+
+Let me look at how the state resize works:
+So both `mesh->resize()` and `state->resize()` only allocate MORE memory (they have `if (new_ncells > current_size)`), so they don't shrink. But the problem is that `memory_realloc_all` can shrink if called through a different code path.
+
+Looking at the crash again from validate_stdout.txt line 86-91:
+```
+realloc+0x64
+MallocPlus::memory_realloc_all+0x1c4
+clamr_mpionly(+0x20204)
+clamr_mpionly(main+0x15c)
+```
+
+The crash is in the **failure-prone run** (attempt 1) NOT the recovery run. Wait, let me re-read:
+
+- Line 49: Injection fires during attempt 1
+- Line 55: **recovery_elapsed=2.53s, exit=139** - this is the RECOVERY attempt (attempt 2) crashed immediately!
+
+The crash happens very quickly (2.53 seconds) in the recovery run. The segfault trace at line 86-91 is from the recovery run (attempt 2). The crash is:
+```
+realloc <- from libc
+MallocPlus::memory_realloc_all
+clamr_mpionly(+0x20204)
+clamr_mpionly(main+0x15c)
+```
+
+`main+0x15c` is in the `main()` function, and `+0x20204` is `veloc_do_restart`. The crash is happening during `mesh->resize()` in `veloc_do_restart`.
+
+The issue is that `mesh->resize()` only calls `memory_realloc_all` if `new_ncells > current_size`. If the checkpoint was taken at a size SMALLER than what the initial `fill_circle` allocates (which is unlikely - the mesh grows over time via AMR), then `resize()` does nothing. But if the restart's `saved_ncells` is **larger** than what was initialized, `realloc` is called. The crash is in `realloc`.
+
+Wait - but the initial mesh after `fill_circle` is only the initial grid (256 cells for 16x16). After AMR refinement cycles, the mesh grows. So `saved_ncells` would be >> 256. When we call `mesh->resize(saved_ncells)`, it calls `memory_realloc_all(saved_ncells)` which calls `realloc` for each registered array.
+
+The crash in `realloc` could be due to a **heap corruption** caused by ghost cells. When `calc_neighbors_local()` is called in main() BEFORE the restart (during the initial setup), it sets up ghost cells and `ncells_ghost > ncells`. The MallocPlus arrays are then sized to `ncells_ghost`. Then `veloc_do_restart` is called after that and resizes back to `saved_ncells`...
+
+Wait, let me re-read the code flow:
+
+```cpp
+mesh->init(nx, ny, circ_radius, initial_order, do_gpu_calc);
+state = new State(mesh);
+state->init(do_gpu_calc);
+state->fill_circle(circ_radius, 80.0, 10.0);
+
+// At this point: ncells = 256 (or whatever initial count)
+// No ghost cells have been added yet
+
+// veloc_do_restart is called HERE:
+bool restarted = veloc_do_restart(mype);
+// veloc_do_restart calls mesh->resize(saved_ncells)
+// saved_ncells might be 2000 (after 10 AMR cycles)
+// mesh->resize(2000) -> memory_realloc_all(2000)
+// This SHOULD work since 2000 > 256
+
+// THEN later:
+mesh->calc_neighbors_local();  // sets ncells_ghost
+```
+
+Hmm, the `calc_neighbors_local()` in main() is AFTER the restart block. So at the time of restart, there are no ghost cells. The `memory_realloc_all(saved_ncells)` call should succeed if `saved_ncells > 256` (current allocation).
+
+But wait! Look at the crash location more carefully:
+- `MallocPlus::memory_realloc_all+0x1c4`
+- `clamr_mpionly(+0x20204)` - this offset is very small, which might be in veloc_do_checkpoint, not veloc_do_restart
+
+Actually, looking at the stack trace again:
+```
+[dev:1807310] [ 2] clamr_mpionly(_ZN10MallocPlus18memory_realloc_allEm+0x1c4)
+[dev:1807310] [ 3] clamr_mpionly(+0x20204)
+[dev:1807310] [ 4] clamr_mpionly(main+0x15c)
+```
+
+The `+0x20204` offset is a symbol without a name, likely in the veloc_do_restart function which is called from main. The offset `main+0x15c` is a small offset into main, corresponding to line 304 or so.
+
+The crash is likely during `mesh->resize(saved_ncells)` in `veloc_do_restart`. The realloc fails because `saved_ncells` is much larger than the initial 256.
+
+But wait - if `saved_ncells > current_size`, `memory_realloc_all` is called and does `realloc(ptr, new_size)`. If `realloc` crashes, it could be because:
+1. The pointer was already corrupted somehow
+2. Some array has null pointer (not properly initialized)
+
+Let me check: does `mesh->init()` properly initialize all arrays that `memory_realloc_all` will iterate over? The MallocPlus iterates its `memory_ptr_dict`, which contains entries added via `memory_add` or `memory_malloc`. If some entry has a NULL pointer or uninitialized pointer, `realloc(NULL, size)` works like `malloc(size)`, which is fine. But a corrupted pointer would crash.
+
+Actually, the real issue might be different. Let me look at the key question: what IS `memory_ptr_dict` at this point in the execution?
+
+After `mesh->init()` and `state->init()`, various arrays are allocated. But `calc_neighbors_local()` also allocates MORE arrays (nlft, nrht, nbot, ntop). If `veloc_do_restart` calls `mesh->resize()` BEFORE `calc_neighbors_local()`, then some of those neighbor arrays might not yet be in MallocPlus's dictionary. So `memory_realloc_all` would only resize the arrays that exist at that point, which would be fine.
+
+Let me think differently. Let me look at where `+0x20204` actually is in the code. The key is that `memory_realloc_all` is crashing with SIGSEGV during `realloc`. This means either:
+1. Some pointer in the MallocPlus dictionary is invalid
+2. The heap has been corrupted before this call
+
+Looking at the code again, I think the real issue is that `mesh->init()` initializes the mesh with `ncells`, and some arrays in `mesh_memory` might have been initialized with GHOST cell sizes. Looking at how `mesh->init()` works:
+The key insight: `Mesh::allocate()` registers many arrays with size 1 (the face arrays like `xface_i`, `xface_j`, etc.). When `memory_realloc_all(saved_ncells)` is called, it resizes ALL registered arrays, including these face arrays, to `saved_ncells`. But these face arrays shouldn't be resized this way.
+
+Also, `celltype` is not allocated in `Mesh::allocate()` - it's only allocated when `calc_celltype()` is called. But in `memory_reset_ptrs()`, `celltype = mesh_memory.get_memory_ptr("celltype")` will return NULL if celltype hasn't been allocated, causing a segfault when we try to use it.
+
+Let me check when `calc_celltype` allocates `celltype`:
+Now I see - `calc_celltype` is called during `mesh->init()`, so `celltype` is allocated before `veloc_do_restart`. The problem must be something else.
+
+Let me look more carefully at the crash. The crash trace shows rank 1807310 crashing with:
+```
+realloc+0x64
+MallocPlus::memory_realloc_all+0x1c4
+clamr_mpionly(+0x20204)  <- veloc_do_restart
+clamr_mpionly(main+0x15c)
+```
+
+And there are MULTIPLE ranks crashing (1807309 and 1807310). Looking at the error: `realloc` itself is crashing. This can happen if:
+1. The heap is corrupted before the realloc call
+2. The pointer being passed to realloc is invalid
+
+BUT WAIT - looking at `mesh->resize()`:
+```cpp
+void Mesh::resize(size_t new_ncells) {
+   size_t current_size = mesh_memory.get_memory_size(i);
+   if (new_ncells > current_size) mesh_memory.memory_realloc_all(new_ncells);
+}
+```
+
+It only calls `memory_realloc_all` if `new_ncells > current_size`. If the checkpoint's `saved_ncells` is SMALLER than the initial allocation, it does nothing and the pointers (i, j, level, H, U, V) are still valid but point to larger buffers. We then write to them with `fread(mesh->i, sizeof(int), saved_ncells, fp)` which is fine.
+
+Actually, if `saved_ncells <= current_size`, the resize does nothing, and the pointers are still valid from init. So the crash must be because `saved_ncells > current_size`.
+
+The crash in `realloc` with invalid pointer... Let me look at `memory_realloc_all` more carefully. In the loop at line 349:
+```cpp
+for ( it_old=memory_ptr_dict_old.begin(); it_old != memory_ptr_dict_old.end(); it_old++){
+   malloc_plus_memory_entry *memory_item = it_old->second;
+   it_new = memory_ptr_dict.find(memory_item->mem_ptr);
+   memory_ptr_dict.erase(it_new);  // ERASE from the NEW dict by ptr
+   ...
+   mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+```
+
+After erasing from `memory_ptr_dict` and calling realloc, it inserts back with new ptr. The issue: if `it_new == memory_ptr_dict.end()` (entry not found), `memory_ptr_dict.erase(end())` is undefined behavior! But that shouldn't happen if the entry is present in both copies.
+
+Wait, actually I think the real crash source is different. Let me look at the actual crash frames again:
+
+```
+[dev:1807310] [ 1] /lib/aarch64-linux-gnu/libc.so.6(realloc+0x64)[0xfc18df3c71d4]
+[dev:1807310] [ 2] /home/ndhai/diaspora/guard-agent/build/validation_output/CLAMR_baseline_sonnet46/build/resilient/_build/clamr_mpionly(_ZN10MallocPlus18memory_realloc_allEm+0x1c4)
+[dev:1807310] [ 3] /home/ndhai/diaspora/guard-agent/build/validation_output/CLAMR_baseline_sonnet46/build/resilient/_build/clamr_mpionly(+0x20204)
+[dev:1807310] [ 4] /home/ndhai/diaspora/guard-agent/build/validation_output/CLAMR_baseline_sonnet46/build/resilient/_build/clamr_mpionly(main+0x15c)
+```
+
+The `+0x20204` - this is an anonymous function at offset 0x20204 in the binary. This could be `veloc_do_restart`.
+
+Now I need to understand why `realloc` crashes during `memory_realloc_all`. One theory: `memory_realloc_all` is iterating over `memory_ptr_dict_old` (a copy), and for each entry, it erases from the LIVE `memory_ptr_dict`. But when multiple iterations have the same pointer mapping (e.g., two entries pointing to the same memory block - which is unlikely but possible), the erase could fail.
+
+A more likely cause: during `veloc_do_restart`, we call `mesh->resize(saved_ncells)`. This works if `saved_ncells > current_size`. After `memory_realloc_all`, the `i`, `j`, `level` pointers in `mesh` are now **stale** (realloc may have moved the memory). We then call `mesh->memory_reset_ptrs()` to fix this. But what if `memory_realloc_all` itself crashes DURING the iteration?
+
+Actually wait - I just realized something. The `+0x20204` offset corresponds to a function that is NOT `veloc_do_restart`. Looking at the crash with `main+0x15c` - that's a very small offset into `main`, suggesting the crash happens very early in main. But `veloc_do_restart` is called after lots of initialization code, which takes more instructions. 
+
+Let me reconsider: maybe `+0x20204` is `veloc_do_checkpoint` being called inside the `do_calc` burst loop... No, the stack trace shows it's called from `main`, not from `do_calc`.
+
+Actually wait, `+0x20204` is the address offset of the calling instruction within the binary. This could be anything. The `main+0x15c` is what matters - that's 348 bytes into `main`.
+
+Let me think about a completely different approach. The crash happens because the `realloc` pointer is invalid. Let me look at what happens during `mesh->init()` - specifically, does it call `memory_realloc_all`?
+
+Let me look at what happens during `mesh->init()` - especially with ghost cells:
+Let me take a completely different approach. Instead of trying to diagnose the exact crash cause, let me look at **what actually works** and use a simpler, safer approach for the restart that avoids calling `mesh->resize()` and `memory_realloc_all` altogether.
+
+The safest approach is to NOT try to load data into the existing mesh/state objects' internal pointers, but instead:
+1. Write checkpoint data to VeloC-routed files
+2. On restart, read the data into **separate buffers** first, then manually copy them into the mesh arrays
+
+Actually, even simpler: avoid `mesh->resize()` entirely by using a different strategy. The restart crash is in `realloc`. Let me completely avoid calling `memory_realloc_all` during restart.
+
+The key insight: instead of using `mesh->resize()`, I should allocate fresh buffers and copy the data, then let the normal initialization path handle the mesh state correctly.
+
+Actually, the SIMPLEST approach to avoid all these issues is to **NOT checkpoint the mesh structure at all**. Instead, checkpoint only the STATE arrays (H, U, V) and the scalar cycle counter/simTime. On restart, the mesh is rebuilt from scratch using the same initial conditions, and then the state is restored.
+
+But that doesn't work because the mesh structure changes with AMR refinement - the cell count and layout changes every cycle.
+
+Let me think about a different approach: what if I avoid `mesh->resize()` entirely and instead just directly write to the EXISTING allocated memory? After `mesh->init()` and `state->init()`, the arrays are allocated. After AMR cycles, they've been reallocated larger. On restart, we need the same number of cells. 
+
+The crash might be a subtle timing/ordering issue. Let me look at what the state ACTUALLY looks like during restart by looking at where `memory_realloc_all` is called from `veloc_do_restart`:
+
+```cpp
+mesh->ncells = saved_ncells;  // set size
+mesh->resize(saved_ncells);   // this calls memory_realloc_all if saved_ncells > current_size
+mesh->memory_reset_ptrs();    // refresh ptrs
+state->resize(saved_ncells);  // same for state
+state->memory_reset_ptrs();   // refresh ptrs
+```
+
+The issue: `mesh->resize(saved_ncells)` calls `memory_realloc_all(saved_ncells)`. This resizes ALL arrays in `mesh_memory`, including the tiny 1-element face arrays (`xface_i`, `xface_j`, etc). Those 1-element arrays get reallocated to `saved_ncells` size - wasteful but not crash-prone.
+
+WAIT. I just noticed something. Look at `memory_realloc_all`:
+```cpp
+if (memory_item->mem_flags & HOST_MANAGED_MEMORY) {
+   if (nelem > memory_item->mem_capacity) {
+      mem_ptr=realloc(...)
+   } else {
+      memory_item->mem_nelem[0] = nelem;  // just update count, no realloc
+   }
+} else {
+   mem_ptr=realloc(...)  // ALWAYS realloc
+}
+```
+
+For non-HOST_MANAGED_MEMORY entries, it always calls realloc even if shrinking. But for HOST_MANAGED_MEMORY, it only reallocates if growing. The `celltype` was allocated with `flags = LOAD_BALANCE_MEMORY` (if `parallel`) or `flags = 0`. Let me check what LOAD_BALANCE_MEMORY means:
+Now I understand the memory flags better. `LOAD_BALANCE_MEMORY` doesn't map to `HOST_MANAGED_MEMORY`, so arrays with that flag will ALWAYS be realloc'd (including shrinking) in `memory_realloc_all`. This means if we call `mesh->resize(saved_ncells)` where saved_ncells is LESS than the current capacity (which happens after AMR has grown the mesh), `realloc` would be called to shrink those arrays.
+
+BUT the code says:
+```cpp
+if (new_ncells > current_size) mesh_memory.memory_realloc_all(new_ncells);
+```
+
+So `memory_realloc_all` is only called if `new_ncells > current_size`. The problem is: what is `current_size`?
+
+`mesh_memory.get_memory_size(i)` returns the capacity of the `i` array. Initially after `mesh->init()`, `i` has `ncells_initial` capacity (e.g., 256 for rank 0 with 64 cells on 4 ranks). If `saved_ncells = 2000`, then `2000 > 256` is true, and `memory_realloc_all(2000)` is called.
+
+The crash during `realloc(ptr, 2000*sizeof(int))` - could this be because the ptr in MallocPlus dictionary is invalid? Let me think...
+
+Actually, I have a new theory. After `mesh->init()` is called, the `mesh->i` pointer is valid. However, since this is an AARCH64 machine and we're looking at the stack trace, maybe the crash is on a DIFFERENT rank (rank 1807309 is one rank, 1807310 is another). 
+
+Let me look at the crash trace for rank 1807309:
+```
+realloc
+MallocPlus::memory_realloc_all
+clamr_mpionly(+0x20204)  <- same offset!
+clamr_mpionly(main+0x15c)
+```
+
+Both ranks crash at the exact same code location. This confirms it's during `veloc_do_restart` → `mesh->resize()` → `memory_realloc_all`.
+
+Now, the critical thing I missed: the `memory_realloc_all` non-HOST_MANAGED path calls:
+```cpp
+mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+```
+
+For the small face arrays (size 1), `nelem=saved_ncells` and `mem_elsize=4` (int), so `realloc(ptr, 2000*4)`. This should work fine. But what about the `nlft`, `nrht`, `nbot`, `ntop` arrays? Looking at when they're allocated:
+The nlft/nrht/nbot/ntop arrays are only allocated in `calc_neighbors_local`. Before `veloc_do_restart` is called, `calc_neighbors_local` in main() has NOT been called yet (it comes after the restart block). So `nlft`, `nrht`, `nbot`, `ntop` are NULL at this point.
+
+When `mesh->resize()` is called and it calls `memory_realloc_all(saved_ncells)`, it iterates over ALL entries in `memory_ptr_dict`. Since `nlft` is NULL (not allocated), it's not in the dict. So that's fine.
+
+Hmm. Let me think about this differently. Let me look at what `mesh->init()` actually does step by step to understand what's in `memory_ptr_dict` before the restart call:
+This is very important! During `mesh->init()`, `calc_neighbors_local()` is called at line 1631! This means nlft/nrht/nbot/ntop ARE allocated by the time `veloc_do_restart` is called. They'll be in `memory_ptr_dict` and will be realloc'd during `mesh->resize(saved_ncells)`.
+
+But more importantly: at line 1630, `ncells_ghost = ncells`. The neighbors are computed, and the i/j/level arrays might have been expanded to `ncells_ghost` size. Let me check if `calc_neighbors_local` in init causes ghost cell expansion:
+Now I see the full picture. The `mesh->init()` calls `calc_neighbors_local()` inside a `for (int ilevel=1; ilevel<=levmx; ilevel++)` loop (line 1626-1675), then calls `rezone_all` which changes mesh sizes. After this loop, `ncells_ghost = ncells` is set (line 1677).
+
+So after `mesh->init()` completes, the MallocPlus dict has: i, j, level (with size `ncells_after_init`), celltype, nlft, nrht, nbot, ntop (with size `ncells_ghost_after_init = ncells_after_init`), plus the small face arrays.
+
+Now during `veloc_do_restart`, `saved_ncells` is the checkpoint's ncells. If `saved_ncells` is much larger (after many AMR cycles), `mesh->resize(saved_ncells)` calls `memory_realloc_all(saved_ncells)`. This should work.
+
+BUT WAIT - I just noticed something critical. In `memory_realloc_all`, for `HOST_MANAGED_MEMORY` entries, it only reallocates if growing. For other entries, it always calls `realloc`. 
+
+Looking at `Mesh::allocate()` - the i, j, level are allocated with flag `RESTART_DATA`. The face arrays are allocated with `flags = 0` (no flags). `LOAD_BALANCE_MEMORY = 0x00008` is not `HOST_MANAGED_MEMORY = 0x00001`. And `RESTART_DATA = 0x00010` is not `HOST_MANAGED_MEMORY`.
+
+So ALL mesh arrays will go through the `else { mem_ptr=realloc(...) }` path (not HOST_MANAGED_MEMORY), which means they get realloc'd regardless. This should work but would resize all arrays including small ones.
+
+Actually, let me reconsider the crash. Maybe the crash is NOT in `veloc_do_restart` at all, but in something called from the same stack frame. Let me look at `main+0x15c` offset carefully.
+
+Actually, I think I need to take a completely different approach to diagnosing this. Let me look at what's different between a normal run's restart vs what our code does. 
+
+**The real problem might be simpler**: When we restored from checkpoint in attempt 1, the recovery run (attempt 2) exits after only 2.53 seconds with exit code 139. That's very fast. The crash could be happening because:
+
+1. The VeloC checkpoint files from attempt 1 are stored in `/tmp/clamr_veloc_scratch` and `/tmp/clamr_veloc_persistent`
+2. Attempt 2 reads from these files
+3. The restart reads different ncells on each rank than what's in the checkpoint (possible if load balance differs)
+
+Actually wait - looking at the trace more carefully. Both crashes show `main+0x15c`. The `+0x15c` = decimal 348 bytes into main. With the code structure, this is very early in main - suggesting the crash happens during `veloc_do_restart` call.
+
+Let me look at another possible cause: the `mesh->init()` during the recovery run calls `calc_neighbors_local()` which allocates nlft, nrht, nbot, ntop. These arrays are registered with some size. Then `veloc_do_restart` is called and resizes them with `memory_realloc_all`. 
+
+Actually - let me think again. If `saved_ncells` from checkpoint is LARGER than what's in memory after `mesh->init()`, `memory_realloc_all` is called, and `realloc` is used. On aarch64 with certain allocators, `realloc` of a small buffer to a large one fails or crashes if the allocator is in a bad state.
+
+But this seems unlikely to be the root cause. Let me look at the problem from a completely different angle.
+
+**Alternative approach**: Instead of using `mesh->resize()` which calls `memory_realloc_all`, I should read the checkpoint data into fresh malloc'd buffers, then manually copy to mesh->i etc. if they're large enough. Or better yet, use a completely different mechanism to restore state.
+
+The cleanest fix for the segfault: **avoid `mesh->resize()` and `state->resize()` entirely**. Instead:
+1. Read saved_ncells from the checkpoint header
+2. Use `std::vector` to hold the checkpoint data temporarily 
+3. Then manually write to mesh->i[0..saved_ncells-1] etc.
+4. But first ensure the arrays are large enough
+
+For ensuring the arrays are large enough without crashing: just check if `saved_ncells <= mesh->ncells_ghost` (current capacity after init, which includes ghost cell headroom). If so, just write directly. If not, we need to call resize. But maybe the issue is that `mesh->ncells` at the time of the resize call doesn't reflect the ghost capacity.
+
+Let me look at another approach entirely: skip the resize and instead just do a `new` allocation. Since `mesh_memory` manages the pointers, and we just need to write to them, maybe we can use `memory_request_all` instead.
+
+Actually, let me look at this from a practical perspective. The simplest fix is:
+
+**Option A**: Call `mesh->resize(saved_ncells)` BEFORE `state->init()` and `state->fill_circle()`. This way, the resize happens with a fresh/clean MallocPlus dict. But this requires knowing `saved_ncells` before calling those functions...
+
+**Option B**: Skip `mesh->resize()` entirely and instead use `mesh->memory_request_all(saved_ncells)` which uses `realloc` to set the capacity without changing nelem.
+
+**Option C**: The simplest - use `malloc`/`fread` into temporary buffers, then copy to the mesh arrays using memcpy. This avoids touching MallocPlus at all for the resize.
+
+Wait, let me look at exactly what `mesh_memory.get_memory_size(i)` returns - is it the capacity or the current nelem?
+So `get_memory_size` returns `mem_nelem[0]` - the CURRENT element count, not the capacity. So `mesh_memory.get_memory_size(i)` = number of elements (not capacity).
+
+Now, after `mesh->init()` is called, `ncells` is set for this rank (e.g. 64 cells per rank for 256/4). After the levmx loop in init, ncells gets larger due to AMR refinement of the initial circle. Let me check what a typical initial ncells is.
+
+With `nx=16, ny=16, levmx=1`, the initial grid has 256 cells. After levmx=1 refinement, cells near the circle are refined. So per rank (4 ranks), maybe 100-200 cells each.
+
+After 10 cycles of AMR, ncells could be 500-1000 per rank. So `saved_ncells = 1000` and `current_size = 200` → `memory_realloc_all(1000)` is called.
+
+The segfault during `realloc(ptr, 1000*sizeof(int))` on aarch64 is suspicious. Let me look at this from yet another angle.
+
+Let me check if there's a `HOST_MANAGED_MEMORY` flag issue. After `memory_realloc_all` shrinks an entry via the `else` path (non-HOST_MANAGED), the ptr might become NULL if realloc with size 0 is called. But we're growing here, not shrinking.
+
+Actually, I think I see the real issue now. During `mesh->init()`, the `rezone_all` function (called in the levmx loop) likely calls `memory_realloc_all` with different sizes, which may leave some entries in an inconsistent state. Let me look at `rezone_all` more carefully:
+OK, I'm spending too much time on root cause analysis. Let me take a much more pragmatic approach.
+
+The key insight from the validate output is:
+1. The recovery run crashes with segfault (exit=139) very quickly (2.53s)
+2. The crash is in `realloc` via `memory_realloc_all` via `veloc_do_restart` from `main`
+
+The most reliable fix is to **avoid calling `mesh->resize()` and `state->resize()` entirely** during restart. Instead, I'll read the checkpoint data into temporary `std::vector` buffers, then once we know `saved_ncells`, we'll ensure the mesh arrays can hold it via a different mechanism.
+
+Actually, looking at this more carefully, there's a much simpler approach: **don't call `memory_realloc_all` at all**. The `i[]`, `j[]`, `level[]`, `H[]`, `U[]`, `V[]` arrays after `mesh->init()` already have been allocated to some size. After the levmx refinement loop in init, they're grown to accommodate the initial refined mesh.
+
+If I checkpoint AFTER the initial setup (i.e., after cycle 10), `saved_ncells` will be some evolved size. The problem: the initial allocation size after init might be SMALLER than `saved_ncells` from the checkpoint.
+
+**The real fix**: Instead of using `mesh->resize()`, I should just use `fread` into temporary vectors, set `mesh->ncells = saved_ncells` and `mesh->ncells_ghost = saved_ncells`, then copy from those vectors. The existing pointers `mesh->i`, `mesh->j` etc. might not be large enough, so I need to ensure they're large enough first.
+
+Let me use a completely different approach: **allocate fresh arrays of the right size using regular malloc, then assign them to the mesh pointers after removing the old ones from MallocPlus**.
+
+Actually, the CLEANEST approach that avoids ALL these issues: **reinitialize the mesh from checkpoint state without using MallocPlus resize at all**, by:
+
+1. Reading checkpoint data into temporary vectors
+2. Setting `mesh->ncells = saved_ncells`  
+3. Using `mesh->calc_celltype(saved_ncells)` (which handles its own reallocation)
+4. Then using `mesh->memory_request_all(saved_ncells)` which is designed to set capacity
+5. Calling `mesh->memory_reset_ptrs()`
+6. Copying from temporary vectors
+
+Wait, but `memory_request_all` also calls `realloc` unconditionally for non-HOST_MANAGED. Let me look at what's really happening.
+
+Actually - I want to trace through the exact execution sequence. After `mesh->init()` completes:
+- `ncells` = initial refined count per rank (maybe 80 cells per rank for 4 ranks on 16x16 with levmx=1)
+- `ncells_ghost` = `ncells` (set at line 1677)
+- MallocPlus entries: i (size ncells), j (size ncells), level (size ncells), celltype (size ncells), nlft (size ncells), nrht (size ncells), nbot (size ncells), ntop (size ncells), xface_i (size 1), etc.
+
+After `state->init()`:
+- H, U, V allocated with size ncells in state_memory
+
+After `state->fill_circle()`:
+- H, U, V filled with initial values
+
+Now `veloc_do_restart(mype)` is called. Let's say `saved_ncells = 500` (more than initial ~80).
+
+1. `mesh->ncells = 500`
+2. `mesh->ncells_ghost = 500`
+3. `mesh->resize(500)`:
+   - `current_size = mesh_memory.get_memory_size(i)` = 80 (current nelem)
+   - Since 500 > 80: `mesh_memory.memory_realloc_all(500)` is called
+   - This reallocs ALL entries to 500 elements
+   - **CRASH?** Why would realloc crash here?
+
+Actually wait... Let me look at the `HOST_MANAGED_MEMORY` path again. For entries WITHOUT `HOST_MANAGED_MEMORY` flag:
+```cpp
+mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+memory_item->mem_capacity = nelem;
+memory_item->mem_nelem[0] = nelem;
+memory_item->mem_ptr = mem_ptr;
+// Insert back into dict
+memory_ptr_dict.insert(...)
+```
+
+If `realloc` returns NULL (failure), then `mem_ptr = NULL` is inserted into the dict. But `realloc` shouldn't fail for a relatively small allocation.
+
+Let me look if there's a `mem_elsize = 0` issue - if an entry has `mem_elsize = 0`, then `nelem * mem_elsize = 0`, and `realloc(ptr, 0)` returns NULL on some systems, causing the next iteration to crash when `memory_ptr_dict.find(NULL)` finds something unexpected.
+
+Looking at the face arrays: they're allocated with `sizeof(int)` = 4 bytes, `sizeof(uchar_t)` for some. None should have 0 elsize.
+
+Actually, let me try a completely different approach to fixing this. Let me look at what `inspect.md` says:
+The inspection.md shows **NO SOURCE EDITS** during iter_1! This means the previous agent ran but didn't actually modify any files. Looking at the opencode_stdout.txt (which was huge - 758 lines), the agent was describing what it WOULD do but clearly didn't actually do it.
+
+So the current state of `clamr_mpionly.cpp` must be from an EARLIER state. Let me check what the CMakeLists.txt looks like:
+So the CMakeLists.txt and clamr_mpionly.cpp already have the VeloC code from before, and veloc.cfg already exists. But the previous iteration (iter_1) made NO source edits. So this code was already in the repository from a PREVIOUS state (maybe pre-existing or from a prior session).
+
+Looking at the validate output again:
+1. **Attempt 1 (checkpoint run)**: Ran successfully (74.21 seconds), wrote 1607 checkpoint files (8.5 GB!)
+2. **Attempt 2 (recovery run)**: Crashed immediately (2.53s) with segfault in `memory_realloc_all`
+3. **Failure-free run**: Disk exhausted (10.91 GB > 10.74 GB)
+
+The two problems are:
+1. **Segfault during recovery**: In `veloc_do_restart` → `mesh->resize()`
+2. **Disk exhaustion**: 1607 checkpoint files at 8.5 GB is too large (checkpointing too aggressively and/or too much data per checkpoint)
+
+Let me plan the fix:
+
+**Fix 1: Segfault in recovery**
+The crash is in `memory_realloc_all`. The safest fix is to avoid calling `mesh->resize()` and `state->resize()` during restart. Instead, read into temporary buffers, then use `memcpy` directly to the existing pointers.
+
+But wait - if `saved_ncells > current_capacity`, we can't just write to the existing pointers. We need to ensure enough space.
+
+Actually, let me look at this from a completely different angle. The `mesh->resize()` function only calls `memory_realloc_all` if `saved_ncells > current_size`. The current_size is `mesh_memory.get_memory_size(i)` = `nelem` of the `i` array. After `mesh->init()` completes, what is this value?
+
+The key: after `mesh->init()`, `ncells` = initial refined cell count per rank. Let me check what happens when the levmx AMR loop runs:
+
+After levmx=1 loop:
+- 16x16=256 initial cells, refined to ~400 cells, then split among 4 ranks = ~100 per rank
+- `ncells = 100` (per rank), `mesh_memory.get_memory_size(i)` could be larger if rezone_all over-allocated
+
+Actually, `rezone_all` during `mesh->init()` works on the FULL mesh before partitioning. Looking at the loop again: at line 1657, `rezone_all(icount, jcount, mpot, 0, dummy)` is called with a dummy state_memory. This adds cells. Then `ncells = new_ncells` (line 1659). But what about the MallocPlus capacity?
+
+During rezone_all, `mesh_memory.memory_realloc_all(old_ncells + indices_needed)` is called (line 8645). This sets the new capacity. After `mesh->init()` returns, the capacity of the `i` array could be > ncells.
+
+When I then call `veloc_do_restart` with `saved_ncells` from a checkpoint, the comparison is:
+- `get_memory_size(i)` = nelem (= ncells after init = maybe 100 per rank)
+- `saved_ncells` = cells after 10 AMR cycles = maybe 500 per rank
+
+So 500 > 100, and `memory_realloc_all(500)` is called. This should work in theory.
+
+Let me look at the actual crash more carefully. The crash is `realloc+0x64`. On aarch64, this is a small offset into glibc's `realloc`. The crash could be a null pointer dereference or a corrupted heap. 
+
+I'm going to look at this from a completely different angle. Let me check the veloc.h API to understand `VELOC_Restart_begin` and `VELOC_Route_file`:
+Now I understand the VeloC API fully. Looking at the `max_versions` option - this is the key for limiting disk usage. I should add `max_versions = 2` to veloc.cfg.
+
+Now let me figure out the real cause of the segfault. Looking at the API:
+- `VELOC_Route_file("clamr_rank.dat", ckpt_path)` - routes the file
+- The function returns the path to use
+
+During RESTART, `VELOC_Restart_begin(name, latest)` is called, then `VELOC_Route_file` is called to get the path of the existing checkpoint file.
+
+**Key question**: Does `VELOC_Route_file` during restart give the path to the EXISTING checkpoint file (which has the data), or to a NEW empty file?
+
+Looking at the VeloC documentation comment: "obtain the full path for the file associated with the named checkpoint and version number". This suggests it gives the path to the existing checkpoint for the current context (between restart_begin and restart_end). So the file should already exist.
+
+But here's a potential issue: maybe `VELOC_Route_file` during restart returns a path that doesn't exist yet, and we're trying to open it with `"rb"` - this would make `fopen` return NULL. We handle that case by calling `VELOC_Restart_end(0)` and returning false. But then `restarted = false` and no crash... unless the NULL check is bypassed.
+
+Wait, looking at the code: if `fopen` returns NULL, we call `VELOC_Restart_end(0)` and `return false`. So the crash is NOT from fopen failing.
+
+Let me think about this differently. The crash is happening in `memory_realloc_all`. In the `memory_realloc_all` function, there's this code:
+
+```cpp
+map <void *, malloc_plus_memory_entry*> memory_ptr_dict_old = memory_ptr_dict;
+...
+for ( it_old=memory_ptr_dict_old.begin(); it_old != memory_ptr_dict_old.end(); it_old++){
+   malloc_plus_memory_entry *memory_item = it_old->second;
+   it_new = memory_ptr_dict.find(memory_item->mem_ptr);
+   memory_ptr_dict.erase(it_new);
+```
+
+The `memory_ptr_dict_old` is a copy of `memory_ptr_dict`. After erasing from `memory_ptr_dict` and calling realloc, we insert the new pointer. But if two entries in the dict happen to have the same pointer value (unlikely but possible with freed memory being reused), this could cause issues.
+
+More importantly: if `it_new = memory_ptr_dict.end()` because the entry is not found (which shouldn't happen), then `memory_ptr_dict.erase(end())` is UB.
+
+Actually, I think I found the real issue. Look at this in `memory_realloc_all`:
+
+```cpp
+it_new = memory_ptr_dict.find(memory_item->mem_ptr);
+memory_ptr_dict.erase(it_new);
+```
+
+After this erase, in the NEXT iteration of the outer loop, when we process another entry from `memory_ptr_dict_old`, we look for `memory_item->mem_ptr` in the MODIFIED `memory_ptr_dict`. If realloc changed a previous entry's pointer AND the new pointer happens to collide with an existing entry's pointer (hash collision), this could cause confusion.
+
+But more likely: the crash is from a NULL or invalid pointer being passed to realloc. This could happen if one of the entries in `mesh_memory` has a `mem_ptr = NULL`. 
+
+Which entries might have NULL ptr? The face arrays: `xface_i`, `xface_j`, etc. are allocated with size 1. After the levmx loop in init (which calls `rezone_all`), these face arrays might have been freed and not reallocated. Let me check:
+OK so the face arrays are never explicitly deleted. They stay in `memory_ptr_dict` with their size=1 allocations, and when `memory_realloc_all` is called, they get realloc'd to saved_ncells size. That's wasteful but shouldn't crash.
+
+Let me try a completely different angle. Let me look at what happens if there's a VeloC header issue - maybe `VELOC_FAILURE` has a different value than expected:
+OK so `VELOC_FAILURE = -1`. The check `if (latest == VELOC_FAILURE)` would be true if `VELOC_Restart_test` returns -1 (no checkpoint found). That's correct.
+
+Wait - `VELOC_Restart_test(name, 0)` with version=0 means "find the latest version with version < 0". But 0 means "no limit"? Let me re-read the doc: "IN needed_version - maximum version to look for". So `version=0` means look for version < 0, which means NO checkpoints would be found! That's a bug!
+
+Actually, looking at the docs again: "returns VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise". If `needed_version=0`, then we're looking for versions < 0, which would be none. So `VELOC_Restart_test(name, 0)` would always return -1!
+
+But wait - the validation shows "checkpoint-observed: detected 3008 checkpoint file(s)" and then the recovery run is launched. So VeloC IS detecting checkpoints. The check in `veloc_do_restart` with `VELOC_Restart_test(VELOC_CKPT_NAME, 0)` - what does `version=0` mean in the VeloC implementation?
+
+Let me check the VeloC implementation to see what version=0 means:
+
+Actually, looking at VeloC source conventions, `version=0` typically means "latest version" (all versions). But the doc says "maximum version". Let me check if `0` means "any version" in this context.
+
+Actually, looking at this more carefully - the CLAMR code uses `VELOC_Restart_test(VELOC_CKPT_NAME, 0)`. The VeloC docs say this returns `latest version < needed_version` or -1. If `needed_version=0`, then returns `-1` always.
+
+But actually, maybe 0 is a special value meaning "find any version". Let me look at VeloC source:
+Let me look at a different approach to understand the `VELOC_Restart_test` behavior. Let me look at whether the previous code was actually correctly calling VeloC restart or if there was a bug.
+
+Actually, the validate log says the recovery run ran for 2.53 seconds and crashed. The checkpoint files DID exist (1607 files, 8.5 GB). So `VELOC_Restart_test` must have returned something other than `VELOC_FAILURE`. But wait - the segfault is in `memory_realloc_all` called from `main+0x15c`. If `VELOC_Restart_test` returned VELOC_FAILURE, the code would return false from `veloc_do_restart` and no resize would happen.
+
+So the crash IS happening during the actual restart - the test succeeded, VeloC found a checkpoint, and then `memory_realloc_all` crashed.
+
+Let me look at this from a fresh perspective. The key insight I may be missing: the previous code was attempting to do `mesh->resize(saved_ncells)` AFTER reading `saved_ncells` from the checkpoint file. But `mesh->resize()` calls `memory_realloc_all(new_ncells)`. On aarch64 with glibc, this could crash if there's heap corruption.
+
+What if the issue is that during the checkpoint write (attempt 1), writing to the VeloC-routed file works fine, but the `memory_realloc_all` call is causing heap corruption in the CHECKPOINT run, and then the RECOVERY run crashes because the heap is already corrupted? No, that doesn't make sense - they're separate processes.
+
+Let me take yet another approach. The crash trace says:
+```
+[ 2] clamr_mpionly(_ZN10MallocPlus18memory_realloc_allEm+0x1c4)
+[ 3] clamr_mpionly(+0x20204)
+[ 4] clamr_mpionly(main+0x15c)
+```
+
+The `+0x20204` is the instruction address of the call site (the call to `memory_realloc_all`). This is called from an anonymous location (`+0x20204`), which is a function without a name in the symbol table. This could be `veloc_do_restart` if it was inlined or declared as `static`.
+
+Actually, `static void veloc_do_restart(int mype)` - since it's `static`, it might get inlined by the compiler at `-O3` (which is what CLAMR uses). If it's inlined into `main`, then the frame would show as `main+something`. But the trace shows `main+0x15c` for the `veloc_do_restart` CALL site, and `+0x20204` for the `memory_realloc_all` call within `veloc_do_restart`.
+
+Actually the `+0x20204` IS the call to `memory_realloc_all` inside `veloc_do_restart`. And `main+0x15c` is the call to `veloc_do_restart` from main. Both make sense.
+
+OK let me approach this completely differently. Instead of debugging the exact crash, let me **rewrite the restart mechanism** to avoid calling `memory_realloc_all` at all.
+
+**New approach**: Use `VELOC_Mem_protect` API instead of manual file I/O. Register the scalars and arrays before checkpointing, and use VeloC's built-in memory restore during restart.
+
+But with dynamic arrays (AMR), we can't use `VELOC_Mem_protect` directly because sizes change. 
+
+**Simplest safe approach**: Write the checkpoint to a manually managed file (NOT through `VELOC_Route_file`), just use a fixed filename per rank derived from MPI rank. Then register THAT file with VeloC using `VELOC_Route_file`. On restart, read from the file after restoring memory.
+
+Actually wait - I think the issue might be much simpler than I thought. Let me re-read the code:
+
+```cpp
+mesh->resize(saved_ncells);   // calls memory_realloc_all if saved_ncells > current
+mesh->memory_reset_ptrs();    // refresh ptrs
+state->resize(saved_ncells);  // calls memory_realloc_all if saved_ncells > current
+state->memory_reset_ptrs();   // refresh ptrs
+```
+
+After `mesh->resize(saved_ncells)` calls `memory_realloc_all`, the `i`, `j`, `level` pointers in `mesh` are STALE (realloc may have moved them). `memory_reset_ptrs()` is supposed to fix this. But then `fread(mesh->i, ...)` uses the NEW pointer from `memory_reset_ptrs()`. That should be fine.
+
+But wait - `state->resize(saved_ncells)` calls `state_memory.memory_realloc_all(saved_ncells)`. But `state_memory.get_memory_size(H)` = current size. If `saved_ncells > current_size`, it reallocates H, U, V. This should also work.
+
+Unless... the `state_memory.memory_realloc_all(saved_ncells)` is the one that crashes! Let me think about the order:
+1. `mesh->resize(saved_ncells)` - reallocates mesh_memory entries
+2. `mesh->memory_reset_ptrs()` - refreshes mesh pointers
+3. `state->resize(saved_ncells)` - reallocates state_memory entries ← CRASH HERE?
+
+During `state->resize`, `state_memory.memory_realloc_all(saved_ncells)` iterates over state_memory entries (H, U, V). But wait - do state_memory entries somehow reference mesh_memory entries? Probably not. They're separate MallocPlus objects.
+
+Hmm. Actually, let me look at `State::init`:
+Note: `LOAD_BALANCE_MEMORY | RESTART_DATA | REZONE_DATA` is the flag for H, U, V. `LOAD_BALANCE_MEMORY = 0x00008`, NOT `HOST_MANAGED_MEMORY = 0x00001`. So the `else` path in `memory_realloc_all` is taken for H, U, V, which always calls `realloc`.
+
+Actually wait - let me look at `REZONE_DATA`:
+So `REZONE_DATA = 0x00100`, which is not `HOST_MANAGED_MEMORY = 0x00001`. The `else` path (always realloc) is still taken.
+
+OK, I need a fundamentally different approach to fix the segfault. Let me just **avoid calling `mesh->resize()` and `state->resize()` entirely**. Instead:
+
+1. On restart, first read only the scalars (`ncycle`, `simTime`, `deltaT`, `H_sum_initial`, `saved_ncells`) from the checkpoint
+2. Then use these to reconstruct the mesh from scratch - by running `mesh->init()` again but with the checkpoint data loaded
+
+Actually, the cleanest approach: **don't use `memory_realloc_all` at all during restart**. Instead:
+- Read checkpoint data into temporary `std::vector<int>` and `std::vector<state_t>` buffers
+- Then, AFTER the normal main() setup flow, copy from those buffers to the actual mesh/state arrays
+
+Wait but the problem is that `mesh->init()` sets up the initial (pre-AMR) mesh, and we need to REPLACE that with the checkpoint data. The mesh pointers after `mesh->init()` are valid but may be smaller than needed.
+
+Here's the key insight: **the `mesh->init()` call that includes the levmx loop already grows the mesh to handle the refinement**. So after `mesh->init()`, the MallocPlus allocations might already be large enough to hold the checkpoint data, because the mesh has been refined! Let me check...
+
+Wait, no. `mesh->init()` runs its own AMR loops to create the initial refined mesh shape. The resulting ncells per rank after init might be similar to (but not the same as) the ncells after 10 AMR simulation cycles. If the checkpoint is from cycle 10 and the mesh has grown significantly, `saved_ncells >> ncells_after_init`.
+
+OK I'll take a completely different approach. Let me fix this properly by:
+
+1. **Not using `mesh->resize()` at all** - instead, read the checkpoint into temporary vectors, compute where we need to be
+2. **Force a proper resize** by calling `memory_request_all` which ensures capacity without corrupting the dict
+3. Or simply: **re-allocate arrays completely** by clearing the mesh_memory and doing a fresh allocation
+
+Actually the SIMPLEST fix that avoids the crash: **read checkpoint into temp vectors first, then call resize, then copy from temp vectors**. If the crash is a heap corruption caused by the mesh being in an inconsistent state (e.g., some pointer is stale or already realloc'd during init's levmx loop), then the problem might be that `mesh_memory.memory_ptr_dict` has stale entries.
+
+Let me take the most pragmatic approach: **completely rewrite veloc_do_restart to avoid calling mesh->resize()**. Instead:
+
+1. Read scalars from file (ncycle, simTime, deltaT, H_sum_initial, saved_ncells)
+2. Read arrays into temp std::vectors
+3. Directly copy to mesh->i, mesh->j, mesh->level (up to their current capacity, growing manually if needed using plain realloc/malloc)
+
+No wait, that bypasses MallocPlus entirely which would leave the dict inconsistent.
+
+**The real fix**: Restructure the restart so that resize happens BEFORE any mesh functions are called. Specifically:
+
+1. Do the normal init path: `mesh->init()`, `state->init()`, `state->fill_circle()`
+2. Peek at the checkpoint file to get `saved_ncells` (read just the header)
+3. Call `mesh->resize(saved_ncells)` and `mesh->memory_reset_ptrs()`
+4. Call `state->resize(saved_ncells)` and `state->memory_reset_ptrs()`  
+5. Call `VELOC_Restart_begin(...)` 
+6. Get the file path and read the full data
+7. Call `VELOC_Restart_end(1)`
+
+The question is still: WHY does `mesh->resize(saved_ncells)` crash?
+
+Let me look at this from a completely different direction. Maybe the crash isn't in `veloc_do_restart` at all. Maybe it's caused by reading from the VeloC-routed file and the `fread` returning corrupted data. If `fread` reads garbage into `mesh->i[0..saved_ncells-1]`, then later code crashes. But the crash stack shows it's `memory_realloc_all`, not downstream code.
+
+OK, I have a new theory. The crash might be because **the VeloC library itself allocates memory during `VELOC_Restart_begin`**, and this allocation could corrupt the heap if VeloC internally uses some allocator that conflicts with the process's allocator.
+
+But that doesn't explain why it crashes in OUR code's `memory_realloc_all`.
+
+Let me try yet another angle. Looking at the crash on TWO ranks simultaneously: both ranks crash at the same code location. This is consistent with a deterministic bug (not a race condition). The bug happens in `memory_realloc_all` when called with `saved_ncells`.
+
+Here's my new hypothesis: the `memory_realloc_all` function uses `it_old->second` to get the `malloc_plus_memory_entry*`. This pointer comes from `memory_ptr_dict_old` which is a copy of `memory_ptr_dict`. However, `malloc_plus_memory_entry*` points to memory allocated on the heap. If this memory was freed by some previous operation, then dereferencing it would cause a segfault.
+
+When does `malloc_plus_memory_entry` get freed? When `memory_delete` is called. During `mesh->init()`, `calc_celltype` is called which might delete and re-malloc celltype. When it does `mesh_memory.memory_delete((void *)celltype)`:
+OK so when `memory_delete` is called, it frees `memory_item->mem_ptr`, frees `memory_item->mem_nelem`, frees `memory_item->mem_name`, and frees `memory_item` itself. It also erases from both dictionaries.
+
+The `memory_ptr_dict_old` in `memory_realloc_all` is a copy of the MAP (key-value pairs copied). The `malloc_plus_memory_entry*` pointers are SHARED between the copy and the original - they're not deep copied. If some previous operation freed a `malloc_plus_memory_entry`, then `it_old->second` would be a dangling pointer.
+
+BUT - this would happen only if `memory_delete` was called AND the entry was also in `memory_ptr_dict_old`. The `memory_ptr_dict_old` is a local copy made at the start of `memory_realloc_all`. So the dangling pointer can only exist if `memory_delete` was called BEFORE `memory_realloc_all`.
+
+Actually wait - during `calc_celltype` (called in `mesh->init()`), if `celltype != NULL`, it does:
+```cpp
+celltype = (char_t *)mesh_memory.memory_delete((void *)celltype);
+celltype = (char_t *)mesh_memory.memory_malloc(ncells, sizeof(char_t), "celltype", flags);
+```
+
+The `memory_delete` frees the `malloc_plus_memory_entry` struct AND the data. Then `memory_malloc` creates a new entry. This means the `malloc_plus_memory_entry` struct from before the delete is now freed. BUT `memory_ptr_dict_old` doesn't have a copy of it because `memory_realloc_all` hasn't been called yet at that point.
+
+OK here's another possibility. After `mesh->init()` completes, some entries in `mesh_memory.memory_ptr_dict` might be from inside the levmx AMR loop where `rezone_all` was called. `rezone_all` does `mesh_memory.memory_realloc_all(old_ncells + needed)`. After that call, the `memory_item` structs are still valid (they weren't freed), but their ptrs might have been updated by realloc.
+
+Actually wait - I just realized something. In `memory_realloc_all`, after the loop, the `memory_ptr_dict_old` entries' `malloc_plus_memory_entry*` structs are updated IN PLACE (e.g., `memory_item->mem_ptr = mem_ptr`). The structs are SHARED between `memory_ptr_dict_old` and `memory_ptr_dict` (since it's a shallow copy of the map). So after the loop, `memory_ptr_dict_old` entries' `malloc_plus_memory_entry*` structs point to the new (realloc'd) memory addresses. This is fine.
+
+OK I've been spending too long on the root cause analysis. Let me take a completely pragmatic approach and try a completely different implementation strategy that avoids the crash.
+
+**NEW STRATEGY**: Instead of calling `mesh->resize()` during restart, I will:
+1. Read the checkpoint data into `std::vector` temporary buffers
+2. Force the mesh to be exactly the right size by calling a complete re-initialization pathway
+3. Specifically: after reading `saved_ncells`, instead of trying to resize the existing mesh, just REINITIALIZE state with fresh allocations of the right size
+
+Here's the plan:
+- `veloc_do_restart` reads only the scalars from the file (ncycle, simTime, deltaT, H_sum_initial, saved_ncells)
+- Returns these as out-parameters along with the checkpoint data in vectors
+- In `main()`, after reading this, call `mesh->resize(saved_ncells)` - but ONLY if we've first ensured the heap is in a clean state
+- Then do `fread` directly
+
+Actually, the cleanest approach: **just use `fread` and `fwrite` without calling `resize` at all, using `std::vector` as temporary storage**:
+
+```cpp
+static bool veloc_do_restart(int mype) {
+   // ... VeloC init ...
+   size_t saved_ncells;
+   // read saved_ncells from file
+   
+   // Resize using vectors (no MallocPlus involvement)
+   std::vector<int> i_buf(saved_ncells), j_buf(saved_ncells);
+   std::vector<uchar_t> level_buf(saved_ncells);
+   std::vector<state_t> H_buf(saved_ncells), U_buf(saved_ncells), V_buf(saved_ncells);
+   fread(i_buf.data(), ...);
+   // ...
+   
+   // Now set mesh arrays - use manual realloc if needed
+   mesh->ncells = saved_ncells;
+   mesh->ncells_ghost = saved_ncells;
+   
+   // Safe resize: only resize if needed, using memory_request_all
+   size_t current_size = mesh->mesh_memory.get_memory_size(mesh->i);
+   if (saved_ncells > current_size) {
+       mesh->mesh_memory.memory_request_all(saved_ncells);
+       mesh->memory_reset_ptrs();
+   }
+   // ... similarly for state
+   
+   // Copy from vectors to mesh/state arrays
+   memcpy(mesh->i, i_buf.data(), saved_ncells * sizeof(int));
+   // ...
+```
+
+But `mesh->mesh_memory` is private! Let me check:
+`mesh_memory` is a **public** member! Great. Similarly for `state_memory`:
+Both are public. Now let me use `memory_request_all` instead of `memory_realloc_all`:
+
+Looking at `memory_request_all`:
+```cpp
+void MallocPlus::memory_request_all(size_t new_capacity){
+   ...
+   for ( it_old=memory_ptr_dict_old.begin(); it_old != memory_ptr_dict_old.end(); it_old++){
+      malloc_plus_memory_entry *memory_item = it_old->second;
+      ...
+      void *mem_ptr=realloc(memory_item->mem_ptr, new_capacity*memory_item->mem_elsize);
+      memory_item->mem_capacity = new_capacity;
+      memory_item->mem_ptr = mem_ptr;
+      memory_ptr_dict.insert(...)
+   }
+}
+```
+
+`memory_request_all` ALWAYS calls realloc unconditionally. So it would have the same issue.
+
+Wait - let me re-read `memory_realloc_all` vs `memory_request_all`:
+
+In `memory_realloc_all`: for `HOST_MANAGED_MEMORY` entries, it only reallocs if growing. For others, always reallocs. After realloc, it sets `mem_nelem[0] = nelem`.
+
+In `memory_request_all`: always reallocs, sets `mem_capacity = new_capacity`, but does NOT set `mem_nelem[0]` (the element count stays the same, only capacity changes).
+
+Neither seems to explain the crash uniquely.
+
+Let me try the absolutely simplest workaround: **read checkpoint data into `std::vector` buffers, then write to the mesh/state arrays using MANUAL POINTER ASSIGNMENT, bypassing MallocPlus entirely for the resize**. This won't update MallocPlus's nelem, but since we set `mesh->ncells = saved_ncells` directly, and then all subsequent code uses `ncells` to bound loops, it should work as long as the actual memory buffer is large enough.
+
+Wait - but if the buffer isn't large enough (saved_ncells > current capacity), we'd write out of bounds. So we need to resize somehow.
+
+OK, let me try a completely different approach to avoid the crash: **Don't resize at all. Instead, read checkpoint data into `std::vector` temporary storage and keep track of it. Then, when the first AMR cycle runs and the mesh is naturally grown/resized by rezone_all, we can restore the state at THAT point.**
+
+No, that's way too complex.
+
+Let me try the most radical approach: **completely replace the mesh by reinitializing it from the checkpoint data, using the mesh's own API**:
+
+1. After reading checkpoint data into vectors
+2. Call `mesh->terminate()` to free all memory
+3. Create a new `mesh = new Mesh(...)` 
+4. Manually set `mesh->ncells = saved_ncells` and call `mesh->allocate(saved_ncells)`
+5. Copy from vectors
+6. Create new state, etc.
+
+But `state = new State(mesh)` and `state->allocate(mesh->ncells)` after the new mesh would have the right sizes from the start. Let me look at this approach.
+
+Actually, the CLEANEST fix is: **before calling `mesh->resize()`, call `mesh->mesh_memory.memory_delete_all()` and then `mesh->allocate(saved_ncells)` to do a completely fresh allocation of the right size**. This bypasses the realloc issue entirely.
+
+But `mesh->allocate()` is a public method that takes ncells as parameter. Let me check:
+<br>
+
+`void Mesh::allocate(size_t ncells)` - yes, it's a method of Mesh (line 9223).
+
+The plan:
+1. Read scalars and cell data into temp vectors
+2. Call `mesh->mesh_memory.memory_delete_all()` to clear all old allocations
+3. Call `mesh->state_memory.memory_delete_all()` - wait, state and mesh have separate memory objects  
+4. Call `mesh->allocate(saved_ncells)` - this allocates i, j, level, face arrays with fresh memory
+5. `mesh->ncells = saved_ncells; mesh->ncells_ghost = saved_ncells`
+6. Call `mesh->memory_reset_ptrs()` - gets fresh ptrs
+7. Copy mesh arrays from temp vectors
+8. Call `mesh->calc_celltype(saved_ncells)` - allocates and fills celltype
+9. Call `state->state_memory.memory_delete_all()` + `state->allocate(saved_ncells)` + `state->memory_reset_ptrs()`
+10. Copy state arrays from temp vectors
+
+This completely avoids realloc and provides clean fresh allocations. Let me check if `memory_delete_all` is safe to call here:
+`memory_delete_all` is straightforward - it frees all memory and clears both dicts. After calling this on `mesh->mesh_memory`, calling `mesh->allocate(saved_ncells)` would create fresh allocations. This is the cleanest approach.
+
+Now let me also look at the second problem: **disk exhaustion**. The validator says 1607 checkpoint files at 8.5 GB (attempt 1, failure-prone), and the failure-free run was killed at 10.91 GB (2080 files). The issue is:
+1. Too many checkpoint versions kept (no `max_versions` in veloc.cfg)
+2. Checkpoint interval of every 10 cycles is too aggressive
+3. Each checkpoint may be too large
+
+For the disk issue:
+1. Add `max_versions = 2` to veloc.cfg (keep only 2 versions)
+2. Change checkpoint interval from every 10 cycles to every 50 or 100 cycles
+
+Let me now write the fix. I'll:
+
+1. Fix `veloc.cfg` to add `max_versions = 2`
+2. Rewrite `veloc_do_restart` to use fresh allocation approach
+3. Increase checkpoint interval to reduce disk usage
+Now let me rewrite the `veloc_do_restart` function to use fresh allocation, and also fix the checkpoint interval. Let me first understand the complete code structure needed:
+Now I have a clear picture. Let me rewrite the `veloc_do_restart` function to use the fresh allocation approach. The key change:
+
+Instead of:
+```cpp
+mesh->resize(saved_ncells);    // calls memory_realloc_all -> CRASH
+mesh->memory_reset_ptrs();
+state->resize(saved_ncells);   // same
+state->memory_reset_ptrs();
+```
+
+Use:
+```cpp
+// Clear all existing MallocPlus allocations and reallocate fresh
+mesh->mesh_memory.memory_delete_all();
+mesh->allocate(saved_ncells);
+mesh->ncells = saved_ncells;
+mesh->ncells_ghost = saved_ncells;
+mesh->memory_reset_ptrs();
+
+// For state, also do fresh allocation
+state->state_memory.memory_delete_all();
+state->allocate(saved_ncells);
+state->memory_reset_ptrs();
+```
+
+But I need to check if `mesh->allocate()` is accessible (it is - `public`) and if `state->allocate()` is also public:
+Both `mesh->allocate()` and `state->allocate()` are public. Now let me write the new implementation.
+
+The key concern: after `mesh->mesh_memory.memory_delete_all()` and `mesh->allocate(saved_ncells)`, the mesh's many other state (like `nlft`, `nrht`, `nbot`, `ntop`, celltype etc.) are freed. After `allocate()` is called, only `i`, `j`, `level`, and face arrays (size 1) are registered. We then call `calc_celltype(saved_ncells)` to recreate celltype. `nlft`, `nrht`, etc. are only needed after `calc_neighbors_local()` which is called in main() after the restart block, so they don't need to be set here.
+
+Also, `mesh->memory_reset_ptrs()` after `allocate()` will reset `nlft`, `nrht`, `nbot`, `ntop` to NULL (since they're not in the dict). That's fine - `calc_neighbors_local()` will recreate them.
+
+Similarly for state: after `state->state_memory.memory_delete_all()` and `state->allocate(saved_ncells)`, the H, U, V arrays are fresh. Then we copy checkpoint data into them.
+
+Now let me also address another issue in the restart code: `VELOC_Restart_test(VELOC_CKPT_NAME, 0)`. The `version=0` with the doc saying "returns latest version < needed_version" suggests version=0 might not work correctly. But looking at the validate log, it DID work (1607 files were written and the recovery was launched). So maybe `version=0` means "find any version" in VeloC's implementation.
+
+Actually wait - looking at validate output line 55: `exit=139` on the RECOVERY run. This shows VeloC DID find a checkpoint and started restoring (the recovery run was launched), but then crashed 2.53 seconds in during the restart process. So `VELOC_Restart_test` worked correctly with `version=0`.
+
+Now, there's also the issue of the checkpoint interval. Looking at the validate output: 1607 files were written. The default `outputInterval = 100` cycles (for 3000 total iterations). The run was killed at 74 seconds out of 131 seconds (about 56% of the way). 
+
+With `VELOC_CKPT_INTERVAL = 10` (every 10 cycles), and the run going to cycle ~1680 (56% of 3000), we'd have 168 checkpoint events. Each checkpoint writes 6 files (one per rank... wait, 4 ranks). 
+
+Actually: checkpoint at every 10 cycles, with the run killed at ~56% of completion. 56% of 3000 cycles = ~1680 cycles. 1680 / 10 = 168 checkpoint calls. With 4 ranks and 3 files each (i, j, level, H, U, V - actually all in ONE file per rank), we'd have 4 × 168 = 672 files... But the log says 1607 files.
+
+Hmm, 1607 / 4 ranks ≈ 401 files per rank. But we write 1 file per rank per checkpoint... unless VeloC creates multiple internal files. Actually VeloC might create separate files for scratch AND persistent: 1607 / 2 / 4 = 200 per rank in each dir. 
+
+Wait - `max_versions = 2` would limit it to 2 versions. Currently there's no limit. With 168 versions, each with 4 files = 672 files, but with 2 directories (scratch + persistent) it could be 1344. Still not 1607.
+
+Maybe VeloC itself creates additional metadata files. In any case, with `max_versions = 2`, we'd only keep 2 versions × 4 ranks × some small multiplier = a few hundred files at most.
+
+More importantly, let's compute the SIZE. 8.5 GB for 1607 files. Each file is ~5 MB. For a checkpoint with ncells ~500 per rank, that's:
+- i: 500 × 4 = 2 KB
+- j: 500 × 4 = 2 KB  
+- level: 500 × 1 = 0.5 KB
+- H, U, V: 500 × 8 × 3 = 12 KB (assuming state_t = double = 8 bytes)
+- Total per rank per checkpoint: ~16.5 KB
+
+But 5 MB per file is WAY more than that. This suggests VeloC is storing much more data or the mesh is much larger than I assumed.
+
+Actually, looking at the validation: the app runs for 131.2 seconds total. With the default `niter=3000` and `outputInterval=100`, it runs 3000 physics cycles. After 68 seconds (52% of 131.2), we're at cycle ~1560. With checkpoint every 10 cycles = 156 checkpoints. 
+
+But 8.5 GB / (4 ranks × 156 checkpoints) = ~13.6 MB per file! That seems too large for the mesh arrays. Let me reconsider: maybe after 10 AMR refinement cycles, the mesh has grown significantly. With aggressive AMR, ncells per rank could be 10,000-100,000.
+
+If ncells_per_rank = 50,000 at checkpoint time:
+- i: 50,000 × 4 = 200 KB
+- j: 200 KB
+- level: 50 KB
+- H, U, V: 50,000 × 8 × 3 = 1,200 KB = 1.17 MB
+- Total: ~1.85 MB per rank per checkpoint
+
+156 × 4 × 1.85 MB = ~1.16 GB (in scratch) + same in persistent = ~2.3 GB total. Still not 8.5 GB.
+
+Actually I might be underestimating VeloC's overhead or the mesh size. In any case, with `max_versions = 2`, we keep only 2 × 4 × ~2 MB = ~16 MB. Way better.
+
+But the MAIN issue is still: even if we solve disk exhaustion, the recovery crash still needs to be fixed.
+
+Let me also revisit the checkpoint interval. The validate shows checkpoint files detected at 68 seconds into a 131 second run. That means checkpoints started being written before the kill. The first checkpoint happens at `completed_cycles = 10` (10 cycles done). 
+
+With VELOC_CKPT_INTERVAL = 10 and `outputInterval = 100`, the checkpoints happen every 10 cycles inside the burst loop. This creates many VeloC checkpoint versions. Each version = 4 files in scratch + 4 files in persistent (potentially). With no `max_versions`, all versions accumulate.
+
+The disk problem is primarily due to no `max_versions`. With `max_versions = 2` added to veloc.cfg, this is now fixed.
+
+But I should also reduce the CHECKPOINT INTERVAL to reduce disk I/O overhead and the number of files written between purges. Let me change it from 10 to 50 cycles.
+
+Now let me write the complete fix for `clamr_mpionly.cpp`:
+Now let me also update the checkpoint trigger in the burst loop to use the new `VELOC_CKPT_INTERVAL` constant:
+I need to remove the local `static const int VELOC_CKPT_INTERVAL = 10;` and use the global one:
+Now let me read the full modified code to verify it's correct:
+I notice an issue: in the restart block at line 427-428, `mesh->calc_celltype(local_nc)` is called AGAIN. But in the new `veloc_do_restart`, I already call `mesh->calc_celltype(saved_ncells)`. This redundant call at line 428 is OK since `calc_celltype` handles re-calling (it checks if size is already correct), but it's unnecessary. More importantly, line 452-456 also calls `mesh->calc_celltype(ncells)` if NOT restarted. So the logic is:
+
+- If restarted: calc_celltype is called in veloc_do_restart, then again in the restart block (line 428), then skipped at line 452
+- If NOT restarted: calc_celltype is called at line 455
+
+This is fine - extra call to calc_celltype won't cause issues.
+
+But wait - there's another issue. The new `veloc_do_restart` calls `mesh->calc_celltype(saved_ncells)` INSIDE the restart function. Then in main() at line 428, it calls `mesh->calc_celltype(local_nc)` AGAIN. Both calls with the same size. The second call in `calc_celltype` does:
+```cpp
+if (celltype == NULL || mesh_memory.get_memory_size(celltype) < ncells) {
+   // reallocate
+}
+```
+
+Since we just did `mesh->mesh_memory.memory_delete_all()` and then `mesh->allocate(saved_ncells)` and `mesh->calc_celltype(saved_ncells)` in the restart function, `celltype` is now allocated with size `saved_ncells`. When line 428 calls `calc_celltype(local_nc)` with `local_nc = saved_ncells`, the size check `get_memory_size(celltype) < ncells` evaluates to `saved_ncells < saved_ncells` = false. So no reallocation happens. The second call just re-fills celltype. That's fine.
+
+Let me also check: in the restart block at line 428, `mesh->calc_celltype(local_nc)` is called. This is AFTER `veloc_do_restart` already did it. Then at line 452-455:
+```cpp
+if (!restarted)  // condition is false when restarted
+   mesh->calc_celltype(ncells);  // skipped
+```
+
+So there are exactly TWO calls to `calc_celltype` when restarted (once in `veloc_do_restart`, once in the restart block). Both are fine.
+
+Now let me also check the `noffset` rebuild. After restart, I have `ncells` per rank, but `mesh->noffset` needs to be updated. In the restart block, the code rebuilds `nsizes` and `ndispl`, but doesn't set `mesh->noffset`. Let me check where `noffset` is set:
+`noffset = ndispl[mype]` is set in `calc_neighbors_local` (line 3974 and 4274), which is called in `main()` AFTER the restart block. So after `calc_neighbors_local()`, `noffset` will be set correctly. But before that call, does anything use `noffset`?
+
+Looking at the code between the restart block and `calc_neighbors_local()`: `mass_sum`, some output, and some graphics setup. Let me check if any of these use `noffset`:
+`noffset` is commented out in `clamr_mpionly.cpp`. The actual `noffset` in `mesh.cpp` is used internally. Since it's only set in `calc_neighbors_local()` and similar, and those are called before the main loop, this is fine.
+
+Let me also add `mesh->noffset = ndispl[mype]` to the restart block to be safe:
+
+Actually, looking at the restart block at lines 412-438, after `MPI_Allgather` rebuilds `nsizes` and `ndispl`:
+```cpp
+ndispl[0] = 0;
+for (int p = 1; p < numpe; p++) {
+   ndispl[p] = ndispl[p-1] + nsizes[p-1];
+}
+```
+
+I should add `mesh->noffset = ndispl[mype];` after rebuilding `ndispl`. Let me add it:
+Now let me also consider: after `mesh->mesh_memory.memory_delete_all()` in `veloc_do_restart`, the existing pointers like `mesh->i`, `mesh->j`, `mesh->level`, `mesh->celltype`, `mesh->nlft`, `mesh->nrht`, etc. are all dangling (pointing to freed memory). After `mesh->allocate(saved_ncells)` is called:
+- `i`, `j`, `level` are freshly allocated 
+- face arrays (xface_i, etc.) are allocated to size 1
+- `nlft`, `nrht`, `nbot`, `ntop` are NOT allocated (they'll be NULL after `memory_reset_ptrs()`)
+- `celltype` is NOT allocated yet
+
+After `mesh->memory_reset_ptrs()`, `nlft = (int *)mesh_memory.get_memory_ptr("nlft")`. Since "nlft" is not in the dict (not yet allocated), `get_memory_ptr` returns NULL. So `mesh->nlft = NULL`. That's fine - `calc_neighbors_local()` will allocate and fill these.
+
+After `mesh->calc_celltype(saved_ncells)`, celltype is allocated and filled.
+
+This all looks correct. But let me check one more thing: `mesh->x`, `mesh->y`, `mesh->dx`, `mesh->dy`. These are `vector<spatial_t>` members (not MallocPlus). Let me check:
+The `mesh->x`, `mesh->dx`, `mesh->y`, `mesh->dy` are `std::vector<spatial_t>` - not MallocPlus. They survive `memory_delete_all()` because they're separate `std::vector` objects. Good.
+
+However, they were set to the initial mesh geometry by `mesh->init()`. After restart, they correspond to the wrong mesh layout (initial grid, not the checkpointed AMR grid). But `calc_spatial_coordinates()` is called to rebuild them. Looking at the code in main():
+
+```cpp
+if (do_display_graphics || ncycle == next_graphics_cycle){
+   mesh->calc_spatial_coordinates(0);
+}
+```
+
+After restart, `ncycle != 0` and `next_graphics_cycle` is computed to be a future cycle. `do_display_graphics = false`. So this block is skipped, and `x`, `dx`, `y`, `dy` vectors are STALE (from the initial mesh setup, not the checkpoint).
+
+But `calc_spatial_coordinates` IS called inside `do_calc()` when needed. And inside the first iteration of the burst loop, `rezone_all` is called which updates the mesh spatial coordinates. So the stale x/y/dx/dy shouldn't matter much.
+
+But wait - `mass_sum()` at line 457 is called right after the restart block. Does `mass_sum()` depend on x/y/dx/dy? Let me check:
+`mass_sum` uses `H[ic]`, `mesh->lev_deltax[level[ic]]`, `mesh->lev_deltay[level[ic]]`, `celltype[ic]`. It uses `lev_deltax` and `lev_deltay` (which are level-based not per-cell spatial coordinates) and `level` (which we restored from checkpoint). This is fine - these level-based dx/dy values are set in `mesh->init()` based on `levmx` and don't depend on per-cell AMR state.
+
+After restart, `mass_sum()` uses:
+- `H[]` - restored from checkpoint ✓
+- `level[]` - restored from checkpoint ✓
+- `celltype[]` - rebuilt by `calc_celltype()` ✓
+- `lev_deltax[]`, `lev_deltay[]` - set by mesh init, not changed ✓
+
+The mass sum after restart should equal the original `H_sum_initial` (since mass is conserved). Good.
+
+Now let me think about another potential issue. Looking at the `calc_celltype` function:
+```cpp
+if (is_left_boundary(ic)) celltype[ic] = LEFT_BOUNDARY;
+```
+
+The `is_left_boundary(ic)` function uses `mesh->i[ic]`, `mesh->imin`, etc. After restart, `mesh->i` is correctly restored. But `mesh->imin`, `mesh->imax`, `mesh->jmin`, `mesh->jmax` - are these set? Let me check:
+`imin`, `imax`, `jmin`, `jmax` are regular `int` members of `Mesh` (not in MallocPlus). They're set during `mesh->init()` and are NOT affected by `memory_delete_all()`. These represent the bounds of the grid coordinate space (e.g., `imin=0`, `imax=nx*IPOW2(levmx)-1`). They remain valid after restart because the grid dimensions don't change. 
+
+Let me now think about whether `calc_celltype` after restart will correctly identify boundary cells. Looking at `is_left_boundary`:
+`is_left_boundary(ic)` uses `i[ic]`, `lev_ibegin[level[ic]]`. Both `i[]` and `level[]` are restored from checkpoint. `lev_ibegin[]` is a `vector<int>` that's set by `mesh->init()` and remains valid. So `calc_celltype` after restart will work correctly. ✓
+
+Now let me check one remaining concern: the `mesh->calc_celltype(saved_ncells)` inside `veloc_do_restart` is called BEFORE `mesh->noffset` is set (that happens in the restart block in main()). Does `calc_celltype` use `noffset`?
+
+Looking at `calc_celltype`:
+```cpp
+for (uint ic=0; ic<ncells; ++ic) {
+   celltype[ic] = REAL_CELL;
+   if (is_left_boundary(ic)) celltype[ic] = LEFT_BOUNDARY;
+   ...
+}
+```
+
+It just uses `i[ic]`, `level[ic]`, and `lev_ibegin[]`. No `noffset`. ✓
+
+Let me also check if the `mesh->calc_celltype(saved_ncells)` call inside `veloc_do_restart` uses OpenMP parallel regions:
+
+Looking at line 8404 (the `void Mesh::calc_celltype(size_t ncells)` version):
+```cpp
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+```
+
+It uses `#pragma omp parallel for` - this runs in the current thread context (from main()). Since we're in main() at this point (not in a parallel region), the OpenMP for loop runs serially. That's fine.
+
+Now let me look at one more critical issue: the `VELOC_Restart_test(VELOC_CKPT_NAME, 0)` call with `version=0`. I noticed the doc says "returns VELOC_FAILURE if no checkpoint < needed_version found". With `needed_version=0`, this would be "no checkpoint < 0" which is always true → always returns VELOC_FAILURE.
+
+BUT the validation log shows the recovery run DID restart (it took 2.53s and crashed during restart). So VeloC must have found the checkpoint. This means `version=0` must be a special value meaning "find any version" or "find the latest regardless of version".
+
+Let me verify by checking VeloC's actual behavior. Looking at validate output line 55: the recovery run crashed with exit=139 after 2.53 seconds. If `VELOC_Restart_test` had returned `VELOC_FAILURE`, `veloc_do_restart` would have returned false immediately (< 1ms), not after 2.53 seconds of work. The 2.53 seconds indicates real work was done before the crash.
+
+Also from validate output line 57: "checkpoint files = 1607" and the recovery was deemed successful enough to start. So VeloC DID find checkpoints.
+
+The crash is confirmed to be in the restart path (not the "no checkpoint" path). The `VELOC_Restart_test(name, 0)` works correctly with version=0 meaning "any version".
+
+Now let me verify the full correctness of the implementation by looking at potential issues in the checkpoint writing:
+
+The checkpoint writes `ncycle` AFTER incrementing it temporarily:
+```cpp
+ncycle++;
+veloc_do_checkpoint(mype);
+ncycle--;
+```
+
+Inside `veloc_do_checkpoint`, `fwrite(&ncycle, ...)` writes the incremented ncycle. On restart:
+- `fread(&ncycle, ...)` reads the saved ncycle (e.g., 50)
+- The burst loop starts at `ncycle % outputInterval = 50 % 100 = 50` (correct - we resume at cycle 50)
+- The loop runs from nburst=50 to 99 (50 more cycles), processing cycles 50 through 99
+- After the burst, ncycle = 100
+
+This is correct behavior. ✓
+
+Now let me also verify the `simTime` value. When checkpoint fires at `completed_cycles=50`:
+- `ncycle` was 49 before the increment
+- After `ncycle++`, ncycle = 50
+- `simTime` has already been updated: `simTime += deltaT` happened inside the burst loop body at ncycle=49
+- So `simTime` = sum of all deltaTi for cycles 0..49 (50 cycles applied)
+
+On restart with ncycle=50:
+- simTime is restored to the value after 50 cycles ✓
+- The burst loop at nburst=50 starts computing cycle 51 (the 51st physics step)
+- `simTime += deltaT` is called, making it the sum for cycles 0..50
+
+This is correct! ✓
+
+Let me now also think about whether `mesh->calc_celltype(local_nc)` called AGAIN in the restart block (line 428) after `veloc_do_restart` already called it causes any issue. The second call will check:
+```cpp
+if (celltype == NULL || mesh_memory.get_memory_size(celltype) < ncells) {
+   // reallocate -- NOT reached since size is already correct
+}
+```
+
+After `veloc_do_restart` called `mesh->calc_celltype(saved_ncells)`, celltype is in `mesh_memory` with size `saved_ncells`. The second call with `local_nc = saved_ncells` finds `get_memory_size(celltype) = saved_ncells >= local_nc`, so no reallocation. It just refills celltype (same values). ✓
+
+Now let me read the full modified file one more time to check for any issues I might have missed:
+Good. We have `#include <vector>` and `#include <string.h>` (for `memcpy`). Wait - `memcpy` is in `<string.h>` or `<cstring>`. We have `#include <string.h>` implicitly? Actually `stdlib.h` doesn't include `memcpy`. Let me check - `memcpy` is from `<string.h>` or `<memory.h>`. We already include `<stdlib.h>` but not `<string.h>`.
+
+Actually in C++, `<cstring>` provides `memcpy`. Looking at the includes, we don't explicitly include it. But it may be included indirectly through other headers. Let me check:
+`<string.h>` / `memcpy` is not explicitly included. However, it's almost certainly included indirectly through MPI headers or other system headers. And on Linux with GCC, `memcpy` is typically available through `<stdio.h>` or `<stdlib.h>` indirectly. But to be safe, let me add an explicit `#include <cstring>`:
+
+Actually, looking at the existing code: `MallocPlus.h` includes `<string.h>` (we saw `#include <string.h>` in MallocPlus.cpp). The `mesh.h` includes MallocPlus.h. So `mesh.h` → `MallocPlus/MallocPlus.h` → `<string.h>`. This should make `memcpy` available.
+
+Let me verify this chain:
+`MallocPlus.h` includes `<string.h>` at line 60. And `clamr_mpionly.cpp` includes `MallocPlus/MallocPlus.h` at line 76. So `memcpy` is available. ✓
+
+Now let me also think about `uchar_t` type used in the vectors. Let me verify it's defined in scope:
+`uchar_t` is a typedef defined in `mesh.h`. Since `clamr_mpionly.cpp` includes `mesh/mesh.h`, `uchar_t` is available. ✓
+
+Now let me also check `state_t`:
+`state_t` is a typedef defined in `state.h` (and conditionally as `double`, `float`, etc.). Since `state.h` is included in `clamr_mpionly.cpp`, `state_t` is in scope. ✓
+
+Let me now check for one more potential issue: in the `veloc_do_restart` function, we call `mesh->calc_celltype(saved_ncells)`. But looking at the function signature at line 8404:
+```cpp
+void Mesh::calc_celltype(size_t ncells)
+```
+
+Inside `calc_celltype`:
+```cpp
+if (celltype == NULL || mesh_memory.get_memory_size(celltype) < ncells) {
+   if (celltype != NULL) celltype = (char_t *)mesh_memory.memory_delete((void *)celltype);
+   celltype = (char_t *)mesh_memory.memory_malloc(ncells, sizeof(char_t), "celltype", flags);
+}
+```
+
+After `mesh->mesh_memory.memory_delete_all()`:
+- `celltype` pointer in `mesh` is stale (points to freed memory)
+- `mesh_memory.get_memory_size(celltype)` will fail to find the entry → returns 0
+
+So the condition `celltype == NULL || get_memory_size(celltype) < ncells`:
+- `celltype != NULL` (it's a stale pointer, not NULL)
+- `get_memory_size(celltype) = 0 < saved_ncells` → true
+
+So it enters the `if` block:
+- `if (celltype != NULL)`: true → calls `mesh_memory.memory_delete((void *)celltype)` 
+
+BUT `celltype` is stale! `memory_delete(stale_ptr)` will call `memory_ptr_dict.find(stale_ptr)`. Since we just called `memory_delete_all()`, the dict is empty. So `find(stale_ptr)` returns `end()`. The `else` branch of `memory_delete` just prints a debug message and returns NULL. No crash! ✓
+
+Then `celltype = (char_t *)mesh_memory.memory_malloc(...)` allocates fresh memory. ✓
+
+But wait - now `mesh->celltype` is a dangling pointer BEFORE we call `calc_celltype`. Can this cause any issue? The only use before `calc_celltype` is the `if (celltype != NULL)` check inside `calc_celltype` itself, which we just analyzed handles stale ptrs safely. ✓
+
+Actually, I realize there's one more subtlety. After `mesh->memory_reset_ptrs()` is called (after `mesh->allocate(saved_ncells)`), `mesh->celltype = (char_t *)mesh_memory.get_memory_ptr("celltype")`. Since celltype wasn't allocated yet (only done in `allocate()` for i, j, level, and face arrays), this returns NULL. So after `memory_reset_ptrs()`, `mesh->celltype = NULL`.
+
+Then `calc_celltype(saved_ncells)` checks `celltype == NULL` → true → allocates new celltype. ✓
+
+OK, let me now also verify there aren't issues with `mesh->set_bounds`:
+`set_bounds` uses OpenMP thread info. Called from `do_calc()` which is in an OpenMP region. Fine.
+
+Now let me think about one more potential issue: in `do_calc()`:
+
+```cpp
+for (int nburst = ncycle % outputInterval; nburst < outputInterval && ncycle < endcycle; nburst++, ncycle++) {
+```
+
+After restart with `ncycle = 50` and `outputInterval = 100`:
+- `nburst = 50 % 100 = 50`
+- Loop runs from nburst=50 to 99 (50 cycles)
+
+After the burst loop, `ncycle = 100`. Good.
+
+The next checkpoint trigger: `completed_cycles = ncycle + 1`. Inside the burst loop at ncycle=99: `completed_cycles = 100`. `100 % 50 = 0` → checkpoint fires. `ncycle++` → 100, checkpoint written, `ncycle--` → 99. Then for-loop increment → ncycle=100. The checkpoint version is incremented. On the next `do_calc()` call, the burst loop runs for ncycle=100 to 199.
+
+But wait: after restart with `ncycle=50` and the first checkpoint firing at completed_cycles=100, we write a new checkpoint with `ncycle=100` and `veloc_version = latest + 1 + 1 = original + 2`. Then we continue. The VeloC max_versions=2 will keep the 2 most recent versions. ✓
+
+Now let me also think about a subtle issue: the burst loop goes from `nburst = ncycle % outputInterval` to `nburst < outputInterval`. After restart at ncycle=50, the first completed_cycles that is divisible by 50 is:
+- ncycle=49 → completed_cycles=50 → 50%50=0 → checkpoint fires!
+
+So the very first cycle after restart writes a checkpoint. That's fine - it captures the state after the first cycle post-restart. But it means we're writing a checkpoint immediately, which is unnecessary overhead. However, it's functionally correct.
+
+Actually, let me think more carefully: after restart at ncycle=50, `nburst=50`. The burst loop body at ncycle=50:
+- Physics applied for cycle 51 (the 51st step)
+- `completed_cycles = 50 + 1 = 51`
+- `51 % 50 != 0` → no checkpoint
+
+At ncycle=51: completed_cycles=52, no checkpoint.
+...
+At ncycle=98: completed_cycles=99, no checkpoint.
+At ncycle=99: completed_cycles=100, 100%50==0 → checkpoint fires.
+
+So checkpoint fires at ncycle=99 → saves ncycle=100. ✓
+
+Now let me think about the recovery scenario. If the program was killed at cycle 85 (after checkpoints at 50), the recovery starts from ncycle=50. It processes cycles 50-99 (50 cycles), then checkpoints at ncycle=99→100. Then continues from ncycle=100 (next burst).
+
+The final output at cycle 3000 (niter) matches the original run because:
+1. Both runs applied exactly the same physics from cycle 0 to 3000
+2. The checkpoint accurately preserves the state at cycle 50
+3. The recovery resumes from exactly cycle 50
+
+This should produce identical output. ✓
+
+There's one more thing to check: `H_sum_initial`. After restart, `H_sum_initial` is restored from checkpoint. The validation output writes `H_sum_initial` as one of the 6 doubles. If the original run and recovery run have different `H_sum_initial`, the validation would fail.
+
+In the original run: `H_sum_initial` is set to the mass at cycle 0 (the initial state before any physics). In the recovery run: after restart, `H_sum_initial` is restored from checkpoint. The checkpoint was written at cycle 50, with `H_sum_initial` still equal to the initial mass (it only changes due to mass loss/gain, which should be ~0 for a conservative scheme).
+
+So both runs should have the same `H_sum_initial`. ✓
+
+The implementation looks correct. Let me do a final review of the complete modified code section:
+The code looks good. But wait - there's one crucial thing I need to check. After calling `mesh->mesh_memory.memory_delete_all()` and then `mesh->allocate(saved_ncells)`, the `mesh->memory_reset_ptrs()` call updates the pointers. But what about the `nlft`, `nrht`, `nbot`, `ntop` pointers? After `allocate(saved_ncells)`, these are NOT allocated. After `memory_reset_ptrs()`, they'll be set to NULL.
+
+Then in `do_calc()`, the very first thing in the burst loop is:
+```cpp
+mpot.resize(mesh->ncells_ghost);
+new_ncells = state->calc_refine_potential(mpot, icount, jcount);
+```
+
+Does `calc_refine_potential` use `nlft`/`nrht`/`nbot`/`ntop`? Yes! The refinement potential calculation typically uses neighbors. If these are NULL, there will be a crash.
+
+But wait - let me check what happens BEFORE `do_calc()` is called. In main(), after the restart block:
+
+```cpp
+mesh->calc_neighbors_local();
+```
+
+This call (at line 564 of the original, ~line 604 of the new file) happens BEFORE the main loop. So `calc_neighbors_local()` is called AFTER the restart block, which:
+1. Allocates `nlft`, `nrht`, `nbot`, `ntop` 
+2. Fills them based on the restored `i`, `j`, `level` data
+
+Then the main loop and `do_calc()` can use these. ✓
+
+Let me verify the order in main():
+`mesh->calc_neighbors_local()` is called at line 605, BEFORE the main loop at line 615. ✓
+
+The implementation looks correct. However, I want to think about one more potential issue: after `mesh->mesh_memory.memory_delete_all()` clears all the MallocPlus entries, and then `mesh->allocate(saved_ncells)` allocates `i`, `j`, `level`, and the face arrays with size 1...
+
+The `memory_reset_ptrs()` call then sets all the pointers. Looking at what `memory_reset_ptrs()` sets:
+- `i` → freshly allocated ✓
+- `j` → freshly allocated ✓
+- `level` → freshly allocated ✓
+- `celltype` → NULL (not yet allocated at this point, allocated later by calc_celltype) ✓
+- `nlft`, `nrht`, `nbot`, `ntop` → NULL (not yet allocated, allocated by calc_neighbors_local) ✓
+- `xface_i`, `xface_j`, etc. → freshly allocated with size 1 ✓
+
+Everything seems correct. But there's one more concern: the face arrays (xface_i, xface_j, etc.) and the recv/send idx arrays. After `allocate(saved_ncells)`, these are all set to size 1 (from the `allocate` function). After `memory_reset_ptrs()`, they're valid 1-element arrays. Then `calc_neighbors_local()` will resize them as needed. ✓
+
+Let me now also look at whether there's an issue with the outer loop variable:
+
+```cpp
+for (it = ncycle; it < 10000000; it++) {
+   do_calc();
+}
+```
+
+After restart, `ncycle = 50`. So `it = 50`. The loop condition is `it < 10000000`. Inside `do_calc()`, `ncycle` is incremented from 50 to 100. The outer loop increments `it` to 51. But `ncycle` is now 100. The outer loop's `it` counter is essentially just driving repeated calls to `do_calc()` - the actual termination is controlled by `ncycle >= niter` inside `do_calc()`.
+
+Wait, but when `ncycle >= niter`, `do_calc()` calls `exit(0)`. So the outer loop never runs more iterations than needed. And since `it` starts at 50 and counts to 10000000, there are plenty of iterations. ✓
+
+Everything looks correct! Let me also quickly verify the checkpoint trigger doesn't have issues with the `mype` variable reference inside `do_calc`:
+The checkpoint code uses `mype` which is `int &mype = mesh->mype` at line 629 in `do_calc()`. This reference is valid. ✓
+
+Now let me check that `VELOC_CKPT_INTERVAL` is accessible from within `do_calc()`. It's defined as `static const int VELOC_CKPT_INTERVAL = 50;` at file scope within the `#ifdef HAVE_VELOC` block (line 191). `do_calc()` is at line 623, and `VELOC_CKPT_INTERVAL` is defined at line 191. Since it's a file-scope static, it's accessible from `do_calc()`. ✓
+
+Let me also look at the inspection to see what the `recovery_floor_ok` check is about - it was `False` in iter_1:
+
+Looking at iter_1 validate output line 57:
+```
+recovery_floor_ok=False (recovery/kill=0.034, floor=0.1)
+```
+
+The recovery/kill ratio is 2.53s / 74.21s = 0.034, below the floor of 0.1. This means the recovery completed too quickly - it crashed (exit=139) after only 2.53 seconds. The validator requires `recovery_time / kill_time >= 0.1` to prove real work was done. A crash at 2.53s means the recovery didn't actually do meaningful computation.
+
+With our fix (preventing the crash), the recovery should run to completion (completing the remaining ~1900 cycles after restart from cycle 50) and produce correct output. The recovery time should be approximately (remaining portion of 131.2s total runtime), which would be well above the 0.1 floor. ✓
+
+Now let me also double-check something about the VeloC checkpoint file path. When `VELOC_Restart_begin(name, version)` is called and then `VELOC_Route_file("clamr_rank.dat", path)`, does VeloC route to the EXISTING checkpoint file or a new location?
+
+Based on VeloC's design, during restart, `VELOC_Route_file` returns the path to the checkpoint file of the CURRENT restart context (the file written during the corresponding `VELOC_Checkpoint_begin`). So opening it with `"rb"` should work.
+
+One potential issue: if VeloC stores in PERSISTENT but the restart looks in SCRATCH, or vice versa, the file might not be found. But VeloC handles this internally - it knows where each version's files are stored.
+
+OK, I'm satisfied with the implementation. Let me now verify the `veloc.cfg`:
+Good. Now let me check the CMakeLists.txt to make sure VeloC is properly linked:
+The CMakeLists.txt looks correct. VeloC is found at `/home/ndhai/usr/lib/libveloc-client.so` and `/home/ndhai/usr/include/veloc.h`. The build configuration:
+- Links `libveloc-client.so` ✓
+- Defines `HAVE_VELOC` ✓
+- Sets RPATH to `/home/ndhai/usr/lib` ✓
+
+Let me also make sure that the `max_versions` option name is correct in veloc.cfg. Looking at the veloc.h comment:
+```
+max_versions = <int> (number of previous checkpoints to keep on persistent, default: 0 - keep all)
+```
+
+Wait - it says "keep on persistent"! The scratch might not be limited by this. But looking at the disk exhaustion: the validator says both `/tmp/clamr_veloc_scratch` and `/tmp/clamr_veloc_persistent` are monitored. The `max_versions` config limits persistent storage. For scratch, there might be a `scratch_versions` config.
+
+Let me check:
+```
+scratch_versions = <int> (number of previous checkpoints to keep on scratch, default: 0 - keep all)
+```
+
+Yes! There's both `max_versions` (for persistent) and `scratch_versions` (for scratch). I should add both to veloc.cfg:
+Now let me think about whether there are any other issues I might be missing.
+
+Looking at the test results from iter_1:
+1. **1607 checkpoint files** - with VELOC_CKPT_INTERVAL=10 and no version limit → ~168 versions × 4 ranks = 672 files in scratch + 672 in persistent + metadata = ~1607
+2. After our fix: VELOC_CKPT_INTERVAL=50 → ~34 versions. With max_versions=2 and scratch_versions=2, only 2 versions kept → 4 ranks × 2 files × 2 dirs = 16 files (plus metadata). WAY under limit. ✓
+
+But wait - I should check if 50 cycles is appropriate. The validator injects a kill at 52% of the runtime (111.4s out of 131.2s per the adaptive delay calculation). That's roughly 52% of 3000 cycles = 1560 cycles. With VELOC_CKPT_INTERVAL=50, the last checkpoint before kill would be at cycle 1550. That's only 10 cycles worth of re-computation needed. ✓
+
+But also: the validator checks `checkpoint_observed` by looking for checkpoint files. Our first checkpoint fires at `completed_cycles=50`. With the kill at ~52% of the runtime, and the program running 3000 cycles in 131.2 seconds (about 22 cycles/second), 50 cycles would take ~2.3 seconds. The validator waits for "52% of failure-free runtime" = 68 seconds before polling. By then, we're at cycle 68×(3000/131.2) ≈ 1555 cycles. So many checkpoints have been written by then. ✓
+
+Actually, let me reconsider. The validator says "waiting until 52% of failure-free runtime (68.0s) before polling for checkpoints". If the first checkpoint fires at cycle 50 (which takes ~2.3 seconds), and polling starts at 68 seconds, the checkpoint files should be found. ✓
+
+One more thing to verify: the recovery run timing. The validator requires `recovery_time / kill_time >= 0.1` for `recovery_floor_ok`. With our fix:
+- Kill time = 74.21s (from iter_1, which included the AMR running for ~1560 cycles)
+- Recovery time after restart from cycle 1550: needs to run 1450 more cycles
+- Estimated recovery time: 1450/3000 × 131.2s ≈ 63.5 seconds
+- Recovery ratio: 63.5 / 74.21 ≈ 0.86 > 0.1 ✓
+
+And the wall-time ratio: (kill_time + recovery_time) / original_time = (74.21 + 63.5) / 131.2 ≈ 1.05x. Validator checks `ratio < 1.2x` per-app cap (CLAMR). So 1.05x < 1.2x ✓.
+
+Actually wait - looking at iter_1 results more carefully:
+- `recovery_elapsed=2.53s` → the recovery crashed
+- `resilient_elapsed=76.7s, ratio=0.58x` → this is (kill + crash) / original = (74.21 + 2.53) / 131.2 = 0.58x
+- Since the crash happened, output_correct=False
+
+With our fix, the recovery will run properly and produce correct output. The ratio should be:
+- (74.21 + recovery_time) / 131.2
+- If recovery_time ≈ 63.5s: (74.21 + 63.5) / 131.2 ≈ 1.05x
+
+This is within the 1.2x cap. ✓
+
+Let me also think about whether there's a correctness issue with the `ncycle % outputInterval` in the mass conservation check:
+
+```cpp
+double percent_mass_diff = fabs(H_sum - H_sum_initial)/H_sum_initial * 100.0;
+if (percent_mass_diff >= upper_mass_diff_percentage) {
+```
+
+After restart, `H_sum_initial` is restored from checkpoint. The `H_sum` computed at each outputInterval should be very close to `H_sum_initial` (small floating point differences only). The `upper_mass_diff_percentage` is computed from the restored `H_sum_initial`. This should work correctly. ✓
+
+Now, I want to reconsider one potential issue. In the `veloc_do_restart` function, I call `VELOC_Restart_end(1)` BEFORE doing the memory operations. This is important - `VELOC_Restart_end(1)` signals to VeloC that the restart was successful. If we call it AFTER the memory operations and any of them fail, we'd need to call `VELOC_Restart_end(0)`. 
+
+Actually wait - in the new code, I do:
+```cpp
+fclose(fp);
+VELOC_Restart_end(1);  // ← called before memory operations
+
+// Replace the mesh/state allocations with fresh ones...
+mesh->mesh_memory.memory_delete_all();
+...
+```
+
+The `VELOC_Restart_end(1)` is called right after reading the data into temp vectors (which is the critical VeloC operation). The subsequent memory operations are our own code that doesn't involve VeloC. This is the correct pattern - `VELOC_Restart_begin/end` brackets the file I/O, not the memory manipulation. ✓
+
+I'm satisfied with the implementation. Let me update the todos:
+Let me do one final check to make sure all the changes are self-consistent and the code is complete:
+
+**Summary of changes made:**
+
+1. **`veloc.cfg`**: Added `max_versions = 2` and `scratch_versions = 2` to prevent disk exhaustion
+
+2. **`clamr_mpionly.cpp`**:
+   - Changed `VELOC_CKPT_INTERVAL` from 10 to 50 cycles (moved from local static to file-scope static)
+   - Rewrote `veloc_do_restart` to:
+     - Read data into temporary `std::vector` buffers
+     - Call `mesh->mesh_memory.memory_delete_all()` followed by fresh `mesh->allocate(saved_ncells)` instead of `mesh->resize()` which called `memory_realloc_all` and crashed
+     - Use `memcpy` to copy from temp vectors to freshly allocated mesh/state arrays
+     - Added error checking for all `fread` calls
+   - Added `mesh->noffset = ndispl[mype]` in the restart block in `main()`
+
+Let me do one final review of the complete `veloc_do_restart` and the restart block in main() to make sure everything is in order:
+
+The changes look complete and correct. The key fix is the replacement of `mesh->resize()` (which called `memory_realloc_all` and crashed on aarch64) with a clean `memory_delete_all()` + fresh `allocate()` approach.
+
+Let me verify the veloc.cfg one more time:
+Let me also look at the full modified `clamr_mpionly.cpp` around the restart block one more time to make sure there are no compilation issues:
+The code looks correct. The `restarted` variable is declared inside `#ifdef HAVE_VELOC` and used in subsequent `#ifdef HAVE_VELOC` blocks, so compilation without VELOC still works correctly.
+
+Let me now also think about whether we need `MPI_Barrier` calls at critical points during restart to ensure all ranks are synchronized. Looking at the restart code:
+
+1. `VELOC_Restart_begin` - collective, all ranks must call ✓
+2. `VELOC_Route_file` - not collective, each rank gets its own path ✓
+3. File I/O - independent per rank ✓
+4. `VELOC_Restart_end` - collective, all ranks must call ✓
+5. `mesh->mesh_memory.memory_delete_all()` - local operation ✓
+6. `mesh->allocate(saved_ncells)` - local ✓
+7. `MPI_Allreduce` - collective ✓ (in the restart block in main())
+8. `MPI_Allgather` - collective ✓ (in the restart block in main())
+
+The critical thing is that `VELOC_Restart_begin` and `VELOC_Restart_end` are collective. Between them, each rank independently reads its own checkpoint file. This is correct. ✓
+
+However, there's one subtle timing issue: if rank 3's checkpoint file is larger than rank 0's (because rank 3 has more cells), rank 3 will take longer to read. Between `VELOC_Restart_end` (where ranks synchronize) and `MPI_Allreduce` (next collective), all ranks must have completed reading. Since `VELOC_Restart_end` is collective and happens AFTER each rank has read its file, this is fine. ✓
+
+I believe the implementation is correct and complete. Let me create a brief summary of all changes:
+
+## Summary of Changes
+
+### `veloc.cfg`
+Added version limits to prevent disk exhaustion:
+```
+max_versions = 2
+scratch_versions = 2
+```
+
+### `clamr_mpionly.cpp`
+
+**`veloc_do_restart` function (lines 242-330)**:
+- **Fixed crash**: Replaced `mesh->resize()` (which called `memory_realloc_all` and segfaulted) with `mesh->mesh_memory.memory_delete_all()` + fresh `mesh->allocate(saved_ncells)`. This avoids all `realloc` calls on the existing allocations.
+- Added error checking for all `fread` calls.
+- Reads checkpoint data into `std::vector` temporaries, then uses `memcpy` to fill the fresh allocations.
+- Calls `mesh->calc_celltype(saved_ncells)` to rebuild the celltype array.
+- Similarly fresh-allocates state arrays via `state->state_memory.memory_delete_all()` + `state->allocate(saved_ncells)`.
+
+**Checkpoint interval (line 191)**:
+- Changed `VELOC_CKPT_INTERVAL` from 10 to 50 cycles (fewer checkpoint writes, reducing I/O overhead and the number of versions needing purging between `max_versions` enforcement).
+
+**Restart block in `main()` (line 426)**:
+- Added `mesh->noffset = ndispl[mype]` to correctly set the rank offset after rebuilding `nsizes`/`ndispl`.

@@ -1,0 +1,309 @@
+I'll start by examining the previous attempt's validation output to understand what went wrong.
+The key failure is on line 76: **Test 1 (VeloC, failure-prone): [FAIL]** - The recovery output doesn't match the baseline. The application checkpoints are saved but after recovery (restart), the output is incorrect. This means the checkpoint/restart logic isn't properly loading the state and continuing from where it left off.
+
+Let me examine the current codebase:
+Now I understand the issue clearly. Looking at the failure:
+
+```
+Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance, max_abs_diff=3.815e+05
+```
+
+The recovery after kill produces wrong results. The problem is in the checkpoint/restart logic. When restoring, the code:
+1. Calls `setInitialValues(myCase)` which calls `sLattice.initialize()` AFTER registering memory with VeloC and checking for checkpoints - but the issue is that `setInitialValues` is called BEFORE `simulate()` in `main()`, so the lattice gets initialized to zero/default first, then in `simulate()` it restores the checkpoint. BUT the restoration with `sLattice.load()` is happening correctly...
+
+Wait, looking more carefully at the code flow in `simulate()`:
+
+1. `sLattice.getSerializableSize()` is called - this serializes to get size
+2. A buffer is allocated  
+3. `VELOC_Mem_protect` is called to register memory regions
+4. `VELOC_Restart_test` is called to check for checkpoints
+5. If found, `VELOC_Restart` loads the data into `ckpt_buf`
+6. Then `sLattice.load(ckpt_buf.data())` deserializes
+
+The real issue: **The lattice is initialized with `setInitialValues()` BEFORE `simulate()` is called.** When restarting, `setInitialValues()` runs and calls `sLattice.initialize()` which resets the lattice state. Then `simulate()` restores from the checkpoint. However...
+
+Looking at the OpenLB API - `sLattice.save()` and `sLattice.load()` - I need to verify how these work. Let me check the OpenLB source to understand the serialization API.
+Now let me look at how `postLoad()` works and the actual serialization implementation:
+Now let me check the `Serializable::load(buffer)` method to understand if it calls `postLoad()`:
+Good - so `Serializable::load(buffer)` creates a `Serializer` and calls `tmpSerializer.load(buffer)` which calls `postLoad()`. So the load mechanism works properly.
+
+Now the key question is: **why does the recovery produce wrong output?** Looking at the validate output:
+- The recovery attempt (attempt_2) completes in 75.71s with exit=0
+- The ratio is 1.13x (good, within limits) 
+- But the output comparison fails with max_abs_diff=3.815e+05
+
+The issue must be that when restarting, the checkpoint restores state but the computation continues **from the wrong iteration count**, leading to different final output. Let me look more carefully at the checkpoint/restart code:
+
+Looking at `bstep2d.cpp` lines 317-385, the current logic:
+1. Gets `serialSize = sLattice.getSerializableSize()` 
+2. Allocates `ckpt_buf`
+3. Registers `ckpt_buf.data()` (the buffer) with VeloC id=1, `iT_saved` with id=2
+4. On restart: `VELOC_Restart` loads into the registered memory (`ckpt_buf` and `iT_saved`)
+5. Then calls `sLattice.load(ckpt_buf.data())` to deserialize
+
+The problem: **`VELOC_Mem_protect` registers the *memory address* of `ckpt_buf.data()`. But on restart, `VELOC_Restart` will write the checkpoint data directly into that buffer.** Then we call `sLattice.load(ckpt_buf.data())` to deserialize from it.
+
+Wait - this should work... Let me think more carefully.
+
+Actually, looking at the OpenLB `sLattice.save()` API - this uses a `Serializable::save(uint8_t* buffer)` which creates a temp Serializer and calls `serializer2buffer`. This should correctly serialize the lattice state.
+
+But there might be an issue with how VeloC handles collective checkpoints - in MPI mode, all ranks may need to checkpoint the same things. Let me check the VeloC API more carefully.
+
+The key issue might be: **VeloC's `VELOC_Mem_protect` registers a single contiguous buffer per call.** Each MPI rank registers its own `ckpt_buf`. The `sLattice.getSerializableSize()` might return *total* size across all ranks (since it's an MPI-reduced function), not the per-rank size.
+
+Let me check:
+The `getSerializableSize()` in `SuperLattice` sums over `_block`, where `_block` is the list of **local** blocks for this rank (from `LoadBalancer`). So it's per-rank. Good.
+
+Now the real question: why is recovery producing wrong output?
+
+Let me look more carefully at the VeloC checkpoint/restart flow. A crucial detail: When **VeloC writes a checkpoint**, it writes the memory regions that were registered with `VELOC_Mem_protect`. The registration includes the *buffer*. The save goes: `sLattice.save(ckpt_buf.data())` → data is in buffer → VeloC checkpoint writes that buffer.
+
+On restart: VeloC reads the checkpoint file into the registered memory (`ckpt_buf.data()`). Then we call `sLattice.load(ckpt_buf.data())` to deserialize.
+
+This seems correct. But wait - **what is `serialSize` on restart?** The `serialSize` is computed from `sLattice.getSerializableSize()`. This is called before `setInitialValues()` runs and calls `sLattice.initialize()`. Let me look at whether `getSerializableSize()` could return different values before/after initialize.
+
+Actually, looking at the code flow:
+1. `prepareLattice(myCase)` sets up dynamics
+2. `setInitialValues(myCase)` calls `sLattice.initialize()`
+3. Then `simulate(myCase)` is called
+
+In `simulate()`:
+- `std::size_t serialSize = sLattice.getSerializableSize()` - size depends on the block structure
+- The lattice is already initialized at this point
+
+Actually wait - I need to look more carefully at one potential problem. The `sLattice.load()` call deserializes from the buffer, but it might not trigger a proper `communicate()` call afterward, which would sync the halo regions.
+
+Let me check the `postLoad` for block lattice:
+Now let me look at the critical issue. What happens after `sLattice.load()`:
+
+After restoring from checkpoint, the code calls:
+```cpp
+sLattice.setProcessingContext(ProcessingContext::Simulation);
+```
+
+But there's NO `sLattice.communicate()` call! After loading from checkpoint, the halos (ghost cell layers) need to be synchronized. In OpenLB, `initialize()` calls `communicate()` internally. But on restart, we skip `initialize()` and just load.
+
+Let me look at what the original OpenLB checkpoint/restart examples use:
+Only one example. Let me check OpenLB's built-in checkpoint support (the non-VeloC version):
+I see something critical at line 251: `if (!_initialized)` - the `initialize()` call is guarded by `_initialized` flag. If `setInitialValues()` already called `initialize()`, then the flag is set.
+
+But more importantly: looking at line 259: `_communicationNeeded = true` - this is set after initialization. After loading from checkpoint, we need to communicate.
+
+Let me look at `collideAndStream()` to understand what `_communicationNeeded` means:
+Now let me look at what happens in the setProcessingContext and the initialized flag:
+Now I understand the issue. When `setProcessingContext(ProcessingContext::Simulation)` is called, it does NOT trigger a communicate. And after `sLattice.load()` from the checkpoint, the halo/overlap regions may not be synchronized.
+
+But actually, this might not be the real problem. Let me re-examine the simulation output - the `validation_output.bin` holds:
+- `sig_buf[0]` = `stats.getTime()` - the lattice time step count  
+- `sig_buf[3]` = `stats.getAverageEnergy()` - final step energy
+
+On recovery, the simulation runs from `iT_start` (the saved step) to `totalSteps`. If `iT_start` was saved as e.g. step 500, then recovery would do steps 500..N with the restored state. The final stats should match the uninterrupted run.
+
+Wait - there's one issue I haven't looked at: **`stats.getTime()` in the validation output**. On recovery, the statistics' time counter starts from 0 (freshly initialized). The `LatticeStatistics` class has a `getTime()` method that returns how many times `incrementTime()` was called.
+
+After recovery:
+- The lattice state is restored to step `iT_saved`
+- The loop runs from `iT_start=iT_saved` to `totalSteps`, executing `totalSteps - iT_saved` more iterations
+- Each `collideAndStream()` increments statistics time
+- So `stats.getTime()` at the end = `totalSteps - iT_saved` (not `totalSteps`)
+
+This would cause `sig_buf[0]` to be wrong! The validator compares stats.getTime() between recovery and baseline, and they'll differ.
+
+But wait - would that cause `max_abs_diff=3.815e+05`? Let's see: `totalSteps` for `MAX_PHYS_T=24` would be fairly large. If the kill was at ~71.8s and total was 135.5s, that means the kill was at ~53% of the run. So `iT_saved` would be around 53% of total steps. Then on recovery, `stats.getTime()` would be ~47% of total steps, but the baseline would have 100%. The difference would be ~53% × total_steps which could be huge.
+
+Actually looking at `sig_buf[0] = stats.getTime()`:
+
+Let me look at what `getTime()` returns:
+`latticeTime` is incremented each call to `incrementTime()`. This is called from `collectStatistics()` in `superLattice.hh` each iteration (after `collideAndStream()`).
+
+After recovery, `latticeTime` starts at 0 and only counts the iterations after the restart. So `sig_buf[0] = stats.getTime()` will be `totalSteps - iT_saved` instead of `totalSteps`. This difference would be `iT_saved` which could be hundreds or thousands of steps - explaining the `max_abs_diff=3.815e+05`.
+
+The fix: I need to **also checkpoint and restore the `latticeTime`** (the statistics time counter), OR use the simulated `iT` value (which we already checkpoint as `iT_saved`) to set the statistics time after recovery.
+
+Looking at the `LatticeStatistics` interface, there's a `resetTime(size_t value=0)` method! I need to call `sLattice.getStatistics().resetTime(iT_saved)` after restoring from checkpoint.
+
+Wait, but `SuperLattice::getStatistics()` returns the **super lattice's** statistics, and `collectStatistics()` is called from `collideAndStream()`. Let me re-check...
+
+Actually `collectStatistics()` calls `getStatistics().incrementTime()` at the end. But the `_statistics` of the SuperLattice is the aggregate, and it's reset each call. The `latticeTime` in `_statistics` tracks how many `collectStatistics()` calls have been made.
+
+After recovery, `_statistics.latticeTime` = 0. After running `totalSteps - iT_saved` more steps, `_statistics.getTime()` = `totalSteps - iT_saved`.
+
+But the baseline's `_statistics.getTime()` after `totalSteps` iterations = `totalSteps`.
+
+So `sig_buf[0]` differs by `iT_saved`. This is the cause of the mismatch!
+
+The fix: After loading from checkpoint and setting `iT_start = iT_saved`, call `sLattice.getStatistics().resetTime(iT_saved)`.
+
+Let me also check if the LatticeStatistics is part of the Serializable data:
+Good. Now I understand the full picture. The `LatticeStatistics` is NOT serialized as part of `sLattice.save()` - it's part of `_statistics` which is not included in `getBlock()`. So after restoring from checkpoint, `_statistics.latticeTime` will be 0.
+
+**The fix is straightforward**: After successfully restoring from checkpoint and setting `iT_start = iT_saved`, we must call `sLattice.getStatistics().resetTime(iT_saved)` to reset the statistics lattice time to where we're resuming from.
+
+Let me also look at if there are any other statistics we need to restore:
+
+Looking at the `collectStatistics()` in `superLattice.hh`:
+- It calls `getStatistics().reset()` at the start (clears avRho, avEnergy, etc.)
+- Then recomputes from all blocks
+- At the end calls `getStatistics().incrementTime()`
+
+So each `collideAndStream()` call replaces the statistics with fresh values. Only `latticeTime` accumulates. Therefore only `latticeTime` needs to be restored.
+
+Also, there may be another issue: The `_communicationNeeded` flag. After `sLattice.load()`, the flag state is whatever it was when the checkpoint was saved. Let me think... actually the flag isn't serialized, so it stays whatever it was after `initialize()` sets it to `true`. When we call `setProcessingContext(ProcessingContext::Simulation)`, it doesn't communicate. Then the first `collideAndStream()` call should handle communication through the normal flow.
+
+Actually wait, looking at line 663 in `superLattice.hh`:
+```cpp
+void SuperLattice<T,DESCRIPTOR>::collideAndStream()
+```
+
+Let me check the beginning of `collideAndStream()`:
+OK - `collideAndStream()` checks `_initialized` and initializes if needed. After `setInitialValues()` is called (before `simulate()`), `_initialized = true`, so the check is skipped.
+
+Now let me plan the fix:
+Now let me check the `LatticeStatistics::resetTime` method to confirm the signature:
+`resetTime(size_t value)` sets `latticeTime = value`. So calling `sLattice.getStatistics().resetTime(iT_saved)` after restoring from checkpoint will set the lattice time to where we're resuming from.
+
+Now let me look at the actual stats flow. `collectStatistics()` at the end calls `getStatistics().incrementTime()`. So after N iterations, `latticeTime = N`. After restoring from checkpoint at `iT_saved` and running `totalSteps - iT_saved` more iterations, `latticeTime = totalSteps - iT_saved`. We need `latticeTime = totalSteps`.
+
+So after restore, set `latticeTime = iT_saved`. Then after `totalSteps - iT_saved` more iterations, it becomes `iT_saved + (totalSteps - iT_saved) = totalSteps`. 
+
+Now let me also think about whether there's a `communicate()` needed after loading. The `postLoad()` method in `SuperLattice` calls `_block[iC]->postLoad()` for each block. The block's `postLoad()` calls `population[iPop].postLoad()`. This should handle device-host synchronization on GPU (if any). For CPU, this may just be a no-op.
+
+After loading the lattice state, the halo regions (overlap cells) might be stale. We should call `sLattice.communicate()` to ensure they're updated. Let me add this as well.
+
+Actually - let me think about this more carefully. The `communicate()` requires `_communicationNeeded` to be true. After `setInitialValues()` → `sLattice.initialize()`, `_communicationNeeded` is set to true. But then our `VELOC_Restart` and `sLattice.load()` path runs. Since `_communicationNeeded` is still true (nothing reset it after `initialize()`), calling `communicate()` should work.
+
+Let me now make the fix:
+Now let me verify the fix looks correct in context:
+The fix looks correct. Now let me think about whether `sLattice.communicate()` will actually do anything useful. The `communicate()` method checks `_communicationNeeded`. After `setInitialValues()` → `sLattice.initialize()`, `_communicationNeeded` is set to true at line 259. So `communicate()` will run a Full stage communication.
+
+But wait - `sLattice.load()` deserializes the lattice. The loaded data overwrites the initialized lattice cells (both interior and overlap). The overlap cells were saved as part of the checkpoint. So after load, the overlap should already have the correct values from the checkpoint. Calling `communicate()` would then redundantly update the overlap with the interior values (via MPI), which should be safe since the interior and overlap are consistent in the checkpoint.
+
+Actually, I should think about whether calling `communicate()` could cause issues. The `_communicationNeeded` flag was set to true by `initialize()`. After `sLattice.load()`, the data is restored. Calling `communicate()` exchanges overlap/halo data between blocks. Since the saved checkpoint already had correct overlap data, this communication is redundant but harmless.
+
+However, there's a potential concern: calling `communicate()` while `_communicationNeeded` is true will update the overlap with neighbor interior data. If the loaded checkpoint has non-uniform distribution across ranks (i.e., rank 0's interior loaded correctly and rank 1's interior loaded correctly), the communicate will sync them - which is exactly what we want.
+
+The fix looks good. Let me also double-check that the `iT_saved` value is correctly being populated by `VELOC_Restart` before being used:
+
+Looking at the flow:
+1. `VELOC_Mem_protect(2, &iT_saved, 1, sizeof(std::size_t))` - registers `iT_saved` with VeloC
+2. `VELOC_Restart("bstep2d", ckpt_version)` - loads checkpoint data into registered memory, which includes `&iT_saved`
+3. Now `iT_saved` contains the value that was saved during the checkpoint (i.e., `iT + 1` from the checkpoint iteration)
+4. `sLattice.load(ckpt_buf.data())` - deserializes the lattice state
+5. `sLattice.getStatistics().resetTime(iT_saved)` - sets lattice time to the saved step count
+
+This is correct.
+
+Let me also verify the `veloc.cfg` file is present and correct:
+The `veloc.cfg` is in place. Now let me also check the validation output one more time to make sure I understand what `stats.getTime()` corresponds to and whether the diff of 3.815e+05 is consistent with my hypothesis:
+
+From the validation:
+- `MAX_PHYS_T = 24` seconds
+- `RESOLUTION = 20`
+- `LATTICE_RELAXATION_TIME = 0.516...`
+
+With resolution 20, the converter computes lattice time step from physical time. The UnitConverter uses:
+```
+latticeVelocity = (physCharLength * latticeRelaxationTime - 0.5) / (physCharLength / resolution) / physCharVelocity
+```
+
+Actually, let me just think about the magnitude. The `max_abs_diff = 3.815e+05` is the difference in the output binary. The binary is 6 doubles (48 bytes). The first double `sig_buf[0] = stats.getTime()` is the iteration count.
+
+Looking at the test:
+- Baseline runtime: ~135s
+- The kill happened at ~77.88s (53% into the run)
+- Checkpoint was at ~53% of iterations
+
+For `MAX_PHYS_T=24`, with `RESOLUTION=20` and `LATTICE_RELAXATION_TIME≈0.52`:
+- `latticeRelaxationFrequency = 1/tau = 1/0.52 ≈ 1.923`
+- Lattice velocity `u = physCharVelocity × Nu = 1.0 × Nu`
+- With resolution 20, the lattice unit time corresponds to `physDeltaT = deltaX/u × mach`
+
+This is getting complex. The point is that `3.815e+05` is extremely large - consistent with being a raw iteration count difference (hundreds of thousands of lattice iterations).
+
+The fix of calling `sLattice.getStatistics().resetTime(iT_saved)` should directly correct `sig_buf[0]`, and the lattice state continuity should ensure the other stats (`avRho`, `avEnergy`, `maxU`) are also correct.
+
+Let me also check if there are any other issues by looking at the previous iteration's logs:
+Good - I can see the history. The previous issue was: iter_1 crashed immediately (exit code 255) due to VeloC init failing. Iter_2 fixed that (the code in the current file shows the multi-path search for veloc.cfg). But iter_2 passed the VeloC init, ran successfully, checkpointed, but recovery produced wrong output because `stats.getTime()` was wrong.
+
+My fix (calling `resetTime(iT_saved)` and `communicate()`) should fix the correctness issue. Let me verify the full code once more to ensure everything is consistent:
+The code looks correct. Let me also think about a subtle issue: after `sLattice.communicate()` (line 350), `setProcessingContext(ProcessingContext::Simulation)` is called on line 352. Looking at `setProcessingContext` code in superLattice.hh:
+
+```cpp
+void SuperLattice<T,DESCRIPTOR>::setProcessingContext(ProcessingContext context)
+{
+  // Communicate overlap prior to evaluation
+  if (context == ProcessingContext::Evaluation) {
+    communicate();
+    ...
+  }
+  for (int iC = 0; iC < this->_loadBalancer.size(); ++iC) {
+    _block[iC]->setProcessingContext(context);
+  }
+}
+```
+
+For `ProcessingContext::Simulation`, it doesn't communicate. Good. So the order is:
+1. `sLattice.load(ckpt_buf.data())` - restores lattice data
+2. `sLattice.getStatistics().resetTime(iT_saved)` - restores time counter
+3. `sLattice.communicate()` - syncs halo regions
+4. `sLattice.setProcessingContext(ProcessingContext::Simulation)` - sets context
+
+After step 3, `_communicationNeeded` is set to `false` (see line 848). After step 4, the blocks' processing context is set to Simulation. Then the loop runs normally.
+
+Actually, wait. After `communicate()` is called, `_communicationNeeded = false`. Then `setProcessingContext(Simulation)` just sets the blocks' context. But on the next `collideAndStream()`, there might be an issue if communication is needed again...
+
+Looking at `collideAndStream()`:
+- It runs the physics
+- At line 714: `_communicationNeeded = true` is set after `collectStatistics()`
+
+So yes, `_communicationNeeded` will be set back to true after the first iteration, and communication will work normally.
+
+But actually, is there a risk that after loading checkpoint + communicating, the first `collideAndStream()` might do incorrect communication because `_communicationNeeded = false`? Let me check what `PostPostProcess().communicate()` does on line 709:
+
+```cpp
+getCommunicator(PostPostProcess()).communicate();
+```
+
+This is NOT guarded by `_communicationNeeded`. The `communicate()` (line 844) that IS guarded is only for the `stage::Full`. So the per-stage communicators run independently.
+
+Actually, looking at the `Full` stage communicator:
+```cpp
+void SuperLattice<T,DESCRIPTOR>::communicate()
+{
+  if (_communicationNeeded) {
+    getCommunicator(stage::Full()).communicate();
+    _communicationNeeded = false;
+  }
+}
+```
+
+The `stage::Full` communicator is only called from `SuperLattice::communicate()` which is called from `setProcessingContext(Evaluation)`. This is for ensuring halos are up-to-date before output/evaluation.
+
+The per-iteration communication in `collideAndStream()` happens through `executePostProcessors(PostCollide())` and `executePostProcessors(PostStream())` which run their own communicators.
+
+So my concern about `_communicationNeeded = false` after `communicate()` is not a problem for the collide/stream communication - that's handled by separate communicators. The `Full` stage communication is only needed before evaluation (output).
+
+The fix is sound. Let me also check whether there's any issue with `setProcessingContext(Simulation)` being called after `communicate()`:
+
+After `sLattice.communicate()`:
+- `_communicationNeeded = false`
+- Halos are synchronized with current interior values
+
+After `sLattice.setProcessingContext(ProcessingContext::Simulation)`:
+- Blocks' processing context set to Simulation (no communication here)
+
+When the first iteration starts with `sLattice.collideAndStream()`:
+- Checks `_initialized` - yes, set by `setInitialValues()`
+- Runs collide/stream/post-processors
+
+This is all correct.
+
+One more thing to verify: the `sLattice.communicate()` after loading the checkpoint. Since `_communicationNeeded` was set to `true` by `initialize()` and hasn't been reset, this will work. But what if `_communicationNeeded` is somehow `false` when we get to the restart path? That shouldn't happen since `initialize()` always sets it to `true`.
+
+The fix is complete. Let me provide a summary:
+
+**Root cause**: When recovering from a checkpoint, the `LatticeStatistics::latticeTime` counter was not restored. It started at 0 and only accumulated the remaining iterations after restart. This caused `sig_buf[0] = stats.getTime()` in the validation output to be `totalSteps - iT_saved` instead of `totalSteps`, leading to a huge numerical difference (`max_abs_diff = 3.815e+05`).
+
+**Fix**: Added `sLattice.getStatistics().resetTime(iT_saved)` immediately after loading the checkpoint, which sets the statistics time counter to `iT_saved`. After running the remaining `totalSteps - iT_saved` iterations, the counter becomes `iT_saved + (totalSteps - iT_saved) = totalSteps`, matching the baseline.
+
+Also added `sLattice.communicate()` to ensure halo regions are properly synchronized after loading the checkpoint state.
