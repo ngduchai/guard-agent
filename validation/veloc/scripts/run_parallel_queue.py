@@ -968,10 +968,12 @@ class Orchestrator:
         benchmark_num_runs: int,
         label: str,
         opencode_retries: int,
-        skip_bench: bool,
+        max_loop_attempts: int = 1,
+        skip_bench: bool = False,
         validate_timeout_s: float = 900.0,
         resume: bool = False,
     ):
+        self._max_loop_attempts = max_loop_attempts
         self.max_gen_workers = max_gen_workers
         self.label = label
         self.skip_bench = skip_bench
@@ -1011,15 +1013,14 @@ class Orchestrator:
                 log_dir=log_dir,
                 vanilla_src=vanilla,
                 max_iters=max_iters,
-                # HARD CAP per user directive (2026-06-04): max_loop_attempts is
-                # ALWAYS 1. Auto-restart from vanilla is NEVER allowed. Even
-                # though _isolate_paths_for_new_attempt would make attempt N+1
-                # safe path-wise, the user wants a single attempt per app per
-                # invocation — no implicit retries. To run another attempt
-                # explicitly, launch a fresh `run_parallel_queue.py` invocation.
-                # Decoupled from --opencode-retries (still used for per-iter
-                # stall retries via max_iter_stall_retries below).
-                max_loop_attempts=1,
+                # Per-app max_loop_attempts: comes from --max-loop-attempts CLI
+                # flag (default 1, per user policy 2026-06-04 — no implicit
+                # retries). Decoupled from --opencode-retries (which controls
+                # per-iter stall retries via max_iter_stall_retries below).
+                # When >1, per-attempt path isolation (_isolate_paths_for_new_attempt)
+                # ensures attempt N+1 writes to <app_dir>_attempt_<N> + <log_dir>
+                # _attempt_<N> so attempt 1 data is never overwritten.
+                max_loop_attempts=self._max_loop_attempts,
                 max_iter_stall_retries=opencode_retries,
                 benchmark_num_runs=benchmark_num_runs,
             )
@@ -2427,7 +2428,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "build/iterative_logs/<APP>_<LABEL>/ "
                              "(default baseline, honors MODEL_TAG env via wrapper)")
     parser.add_argument("--opencode-retries", type=int, default=2,
-                        help="D3 retry budget — max_loop_attempts = 1 + this (default 2)")
+                        help="Per-iter stall retries (default 2). Decoupled "
+                             "from --max-loop-attempts.")
+    parser.add_argument("--max-loop-attempts", type=int, default=1,
+                        help="Max times the iter loop can restart from vanilla "
+                             "after exhausting --max-iters without PASS. "
+                             "DEFAULT 1 (no auto-restart) per user policy "
+                             "2026-06-04. Set >1 ONLY when you explicitly want "
+                             "additional restarts; attempt 2+ writes to "
+                             "<app_dir>_attempt_<N> + <log_dir>_attempt_<N> "
+                             "(per-attempt path isolation prevents overwrite).")
     parser.add_argument("--skip-bench", action="store_true",
                         help="Skip the post-PASS benchmark stage")
     parser.add_argument("--resume", action="store_true",
@@ -2464,6 +2474,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         benchmark_num_runs=args.benchmark_num_runs,
         label=label,
         opencode_retries=args.opencode_retries,
+        max_loop_attempts=args.max_loop_attempts,
         skip_bench=args.skip_bench,
         validate_timeout_s=args.validate_timeout_s,
         resume=args.resume,
