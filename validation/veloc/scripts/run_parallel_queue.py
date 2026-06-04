@@ -690,25 +690,38 @@ def _git(app_dir: Path, *args: str) -> tuple[int, str]:
 def _git_init_snapshot(app_dir: Path, message: str) -> bool:
     """Ensure app_dir is a git repo and commit current state as a snapshot.
 
-    Idempotent: safe to call multiple times.  Returns True on success.
-    Failures are logged to orchestrator stdout but never raise — the iter
-    still runs even if snapshotting fails (the cost is that a subsequent
-    stall cannot be cleanly rolled back).
+    Init-once-then-commit-per-iter: `git init` + identity config run ONCE,
+    on first call when no `.git/` exists (typically iter 1 after vanilla
+    re-copy).  Subsequent iters skip init and just stage+commit — building
+    a SINGLE .git history that captures every iter snapshot, so future
+    audits can revisit the LLM's code at any iter via `git log --all` +
+    `git checkout` on the inner repo.
+
+    Returns True on success.  Failures are logged to orchestrator stdout
+    but never raise — the iter still runs even if snapshotting fails (the
+    cost is that a subsequent stall cannot be cleanly rolled back).
+
+    Previously this function ran `git init --quiet` + `git config` every
+    iter.  `git init` on an existing repo is a no-op (preserves
+    .git/objects + refs + index), so behavior was correct — but the
+    config writes were redundant noise.  Init-once split makes intent
+    explicit, saves two subprocess calls per iter, and matches the
+    user-stated invariant: "init once at beginning, commit per iter, so
+    we have full checkpoint log of the source through iterations".
     """
     if not app_dir.exists():
         return False
 
-    # `git init` is idempotent.  Use --quiet to avoid noisy output for the
-    # already-initialized case.
-    rc, _ = _git(app_dir, "init", "--quiet")
-    if rc != 0:
-        print(f"[git] {app_dir.name}: init failed (rc={rc})", flush=True)
-        return False
-
-    # Set local identity so commits work without relying on global config
-    # (CI containers may have no user.name/user.email).
-    _git(app_dir, "config", "user.email", "orchestrator@guard-agent.local")
-    _git(app_dir, "config", "user.name", "guard-agent orchestrator")
+    if not (app_dir / ".git").exists():
+        # First snapshot of this workspace: init repo + set local identity
+        # so commits work without relying on global config (CI containers
+        # may have no user.name/user.email).
+        rc, _ = _git(app_dir, "init", "--quiet")
+        if rc != 0:
+            print(f"[git] {app_dir.name}: init failed (rc={rc})", flush=True)
+            return False
+        _git(app_dir, "config", "user.email", "orchestrator@guard-agent.local")
+        _git(app_dir, "config", "user.name", "guard-agent orchestrator")
 
     # Stage everything (including deletions) and commit.  --allow-empty
     # handles the case where nothing changed between two consecutive
@@ -997,7 +1010,16 @@ class Orchestrator:
                 log_dir=log_dir,
                 vanilla_src=vanilla,
                 max_iters=max_iters,
-                max_loop_attempts=1 + opencode_retries,
+                # ENFORCED HARD CAP: never allow auto-restart from vanilla.
+                # Per user directive 2026-06-04: attempt 2+ would wipe
+                # attempt 1's source .git history + iter_1 logs because
+                # this orch shares iter_logs/iter_N/ paths and the
+                # tests_<label>/<APP>/ workspace across attempts (no
+                # per-attempt isolation).  Loss for Smilei attempt 1:
+                # iter_1 logs + ALL per-iter source snapshots gone.
+                # Decoupled from --opencode-retries (which still controls
+                # per-iter stall retries via max_iter_stall_retries below).
+                max_loop_attempts=1,
                 max_iter_stall_retries=opencode_retries,
                 benchmark_num_runs=benchmark_num_runs,
             )
