@@ -1,0 +1,691 @@
+/*
+Copyright (c) 2013, Intel Corporation
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+* Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
+* Neither the name of Intel Corporation nor the names of its
+      contributors may be used to endorse or promote products
+      derived from this software without specific prior written
+      permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*******************************************************************
+
+NAME:    Stencil
+
+PURPOSE: This program tests the efficiency with which a space-invariant,
+         linear, symmetric filter (stencil) can be applied to a square
+         grid or image.
+
+USAGE:   The program takes as input the linear dimension of the grid,
+         and the number of iterations on the grid
+
+               <progname> <# iterations> <grid size>
+
+         The output consists of diagnostics to make sure the
+         algorithm worked, and of timing statistics.
+
+FUNCTIONS CALLED:
+
+         Other than MPI or standard C functions, the following
+         functions are used in this program:
+
+         wtime()
+         bail_out()
+
+HISTORY: - Written by Rob Van der Wijngaart, November 2006.
+         - RvdW, August 2013: Removed unrolling pragmas for clarity;
+           fixed bug in compuation of width of strip assigned to
+           each rank;
+         - RvdW, August 2013: added constant to array "in" at end of
+           each iteration to force refreshing of neighbor data in
+           parallel versions
+         - RvdW, October 2014: introduced 2D domain decomposition
+         - RvdW, October 2014: removed barrier at start of each iteration
+         - RvdW, October 2014: replaced single rank/single iteration timing
+           with global timing of all iterations across all ranks
+
+*********************************************************************************/
+
+#include <par-res-kern_general.h>
+#include <par-res-kern_mpi.h>
+#include <veloc.h>
+#include <errno.h>
+#include <dirent.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#if DOUBLE
+  #define DTYPE     double
+  #define MPI_DTYPE MPI_DOUBLE
+  #define EPSILON   1.e-8
+  #define COEFX     1.0
+  #define COEFY     1.0
+  #define FSTR      "%lf"
+#else
+  #define DTYPE     float
+  #define MPI_DTYPE MPI_FLOAT
+  #define EPSILON   0.0001f
+  #define COEFX     1.0f
+  #define COEFY     1.0f
+  #define FSTR      "%f"
+#endif
+
+/* define shorthand for indexing multi-dimensional arrays with offsets           */
+#define INDEXIN(i,j)  (i+RADIUS+(long)(j+RADIUS)*(long)(width+2*RADIUS))
+/* need to add offset of RADIUS to j to account for ghost points                 */
+#define IN(i,j)       in[INDEXIN(i-istart,j-jstart)]
+#define INDEXOUT(i,j) (i+(j)*(width))
+#define OUT(i,j)      out[INDEXOUT(i-istart,j-jstart)]
+#define WEIGHT(ii,jj) weight[ii+RADIUS][jj+RADIUS]
+#define VELOC_CHECKPOINT_INTERVAL 100
+
+/* PRK_Stencil validation signature dumper (Step 0 v8: file-based comparison).
+ *
+ * Writes 6 raw doubles (48 bytes) to "validation_output.bin" in CWD on rank
+ * `root`.  Byte layout MUST be identical between vanilla and reference at the
+ * same workload so Step 0.6c cross-consistency passes:
+ *   [0] norm                          (per-active-point L1 norm; rank-root local)
+ *   [1] reference_norm                (target value, deterministic)
+ *   [2] norm - reference_norm         (validation residual; should be near 0)
+ *   [3] (double)iterations            (timestep count from CLI)
+ *   [4] (double)f_active_points       (active grid-point count)
+ *   [5] (double)(COEFX + COEFY)       (sum of stencil coefficients)
+ *
+ * Caller must invoke ONLY on rank `root` (typically my_ID == 0), AFTER the
+ * validation block where `norm /= f_active_points` is applied and
+ * `reference_norm` is computed, BEFORE MPI_Finalize.  On other ranks the
+ * `norm` variable is uninitialised garbage (only rank root received the
+ * MPI_Reduce result).  norm and reference_norm are DTYPE which is `double`
+ * by default (or `float` under -DSINGLE_PRECISION); cast to double for the
+ * binary payload.
+ */
+static void dumpValidationSignatureBin(DTYPE norm, DTYPE reference_norm,
+                                       int iterations, DTYPE f_active_points)
+{
+   double buf[6];
+   buf[0] = (double)norm;
+   buf[1] = (double)reference_norm;
+   buf[2] = (double)(norm - reference_norm);
+   buf[3] = (double)iterations;
+   buf[4] = (double)f_active_points;
+   buf[5] = (double)(COEFX + COEFY);
+   FILE* f = fopen("validation_output.bin", "wb");
+   if (f) {
+      fwrite(buf, sizeof(double), 6, f);
+      fclose(f);
+   }
+}
+
+static int ensureDirectory(const char *path)
+{
+   if (mkdir(path, 0777) == 0 || errno == EEXIST) {
+      return 0;
+   }
+   return -1;
+}
+
+static int directoryHasEntries(const char *path)
+{
+   DIR *dir = opendir(path);
+   if (dir == NULL) {
+      return 0;
+   }
+
+   struct dirent *entry;
+   while ((entry = readdir(dir)) != NULL) {
+      if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+         closedir(dir);
+         return 1;
+      }
+   }
+
+   closedir(dir);
+   return 0;
+}
+
+static int registerVelocState(int *checkpoint_iter, DTYPE *in, size_t in_count,
+                              DTYPE *out, size_t out_count)
+{
+   return VELOC_Mem_protect(0, checkpoint_iter, 1, sizeof(*checkpoint_iter)) == VELOC_SUCCESS &&
+          VELOC_Mem_protect(1, in, in_count, sizeof(*in)) == VELOC_SUCCESS &&
+          VELOC_Mem_protect(2, out, out_count, sizeof(*out)) == VELOC_SUCCESS;
+}
+
+static int saveVelocCheckpoint(const char *checkpoint_name, int version)
+{
+   return VELOC_Checkpoint(checkpoint_name, version) == VELOC_SUCCESS ? 0 : -1;
+}
+
+static int findLoadableCheckpoint(const char *checkpoint_name, int max_version,
+                                  int *checkpoint_iter)
+{
+   int local_candidate = VELOC_Restart_test(checkpoint_name, max_version);
+   local_candidate = local_candidate == VELOC_FAILURE ? 0 : local_candidate;
+
+   int candidate = 0;
+   MPI_Allreduce(&local_candidate, &candidate, 1, MPI_INT, MPI_MIN,
+                 MPI_COMM_WORLD);
+   if (candidate <= 0) {
+      return VELOC_FAILURE;
+   }
+
+   int loaded = VELOC_Restart(checkpoint_name, candidate) == VELOC_SUCCESS;
+   int all_loaded = 0;
+   MPI_Allreduce(&loaded, &all_loaded, 1, MPI_INT, MPI_MIN,
+                 MPI_COMM_WORLD);
+   return all_loaded && *checkpoint_iter > 0 ? candidate : VELOC_FAILURE;
+}
+
+int main(int argc, char ** argv) {
+
+  int    Num_procs;       /* number of ranks                                     */
+  int    Num_procsx, Num_procsy; /* number of ranks in each coord direction      */
+  int    my_ID;           /* MPI rank                                            */
+  int    my_IDx, my_IDy;  /* coordinates of rank in rank grid                    */
+  int    right_nbr;       /* global rank of right neighboring tile               */
+  int    left_nbr;        /* global rank of left neighboring tile                */
+  int    top_nbr;         /* global rank of top neighboring tile                 */
+  int    bottom_nbr;      /* global rank of bottom neighboring tile              */
+  DTYPE *top_buf_out;     /* communication buffer                                */
+  DTYPE *top_buf_in;      /*       "         "                                   */
+  DTYPE *bottom_buf_out;  /*       "         "                                   */
+  DTYPE *bottom_buf_in;   /*       "         "                                   */
+  DTYPE *right_buf_out;   /*       "         "                                   */
+  DTYPE *right_buf_in;    /*       "         "                                   */
+  DTYPE *left_buf_out;    /*       "         "                                   */
+  DTYPE *left_buf_in;     /*       "         "                                   */
+  int    root = 0;
+  int    n, width, height;/* linear global and local grid dimension              */
+  long   nsquare;         /* total number of grid points                         */
+  int    iter, leftover;  /* dummies                   */
+  int    restart_version = VELOC_FAILURE;
+  int    checkpoint_iter = 0;
+  int    veloc_enabled = 0;
+  int    checkpoint_interval = VELOC_CHECKPOINT_INTERVAL;
+  char   checkpoint_name[128];
+  int    istart, iend;    /* bounds of grid tile assigned to calling rank        */
+  int    jstart, jend;    /* bounds of grid tile assigned to calling rank        */
+  DTYPE  norm,            /* L1 norm of solution                                 */
+         local_norm,      /* contribution of calling rank to L1 norm             */
+         reference_norm;
+  DTYPE  f_active_points; /* interior of grid with respect to stencil            */
+  DTYPE  flops;           /* floating point ops per iteration                    */
+  int    iterations;      /* number of times to run the algorithm                */
+  double local_stencil_time,/* timing parameters                                 */
+         stencil_time,
+         avgtime;
+  int    stencil_size;    /* number of points in stencil                         */
+  DTYPE  * RESTRICT in;   /* input grid values                                   */
+  DTYPE  * RESTRICT out;  /* output grid values                                  */
+  long   total_length_in; /* total required length to store input array          */
+  long   total_length_out;/* total required length to store output array         */
+  int    error=0;         /* error flag                                          */
+  DTYPE  weight[2*RADIUS+1][2*RADIUS+1]; /* weights of points in the stencil     */
+  MPI_Request request[8];
+
+  /*******************************************************************************
+  ** Initialize the MPI environment
+  ********************************************************************************/
+  MPI_Init(&argc,&argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &my_ID);
+  MPI_Comm_size(MPI_COMM_WORLD, &Num_procs);
+
+  char veloc_cfg_buf[256] = "";
+  if (my_ID == root) {
+    const char *cfg_candidates[] = {
+      "veloc.cfg", "../veloc.cfg", "../../veloc.cfg", "../../../veloc.cfg",
+      "../../../../veloc.cfg"
+    };
+    for (int cfg_index = 0; cfg_index < 5; cfg_index++) {
+      if (access(cfg_candidates[cfg_index], R_OK) == 0) {
+        strncpy(veloc_cfg_buf, cfg_candidates[cfg_index], sizeof(veloc_cfg_buf) - 1);
+        break;
+      }
+    }
+  }
+  MPI_Bcast(veloc_cfg_buf, (int) sizeof(veloc_cfg_buf), MPI_CHAR, root,
+            MPI_COMM_WORLD);
+  if (veloc_cfg_buf[0] == '\0') {
+    printf("ERROR: rank %d could not find VeloC config file\n", my_ID);
+    fflush(stdout);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  if (ensureDirectory("/tmp/prkstencil_veloc_scratch") != 0 ||
+      ensureDirectory("/tmp/prkstencil_veloc_persistent") != 0) {
+    printf("ERROR: rank %d could not create VeloC checkpoint directories\n", my_ID);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  int checkpoint_dirs_have_state = 0;
+  if (my_ID == root) {
+    checkpoint_dirs_have_state = directoryHasEntries("/tmp/prkstencil_veloc_scratch") ||
+                                  directoryHasEntries("/tmp/prkstencil_veloc_persistent");
+  }
+  MPI_Bcast(&checkpoint_dirs_have_state, 1, MPI_INT, root, MPI_COMM_WORLD);
+  int veloc_init_ok = VELOC_Init_single((unsigned int) my_ID, veloc_cfg_buf) == VELOC_SUCCESS;
+  MPI_Allreduce(&veloc_init_ok, &veloc_enabled, 1, MPI_INT, MPI_MIN,
+                MPI_COMM_WORLD);
+  if (!veloc_enabled && checkpoint_dirs_have_state) {
+    printf("ERROR: rank %d could not initialize VeloC for checkpoint restart\n", my_ID);
+    fflush(stdout);
+    MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  }
+  if (!veloc_enabled && my_ID == root) {
+    printf("WARNING: VeloC initialization failed; continuing without restart support\n");
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  /*******************************************************************************
+  ** process, test, and broadcast input parameters
+  ********************************************************************************/
+
+  if (my_ID == root) {
+    printf("Parallel Research Kernels version %s\n", PRKVERSION);
+    printf("MPI stencil execution on 2D grid\n");
+#if !STAR
+    printf("ERROR: Compact stencil not supported\n");
+    error = 1;
+    goto ENDOFTESTS;
+#endif
+
+    if (argc != 3){
+      printf("Usage: %s <# iterations> <array dimension> \n",
+             *argv);
+      error = 1;
+      goto ENDOFTESTS;
+    }
+
+    iterations  = atoi(*++argv);
+    if (iterations < 1){
+      printf("ERROR: iterations must be >= 1 : %d \n",iterations);
+      error = 1;
+      goto ENDOFTESTS;
+    }
+
+    n       = atoi(*++argv);
+    nsquare = (long) n * (long) n;
+    if (nsquare < Num_procs){
+      printf("ERROR: grid size %ld must be at least # ranks: %d\n",
+	     nsquare, Num_procs);
+      error = 1;
+      goto ENDOFTESTS;
+    }
+
+    if (RADIUS < 0) {
+      printf("ERROR: Stencil radius %d should be non-negative\n", RADIUS);
+      error = 1;
+      goto ENDOFTESTS;
+    }
+
+    if (2*RADIUS +1 > n) {
+      printf("ERROR: Stencil radius %d exceeds grid size %d\n", RADIUS, n);
+      error = 1;
+      goto ENDOFTESTS;
+    }
+
+    ENDOFTESTS:;
+  }
+  bail_out(error);
+
+  /* determine best way to create a 2D grid of ranks (closest to square)     */
+  factor(Num_procs, &Num_procsx, &Num_procsy);
+
+  my_IDx = my_ID%Num_procsx;
+  my_IDy = my_ID/Num_procsx;
+  /* compute neighbors; don't worry about dropping off the edges of the grid */
+  right_nbr  = my_ID+1;
+  left_nbr   = my_ID-1;
+  top_nbr    = my_ID+Num_procsx;
+  bottom_nbr = my_ID-Num_procsx;
+
+  if (my_ID == root) {
+    printf("Number of ranks        = %d\n", Num_procs);
+    printf("Grid size              = %d\n", n);
+    printf("Radius of stencil      = %d\n", RADIUS);
+    printf("Tiles in x/y-direction = %d/%d\n", Num_procsx, Num_procsy);
+    printf("Type of stencil        = star\n");
+#if DOUBLE
+    printf("Data type              = double precision\n");
+#else
+    printf("Data type              = single precision\n");
+#endif
+#if LOOPGEN
+    printf("Script used to expand stencil loop body\n");
+#else
+    printf("Compact representation of stencil loop body\n");
+#endif
+    printf("Number of iterations   = %d\n", iterations);
+  }
+
+  MPI_Bcast(&n,          1, MPI_INT, root, MPI_COMM_WORLD);
+  MPI_Bcast(&iterations, 1, MPI_INT, root, MPI_COMM_WORLD);
+
+  /* compute amount of space required for input and solution arrays             */
+
+  width = n/Num_procsx;
+  leftover = n%Num_procsx;
+  if (my_IDx<leftover) {
+    istart = (width+1) * my_IDx;
+    iend = istart + width;
+  }
+  else {
+    istart = (width+1) * leftover + width * (my_IDx-leftover);
+    iend = istart + width - 1;
+  }
+
+  width = iend - istart + 1;
+  if (width == 0) {
+    printf("ERROR: rank %d has no work to do\n", my_ID);
+    error = 1;
+  }
+  bail_out(error);
+
+  height = n/Num_procsy;
+  leftover = n%Num_procsy;
+  if (my_IDy<leftover) {
+    jstart = (height+1) * my_IDy;
+    jend = jstart + height;
+  }
+  else {
+    jstart = (height+1) * leftover + height * (my_IDy-leftover);
+    jend = jstart + height - 1;
+  }
+
+  height = jend - jstart + 1;
+  if (height == 0) {
+    printf("ERROR: rank %d has no work to do\n", my_ID);
+    error = 1;
+  }
+  bail_out(error);
+
+  if (width < RADIUS || height < RADIUS) {
+    printf("ERROR: rank %d has work tile smaller then stencil radius\n",
+           my_ID);
+    error = 1;
+  }
+  bail_out(error);
+
+  snprintf(checkpoint_name, sizeof(checkpoint_name), "stencil_i%d_n%d_p%d_r%d",
+           iterations, n, Num_procs, RADIUS);
+  char *checkpoint_env = getenv("CKPT_EVERY");
+  if (checkpoint_env != NULL && atoi(checkpoint_env) > 0) {
+    checkpoint_interval = atoi(checkpoint_env);
+  }
+
+  total_length_in  = (long) (width+2*RADIUS)*(long) (height+2*RADIUS)*sizeof(DTYPE);
+  total_length_out = (long) width* (long) height*sizeof(DTYPE);
+  size_t in_count = (size_t) total_length_in / sizeof(DTYPE);
+  size_t out_count = (size_t) total_length_out / sizeof(DTYPE);
+
+  in  = (DTYPE *) prk_malloc(total_length_in);
+  out = (DTYPE *) prk_malloc(total_length_out);
+  if (!in || !out) {
+    printf("ERROR: rank %d could not allocate space for input/output array\n",
+            my_ID);
+    error = 1;
+  }
+  bail_out(error);
+
+  /* fill the stencil weights to reflect a discrete divergence operator         */
+  for (int jj=-RADIUS; jj<=RADIUS; jj++) for (int ii=-RADIUS; ii<=RADIUS; ii++)
+    WEIGHT(ii,jj) = (DTYPE) 0.0;
+
+  stencil_size = 4*RADIUS+1;
+  for (int ii=1; ii<=RADIUS; ii++) {
+    WEIGHT(0, ii) = WEIGHT( ii,0) =  (DTYPE) (1.0/(2.0*ii*RADIUS));
+    WEIGHT(0,-ii) = WEIGHT(-ii,0) = -(DTYPE) (1.0/(2.0*ii*RADIUS));
+  }
+
+  norm = (DTYPE) 0.0;
+  f_active_points = (DTYPE) (n-2*RADIUS)*(DTYPE) (n-2*RADIUS);
+  /* intialize the input and output arrays                                     */
+  for (int j=jstart; j<=jend; j++) for (int i=istart; i<=iend; i++) {
+    IN(i,j)  = COEFX*i+COEFY*j;
+    OUT(i,j) = (DTYPE)0.0;
+  }
+
+  if (veloc_enabled) {
+    int register_ok = registerVelocState(&checkpoint_iter, in, in_count, out, out_count);
+    MPI_Allreduce(&register_ok, &veloc_enabled, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    if (!veloc_enabled && my_ID == root) {
+      printf("WARNING: VeloC state registration failed; continuing without restart support\n");
+    }
+  }
+
+  if (Num_procs > 1) {
+    /* allocate communication buffers for halo values                          */
+    top_buf_out = (DTYPE *) prk_malloc(4*sizeof(DTYPE)*RADIUS*width);
+    if (!top_buf_out) {
+      printf("ERROR: Rank %d could not allocated comm buffers for y-direction\n", my_ID);
+      error = 1;
+    }
+    bail_out(error);
+    top_buf_in     = top_buf_out +   RADIUS*width;
+    bottom_buf_out = top_buf_out + 2*RADIUS*width;
+    bottom_buf_in  = top_buf_out + 3*RADIUS*width;
+
+    right_buf_out  = (DTYPE *) prk_malloc(4*sizeof(DTYPE)*RADIUS*height);
+    if (!right_buf_out) {
+      printf("ERROR: Rank %d could not allocated comm buffers for x-direction\n", my_ID);
+      error = 1;
+    }
+    bail_out(error);
+    right_buf_in   = right_buf_out +   RADIUS*height;
+    left_buf_out   = right_buf_out + 2*RADIUS*height;
+    left_buf_in    = right_buf_out + 3*RADIUS*height;
+  }
+
+  iter = 0;
+  if (veloc_enabled && checkpoint_dirs_have_state) {
+    restart_version = findLoadableCheckpoint(checkpoint_name, iterations+2,
+                                             &checkpoint_iter);
+  }
+  if (restart_version != VELOC_FAILURE) {
+    iter = checkpoint_iter;
+    if (my_ID == root) {
+      printf("Restarted from VeloC checkpoint version %d\n", restart_version);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    local_stencil_time = wtime();
+  }
+
+  for (; iter<=iterations; iter++){
+
+    /* start timer after a warmup iteration */
+    if (iter == 1) {
+      MPI_Barrier(MPI_COMM_WORLD);
+      local_stencil_time = wtime();
+    }
+
+    /* need to fetch ghost point data from neighbors in y-direction                 */
+    if (my_IDy < Num_procsy-1) {
+      MPI_Irecv(top_buf_in, RADIUS*width, MPI_DTYPE, top_nbr, 101,
+                MPI_COMM_WORLD, &(request[1]));
+      for (int kk=0,j=jend-RADIUS+1; j<=jend; j++) for (int i=istart; i<=iend; i++) {
+          top_buf_out[kk++]= IN(i,j);
+      }
+      MPI_Isend(top_buf_out, RADIUS*width,MPI_DTYPE, top_nbr, 99,
+                MPI_COMM_WORLD, &(request[0]));
+    }
+    if (my_IDy > 0) {
+      MPI_Irecv(bottom_buf_in,RADIUS*width, MPI_DTYPE, bottom_nbr, 99,
+                MPI_COMM_WORLD, &(request[3]));
+      for (int kk=0,j=jstart; j<=jstart+RADIUS-1; j++) for (int i=istart; i<=iend; i++) {
+          bottom_buf_out[kk++]= IN(i,j);
+      }
+      MPI_Isend(bottom_buf_out, RADIUS*width,MPI_DTYPE, bottom_nbr, 101,
+                MPI_COMM_WORLD, &(request[2]));
+    }
+    if (my_IDy < Num_procsy-1) {
+      MPI_Wait(&(request[0]), MPI_STATUS_IGNORE);
+      MPI_Wait(&(request[1]), MPI_STATUS_IGNORE);
+      for (int kk=0,j=jend+1; j<=jend+RADIUS; j++) for (int i=istart; i<=iend; i++) {
+          IN(i,j) = top_buf_in[kk++];
+      }
+    }
+    if (my_IDy > 0) {
+      MPI_Wait(&(request[2]), MPI_STATUS_IGNORE);
+      MPI_Wait(&(request[3]), MPI_STATUS_IGNORE);
+      for (int kk=0,j=jstart-RADIUS; j<=jstart-1; j++) for (int i=istart; i<=iend; i++) {
+          IN(i,j) = bottom_buf_in[kk++];
+      }
+    }
+
+    /* need to fetch ghost point data from neighbors in x-direction                 */
+    if (my_IDx < Num_procsx-1) {
+      MPI_Irecv(right_buf_in, RADIUS*height, MPI_DTYPE, right_nbr, 1010,
+                MPI_COMM_WORLD, &(request[1+4]));
+      for (int kk=0,j=jstart; j<=jend; j++) for (int i=iend-RADIUS+1; i<=iend; i++) {
+          right_buf_out[kk++]= IN(i,j);
+      }
+      MPI_Isend(right_buf_out, RADIUS*height, MPI_DTYPE, right_nbr, 990,
+              MPI_COMM_WORLD, &(request[0+4]));
+    }
+    if (my_IDx > 0) {
+      MPI_Irecv(left_buf_in, RADIUS*height, MPI_DTYPE, left_nbr, 990,
+                MPI_COMM_WORLD, &(request[3+4]));
+      for (int kk=0,j=jstart; j<=jend; j++) for (int i=istart; i<=istart+RADIUS-1; i++) {
+          left_buf_out[kk++]= IN(i,j);
+      }
+      MPI_Isend(left_buf_out, RADIUS*height, MPI_DTYPE, left_nbr, 1010,
+                MPI_COMM_WORLD, &(request[2+4]));
+    }
+    if (my_IDx < Num_procsx-1) {
+      MPI_Wait(&(request[0+4]), MPI_STATUS_IGNORE);
+      MPI_Wait(&(request[1+4]), MPI_STATUS_IGNORE);
+      for (int kk=0,j=jstart; j<=jend; j++) for (int i=iend+1; i<=iend+RADIUS; i++) {
+          IN(i,j) = right_buf_in[kk++];
+      }
+    }
+    if (my_IDx > 0) {
+      MPI_Wait(&(request[2+4]), MPI_STATUS_IGNORE);
+      MPI_Wait(&(request[3+4]), MPI_STATUS_IGNORE);
+      for (int kk=0,j=jstart; j<=jend; j++) for (int i=istart-RADIUS; i<=istart-1; i++) {
+          IN(i,j) = left_buf_in[kk++];
+      }
+    }
+
+    /* Apply the stencil operator */
+    for (int j=MAX(jstart,RADIUS); j<=MIN(n-RADIUS-1,jend); j++) {
+      for (int i=MAX(istart,RADIUS); i<=MIN(n-RADIUS-1,iend); i++) {
+        #if LOOPGEN
+          #include "loop_body_star.incl"
+        #else
+          for (int jj=-RADIUS; jj<=RADIUS; jj++) OUT(i,j) += WEIGHT(0,jj)*IN(i,j+jj);
+          for (int ii=-RADIUS; ii<0; ii++)       OUT(i,j) += WEIGHT(ii,0)*IN(i+ii,j);
+          for (int ii=1; ii<=RADIUS; ii++)       OUT(i,j) += WEIGHT(ii,0)*IN(i+ii,j);
+        #endif
+      }
+    }
+
+    /* add constant to solution to force refresh of neighbor data, if any */
+    for (int j=jstart; j<=jend; j++) for (int i=istart; i<=iend; i++) IN(i,j)+= 1.0;
+
+    if (veloc_enabled &&
+        (iter == 0 || iter == iterations || (iter+1) % checkpoint_interval == 0)) {
+      int completed_iter = iter;
+      int next_iter = completed_iter + 1;
+      checkpoint_iter = next_iter;
+      MPI_Barrier(MPI_COMM_WORLD);
+      int checkpoint_ok = saveVelocCheckpoint(checkpoint_name, next_iter) == 0;
+      MPI_Allreduce(&checkpoint_ok, &veloc_enabled, 1, MPI_INT, MPI_MIN,
+                    MPI_COMM_WORLD);
+      if (!veloc_enabled && my_ID == root) {
+        printf("WARNING: VeloC checkpoint version %d failed; continuing without further checkpoints\n",
+               next_iter);
+      }
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+  } /* end of iterations                                                   */
+
+  local_stencil_time = wtime() - local_stencil_time;
+  MPI_Reduce(&local_stencil_time, &stencil_time, 1, MPI_DOUBLE, MPI_MAX, root,
+             MPI_COMM_WORLD);
+
+  /* compute L1 norm in parallel                                                */
+  local_norm = (DTYPE) 0.0;
+  for (int j=MAX(jstart,RADIUS); j<=MIN(n-RADIUS-1,jend); j++) {
+    for (int i=MAX(istart,RADIUS); i<=MIN(n-RADIUS-1,iend); i++) {
+      local_norm += (DTYPE)ABS(OUT(i,j));
+    }
+  }
+
+  MPI_Reduce(&local_norm, &norm, 1, MPI_DTYPE, MPI_SUM, root, MPI_COMM_WORLD);
+
+  /*******************************************************************************
+  ** Analyze and output results.
+  ********************************************************************************/
+
+/* verify correctness                                                            */
+  if (my_ID == root) {
+    norm /= f_active_points;
+    if (RADIUS > 0) {
+      reference_norm = (DTYPE) (iterations+1) * (COEFX + COEFY);
+    }
+    else {
+      reference_norm = (DTYPE) 0.0;
+    }
+    if (ABS(norm-reference_norm) > EPSILON) {
+      printf("ERROR: L1 norm = "FSTR", Reference L1 norm = "FSTR"\n",
+             norm, reference_norm);
+      error = 1;
+    }
+    else {
+      printf("Solution validates\n");
+#if VERBOSE
+      printf("Reference L1 norm = "FSTR", L1 norm = "FSTR"\n",
+             reference_norm, norm);
+#endif
+    }
+  }
+  bail_out(error);
+
+  /* Step 0 v8: emit binary validation signature for file-based comparison.
+   * Must be called AFTER the validation block (norm /= f_active_points;
+   * reference_norm computed) and BEFORE MPI_Finalize.  Rank-root-only.
+   */
+  if (my_ID == root) {
+    dumpValidationSignatureBin(norm, reference_norm, iterations, f_active_points);
+  }
+
+  if (my_ID == root) {
+    /* flops/stencil: 2 flops (fma) for each point in the stencil,
+       plus one flop for the update of the input of the array        */
+    flops = (DTYPE) (2*stencil_size+1) * f_active_points;
+    avgtime = stencil_time/iterations;
+    printf("Rate (MFlops/s): "FSTR"  Avg time (s): %lf\n",
+           1.0E-06 * flops/avgtime, avgtime);
+  }
+
+  if (veloc_init_ok && VELOC_Finalize(0) != VELOC_SUCCESS && my_ID == root) {
+    printf("WARNING: VeloC finalize reported failure after checkpoint/output completion\n");
+  }
+
+  MPI_Finalize();
+  exit(EXIT_SUCCESS);
+}
