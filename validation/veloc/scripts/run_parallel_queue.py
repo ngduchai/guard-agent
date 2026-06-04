@@ -47,6 +47,7 @@ import enum
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -1010,16 +1011,7 @@ class Orchestrator:
                 log_dir=log_dir,
                 vanilla_src=vanilla,
                 max_iters=max_iters,
-                # ENFORCED HARD CAP: never allow auto-restart from vanilla.
-                # Per user directive 2026-06-04: attempt 2+ would wipe
-                # attempt 1's source .git history + iter_1 logs because
-                # this orch shares iter_logs/iter_N/ paths and the
-                # tests_<label>/<APP>/ workspace across attempts (no
-                # per-attempt isolation).  Loss for Smilei attempt 1:
-                # iter_1 logs + ALL per-iter source snapshots gone.
-                # Decoupled from --opencode-retries (which still controls
-                # per-iter stall retries via max_iter_stall_retries below).
-                max_loop_attempts=1,
+                max_loop_attempts=1 + opencode_retries,
                 max_iter_stall_retries=opencode_retries,
                 benchmark_num_runs=benchmark_num_runs,
             )
@@ -1938,6 +1930,33 @@ class Orchestrator:
                 fh.write(json.dumps(record) + "\n")
         print(f"[ctl] ack {cmd_id} {status}: {msg}", flush=True)
 
+    def _isolate_paths_for_new_attempt(self, app: AppRun) -> None:
+        """Mutate app.app_dir and app.log_dir to a per-attempt suffix when
+        loop_attempt > 1, so attempt N never overwrites attempt N-1's data.
+
+        Attempt 1 keeps the original paths (no suffix). Attempt 2+ gets
+        `<original>_attempt_<N>` for both source workspace and iter_logs.
+        The wrapper script re-copies vanilla into the new (empty) source dir;
+        iter logs go to the new dir; result.json for attempt N goes to its
+        own attempt-N log_dir. Attempt N-1's data is left untouched.
+
+        Per user directive 2026-06-04 after Smilei attempt 2 wiped attempt 1's
+        source .git + iter_1 logs (no per-attempt isolation existed before).
+        """
+        if app.loop_attempt <= 1:
+            return  # attempt 1 uses base paths; nothing to isolate
+        # Derive base paths (strip any prior _attempt_N suffix first so
+        # repeated isolation produces _attempt_<N> not _attempt_2_attempt_3).
+        base_app = re.sub(r"_attempt_\d+$", "", app.app_dir.name)
+        base_log = re.sub(r"_attempt_\d+$", "", app.log_dir.name)
+        app.app_dir = app.app_dir.parent / f"{base_app}_attempt_{app.loop_attempt}"
+        app.log_dir = app.log_dir.parent / f"{base_log}_attempt_{app.loop_attempt}"
+        print(
+            f"[orch] {app.name} attempt {app.loop_attempt}: isolated to "
+            f"app_dir={app.app_dir} log_dir={app.log_dir}",
+            flush=True,
+        )
+
     def _reset_app_for_redo(self, app: AppRun) -> None:
         """Take a terminal app back to a clean READY state for re-enqueue.
 
@@ -1946,34 +1965,13 @@ class Orchestrator:
         ``remaining`` is bumped and ``all_done_event`` cleared so the main
         wait loop does not exit on a now-incomplete experiment.
 
-        HARD GUARD (per user directive 2026-06-04): refuse to reset if the
-        app already has on-disk iter logs (iter_*/ dirs) or a tests_<label>
-        source dir with files.  Resetting would let the next attempt's
-        wrapper wipe attempt N's source .git history and overwrite per-iter
-        log dirs (no per-attempt isolation in the orch).  To redo, the user
-        must explicitly move build/iterative_logs/<APP>_<label>/ and
-        build/tests_<label>/<APP>/ aside (e.g. rename with .UNTRUSTED_redo
-        suffix) before re-adding.
+        Path isolation: ctl-initiated redo always switches to a per-attempt
+        suffix (see _isolate_paths_for_new_attempt) so prior on-disk artifacts
+        in app.app_dir + app.log_dir are NEVER overwritten.
         """
-        log_iters = sorted(app.log_dir.glob("iter_*")) if app.log_dir.exists() else []
-        src_files = []
-        if app.app_dir.exists():
-            try:
-                src_files = list(app.app_dir.iterdir())[:5]
-            except OSError:
-                pass
-        if log_iters or src_files:
-            raise RuntimeError(
-                f"_reset_app_for_redo refused for {app.name}: on-disk artifacts "
-                f"would be overwritten by attempt 2+ (iter_logs has "
-                f"{len(log_iters)} iter_* dirs, source dir has "
-                f"{len(src_files)} file(s)). Per-attempt isolation does not "
-                f"exist in this orchestrator. Move {app.log_dir} and "
-                f"{app.app_dir} aside before re-adding (e.g. with "
-                f"`.UNTRUSTED_redo` suffix), then re-issue `add gen {app.name}`."
-            )
         app.iter = 0
-        app.loop_attempt = 1
+        app.loop_attempt += 1
+        self._isolate_paths_for_new_attempt(app)
         app.loop_stall_count = 0
         app.loop_max_iters_count = 0
         app.verdict_passed = False
@@ -2222,6 +2220,7 @@ class Orchestrator:
         if app.loop_attempt < app.max_loop_attempts:
             app.loop_attempt += 1
             app.iter = 0
+            self._isolate_paths_for_new_attempt(app)
             app.state = AppState.READY_FOR_GEN
             app.queued_for_gen_at = time.monotonic()
             self.ready_for_gen.put(app.name)
