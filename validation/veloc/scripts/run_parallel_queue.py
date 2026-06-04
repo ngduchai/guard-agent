@@ -1011,7 +1011,15 @@ class Orchestrator:
                 log_dir=log_dir,
                 vanilla_src=vanilla,
                 max_iters=max_iters,
-                max_loop_attempts=1 + opencode_retries,
+                # HARD CAP per user directive (2026-06-04): max_loop_attempts is
+                # ALWAYS 1. Auto-restart from vanilla is NEVER allowed. Even
+                # though _isolate_paths_for_new_attempt would make attempt N+1
+                # safe path-wise, the user wants a single attempt per app per
+                # invocation — no implicit retries. To run another attempt
+                # explicitly, launch a fresh `run_parallel_queue.py` invocation.
+                # Decoupled from --opencode-retries (still used for per-iter
+                # stall retries via max_iter_stall_retries below).
+                max_loop_attempts=1,
                 max_iter_stall_retries=opencode_retries,
                 benchmark_num_runs=benchmark_num_runs,
             )
