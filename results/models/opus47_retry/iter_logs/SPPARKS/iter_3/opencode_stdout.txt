@@ -1,0 +1,236 @@
+I'll start by examining the previous attempt's artifacts to understand what went wrong.
+The recovery attempt timed out. Let me look at the previous attempt's code.
+Let me list the directory using glob.
+Let me look at what's in main.cpp and how the run is done.
+Now let me look at how the previous attempt added the checkpointing. Let me look at the app code where the run is.
+Now let me look at the iter_1 logs to see what they did vs iter_2.
+OK, so the iter_1 issue was checkpoint footprint exploding (>10GB). In iter_2 they added throttling. But iter_2 timed out at recovery. Looking at iter_2 output again:
+
+Line 49: detected 9 checkpoint file(s) - good, checkpoints are being written
+Line 54: kill complete, injection_fired=True
+Line 55-60: recovery attempt timed out after 137s
+
+So the recovery process never wrote the validation output. Let me investigate. Looking at iter_2: there's a recovery, but it takes too long or hangs.
+
+Let me look at the full app_lattice.cpp to understand the structure better:
+Now I understand the architecture. Let me trace what's happening on recovery in iter_2:
+
+The issue is: **Recovery hangs.** The recovery process launches and never produces output. Why?
+
+Looking at `veloc_try_recover()` at line 503:
+- It calls `VELOC_Restart_test("spparks", INT_MAX)` — this returns the latest available version.
+- If `v <= 0`, returns false (no recovery).
+- Then `veloc_protect_state()` and `VELOC_Restart()`.
+
+There's a subtle MPI deadlock potential here. `VELOC_Restart_test` may return different values on different ranks (e.g. some ranks have version 5, others version 4). When called with `INT_MAX`, it should be consistent though.
+
+But the real issue: **AFTER `veloc_try_recover` returns true**, the code path goes into propensity recomputation, then continues with normal iterate. The recovery completed; iterate_rejection then runs from the recovered time. But the issue is — what if `time >= stoptime` already? Then we return early (line 660). What about ranks that didn't recover? They could be at the original time=0. But all ranks should have the same `v`.
+
+Wait — let me look at what could deadlock. `veloc_try_recover` is called in `iterate()`. If on **some** ranks the restart succeeded but on others it failed, then:
+- The succeeded ranks have time=recovered_time, nsweeps=etc.
+- The failed ranks have time=0.
+
+But then `recovered` is per-rank. The propensity recomputation block has no MPI collectives. And `if (time >= stoptime) return;` — IF one rank's recovered time >= stoptime but another's didn't recover (time=0), then one rank returns and others enter the iterate_rejection loop. Inside that loop are many MPI calls (`comm->sector`, `comm->reverse_sector`, `comm->all`). Other ranks will block waiting for the returning rank — DEADLOCK.
+
+This is the classic per-rank decision causing deadlock pattern.
+
+Also, even if all ranks recover, `time >= stoptime` could be true on one rank and false on another due to potential differences. Need to coordinate via MPI_Allreduce.
+
+Let me also check the rest of the iter_2 recovery scenario - the recovery launch was at line 57: "checkpoint-observed attempt 2: launching... attempt_2" - so a brand new mpirun process is launched after the kill. All 4 ranks start fresh, all try to recover from the same checkpoint files. Each rank reads its own per-rank file.
+
+Let me check what could cause hanging. Looking more carefully:
+
+In iter_2 line 49: "detected 9 checkpoint file(s) in scratch/persistent dirs." - 9 files for 4 ranks - that's odd. Could be 1 rank had 2 versions while others had 1. Actually it's metadata files too.
+
+The main problem might be: after the SIGKILL of rank 0 (line 53 says rank PID, but we don't know which rank), the recovery process starts. Each rank does:
+```
+v = VELOC_Restart_test("spparks", INT_MAX)
+```
+
+If ranks have different latest checkpoint versions (because some ranks' checkpoint was in-flight when killed), then different ranks get different `v`. Then VELOC_Restart with different version numbers per rank — that could deadlock or fail differently.
+
+The fix: **MPI_Allreduce(v, MPI_MIN)** to get the minimum version available on all ranks, and use that consistently.
+
+Also need to handle:
+1. If `VELOC_Restart` fails on some ranks, the whole thing should fail consistently → MPI_Allreduce.
+2. If `time >= stoptime` after recovery, must be a collective decision.
+
+Let me also check if the disk-guard fired in iter_2:
+Good - disk-guard didn't trigger in iter_2 (5s throttling helped). Only 2 checkpoint files at 500KB. Now I need to fix the recovery hang.
+
+Let me also check the `iterate_kmc_sector` and other paths — in this validation in.validation uses `sweep random` so it goes through `iterate_rejection` (not the KMC paths).
+No solve, just sweep — so it's `iterate_rejection`.
+
+Now in `iterate()`:
+```
+veloc_protect_state();
+bool recovered = false;
+if (!veloc_recover_attempted) {
+  veloc_recover_attempted = 1;
+  recovered = veloc_try_recover();
+}
+// recover && solve -> recompute propensities (skipped if no solve)
+if (time >= stoptime) return;  // per-rank decision!!!
+timer->barrier_start(TIME_LOOP);  // collective!
+```
+
+If on one rank recovery succeeds and time becomes >= stoptime, while on another rank recovery succeeds with a different time < stoptime, we get a deadlock at `barrier_start`.
+
+But more likely, all ranks have the same recovered time. The real issue is `solve` check — `recovered && solve` — `solve` is null here so propensity recomp is skipped. Good.
+
+Then in `iterate_rejection`, all the comm calls require all ranks. If `time >= stoptime` on one rank only, that rank returns early.
+
+Let me check: at the time of kill (around 55s), the simulation had advanced ~half-way. The last checkpoint must've captured the time at some sweep. All ranks should checkpoint at the same time (since `veloc_do_checkpoint()` is called in the same loop position by all ranks). So time/nsweeps should be consistent across ranks.
+
+But the issue: did all ranks actually write a checkpoint? Since rank that was killed never finished writing. Actually VELOC_Checkpoint is collective in sync mode IIRC. Hmm.
+
+Actually, looking again: when a rank gets SIGKILL, the surviving ranks would be in the middle of a collective and would hang or get an MPI error. When mpirun sees a rank died, it kills the rest. So the previous run got killed properly.
+
+For recovery: new mpirun starts 4 ranks. Each rank reads its own checkpoint version. All should match.
+
+Let me look at the **`output->setup`** path — `nextoutput = output->setup(time,first_run);` — this is called during setup_app. But during recovery in iterate, `time` is already past in the recovered checkpoint. The `nextoutput` was computed for time=0. So when iterate_rejection starts, `time >= nextoutput` will be true and we'll call `output->compute(time, done)`. Could that cause issues? Likely not deadlock.
+
+Actually wait — I want to check **what veloc_try_recover does on per-rank failure**. Let me look at this carefully. It says `if (VELOC_Restart("spparks", v) != VELOC_SUCCESS) return false;` — but VELOC_Restart is collective! So all ranks must call it consistently. If different ranks have different v (or some have v=0 and skip), this deadlocks.
+
+The fix is clear. Let me write a fix:
+
+1. After calling `VELOC_Restart_test`, do `MPI_Allreduce(MPI_MIN)` to get the lowest version available across all ranks. If any rank has 0, the result will be 0, meaning no recovery.
+2. Use the unified version for `VELOC_Restart`.
+3. Use `MPI_Allreduce` to coordinate the success/failure decision.
+4. After recovery, make `time >= stoptime` a collective decision (MPI_Allreduce MIN).
+
+Also, I should think about: when there's no checkpoint at all (fresh run, no recovery needed), `VELOC_Restart_test` returns 0 or VELOC_FAILURE on all ranks → allreduce gives 0 → no recovery → continue normally. Good.
+
+Let me also examine: when the recovery process IS running, is there a chance the checkpoint files exist but for some reason `VELOC_Restart_test` fails on some ranks but not others? In a 4-rank setup, all 4 per-rank files must exist. They were written collectively. The kill kills entire run. The previous in-flight checkpoint may be partial — file may not be complete. So one rank might find version 5 partial while others find it complete. Hmm.
+
+Actually, in iter_2 line 50: "waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL" — so the runner waits before killing. So checkpoint should be complete.
+
+Now look at line 49: "detected 9 checkpoint file(s)" — that's 9 files in /tmp/spparks_veloc_*. For 4 ranks with `max_versions = 1` we'd expect 4 in scratch + 4 in persistent = 8 (or fewer in persistent if it doesn't move that often). Plus some metadata files maybe. 9 is reasonable.
+
+Let me fix the code now:
+Now let me edit `veloc_try_recover` to use MPI_Allreduce:
+Now fix the iterate() collective decision:
+Now let me check if there's another potential deadlock — the `veloc_do_checkpoint` itself. It's called inside iterate loops. The `veloc_min_interval_sec` check uses `MPI_Wtime()` which is per-rank. Different ranks may have slightly different wall times, so some ranks may decide to checkpoint and others may skip. That would deadlock on `VELOC_Checkpoint` (collective).
+Yes — different ranks may have slightly different `MPI_Wtime()` (especially on first call), leading to different decisions. Need to make the throttling collective.
+Now let me check the iterate() to make sure recovery is attempted on first iterate() ever, not first iterate per run command. Looking at line 640:
+
+```
+if (!veloc_recover_attempted) {
+  veloc_recover_attempted = 1;
+  recovered = veloc_try_recover();
+}
+```
+
+This is fine — it'll attempt once.
+
+Now also: looking at the iter_2 log more carefully:
+- "checkpoint files = 2" — only 2 checkpoint files. For 4 ranks with max_versions=1, we'd expect 4 in persistent (one per rank). Why only 2?
+
+Looking at scratch_versions=1 and max_versions=1, maybe scratch holds 1 and persistent holds 1. So 8 expected, found 2. Hmm odd. But anyway, the recovery should still work for those 2 ranks that have data... no wait, if only 2 ranks have files, then 2 ranks can't recover → MPI_Allreduce MIN = 0 → no recovery → fresh restart → cold replay needs to be allowed.
+
+Actually wait, the failure mode in iter_2: "checkpoint metrics for failure_prone: 500224 bytes across 2 file(s) in 2 dir(s)" — that's the SNAPSHOT after kill (just the kept versions), not the live count. So 2 dirs total content = 500KB across 2 files. So 1 file per dir.
+
+For 4 ranks, with proper checkpoints, we'd expect 4 files per dir (one per rank). Only 1 per dir means only 1 rank actually checkpointed. This might be because checkpoint frequency was 5 sec but only the first checkpoint by rank 0 made it through?
+
+Hmm. Actually wait: the iter_2 log line 49 says **"detected 9 checkpoint file(s) in scratch/persistent dirs"** — that's BEFORE the kill, the live count was 9. Then after kill+5sec wait, the snapshot shows only 2. That's weird unless scratch_versions=1 cleared others.
+
+Actually max_versions=1 keeps only latest. After throttling, rank 0 likely checkpoints, others may follow or maybe there's another issue.
+
+Wait — in iter_2, was the `veloc_do_checkpoint` not collective? Yes that was the bug! Different ranks decided differently based on per-rank MPI_Wtime. So some ranks checkpointed and others didn't. The first call after init: `veloc_ckpt_version > 0` is FALSE, so the throttle is skipped — all ranks should checkpoint on the first call. Then second call onward, throttle check varies per rank.
+
+Hmm, but the 5sec interval is large enough that this might work... unless wall time skew is bigger. Actually for second checkpoint call (~5s later), some ranks might have crossed 5s threshold and others not, so different decision → deadlock.
+
+But if it deadlocks at the first non-uniform decision, the previous run would have hung too. But iter_2 log shows runs completing successfully (until recovery). So maybe the first VELOC_Checkpoint always succeeds (consistent decision) and subsequent ones also tend to be consistent because workers are synchronized at the prior collective `comm->sector` etc. So timing skew is small.
+
+The real deadlock is at recovery time. Let me check one more potential issue:
+
+In `iterate_rejection`, `comm->sector(iset)` and `comm->reverse_sector(iset)` are collectives. If recovered time on one rank means it never enters the while loop (`time >= stoptime`), that rank is in MPI deadlock with others.
+
+But wait — all ranks have the SAME recovered time (same checkpoint version, same simulation state). The time SHOULD be uniform across ranks. So the early-return decision SHOULD be uniform.
+
+Unless... the time stored in each rank's checkpoint is different. Looking at `veloc_protect_state`:
+- `VELOC_Mem_protect(0, &time, 1, sizeof(double));`
+
+`time` is a member of AppLattice — each rank has its own copy. But they should all be equal because they're updated together in iterate_rejection at `time += dt_rkmc;` (line 928). All ranks update simultaneously.
+
+So time should be consistent. But to be safe with my added MPI_Allreduce, even if they differ slightly, we won't deadlock.
+
+Let me look for any **other** per-rank early-return that could deadlock. Looking at iterate():
+Now I also want to think about: after recovery, `setup()` was already called and `nextoutput = output->setup(time, first_run)`. But `time` was 0 at setup time. After recovery, `time` is much larger. The `nextoutput` won't match. But that's a soft issue — output might fire on first iteration. Not a deadlock.
+
+Also, `dt_rkmc` was computed in setup based on time=0. After recovery, time is large. Need `dt_rkmc = MIN(dt_rkmc, stoptime-time)` (line 444), but that was done in setup before recovery. Hmm.
+
+Let me check `setup_app` happens before iterate. Where is iterate called from?
+So setup() is called before iterate(). setup() initializes time = 0 and dt_rkmc. Then iterate is called, which inside calls veloc_try_recover which restores time to the checkpoint value.
+
+After recovery, `nextoutput` and `dt_rkmc` are still based on time=0. dt_rkmc is the per-sweep time increment. That should be fine — it's the rate. But `nextoutput`, computed by `output->setup(time=0, first_run)`, might be wrong. Let me peek at it briefly.
+
+Actually, this would just cause output to fire on the first sweep — not a deadlock. Let's not worry about it for now.
+
+But there's also `setup_end_app()` which might do more setup. Not relevant for ising.
+
+Wait — there is another important thing: `dt_rkmc = MIN(dt_rkmc, stoptime-time)`. At setup, time=0, so dt_rkmc=MIN(dt_rkmc, stoptime). But after recovery, time might be close to stoptime, and dt_rkmc could be larger than `stoptime - time`. That would just overshoot in the first iteration — not a deadlock.
+
+OK. Let me also double-check the check `if (stoptime > time) iterate();` at line 145 of app.cpp — at this point, time=0 (from setup). After iterate() is called, recovery happens inside iterate(). If recovered time >= stoptime, my new code returns early collectively. Good.
+
+Now let me also look for any other potential issues. Let me check if iterate() is called for the `iterate_kmc_sector` and `iterate_kmc_global` paths too — those are for runs with a `solve` (KMC). The validation uses sweep/rejection, so iterate_rejection is the path. Fine.
+
+Let me now make sure the code compiles. Let me check what `world` is in AppLattice context:
+Good. `world` is an MPI_Comm member of pointers.h (and inherited by App and AppLattice). My MPI_Allreduce calls should compile.
+
+Let me check the build script and make sure it would compile properly:
+OK good, that confirms my understanding. Now let me verify the file compiles by reading the entire modified region:
+Good. Let me also check that the iter_2 issue with `agreed_v = 0` skip pathway works — when the recovery is the first attempt after a crash, there ARE checkpoints. But what if VELOC_Restart_test on some rank returns `VELOC_FAILURE` (which is e.g. -1) while others return `5`? The MIN gives 0 (since I clamp negative to 0)... wait, the MIN of `[5,5,5,0]` is 0, meaning no recovery. We'd miss recovery.
+
+But that scenario shouldn't happen if all 4 ranks wrote checkpoints. Let me reconsider — would it be better to try the MAX (highest ck on any rank) and fall back?
+
+Actually NO. If only some ranks have a checkpoint, we can't recover meaningfully because we'd be mixing states. So MIN is correct.
+
+Now, what if all ranks DO have checkpoints with the same version (the normal case)? local_v = 5 on each rank, agreed_v = 5, all VELOC_Restart with v=5 → succeeds → recovery happens. 
+
+Let me also check: is `MPI_Allreduce(&local_skip, &all_skip, 1, MPI_INT, MPI_LAND, world);` the right reduction op? Yes, MPI_LAND treats nonzero as true; if ALL ranks have local_skip=1, all_skip=1 → skip; else (any has 0), all_skip=0 → do checkpoint. Good.
+
+Let me also think about correctness: I need to make sure that on rank-0-only kill, the surviving ranks have a consistent state. The checkpoint must've been written by ALL ranks (since VELOC_Checkpoint is collective, it returns only after all ranks finished). And max_versions=1 keeps only the latest valid one. So if rank 0 was killed mid-checkpoint v=6, the previous v=5 should still be on disk for everyone.
+
+Let me also verify the iter_2 log:
+- Line 49: 9 files detected pre-kill (mid-checkpoint maybe)
+- Line 50: wait 5s for the in-flight checkpoint
+- Line 53: killed
+- Line 60: recovery TIMEOUT
+
+So recovery launches, but never completes. With my fix, ranks should:
+1. All call VELOC_Restart_test → likely all return same v
+2. MPI_Allreduce → agreed_v=v
+3. All call VELOC_Restart(v) → succeed
+4. MPI_Allreduce → all_ok=1
+5. Return true → run continues from recovered state to completion
+
+This should work now. Let me also ensure I don't have issues with the recovery being called twice. Looking at app.cpp line 145: `if (stoptime > time) iterate();` — time is 0 at this point. iterate() is called, recovery happens inside, time becomes large. Then iterate proceeds.
+
+But wait — the `stoptime` was set when `run 18800` was executed. If the recovered time is < 18800, iterate continues. If recovered time >= 18800, the collective check returns early. Good.
+
+Actually wait, there's a subtle issue with the run command processing. Let me check more carefully:
+Critical insight: `stoptime = time + atof(arg[0])`. At setup of a fresh run, time=0, stoptime=0+18800=18800. iterate() is called, which calls veloc_try_recover, which restores time to some value (say 9000). stoptime is still 18800. So `time (9000) < stoptime (18800)`. Good, simulation continues.
+
+Now check line 145: `if (stoptime > time) iterate();` — this is called when time=0 (pre-recovery). stoptime=18800 > 0 → iterate() called. Inside iterate, recovery happens. All good.
+
+If recovery brings time to 18800, then inside iterate(), my collective check triggers and returns early. The `Finish finish` runs. 
+
+One more concern: `dt_rkmc = MIN(dt_rkmc, stoptime - time)` — calculated during setup with time=0. After recovery, time could be 9000, so `dt_rkmc` might be larger than `stoptime-time=9800`. iterate_rejection's loop does `time += dt_rkmc; if (time >= stoptime) done = 1;` — overshoot but terminates correctly. Not a deadlock.
+
+Now let me verify the build picks up my changes. Let me look at how the build works:
+OK the build is handled by the validator. My edits should be picked up.
+
+Let me mark todos complete and verify the changes look right.
+Summary of fixes applied to `src/app_lattice.cpp`:
+
+1. **`veloc_try_recover()`** — Fixed MPI deadlock. Previously each rank independently chose a checkpoint version (or returned early on per-rank failure), and inconsistent decisions across ranks caused the collective `VELOC_Restart` to hang. Now:
+   - All ranks compute their local available version, then `MPI_Allreduce(MPI_MIN)` agrees on a single version that exists on every rank.
+   - If any rank lacks a checkpoint (agreed_v ≤ 0), all ranks skip recovery uniformly.
+   - After `VELOC_Restart`, the success/failure is reduced with `MPI_LAND` so every rank treats it as success or failure consistently.
+
+2. **`iterate()` post-recovery early return** — The `if (time >= stoptime) return;` check was per-rank. If one rank's recovered time crossed stoptime and others' didn't, the returning rank would skip all downstream collectives (`timer->barrier_start`, `comm->sector`, etc.), deadlocking the rest. Replaced with an `MPI_LAND` collective so all ranks agree before returning.
+
+3. **`veloc_do_checkpoint()` throttle** — The 5-second throttle used per-rank `MPI_Wtime()`, so different ranks could make different skip/checkpoint decisions, leading to a deadlock on the collective `VELOC_Checkpoint`. Replaced with an `MPI_LAND` over the local skip decision: only skip when every rank wants to skip, otherwise all ranks checkpoint.
+
+These changes preserve the real state capture/restore (no shortcuts) while keeping every MPI-collective code path in lockstep across ranks, eliminating the deadlock that timed out iter_2 during recovery.

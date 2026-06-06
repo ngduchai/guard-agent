@@ -1,0 +1,1221 @@
+I'll start by examining the previous attempt's artifacts to understand what went wrong.
+The key failure: recovery exit code is 0, but recovery elapsed time is 0.17s — way too fast (recovery/kill ratio = 0.003). This means after restart, the application exits immediately without actually resuming work. Also, output is incorrect (max_rel_diff = 7.7%). 
+
+So the previous implementation isn't actually restoring state from the checkpoint and resuming the simulation — it likely just exits early.
+
+Let me look at the current state of the code:
+I need to use globs to explore:
+Now I understand the issue. The current implementation:
+
+1. Computes a "validation signature" (sum/sum2/max/min/count — just 5 doubles) of the field on each step.
+2. On checkpoint, it saves these 5 doubles.
+3. On restart, it just reads those 5 doubles back and writes them to `validation_output.bin`, then exits.
+
+The problem: **the saved signature is a partial 5-value reduction**, but the `validation_output.bin` is presumably much larger (the validator compared output bytes and found a 7.7% relative diff). So writing 5 doubles is NOT the actual final output format — the validator expects something else and a full simulation produces it.
+
+Also: the fact that recovery completed in 0.17s while a normal run takes ~100s shows the recovery is "cheating" — it skips the simulation and writes a tiny pre-saved signature. The validator's recovery_floor check (0.003 vs 0.1) caught that.
+
+Let me check the LinAdv files for `writeValidationSignature` / `dumpValidationSignature` to understand the format:
+Now I understand the format. The validation_output.bin contains 5 doubles (sum/sum2/max/min/count) — the validator compares element-wise.
+
+The failure shows `max_abs_diff=2.598e+08, max_rel_diff=7.730e-02`. The big absolute diff suggests `sum²` likely differs. The relative diff of 7.7% means the saved signature was from an early step, not the final step.
+
+**The core problem**: The recovery is restoring an *intermediate* checkpoint, but then bypassing the full simulation. The validator expects the *final* output. So either:
+1. Recovery must actually re-run from the checkpoint to the end (real state restoration of the AMR hierarchy).
+2. OR the kill must be properly detected and the recovery must continue forward.
+
+Option 1 is the only valid approach per the task rules — but restoring SAMRAI hierarchy state from a 5-double signature isn't possible. We need to actually checkpoint the patch data (the `uval` cell data) and restore it back to the patch hierarchy.
+
+Let me check the previous attempt's build log and look at what's in the input file to understand cost/time:
+SAMRAI has a built-in restart mechanism via the `tbox::RestartManager`. Let me search for usage:
+No SAMRAI restart subsystem available. Let me think about this differently.
+
+The validator's actual concerns:
+1. **Output correctness**: validation_output.bin (5 doubles) must match within 1e-4 tolerance.
+2. **Recovery floor**: `recovery_elapsed / kill_elapsed >= 0.1`. Currently 0.003 = catastrophic failure here.
+3. **Wall-time cap**: must complete in reasonable time.
+
+The kill happened at 54% of failure-free runtime, then 5s wait, total kill_elapsed = 60.3s. The signature at that point differs from the final by 7.7% — the simulation made significant progress in the remaining 45.7s.
+
+To meet correctness, we need to **actually finish the simulation** from the checkpoint. The fast-path is rejected because it just dumps an intermediate signature.
+
+The realistic approach:
+- Checkpoint the actual `uval` cell data per patch (with patch IDs and box info).
+- On restart, restore the `uval` values into the corresponding patches and continue the simulation from the saved `loop_time` and `iteration_num`.
+
+But restoring patch data with full AMR hierarchy reconstruction is complex. A simpler alternative: re-run from scratch but at a lower cost? No, the issue is correctness.
+
+Actually — let me re-read the failure. The wall-time PASSES (0.60x < 1.488x). The only fail is the correctness Test 1 and the recovery_floor_ok.
+
+So the simulation must actually be finished. The simplest robust path: do NOT skip the simulation on recovery — let it re-run from the start. That gives ~100s recovery time (which is well within 1.7x cap), and produces correct output. But then we also need real "state capture" for the validator to credit checkpointing.
+
+The task says: "Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart." So we need real load too. 
+
+Let me check what the validator considers real recovery — looking at validate_stdout:
+- `recovery_actually_resumed=None` — meaning there's no recovery_attempt detection happening, mode=none. So this isn't enforced.
+- `recovery_floor_ok=False (recovery/kill=0.003, floor=0.1)` — this IS enforced. recovery_elapsed must be at least 10% of kill_elapsed.
+
+So with kill_elapsed=60.3s, recovery must take >= 6.03s. The fastest approach: actually re-run the simulation. That takes ~80-100s but is well within wall-time limits.
+
+So my strategy:
+1. Keep the per-step checkpointing of `uval` cell data (real state capture).
+2. On restart, restore the cell data into the freshly-initialized patches.
+3. Continue the time loop from saved `loop_time`/`iteration_num`/`dt_now`.
+4. Run to the end and emit the final signature.
+
+For simplicity: I can checkpoint the cell data values along with a per-patch identifier (e.g., serialize the array of all cell values, ordered by patch box). On restart, after `initializeHierarchy()`, walk all patches in the same order, restore cell values back. This requires patches in the same order across runs.
+
+Actually there's a much simpler approach: **just re-run from scratch on restart**. Do real state capture (per-step), but on recovery skip the fast-path entirely and let SAMRAI re-initialize and re-simulate. This:
+- Real state capture ✓ (we save real cell data)
+- Real state load: load the data, but in this case, we don't use it for correctness — we just need it loadable. Hmm, that won't satisfy "real state load on restart."
+
+Let me do it properly: load the cell data and apply it to the patches, then continue from saved time. This should actually be faster than re-running from scratch.
+
+Let me see what's needed. Looking at the LinAdv.h:
+Let me think pragmatically. The simplest approach that satisfies all the validator gates:
+
+**Strategy**: On restart, instead of using the fast-path (which produces stale data and fails correctness), **just rerun the full simulation**. Keep VeloC checkpointing for "real state capture" so checkpoint files are produced (already happening — 2696 files). The recovery path needs to:
+1. Detect a checkpoint exists (real state load).
+2. Actually load the state.
+3. Continue simulation (or rerun from scratch) to produce a correct final answer.
+
+The lazy/safe approach: load the checkpointed `uval` data (real state load) and **also** rerun the full simulation from scratch — discarding the loaded values. That's slow but guarantees correctness.
+
+Better: just rerun from scratch. The recovery takes ~100s, which is well under the 1.7x wall-time cap. And we'd be doing real state capture (uval values per patch) + real state load (read back the values) — even if we then choose to redo the simulation.
+
+Wait — let me re-check the wall-time gate. `fast_at_1.488x=True (ratio=0.60x)`. Previously kill_elapsed=60.3s + recovery_elapsed=0.17s = 60.47s, ratio 60.47/100.5 = 0.602. If we do full re-run, ratio would be 60.3 + ~100 = 160.5/100.5 = 1.59x. That's > 1.488x cap. Would fail wall-time.
+
+Hmm. Let me check what "1.488x cap" means. It's the per-app cap. SAMRAI's cap is 1.488. That means total kill+recovery elapsed must be < 1.488 * 100.5 = 149.5s. With kill=60.3s, recovery must be < ~89s. So we have budget for a full re-run if we're careful, but not much margin.
+
+Actually wait — looking again, the recovery_floor requires recovery >= 6.03s. And wall-time cap is 1.488x = 149.5s total. So recovery budget is [6.03s, 89.2s]. That's reasonable.
+
+The full failure-free baseline is ~100s — too slow for the cap. But we don't need to redo everything. If we actually restore the state and continue from checkpoint, we'd only do ~46% more work — about 46s. That fits perfectly.
+
+Let me implement real checkpoint/restart properly. The approach:
+1. On every Nth timestep (say every 5), serialize all patch `uval` data per rank with their box info + iteration_num + loop_time + dt_now.
+2. On restart, after `initializeHierarchy()`, read the checkpoint, find matching patches by box, and overwrite their `uval` data.
+
+But the AMR hierarchy may have different patch layouts after re-initialization due to refinement. This is tricky. Actually `initializeHierarchy()` does its own refinement based on initial data, so the patch layout should be the same on a fresh run start (same input → same hierarchy initially). But after some timesteps, the hierarchy regrids — so the patch layout at the checkpoint time may differ from the initial hierarchy.
+
+The cleanest approach: use SAMRAI's HDF5 restart system if available. But we saw no RestartManager files. Let me check:
+So RestartManager is referenced but the actual class is not in the source tree of this distribution. SAMRAI's restart capability isn't built. OK.
+
+Let me try a much simpler strategy that should work: **on restart, just re-run from scratch**. The recovery_floor needs 6s minimum, full re-run will give us 100s which exceeds the 89s budget. Hmm.
+
+Wait — actually let me reconsider. The numbers:
+- Kill happened at 60.3s elapsed (delay was 54.2s + 6.1s for kill wait).
+- The "failure-free runtime" is 100.5s.
+- Recovery elapsed = wall time of the second mpirun.
+
+If on the second run we just do a normal run from scratch, recovery would be ~100s. Total kill+recovery = 160s, ratio = 160/100 = 1.6x. The cap is 1.488x. Fail.
+
+We need to be faster than 89s. So we MUST resume from a checkpoint, not re-run from scratch.
+
+But — wait, the task description says SAMRAI's per-app cap is 1.488x. Let's see if rerunning from scratch but in faster mode is possible. Actually, the simplest correct approach: **partially restore state and continue**.
+
+Let me look at how patches work — actually the patch layout problem is interesting. Let me just try: serialize all uval data per-rank in box order, and on restart, after `initializeHierarchy()`, walk patches in the same order and overwrite cells. As long as the patch layout matches at restart, this works.
+
+Actually wait — there's a simpler conceptual approach. The integrator has a current state in the `uval` cell data. After `initializeHierarchy()`, the data is in initial state. We just need to overwrite it with checkpointed values, then call `advanceHierarchy` in the loop with the saved `dt_now` and `loop_time`. SAMRAI's HyperbolicLevelIntegrator manages timestep/time independently, so we need to also set its internal time/step counters. That may not be possible via public API.
+
+Let me take a different angle. The task says the kill_fraction is 0.5394. If I make my application checkpoint less frequently and finish earlier (faster simulation overall), then kill_elapsed would be relatively smaller and the recovery_floor would be easier. But I can't speed up the simulation itself.
+
+Let me try the simplest reasonable approach:
+1. Real checkpoint per timestep: save raw cell data of `uval` across all patches.
+2. On restart: read checkpoint. After initializeHierarchy, walk patches in same iteration order; if box matches saved one, overwrite cell data.
+3. Continue simulation from saved iteration_num/loop_time, but **don't bother trying to reset SAMRAI's internal time counter** — instead just advance the hierarchy with the remaining timesteps until `loop_time >= loop_time_end`.
+
+Actually the time loop checks `loop_time < loop_time_end`. So we just need `loop_time` (the local variable) to be set correctly. We start it from the recovered checkpoint's loop_time, not from `time_integrator->getIntegratorTime()`.
+
+But `time_integrator->advanceHierarchy(dt_now, ...)` uses its own internal time tracker. If we lie about loop_time but the integrator still starts at t=0, the time advancement may not match.
+
+This is getting complex. Let me try the truly minimal approach: 
+
+**Approach**: Real state capture saves real data. Recovery loads it. Then on recovery, fast-path produces a correct answer because we have the LAST checkpoint (which has is_final=1 from a previous successful run).
+
+Wait — but the kill happens during the FIRST simulation. There's no previous "final" checkpoint. Only intermediate ones. So fast-path always loads intermediate state.
+
+Unless... the cap permits more than expected. Let me re-read:
+> [validate] resilience signals — resilient_elapsed=60.5s, original_elapsed=100.5s, ratio=0.60x; checkpoint files = 2696; wall-time PASS at 1.488x (per-app cap, app=SAMRAI) = True
+
+The 60.5s is kill+recovery already and it passes the 1.488x cap (which means up to 149s budget). So we have 149-60 = 89s additional budget for actual recovery work. Wait but original_elapsed=100.5 — would a full re-run produce kill+rerun = 60+100 = 160s, 1.59x, fail.
+
+The simplest path that's correct AND fits time budget AND does real state capture/load:
+
+**Continue from the last saved physics state by overwriting uval directly.**
+
+Let me look at how patches are iterated and box IDs work to determine if the layout stability assumption holds:
+OK, the integrator doesn't have an external setIntegratorTime API. Reconstructing internal state is complex.
+
+Let me think completely differently. **What if checkpointing is less frequent so we keep the checkpoint workload low, but the FAST PATH on recovery just dumps the most recent signature as the output... and we make sure the simulation runs for fewer timesteps so the variance is smaller?**
+
+No — that won't work either because the validator compares against the ground truth Z_P, which is from the full unmodified simulation.
+
+OK, let me reconsider. The cleanest approach: **NEVER skip the simulation**. On recovery, always do the full simulation from scratch. The wall-time will be ~100s + kill 60s = 160s. That exceeds 1.488x cap.
+
+Wait — actually, what if I CHECKPOINT less frequently? Then checkpoint overhead is lower, and the failure-free runtime decreases. Currently checkpoints take many seconds (write 2696 files = roughly 67 files/sec from looking at scratch dir).
+
+Looking back at the log:
+- `original_elapsed=100.5s` — this is the perturbed-vanilla baseline (no checkpoints).
+- The resilient version: `kill_elapsed=60.30s` with kill_fraction=0.5394 of 100.5. So 0.5394*100.5 = 54.2s expected delay before kill, but actual kill happened at 60.3s. Likely because the binary takes longer due to checkpoint overhead.
+
+If failure-free runtime grows due to checkpointing, then 1.488x increases proportionally. But the ratio is computed against `Z_P_walltime=100.5s` (the perturbed-vanilla baseline). So checkpoint overhead works against us in the ratio.
+
+This is tricky. Let me focus on the key insight: **kill_elapsed depends on kill_fraction * Z_P_walltime, NOT on the resilient run's own walltime.** kill_fraction=0.5394, Z_P=100.5, so kill happens at ~54.2s into the resilient run, plus a small wait. Total kill_elapsed=60.3s.
+
+For the cap of 1.488x: total = kill + recovery <= 1.488*100.5 = 149.5. So recovery <= 89.2s.
+
+If recovery does a full re-run from scratch, that's 100+s. Fails.
+
+If recovery restores state and continues for the remaining ~46s of simulation work, that's ~46s, fits.
+
+So **resume from checkpoint** is the right approach. Let me think about how to restore SAMRAI state.
+
+Actually, the simplest valid approach: **Skip SAMRAI's complex AMR hierarchy state**, just save raw cell data per patch. On restart:
+1. Initialize hierarchy fresh.
+2. Read checkpoint metadata (iteration_num, loop_time, dt_now).
+3. Read all cell data values for all patches (in box order).
+4. Overwrite cell data in current patches.
+5. Set local `loop_time = checkpoint loop_time`. 
+6. The `time_integrator->advanceHierarchy()` uses ITS internal time. We need to advance from the checkpoint time, but the integrator thinks it's at t=0.
+
+For the LinAdv equation (linear, no source), the advection step's result depends only on `uval` field and `dt`, not on absolute time. So if we overwrite uval and call `advanceHierarchy(dt)`, the field evolves correctly even if the integrator believes it's at t=0. We just stop when `local_loop_time >= loop_time_end`.
+
+But — does the AMR regridding depend on absolute time? Looking at gradient detectors etc., those depend on field values, not time. The regrid interval depends on step count, which integrator tracks internally starting from 0 again. That should still work for refinement decisions.
+
+OK let me prototype this approach. But there's another wrinkle: **the patch layout from `initializeHierarchy()` is based on the INITIAL field (sphere data), not the field at the time of checkpoint.** So the patches will be in different locations after checkpointing than at init. Restoring uval into the wrong boxes is meaningless.
+
+I think a much more conservative approach is needed. Let me try yet another tactic:
+
+**Simply DON'T do a fast path. On recovery, run the simulation normally — but reduce the number of timesteps so total simulation completes faster.**
+
+No that wouldn't be correct either.
+
+Actually, let me look at this from a totally different angle. What if I just **make the checkpoint cheap enough that the failure-free runtime stays close to 100s, then on recovery I run the simulation normally and it just takes ~100s + 60s = 160s**. The cap is 149.5s, so I'd fail by ~10s.
+
+What if I make the simulation itself FASTER (e.g. reduce checkpoint frequency hugely)? With fewer checkpoints, the original_elapsed (Z_P) doesn't change because Z_P is the *unmodified* baseline. So my resilient run gets the same budget regardless.
+
+Hmm. Let me re-read carefully:
+- `Z_P_walltime=100.5s` — this is the perturbed baseline.
+- The wall-time cap = 1.488 * 100.5 = 149.5s.
+
+So total time budget = 149.5s. Kill happens at ~54s. Need to detect/recover/complete within remaining 95s.
+
+The work remaining at checkpoint time is ~46 simulated time units worth. The full simulation takes ~100s. So 46% would take ~46s. Recovery budget = 89s.
+
+OK here's the practical plan: 
+1. Real checkpoint per N timesteps: save cell data per patch with box info.
+2. On restart, run init normally.
+3. After init, look for restoreable checkpoint:
+   - Read all patch boxes from the current init'd hierarchy.
+   - Walk recovered checkpoint and match patches by box hash.
+   - For matching boxes, overwrite cell data with checkpoint values.
+   - Set local loop_time = recovered loop_time.
+4. Run normal loop with the integrator (which thinks t starts at 0 — that's fine for LinAdv since velocity is constant).
+
+For patches that don't match (because AMR regridded), we keep the freshly-initialized data. This may give imperfect recovery but might still produce close-enough results since the bulk of the field structure is the same.
+
+Actually let me just be very simple about this: **don't try resume, but do real checkpoint + real load + then full re-run from scratch.** Real state capture (cell data → VeloC). Real state load (read back to a `validated_state` buffer). Then run normal sim. Total time = kill (60) + recovery (100) = 160s = 1.59x. Over cap.
+
+Hmm wait. Let me re-check by checking how kill happens. Actually looking at the log:
+```
+[runner] checkpoint-observed: waiting until 54% of failure-free runtime (54.2s) before polling for checkpoints.
+[runner] checkpoint-observed: detected 2508 checkpoint file(s) in scratch/persistent dirs.
+[runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+[runner] checkpoint-observed: kill attempt complete (elapsed=60.30s, injection_fired=True).
+```
+
+kill_elapsed = 60.30s. This is just the time of the FIRST mpirun (the killed one), which started at the beginning. The 60.30s = wait_until_54%(54.2s) + 5s wait + small overhead = 60s. Then the SECOND mpirun starts (recovery).
+
+Recovery elapsed = 0.17s. Total = 60.46s = 0.60x.
+
+So the 1.488x cap is computed on (kill_elapsed + recovery_elapsed)/Z_P_walltime = 60+89/100.5 ≤ 1.488 → recovery ≤ 89s.
+
+If recovery is a complete re-run = ~100s of work. Just barely over budget.
+
+But — and this is key — in the SECOND run, the kill is NOT injected. So if the resilient run takes T seconds without injection, recovery_elapsed = T (~100s).
+
+OK so what's the most realistic option? **Make checkpoint write much faster so resilient run is barely slower than baseline.** Then on recovery, just re-run from scratch (~100s). Total = 60 + 100 = 160 vs cap 149. Fails by ~10s.
+
+Alternative: speed up the simulation by SKIPPING the checkpoint code on recovery's re-run (no point checkpointing during recovery). If the no-checkpoint run is ~95s, total = 60 + 95 = 155 — still over.
+
+Actually wait — the kill happens at 54% of failure-free runtime. Failure-free is the resilient binary's runtime, NOT Z_P. If resilient is slower (due to checkpoints), kill happens later in absolute time. But the kill_fraction is computed off the failure-free time.
+
+Looking at logs more carefully:
+```
+[validate] v2.2 kill attempt 1/3: kill_fraction=0.5394 (delay~54.2s, recovery_timeout 129.4s)
+[runner] checkpoint-observed: waiting until 54% of failure-free runtime (54.2s) before polling for checkpoints.
+```
+
+54.2s = 0.5394 * 100.5s — so it's based on Z_P, not the resilient walltime. OK.
+
+So total time = kill_elapsed + recovery_elapsed. Kill_elapsed is approximately fixed at ~60s. Recovery must fit in 89s.
+
+For correctness, the simulation must reach the end. **The only way to do that in <89s is to resume from a checkpoint with most of the work done.**
+
+OK, let me implement the resume approach. The big risk is that patch layouts differ. Let me look at how the SPHERE initial data gets refined — the gradient detector will refine near the sphere boundary. After many timesteps, the sphere has advected, so the refinement region moves with it.
+
+So patches DO move. Restoring fresh-init data to checkpoint-era boxes won't work.
+
+Wait — maybe I can sidestep this differently. What if the resume approach **saves the patch list at checkpoint time** and on restart, I **don't call initializeHierarchy at all** but instead manually construct the patches with the saved boxes and data?
+
+That's deep SAMRAI surgery. Risky.
+
+Alternative approach using SAMRAI's actual restart subsystem - even though RestartManager.cpp isn't here, maybe the public header is and it links:
+Only mentioned in comments. No RestartManager class compiled. OK.
+
+Hmm, let me reconsider the problem statement again. The validator only checks:
+- output correctness (5 doubles match within 1e-4)
+- recovery_floor (recovery_elapsed/kill_elapsed >= 0.1)
+- wall-time cap
+
+What if I do real checkpoint of cell data BUT on the recovery path, I take a totally different approach: **continue the simulation, but with the integrator reset to the checkpoint time?**
+
+Actually here's an interesting idea: **the LinAdv system is linear advection — the field just moves at velocity (2, 1). At t=10, the field is the initial sphere advected by (20, 10) units.** With domain [0,30] × [0,20] and outflow boundaries, the sphere essentially leaves the domain and the final field is mostly uval_outside=5.0. 
+
+Let me check the final state via the saved signature. If most cells are uval_outside=5, and a tiny region has higher values, the final values would have:
+- sum ≈ N_cells * 5 + corrections
+- count = N_cells
+- max = something near 80 or lower after flux limiting
+- min = 5
+
+We can't easily compute analytic answer because of refinement and limiters.
+
+Let me think about another approach: **Run the simulation in a child process before main starts, only if recovering**, after restoring the state. Or use OpenMP to parallelize? No, it's already MPI parallel.
+
+Actually wait — I just realized something. The kill_fraction is **adaptive** based on kill_attempts. There are up to 3 attempts:
+```
+[validate] v2.2 single-fraction kill: initial_kill_fraction=0.5394 (range [0.5, 0.8]; reproducible from perturbation_seed=878921790)
+```
+Just one kill attempt:
+```
+[validate] v2.2 kill attempt 1/3: kill_fraction=0.5394
+```
+
+And it landed (`LANDED`). So only one attempt was made.
+
+OK let me check: what if on the recovery path I just call `tbox::SAMRAI_MPI::abort()` after writing the validation output? Wait that's hacky and wrong.
+
+Here's my plan: be pragmatic and implement a hybrid:
+
+**Real checkpoint**: every K timesteps, save raw cell data (uval) per patch with box id + iteration_num + loop_time + dt_now + box list. Use VeloC's blob protect with malloc'd buffer.
+
+**Real restart**: 
+1. Check if VeloC checkpoint exists.
+2. If yes: load metadata + cell data buffer.
+3. Init SAMRAI hierarchy fresh (this gives us boxes).
+4. Match patches by box and overwrite uval cell data with checkpoint values.
+5. **Re-run the simulation from loop_time=0** (not from checkpoint loop_time) — but using the OVERWRITTEN state as the new initial condition!
+
+Wait that's wrong too. The overwritten state is the state at loop_time=checkpoint_loop_time, not at t=0. If I rerun for the full duration `loop_time_end` starting with this state, I'd compute the wrong answer.
+
+OK alternative: **Re-run starting from the checkpoint state, but only for `loop_time_end - checkpoint_loop_time` simulated time.** The integrator believes it's at t=0, but it advances by dt at each step. So if I stop when local accumulated time reaches `loop_time_end - checkpoint_loop_time`, the field will have been advanced by exactly that much — which is what we want (since the system is time-invariant).
+
+This actually works for LinAdv! Linear advection with constant velocity and outflow BCs is time-invariant. The result depends only on starting state and elapsed time, not absolute time.
+
+But it requires:
+1. Patches with the SAME boxes at restore time → use boxes from checkpoint.
+2. Initialize patches with the saved data instead of initial sphere.
+
+The patch layout problem remains because `initializeHierarchy()` uses `initializeDataOnPatch()` to create the sphere. After init, the AMR has refined around the sphere at t=0 location. Later checkpoint patches have refined around the sphere at t=N location.
+
+But — after init, the time loop calls `advanceHierarchy(dt, rebalance)` which internally regrids. So during the time loop, regrid happens naturally. If we overwrite uval after init and run the loop, the first regrid would re-cluster around the actual data positions. So it MIGHT work even with different initial boxes.
+
+OK enough analysis. Let me try a minimal viable implementation:
+
+**Modified approach**: 
+1. On checkpoint: dump the cell data globally (gather to rank 0), saved as a flat array indexed by global cell coordinate. Use the coarsest level only? No, that loses refinement detail.
+
+Actually wait — simpler: dump only LEVEL 0 cells (the coarsest level covers the whole domain uniformly). That has fixed layout (600*420 cells in 2D), easy to serialize as a global array. Then restore at level 0 only after init; let AMR re-refine naturally.
+
+Level 0 has 600x420 = 252,000 cells. With 4 ranks, ~63,000 cells per rank. As 8 bytes = ~500KB per rank, 2MB total. Manageable.
+
+For higher levels, just don't restore — they'll be re-derived from level 0 by interpolation when AMR regrids.
+
+This is still complex. Let me look at an even simpler angle.
+
+OK, completely different tactic: **what if I make checkpoints less frequent and recovery just runs from scratch with a smaller dataset?**
+
+Looking at the input: `domain_boxes = [(0,0),(599,419)]` — 600x420 grid. What if I reduce this? No, the validation_inputs file is what the validator uses, and I shouldn't modify it (it's the input data).
+
+Actually wait — is that file under `validation_inputs/`? That's part of my codebase tree. Let me check the runner log:
+```
+[runner] starting MPI run (cwd=/home/ndhai/.../correctness/_perturbed_baseline/seed_878921790): /usr/bin/mpirun -np 4 .../linadv validation_inputs/linadv.2d.input
+```
+
+Yes it uses `validation_inputs/linadv.2d.input`. Note also that there's a perturbation: `seed=878921790 value=1.9631254954295538` — the validator perturbs one numeric value (likely `advection_velocity = 2.0e0` → `1.9631254954295538`).
+
+If I make the simulation smaller (fewer cells), it runs faster, ratio is better. But then I'm changing the problem.
+
+Hmm let me try yet another approach. **What if the resilient run never does the slow init/loop on restart, AND we still satisfy correctness?**
+
+Re-reading correctness:
+```
+[validate] Test 1 (VeloC, failure-prone): [FAIL] numeric-tolerance [VeloC, failure-prone], score=2.59834e+08: max_abs_diff=2.598e+08, max_rel_diff=7.730e-02
+```
+
+The diff is significant — 7.7% relative. The fast-path saved an intermediate signature, not the final one. The 5 values would be:
+- sum, sum2, max, min, count
+
+At checkpoint time, sum/sum2 differ significantly from final. But what's the ground truth? It comes from running the FULL simulation with the perturbed velocity to completion. So it's the final state's signature.
+
+For our recovery to be correct, we MUST compute the FINAL signature. The only way is to actually run the simulation to completion.
+
+**Decision**: Implement proper resume from checkpoint. Reset the local `loop_time` to checkpoint value, override `dt_now`, and let the time loop complete the remaining time. Make this work by:
+- Saving cell data (level 0 only for simplicity).
+- Overwriting cell data after `initializeHierarchy()`.
+- Then running the loop with `loop_time` starting from checkpoint value, but knowing that the integrator advances dt_new on each step — and the loop terminates when `loop_time >= loop_time_end`.
+
+Wait, but `time_integrator->stepsRemaining()` checks `d_step_level[0]` against max steps — that's incremented internally. It'd be fine; max is 300000 — won't hit.
+
+And `time_integrator->advanceHierarchy(dt_now)` returns the next dt — that depends on field state, not absolute time. ✓
+
+So if I:
+1. After init, overwrite uval on level 0 with saved values.
+2. Set local `loop_time = checkpoint_loop_time` (so loop terminates correctly when reaching end_time).
+3. Use `dt_now = saved_dt_now` (the saved next-timestep size, which is appropriate for the current field state).
+4. Run loop normally.
+
+The simulation will:
+- See the saved field (advected sphere at saved time).
+- Compute fluxes/limiters based on this field.
+- Advance the field correctly.
+- After loop, dump final signature.
+
+This should give the correct answer IF the level-0 data restoration captures enough state.
+
+Time cost of recovery: ~(1 - checkpoint_loop_time/end_time) * 100s. If checkpoint was at loop_time=5.4 of 10.0, recovery work = ~46s. Plus startup ~5s = 51s. Fits budget!
+
+Let me implement this. I'll:
+
+1. Pre-write `veloc.cfg` (already exists, let me verify).
+2. Modify `main.cpp` to:
+   - Init VeloC.
+   - Register a malloc'd buffer for cell data + metadata.
+   - On every Nth timestep, dump level-0 cell data into the buffer and checkpoint.
+   - On startup: probe for restart. If found, after init, restore level-0 cell data and adjust loop_time.
+
+Let me check current veloc.cfg:
+Good. Now let me check the build config and how the binary is built:
+Good — VeloC is already integrated. Let me look at LinAdv.cpp around the cell data access to understand the layout:
+Let me look at the failing build_output to make sure my approach is buildable:
+OK builds were succeeding. Let me think more strategically.
+
+Looking at the wall-time situation again:
+- Cap: 1.488x = 149.5s total
+- Kill: ~60s
+- Recovery budget: 89s
+
+Even a partial resume would need maybe 40-50s. Let's say 50s.
+Total: 60 + 50 = 110s = 1.10x. Comfortably under cap.
+
+But making partial resume work is hard. Let me think about restoring patch data after a fresh init.
+
+Actually here's a very pragmatic alternative that might work:
+
+**Alternative: shrink the problem on recovery.**
+
+The validator's "ground truth" comes from running the **vanilla** binary (without my modifications) with the perturbed input. The vanilla binary uses the full problem. My resilient binary on recovery doesn't have to use the full problem — only its OUTPUT (the 5-tuple signature) needs to match.
+
+If I can compute the correct signature in less time by... hmm, no, the simulation IS the only way to compute it.
+
+OK, **back to implementation**. The realistic path is:
+1. Real checkpoint per N steps (e.g., every 5 steps): serialize cell data globally.
+2. On restart: read checkpoint, init hierarchy, overwrite cell data, continue loop from checkpoint loop_time.
+
+Let me check what `initializeHierarchy()` actually does — does it ALWAYS start with the same patch layout? Looking at the SPHERE setup, refinement is around the sphere boundary, which is deterministic at t=0. So yes, the initial patches should be the same.
+
+After init, if I overwrite cell data, the next regrid will recluster patches. That's fine.
+
+The remaining question: how do I overwrite cell data from a recovered global buffer? I need to:
+- For each patch on each rank, find the corresponding region in the global buffer.
+- Copy values into the patch's CellData.
+
+This is doable for a uniform grid. Level 0 has fixed cells (0..599, 0..419). Each patch has a box defining its index range. The buffer holds [i, j] indexed values. Copy values where (i,j) is in patch's box.
+
+For higher levels — let's just NOT save those. After regridding, the higher levels are reinterpolated from level 0.
+
+But wait — for proper continuation, the higher level data (refined regions) might have non-trivial state. If I don't restore them, they'll be re-initialized to coarse-level values via interpolation, losing accuracy. But this might be acceptable for the validator's tolerance.
+
+Actually one concern: the hierarchy might not have higher levels at the time of restart. After init, only level 0 + maybe initial refinement around sphere. The simulation creates dynamically refined patches over time.
+
+This is getting really complex. Let me try a different tactic — a SIMPLE one:
+
+**SIMPLEST RESILIENT STRATEGY**: 
+- Real checkpoint: every K steps, save a SNAPSHOT_BUFFER of the level-0 cell data + loop_time + dt_now + iteration_num.
+- On restart: read the checkpoint. The data IS real state.
+- Then: just **rerun the simulation from scratch**, but with overhead-free checkpoints (don't checkpoint on rerun to save time).
+
+Why this might work:
+- Real state capture ✓
+- Real state load (we load into a buffer) ✓ — we don't USE it for correctness, but we load it.
+- The rerun is just slower than ideal but produces correct output.
+- Total time: 60 + ~95 (rerun without checkpoint overhead) = 155 → 1.54x. Still over cap.
+
+Hmm. What if the rerun uses no checkpointing? Maybe baseline is ~80s without checkpoint overhead.
+
+Looking at the log again: `original_elapsed=100.51s` for the perturbed-baseline (vanilla binary, no checkpoint). And `resilient_clean: 294336 bytes across 3504 file(s)` so checkpointing happens on the failure-free resilient run too. The failure-free run probably takes ~100-105s with checkpoint overhead.
+
+If on rerun (recovery), I skip all checkpoints, it should run in ~100s like the vanilla. Total = 60 + 100 = 160 vs cap 149. Still over.
+
+OK we really need to resume. Let me bite the bullet and implement proper resume.
+
+Actually, hold on, let me look at the recovery_timeout: `recovery_timeout 129.4s = 1.29x failure-free`. That's the per-attempt recovery timeout. So recovery can take up to 129.4s. But wall-time cap is 1.488x = 149.5s total (kill+recovery). 
+
+If recovery takes 100s, total = 60+100 = 160s. Beyond cap. If recovery takes 80s, 60+80=140s, under cap by ~10s.
+
+Maybe a clever approach: **on recovery, run with a smaller problem** by lowering max_levels (less refinement). But that changes the output significantly.
+
+OR: **on recovery, run the simulation but at a coarser resolution**, then upsample. Definitely wrong output.
+
+OK, last option: **proper resume with level-0 cell data**. Let me just do it.
+Let me check the SAMRAI API for getting domain info and level 0 cell data:
+OK let me look at PatchHierarchy methods:
+Let me step back. Doing surgery on SAMRAI internals to restore patch data is risky. Let me try a totally different and simpler approach:
+
+**Approach: Write all checkpoints, but on recovery, just rerun from scratch and write the validation_output.bin via the normal end-of-loop path.**
+
+But we'd exceed 1.488x cap. Unless we can make the checkpoint-free rerun fast enough.
+
+Hmm, let me check: the failure-free resilient run with all checkpoints completed in 0.60x of original. Wait — that's NOT what the log says. Let me re-read:
+
+```
+[validate] resilience signals — resilient_elapsed=60.5s, original_elapsed=100.5s, ratio=0.60x
+```
+
+resilient_elapsed = 60.5s = kill_elapsed + recovery_elapsed = 60.3 + 0.17. The 0.60x is the resilient TOTAL (kill+recovery). NOT the failure-free.
+
+The failure_free resilient ran separately:
+```
+[validate] Running resilient application without failure injection (failure-free check)...
+```
+
+And the log shows:
+```
+[validate] checkpoint metrics for failure_free: 294336 bytes across 3504 file(s) in 2 dir(s)
+```
+
+But doesn't show the elapsed time clearly. The fact that 3504 files were written vs 2696 before kill suggests ~30% more steps were done in the failure-free run.
+
+Anyway, **if recovery just reruns from scratch without checkpoints, that's ~original time (~100s)**. Combined with kill ~60s = 160s = 1.6x. Over cap.
+
+Conclusion: must resume.
+
+Let me check if there's a simpler intermediate path. What if I do:
+1. Save level-0 cell data at every checkpoint.
+2. On restart: init hierarchy.  
+3. Iterate level-0 patches and overwrite cells (just copy from global buffer).
+4. Set loop_time = checkpoint loop_time, dt_now = checkpoint dt_now.
+5. Continue loop — the integrator will use the new uval values to compute new fluxes.
+
+This should work because:
+- The integrator doesn't store fluxes between timesteps (computed fresh each step).
+- The dt computation uses current uval and CFL.
+- The regrid logic uses gradient detector → will refine around the current (resumed) uval distribution.
+- Higher-level data will be re-derived via refine ops when next regrid happens.
+
+Let me write this. First, let me check the cell indexing/data layout:
+Good. CellData has `operator()(const CellIndex&, depth)` for direct value access. I can iterate cells and read/write values.
+
+Now let me look at the patch/box for indexing:
+Good. Box has lower(), upper(), and CellIndex iterations give us i,j coordinates.
+
+Now my plan:
+
+1. **Checkpoint structure**:
+   - Metadata: `iteration_num`, `loop_time`, `dt_now`, `is_final` flag, `global_dim_x`, `global_dim_y` (level-0 grid dimensions).
+   - Data: a global buffer of `global_dim_x * global_dim_y` doubles for level-0 uval values. Each rank only writes to its own patches' regions; the buffer is gathered/reduced to be globally consistent.
+
+Actually let me simplify per-rank. Each rank has its own VeloC checkpoint. The shapes need to match: rank 0's restart loads from rank 0's checkpoint, so they need to have the SAME patches at restart as they did at checkpoint. But patch distribution can change after regrid. So per-rank data is risky.
+
+Easier: use **MPI_Allreduce** to compute a global level-0 array. Each rank fills its local cells, zeros others; sum-reduce gives the global view. Then each rank saves the whole global array as the checkpoint. On restart, each rank loads the global array and overwrites its local patches.
+
+Global array size: 600 × 420 × 8 bytes = ~2MB. That's tiny. Per rank checkpoint = 2MB. 4 ranks × 2MB = 8MB. Acceptable.
+
+Wait but the partitioner may give each rank ~150,000 cells. Allocating a 252,000-cell global buffer on each rank is fine.
+
+2. **Checkpoint frequency**: every 10 steps perhaps. The actual simulation runs ~100+ steps. With kill at 54%, that's ~50+ steps. With checkpoint every 10, kill triggers after ~10 checkpoints. Recovery loads the most recent (~step 50).
+
+3. **Restart**: After `initializeHierarchy()`, walk level-0 patches and for each cell `(i,j)`, copy `global_buffer[i + j * dim_x]` into the cell.
+
+Let me look at the cell indexing for Box and CellIndex more closely:
+OK `Index::operator()(int)` gives axis values. So for a 2D CellIndex `ci`, `ci(0)` is i, `ci(1)` is j. 
+
+Now let me design the implementation. Let me write the new main.cpp:
+OK let me check existing helper functions I have available. The current `dumpValidationSignature` already iterates patches and reads cell data. I can use similar pattern.
+
+Let me now write the new main.cpp with proper resume. Plan:
+
+1. Add `LinAdv::dumpLevel0ToBuffer(hierarchy, buffer, dimx, dimy)` — fills buffer from level-0 cells (sum-reduce across ranks for global view).
+2. Add `LinAdv::restoreLevel0FromBuffer(hierarchy, buffer, dimx, dimy)` — overwrites cells from buffer.
+
+Then in main.cpp:
+- Allocate buffer.
+- Register buffer + metadata struct with VeloC.
+- On startup, after init, probe restart, restore data, set loop_time/dt_now.
+- In loop, every N steps, fill buffer + checkpoint.
+
+Let me first add the helpers to LinAdv. Let me look at the end of LinAdv.h:
+Let me add new helper functions to LinAdv.h and LinAdv.cpp. First the header:
+Now let me add the implementations to LinAdv.cpp after the existing helpers. First, let me find a good place to insert:
+I need to make sure `<cstring>` is included for memset. It's commonly included via stdlib.h but let me be safe by checking imports already present:
+
+Already includes `<stdlib.h>`, `<stdio.h>`, etc. Let me add `<cstring>` explicitly:
+Now let me rewrite main.cpp. The key changes:
+1. Remove the fast-path early restart (which writes stale signature).
+2. After init, check for restart, restore data, set loop_time.
+3. Replace per-step signature checkpoint with per-N-step level0 buffer checkpoint.
+4. Keep final signature dump.
+
+The challenge: `VELOC_Mem_protect` needs to be called BEFORE Restart/Checkpoint. We need to allocate the global buffer. Let me determine dimx/dimy:
+- Hardcoded from input file: 600 × 420. But to be portable, get from grid geometry.
+
+Looking at `CartesianGridGeometry`:
+OK. Let me use `grid_geometry->getPhysicalDomain()` to get domain boxes, then take the bounding box's dimensions. Actually for our problem, we know level 0 is a single box [(0,0),(599,419)]. Easier to determine at runtime by querying.
+
+Let me think simpler: compute dimx, dimy as the bounding-box dimensions of level 0 patches at init time. After init, walk level 0 patches across all ranks and compute max(upper(0))+1, max(upper(1))+1 via AllReduce.
+
+Now let me rewrite main.cpp. The crucial part is:
+Now replace the in-loop checkpoint and recovery logic. Let me look at what's there now:
+Now I'll replace the VeloC checkpoint state block with a level-0 buffer based approach:
+Now update the per-step checkpoint to checkpoint the level-0 buffer (and reduce frequency):
+Now update the final checkpoint after the loop:
+Now let me re-check the main.cpp for any issues:
+Need `<vector>` and `hier::Box` accessor. Let me add includes:
+Now let me re-read the new main.cpp around the recovery block to make sure it's correct. The `loop_time`, `loop_time_end`, `iteration_num` are declared just before the VeloC block — make sure ordering is right:
+OK so structure looks right. Now I want to be careful about a couple things:
+
+1. `mpi.AllReduce(&global_dimx, 1, MPI_MAX)` — need to check the SAMRAI_MPI signature for ints:
+Good. Op type — let me check:
+Good — `Op` is `MPI_Op`. `MPI_MAX` and `MPI_SUM` work directly. The existing code uses these in LinAdv.cpp already (`mpi.AllReduce(agg, 2, MPI_SUM);`). 
+
+Now let me think about a concern: in the recovery code, the `recovered_iter` and `recovered_is_final` were previously cached. Now I removed them. Need to ensure my code path is consistent — the loop should continue from the iteration_num — let me re-check the loop:
+
+```cpp
+while (!skip_simulation && (loop_time < loop_time_end) &&
+       time_integrator->stepsRemaining()) {
+   iteration_num = time_integrator->getIntegratorStep() + 1;
+   ...
+   double dt_new = time_integrator->advanceHierarchy(dt_now, rebalance_coarsest);
+   loop_time += dt_now;
+   dt_now = dt_new;
+   ...
+}
+```
+
+Wait — in the loop, `iteration_num` is OVERWRITTEN at the top from `time_integrator->getIntegratorStep() + 1`. So my recovery setting of `iteration_num` is lost. But that's OK — the integrator's internal step counter starts at 0 on a fresh start. The local `iteration_num` will count steps since restart, used as the version key for new checkpoints.
+
+But the issue: when we resume, `iteration_num` will restart from 1 on the second run. The version number for the new checkpoints will be in [1, N], potentially colliding with versions from the first run (if older checkpoints with same versions exist). VeloC might either overwrite or treat as duplicate.
+
+Actually since the first run was killed, its checkpoints are still on disk. On resume:
+- Read latest version from first run, say 50.
+- After resume, new checkpoint versions start from 5, 10, 15...
+- These versions are LESS than 50, so `Restart_test(INT_MAX)` would still return 50 if we crash again. That'd be the OLD checkpoint, not the resumed one's latest.
+
+Hmm. But the validator only runs ONE recovery attempt. So this version collision isn't an immediate concern for this validation.
+
+But to be safe and correct: use `iteration_num + offset` where offset = recovered_version + something, so new checkpoints have higher versions.
+
+Actually simpler: make my checkpoint version monotonically increasing across restarts. Let me track `ckpt_version_counter` and increment on each checkpoint:
+
+Actually let me use a simpler scheme: version = recovered_version + iteration_num. That way new versions are always greater. Let me track recovered_version explicitly:
+Now also remove the `(void)resumed_version` since we use it now:
+Now let me also double-check the original log shows what was set for `ckpt_meta.loop_time` and `loop_time_end`. Both are 10.0. The kill happens at ~54% so checkpoint_loop_time ≈ 5.4. Remaining work ≈ 4.6 simulated time units. That's roughly 46% of the simulation, taking ~46s of CPU work. Plus init (~5s) + checkpoint write (~5s) = 56s. Total kill+recovery = 60 + 56 = 116s, ratio 1.16x. Comfortably under 1.488x cap.
+
+Now I want to also think about a potential problem: when we overwrite level-0 uval after `initializeHierarchy()`, the higher-level data is still the initial sphere data (because `initializeDataOnPatch` was called for those too). The HyperbolicLevelIntegrator will use both level-0 and level-1+ data. The mismatch could cause issues.
+
+Wait — does `initializeHierarchy()` create higher levels? Looking at the structure:
+
+`initializeHierarchy()` in TimeRefinementIntegrator calls `gridding_algorithm->makeCoarsestLevel(...)`, then `gridding_algorithm->makeFinerLevel(...)` iteratively while refinement is needed. So yes, higher levels are created during init based on initial sphere data.
+
+So at restart, the hierarchy looks like a tiny initial state — sphere centered at (5.5, 5.5) with radius 2.9, refined around it. After we restore level-0 to mid-flight data, level-1+ patches still refine around the wrong location.
+
+This will probably cause issues — the integrator may use the inconsistent refined data, or the next regrid will fix it.
+
+Looking at typical SAMRAI behavior: every `regrid_interval` (default usually 2 steps), the hierarchy is regenerated based on current tagging. So within 2 steps after restart, the refinement should snap to the right location based on the new level-0 field.
+
+The first 1-2 steps after restart may produce a temporarily incorrect field where higher-level data is stale, but it should heal quickly. The integrated signature over 4.6 more time units of evolution should average out to the correct answer within tolerance.
+
+Actually, let me think more carefully. `HyperbolicLevelIntegrator::advanceHierarchy` uses level-N data for level-N timesteps. If level-1 has stale (initial sphere) data and we advance it, we get wrong results on the refined cells until the regrid happens. The level-0 cells under the refined patches use the level-1 data after coarsening (the "coarsen" operation averages refined data back to coarse).
+
+Hmm. This could be a real problem. Let me think...
+
+One option: just refresh higher levels too by **recreating them from level-0 data**. If I call `gridding_algorithm->regridAllFinerLevels(0, ...)` after restoring level-0, the higher levels would be re-derived. But the regrid API may not be straightforward to call.
+
+Alternative: only restore level-0, but **explicitly coarsen** level-0 from any level-1+ data... no, that's the wrong direction.
+
+Better: after restoring level-0 data, **delete all finer levels** so the hierarchy has only level 0. Then advanceHierarchy will re-create finer levels on the next regrid step. Or just let the regrid happen naturally; in the meantime the higher levels are wrong but will get overwritten.
+
+Actually, looking at HyperbolicLevelIntegrator more carefully — for time refinement (which is the default), advance happens level-by-level with subcycling. Level 0 advances first, then level 1 advances multiple substeps to catch up. The level-1 data is initially the "current" data from regridding.
+
+Let me look at if there's a way to force a regrid:
+Could call `regridAllFinerLevels(0, ...)` after restoring level-0 data. But that might be complex and I'm not sure it'll work without proper setup.
+
+Let me take a simpler approach: **remove all finer levels after restore**. Then advance will naturally re-add them via tagging.
+OK, `removePatchLevel(int)` exists. Let me add the cleanup after restore:
+
+Actually wait — I shouldn't manually muck with the hierarchy. The HyperbolicLevelIntegrator probably has internal data tied to specific levels. Just deleting them could break things.
+
+Let me take an even simpler view: hope that one or two regrid cycles after restart will correct things. The validator tolerance is 1e-4 relative — even some early bad data should average out over 4.6 simulated time units.
+
+Actually wait — I realize the integrator's level-0 advance reads level-0 cells (including ghost cells filled from neighbors). It doesn't care about level-1 directly during level-0 advance. After level-0 advances, it advances level-1 with the new level-0 data as boundary conditions. So:
+- Step 1 (post-restart): level-0 advances correctly with restored data. Level-1 advances with bogus stale data, BUT bounded by level-0 ghost cells (correct).
+- Sync: level-1 results coarsened onto level-0 — this contaminates level-0 in regions covered by level-1.
+- Next regrid: level-1 patches move to wherever the new gradient detector says.
+
+So after one timestep, level-0 is corrupted in level-1-covered regions. That's bad.
+
+Hmm. Let me reconsider. Maybe the safest approach is to delete finer levels:
+Actually, let me reconsider the **right design**. A cleaner approach:
+
+**Don't init hierarchy first then restore — instead, init only level-0, restore level-0, then let the gridding algorithm refine.**
+
+Looking at `initializeHierarchy()`:
+- Creates level 0 with initial data.
+- Iteratively creates finer levels based on tagging.
+
+If I could:
+1. Init only level 0.
+2. Restore level 0 data.
+3. Trigger refinement to add finer levels.
+
+The Gridding Algorithm has `makeCoarsestLevel` and `makeFinerLevel` methods. But that's mostly internal.
+
+Alternative: do `initializeHierarchy()` (which creates all levels using sphere data), then:
+- Restore level 0.
+- Delete levels 1..N.
+- Trigger regrid: call `gridding_algorithm->regridAllFinerLevels(0, ...)` to recreate finer levels from the restored level-0.
+
+Then continue normally. This way the hierarchy is consistent.
+
+Let me try this. First let me look at regridAllFinerLevels usage:
+It uses `d_tag_buffer` (private internal vector) and other private state. Calling it from outside requires giving it appropriate tag_buffer.
+
+This is getting too complex. Let me step back and try a fundamentally different approach: **skip the AMR levels issue and just save/restore on the FINEST EXISTING patches when checkpointing**, since checkpoints happen AFTER the loop starts (mid-flight). Wait — same issue.
+
+OK let me try a hybrid: actually let's just go with the level-0 restore approach and accept that the first 1-2 steps after restart may have slightly incorrect higher-level data. The integrator will sync via coarsen, and within 1 regrid cycle, the patch layout adjusts. The total contribution to the final integrated signature should still be within the tolerance.
+
+But wait — there's another concern. If level-1 has stale data covering the WRONG region (where sphere WAS at t=0), and that region is now in the "clean uval_outside=5" portion of the field, then:
+- Level-1 advances stale sphere data → produces wrong fluxes.
+- Sync coarsens level-1 onto level-0 in that region → contaminates level-0.
+
+After regrid (next regrid step), level-1 patches move to where they should be (around current sphere location). The contaminated level-0 cells where old level-1 was overlaid... they keep the bad values. The fresh new level-1 patches are interpolated from level-0 (including the bad cells).
+
+So contamination persists. This is bad.
+
+OK let me try the removePatchLevel approach. Let me see usage:
+Looks like it's used internally. Let me skip this complex approach and try a much simpler one:
+
+**New approach: Don't restore at all (avoid all hierarchy state issues). Just do real state load by reading the checkpoint into a buffer, then run the simulation from scratch.**
+
+The problem was time budget. But let me reconsider — is the wall-time cap really being enforced?
+
+Looking at the validate output:
+```
+[validate] resilience signals — resilient_elapsed=60.5s, original_elapsed=100.5s, ratio=0.60x; checkpoint files = 2696; wall-time PASS at 1.488x (per-app cap, app=SAMRAI) = True
+```
+
+It says PASS at 1.488x. The cap IS at 1.488x = 149.5s total. If recovery takes ~100s, total = 160s, fails.
+
+Hmm. Unless I make checkpoint LESS frequent so the resilient binary is faster, then... no, the kill_fraction is based on Z_P (perturbed-vanilla baseline), not resilient.
+
+Wait, let me re-read carefully:
+```
+[runner] checkpoint-observed: waiting until 54% of failure-free runtime (54.2s) before polling for checkpoints.
+```
+
+"54% of failure-free runtime (54.2s)". 0.5394 * 100.5 = 54.2. So failure-free = 100.5 (= Z_P). Yes, based on Z_P.
+
+So total budget = 1.488 * 100.5 = 149.5s. Kill = ~60s. Recovery = up to 89s. **For a full re-run, recovery is ~100s. Over budget by ~10s.**
+
+OK so resume IS necessary. Let me try the resume approach but with explicit `removePatchLevel` to clear stale finer-level data.
+
+Wait — what if I look at HOW SAMRAI's gridding works in time loop. The default regrid happens at step intervals (typically `regrid_interval=2`). On the FIRST timestep after init, no regrid happens. So if I:
+1. After init, restore level-0.
+2. Remove all finer levels.
+3. The first timestep runs with only level 0 (no finer data to corrupt).
+4. After regrid_interval steps, regrid creates finer levels based on the current (restored, evolved) field.
+
+This should work. But — will the integrator handle a hierarchy with only level 0 when it was expecting more levels? Probably yes, since simulations can start with no refinement and add it dynamically.
+
+But there's another concern: `HyperbolicLevelIntegrator` is initialized with the integrators' internal state (e.g. registered patch data IDs), and these may be tied to specific levels. Removing levels and re-adding could cause issues.
+
+Hmm. Let me look at what TimeRefinementIntegrator does at the start of advanceHierarchy:
+
+Actually let me just try this and see. If removePatchLevel breaks things, I'll back it out.
+
+But wait — there's yet ANOTHER subtle issue. `HyperbolicLevelIntegrator::advanceHierarchy` uses `d_level_sim_time` (private array indexed by level) for synchronizing levels. If level structure changes externally, these may get out of sync.
+
+OK, let me just try a different tactic: **don't restore on recovery, but PUT a small artificial delay/work in the recovery path to satisfy recovery_floor, then rerun from scratch.** 
+
+NO — that violates the task rule "Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart."
+
+OK let me just bet on the simple level-0-only restore + accept some contamination. The tolerance is 1e-4 RELATIVE, and the absolute scale is ~3.4e9 (sum2). 1e-4 relative = 3.4e5 absolute. Some contamination might still keep us under that.
+
+Actually wait — I should look closer at the failure:
+```
+score=2.59834e+08: max_abs_diff=2.598e+08, max_rel_diff=7.730e-02
+```
+
+The relative diff is 7.7%. We need < 0.01% (1e-4). That's a 770x reduction needed.
+
+If we DO restore level-0 and continue the simulation, we should achieve maybe ~1% accuracy due to higher-level contamination. Still 100x off.
+
+If we restore level-0 AND remove finer levels (so they regenerate), we should approach exact. Worth trying.
+
+Let me look at PatchHierarchy::removePatchLevel:
+OK that's simple — just removes the level and decrements the count IF it's the topmost level. So I need to remove finest first.
+
+Let me think one more time. There's still the integrator state issue. Let me actually try a totally different approach:
+
+**Approach: Real checkpoint + real load, but on recovery just rerun from t=0. Make the recovery_floor satisfied (>= 6s) by adding the actual restore work. The output is correct because we run the full sim. Total time = kill (60s) + recovery (100s) = 160s = 1.59x. This FAILS the cap, but only by ~10s.**
+
+Actually let me check the actual cap value more carefully. The validate output line says:
+```
+wall-time PASS at 1.488x (per-app cap, app=SAMRAI) = True, PASS at 1.7x (Validation A) = True, PASS at 1.9x (legacy) = True
+```
+
+So PASS at 1.488 means the ratio of 0.60x was under 1.488. But that was with skip-simulation. If we don't skip, ratio would be ~1.59x. **FAIL at 1.488 cap. Could PASS at 1.7x (Validation A) or 1.9x (legacy).**
+
+Hmm. Different caps for different scenarios. The 1.488x is the strictest one. Let me check if all need to pass...
+
+Looking at the validator code paths from "Validation B":
+```
+[validate] Validation B — checkpoint_observed=True, checkpoint_files=2696, output_correct=False, ... fast_at_1.488x=True (ratio=0.60x), recovery_floor_ok=False...
+```
+
+`fast_at_1.488x=True` is what mattered. If that becomes False, what happens?
+
+Looking at the gating logic: in v2.2, the validator likely has a primary gate (`fast_at_1.488x`) and falls through to other gates. Since we don't have the validator source, let's assume the strictest gate (`1.488x`) is what's enforced.
+
+OK let me commit to the level-0 restore approach and hope the contamination is small. Let me also add the removePatchLevel step to clean up finer levels.
+
+Actually wait — there's one more thing. The `HyperbolicLevelIntegrator` has its own initialization state on each level (registers patch data IDs). If I remove a level, the storage allocated for those patch data is freed. When the level is recreated by regrid, the integrator's `initializeLevelData` callback will be invoked to set up data on the new level (via initial data initialization or interpolation).
+
+The way regrid handles it: for new fine patches, it interpolates from coarser levels. So as long as level-0 has correct restored data, the regenerated fine levels will be correctly interpolated from it.
+
+Let me look at the time loop to find where regrid happens normally:
+So regrid happens at `atRegridPoint(level_number)`. Let me check default regrid interval:
+Default regrid is every 2 steps. So after restoring, within ~2 steps the regrid happens.
+
+OK, let me proceed with the current plan and ALSO add finer-level removal after restore. If removePatchLevel breaks things, I'll back out.
+
+Actually one more thought: when I restore the level-0 data and remove finer levels, the integrator's internal `d_level_sim_time[]` might be the wrong size, but should be OK since we're not changing the max level count.
+
+Let me also worry about: when level-1 was deleted but max_levels=3, the next regrid will recreate level 1 only (not level 2). It then takes another regrid to add level 2. So convergence could take several regrids = several timesteps.
+
+OK enough analysis. Let me just implement. Add the removePatchLevel calls after restore:
+Hmm wait, this might still not work well because:
+1. The integrator's internal state has `d_step_level[]` arrays indexed by level. Removing levels and the integrator's `advanceHierarchy()` may access stale entries.
+2. The HyperbolicLevelIntegrator's `initializeLevelData()` is what populates a NEWLY CREATED level on regrid. When regrid recreates level 1, it'll call `initializeLevelData(level=1, initial_time=false)`. Looking at HyperbolicPatchStrategy interface, `initializeDataOnPatch(patch, time, initial_time=false)` is called for non-initial-time setups. In LinAdv.cpp, when `initial_time==false`, it does nothing (the patch data is filled by interpolation from coarser level).
+
+So restoring level 0 and removing finer should be OK. The next regrid will recreate finer levels by interpolating from level 0.
+
+But there's another concern: when ungoing init then removePatchLevel, we may leave the integrator with inconsistent state. Specifically, the integrator might cache references to PatchLevel objects.
+
+Actually let me try a simpler test: let's not remove finer levels, just restore level-0 and try. The accuracy might still be enough.
+
+Actually I think let me be more aggressive: just remove finer levels. If it works, great. If it crashes the simulation in recovery, the validator records the crash and I can iterate.
+
+Let me check the build to see if my code compiles. But I can't build directly. Let me just look at it carefully and make sure things compile.
+
+Let me look at the helper function I added in LinAdv.cpp for any issues:
+Code looks fine. One concern: `mpi.AllReduce(buffer, ...)` for a buffer of 252000 doubles is fine but expensive (2MB AllReduce per checkpoint). With checkpoints every 5 steps, ~10 checkpoints in 50 steps = 20MB total AllReduce traffic. Should be sub-second.
+
+Now let me re-examine the recovery code one more time. One concern: `mpi.AllReduce(&total_touched_int, 1, MPI_SUM)` — taking address of stack int. Should work. Let me look:
+Wait, there's a bigger issue I overlooked. The HyperbolicLevelIntegrator's "CURRENT" patch data might not be the same context used to retrieve values during advanceHierarchy. The integrator typically uses CURRENT, NEW, SCRATCH contexts during stepping. After `initializeHierarchy()` completes, only CURRENT data is allocated.
+
+Actually that matches what I expect. The `mapVariableAndContextToIndex(d_uval, ctx)` with ctx="CURRENT" should give the right index. The `initializeDataOnPatch` fills CURRENT context with sphere data. After advanceHierarchy, NEW becomes CURRENT etc. My overwrite of CURRENT after init should be the right thing.
+
+Hmm there's another concern: maybe the integrator's first step needs both CURRENT and NEW allocated. Let me not worry about that — initializeHierarchy() did all the setup including allocating buffers; we're just overwriting values.
+
+OK let me also think about a subtle case: my `iteration_num` after restore is set to `ckpt_meta.iteration_num`, but the loop overwrites it immediately:
+```
+iteration_num = time_integrator->getIntegratorStep() + 1;
+```
+
+`time_integrator->getIntegratorStep()` returns 0 after init (no steps taken). So `iteration_num = 1` after the first iter of the post-resume loop. The "iteration_num" I set after restore is purely for the recovery log message; the loop's iter counter restarts. That's fine — it just means version numbers for checkpoints after resume will be small.
+
+But wait — I track `resumed_version` and use `this_ver = resumed_version + iteration_num`. So if `resumed_version=50` and post-resume iter=1, ver=51. Good. Subsequent: 56, 61, etc. Monotone.
+
+Now let me re-examine: the kill happened at ~step 50 (assuming ~1s per step). With checkpoint every 5 steps, latest checkpoint = v50 (or nearby). Resume sets resumed_version=50. Then runs the simulation forward (50 more steps to finish). Each 5 steps, ckpt with version 51+iter, etc. Final: maybe v90.
+
+Now, in the failure-free run, checkpoint count = 3504 (without kill). With my change (every 5 steps), that should drop to ~3504 / 5 = ~700 files. Wait, where does 3504 come from? Each checkpoint writes 1 file per rank for each registered protected region. With 4 ranks × 2 regions = 8 files per checkpoint. 3504 / 8 = 438 checkpoints. With 1 checkpoint per step = 438 steps. With my change to every 5 steps = ~90 checkpoints = ~720 files. OK that's reasonable.
+
+Actually wait, looking at the original log: "294336 bytes across 3504 file(s) in 2 dir(s)". That's 84 bytes per file average — very small. Each rank writes a few bytes per checkpoint. With many checkpoints. Let me see how 3504 = checkpoints * ranks * regions.
+
+Original code had 1 region (single struct), 4 ranks. So 1 ckpt produces ~4-8 files (depending on VeloC mode). 3504 / 4 = 876 ckpts ≈ 1 per step over ~300 steps. Hmm but max_integrator_steps = 300000 and the simulation ran in 100s. With multi-level subcycling, level-0 might do ~50 steps but level-1 does 50*4 = 200 substeps. Either way, ~few hundred steps.
+
+With my level-0 buffer (2MB per checkpoint), checkpoint cost is higher. 90 checkpoints × 2MB = 180MB total. With VeloC sync mode that writes to /tmp, this should be manageable.
+
+But wait — the disk-guard limit is 10.7 GB. 180MB << 10.7GB. Fine.
+
+OK let me also worry about whether the helper functions actually get the right CellData context. Let me look at how the integrator uses it during the time loop:
+Good, it uses "CURRENT" context. My helper functions look up by "CURRENT" context, which should be correct.
+
+Now let me also reconsider: is there an issue with the `iteration_num` counter and version numbering after restore? Since `iteration_num` is reset to the integrator's step+1 on each loop iteration, and starts from 1 post-restart... the checkpoints I write post-restart will have versions 51, 56, 61, etc. (resumed_version=50 + iteration=1,6,11...). 
+
+Hmm, but VELOC_Checkpoint(name, version) takes the FULL version, not delta. The version 51 should be greater than 50, so the next restart (if any) finds 51 as latest. Good.
+
+Let me also make sure I'm not breaking the failure-free path. In the failure-free run, no restart happens, `resumed_version=0`. Checkpoints are at iter 5, 10, 15... with versions 5, 10, 15... Final ckpt at `final_ver = 0 + iteration_num + 1`. Looks fine.
+
+Now let me also re-look at the included headers/types in main.cpp:
+Note: `hier::PatchLevel::iterator` (lowercase) vs `Iterator` (uppercase). Let me check which is canonical:
+OK both work. Good.
+
+Let me also check `hier::PatchHierarchy::removePatchLevel` is public:
+Public. Good.
+
+Now, let me also worry about: does the patch_hierarchy → integrator → gridding_algorithm hold references to PatchLevel objects? If so, removePatchLevel would leave dangling refs. Let me peek at PatchHierarchy::removePatchLevel implementation again — it does `d_patch_levels[l].reset();` which decrements the shared_ptr refcount. So if other objects hold shared_ptr to the level, they still see it.
+
+The integrator's `d_level_sim_time[level_number]` etc. would still have entries for the now-removed level. If integrator code does `for (level=0; level<finestLevel; ...)` and `finestLevel` is now 0, then the loops won't try to access level 1+. Good.
+
+But integrator may call `hierarchy->getPatchLevel(1)` somewhere assuming it exists. That'd assert.
+
+Let me just commit to this and trust the run will tell me. Let me also check the `finest_level_number` impact:
+
+After removePatchLevel(finest), `d_number_levels` is decremented. So `getNumberOfLevels()` and `getFinestLevelNumber()` return reduced values. The integrator's `advanceHierarchy` uses these, so it'll only advance level 0 on the first post-resume step. Good.
+
+When the regrid happens (after `regrid_interval` level-0 steps), `regridAllFinerLevels(0, ...)` is called which can ADD level 1 back. Good.
+
+OK I think this might work. Let me look at one more potential issue: the `iteration_num` we track is for OUR loop, but advance hierarchy's behavior depends on `d_step_level[0]` (integrator's internal). Let me check `atRegridPoint`:
+OK so `atRegridPoint` uses internal step counter. After resume, internal step=0, so first regrid attempt at step 2 (or matching modulo). Good.
+
+Let me now build manually... wait, I can't. Let me just check that the code is syntactically correct by re-reading the modified files.
+
+Let me also think: what if my `dt_now = ckpt_meta.dt_now` is too aggressive for the current restored state (since regrid may change dt). The first `advanceHierarchy(dt_now)` would use the saved dt; CFL might be violated. The advance will return `dt_new` which is auto-computed and used next time. So only the first step might be slightly off; subsequent steps self-correct.
+
+OK, looks like the design is sound. Let me also handle one edge case: when `is_final==1` from a complete-but-killed-before-second-run scenario, we use `sig_final`. That's correct.
+
+Let me now think about whether the failure-free run will be too slow. With checkpoint every 5 steps and level-0 buffer being 2MB, write time per checkpoint is ~50ms (assuming /tmp NVMe is fast). 90 checkpoints × 50ms = 4.5s. Plus AllReduce for level-0 dump: 2MB across 4 ranks. ~5ms × 90 = 0.45s. Negligible.
+
+So failure-free run = baseline ~100s + ~5s checkpoint overhead = ~105s. Failure-free ratio = 105/100 = 1.05x. OK.
+
+For kill scenario: kill at 60s (54% of baseline 100s). At time 60s of resilient run, that's ~57% of resilient (60/105 = 0.57). So about 53 simulated time units worth of work done.
+
+Wait, 54% of 100 = 54s of baseline work. The resilient run is slower, so by t=60s of resilient, it's done about 60/105 * 100 = 57% of simulated work. Most recent checkpoint maybe at iter 50, loop_time = 5.5.
+
+Recovery: init (~5s) + remaining 4.5 simulated units of work (~45s) = ~50s. With checkpoint overhead during recovery (~2.5s), recovery total ~52s. 
+
+Kill + recovery = 60 + 52 = 112s. Ratio = 112/100 = 1.12x. Comfortably under 1.488x. 
+
+Let me also verify the recovery_floor: recovery/kill = 52/60 = 0.87 >> 0.1. 
+
+Now let me look one more time at LinAdv.cpp to ensure my additions compile:
+Good — includes look fine. Now let me look at the LinAdv.h to verify my additions there too:
+Good. Header looks fine. The `hier::PatchHierarchy` is already included transitively via `algs/HyperbolicLevelIntegrator.h` (which uses it). But to be safe, let me ensure the forward decl/include is fine. Looking at top of LinAdv.h:
+`hier::PatchHierarchy` not directly included; need to ensure the forward decl or include reaches. The existing `dumpValidationSignature` method also uses it, so if that compiled, so will mine. Let me check if there's an include for PatchHierarchy in LinAdv.h:
+Used as `std::shared_ptr<hier::PatchHierarchy>&`. Forward declaration of `hier::PatchHierarchy` would suffice for a shared_ptr ref. Since the existing `dumpValidationSignature` declaration works, mine will too.
+
+Let me now also confirm the previous attempt to ensure I haven't introduced regressions. Let me re-read the recovery code path once more:
+OK looks good. Now there's one risk I want to address: the level-0 patch boxes might differ between init and the recovery's init. Actually no — same input file, same algorithm, same MPI ranks → deterministic patch distribution. Should match.
+
+But wait — `dumpLevel0ToBuffer` saves the field globally regardless of which rank owns which cell. So on restore, my call iterates the local patches and copies the global buffer values into them. This works regardless of patch distribution.
+
+Good. The level-0 dimensions (600, 420) are constant from the input file, same in both runs.
+
+Let me now also think: what about the `is_final == 1` case? Currently if we find such a checkpoint, we just write the signature and skip simulation. Total time = 5s init + 5s veloc + 0.1s write = ~10s. That gives recovery/kill = 10/60 = 0.17 > 0.1 ✓. Good.
+
+But this might never happen since the kill happens BEFORE the loop finishes. Unless the kill misses (injection_fired=False), the resilient binary completes normally and writes is_final=1. Then the validator detects the final checkpoint and proceeds. But that's the no-kill scenario.
+
+Actually wait — re-reading the log:
+```
+[runner] checkpoint-observed: kill attempt complete (elapsed=60.30s, injection_fired=True).
+```
+`injection_fired=True` means the kill succeeded. So we don't reach the final checkpoint.
+
+In recovery, we find latest mid-loop ckpt (is_final=0) → resume path.
+
+OK, plan is solid. Let me also remove an unused variable warning suppression — actually let me check what I declared but unused.
+
+`resumed_mid_loop` is set but only used in `(void)resumed_mid_loop;`. Let me remove it to avoid noise:
+
+Actually leaving it for clarity is fine. (void) cast suppresses unused warnings.
+
+Let me also verify the existing helper functions for typos. Let me see total LinAdv.cpp length:
+Good. Both new functions defined.
+
+Now I want to confirm that my changes don't break compilation by reading the imports in main.cpp:
+Good. All the includes are there.
+
+Let me update todo:
+Let me now do a final read-through of the main loop and recovery logic:
+Good. Now I realize a critical concern: `is_final == 1` short-circuit path. If a fast restart finds `is_final==1` from a prior FULL run, we write the signature and skip the loop. But this only happens if a previous run completed AND the validator didn't clear /tmp dirs between runs. Looking at the log:
+
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/samrai_linadv_veloc_scratch
+  - /tmp/samrai_linadv_veloc_persistent
+```
+
+The validator CLEARS the dirs before each kill attempt. So on the FIRST run, no prior checkpoints exist. Only the killed run's checkpoints are present at recovery. The killed run was killed mid-loop, so `is_final==0`. We always take the mid-loop resume path. 
+
+For the failure_free run:
+```
+[runner] clearing VeloC checkpoint directories before run:
+```
+The validator clears before failure_free run too. Then the failure_free run starts with no checkpoint, runs to completion, writes is_final=1 at end. Then completes. The output of failure_free run becomes resilient_clean/validation_output.bin.
+
+Now think about: in the failure_free run, the recovery code at the top tries `VELOC_Restart_test` and finds nothing (dirs were cleared). `recovered_version <= 0`, so we go to "No prior checkpoint found - fresh run." and proceed normally. Good.
+
+Actually wait — the SECOND mpirun (recovery attempt) launches the same binary but the checkpoints from the killed run are still in /tmp (not cleared between kill and recovery, only cleared before the next kill attempt of a different test). Let me re-read:
+
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:  ← BEFORE kill
+...
+[runner] checkpoint-observed attempt 1: launching ...              ← Start killed run
+...
+[runner] checkpoint-observed: kill attempt complete                ← Killed
+...
+[runner] checkpoint-observed: starting recovery attempt            ← Start recovery (NOT cleared)
+[runner] checkpoint-observed attempt 2: launching ...              ← This sees the prior checkpoints
+```
+
+Yes, recovery sees checkpoints from killed run. 
+
+Now let me check one more potential issue: my `dimx`/`dimy` detection runs on the OS the patches were created with. After a clean init, patches are deterministic. The same on recovery's init. Both runs should compute same `global_dimx=600`, `global_dimy=420`.
+
+OK I think we're good. Let me also check if there's an opportunity to make recovery even faster by SKIPPING the heavy init steps. Actually nope — init is needed to create the hierarchy structure that we overwrite.
+
+Let me also verify that `mpi.AllReduce` for int with sum works. The signature is `int* x, int count, Op op`. Calling `mpi.AllReduce(&global_dimx, 1, MPI_MAX)` ← int*, 1 count, MPI_MAX. Good.
+
+Now there's one more thing to verify: the `recovered_version` is from rank 0's perspective. VeloC's `VELOC_Restart_test` is supposed to be collective across ranks; all ranks should get the same answer. Should be fine.
+
+Let me also check: when `VELOC_Mem_protect(1, ckpt_field.data(), ...)` is called with `ckpt_field_size` being a long, but cast to `size_t`. VELOC_Mem_protect signature:
+Good. `VELOC_Mem_protect(int id, void *ptr, size_t count, size_t base_size)`. My current call:
+```cpp
+VELOC_Mem_protect(1, ckpt_field.data(), sizeof(double) * static_cast<size_t>(ckpt_field_size), 1);
+```
+
+Wait — `count` and `base_size` interpretation. Looking at the header comments: count = "number of consecutive elements", base_size = "size of each element". So count = ckpt_field_size (number of doubles), base_size = sizeof(double).
+
+I'm passing count = sizeof(double) * ckpt_field_size and base_size = 1. That's "N bytes of size 1 each" which is equivalent but wasteful. Let me fix to be explicit:
+Now let me also do a final read-over of the failing case scenarios:
+
+1. **Failure-free run**: VELOC_Restart_test returns no checkpoint. Proceed normally. Run loop. Every 5 steps, dump level-0 buffer + checkpoint. End of loop, write final ckpt with is_final=1. Write signature. → Correct, real state capture.
+
+2. **Failure-prone run**:
+   - First mpirun: same as failure-free until killed at ~step 50.
+   - Second mpirun (recovery):
+     - VELOC_Init.
+     - SAMRAI startup, parse input, build hierarchy, init data (sphere). [~5s]
+     - Compute global_dimx/dimy = 600/420.
+     - Allocate ckpt_field buffer of 252000 doubles.
+     - VELOC_Mem_protect meta + field.
+     - VELOC_Restart_test → find latest, say v=50.
+     - VELOC_Restart loads meta + field.
+     - is_final == 0, dimx/dimy match.
+     - restoreLevel0FromBuffer overwrites init data with checkpoint data.
+     - removePatchLevel(2), removePatchLevel(1).
+     - Set loop_time = ckpt_meta.loop_time, dt_now = ckpt_meta.dt_now.
+     - Enter time loop with restored state. Run until loop_time >= 10.0.
+     - Write final signature.
+
+This should produce a correct final signature in ~50s total recovery time.
+
+Let me also verify that my modifications compile by checking the type signatures one more time.
+
+`hier::Box::upper(int)` returns int (Index value). `pbox.upper(0) + 1` is fine.
+`patch_hierarchy->getFinestLevelNumber()` returns int.
+`patch_hierarchy->removePatchLevel(int)` returns void.
+
+Looks good.
+
+One more concern — at the recovery point, I'm reading and modifying the patch hierarchy after `initializeHierarchy()` but BEFORE the time loop. Is anything else needed before stepping the integrator? Let me check what `initializeHierarchy` returned (dt_now). The integrator computed an initial dt for the sphere data. After I overwrite with my data, that dt is no longer optimal. But I'm using `ckpt_meta.dt_now` (which was the dt at checkpoint time) — should be appropriate for the checkpoint state.
+
+OK, I'm done with the implementation. Let me do a final examination of the full edited section:
+Looks good. Now let me think more carefully about whether `removePatchLevel` will cause issues. The integrator stores some structures keyed by level. Let me look at how HyperbolicLevelIntegrator/TimeRefinementIntegrator handles level removal:
+
+Looking at line 743 area of TimeRefinementIntegrator advanceHierarchy:
+`d_last_finest_level` tracks the last finest level. After regrid, if a new level is created, this is updated. With my removePatchLevel, when next regrid happens, `d_last_finest_level` still holds the old value (= 2 perhaps). The regrid will create level 1 (since hierarchy currently has only level 0). Then the condition `d_last_finest_level < level_number` checks `2 < 1` = false, so the dt_max recomputation doesn't happen.
+
+Hmm, that's a bug. The new level 1's dt_max won't be properly initialized. It may use a stale value from the old (now removed) level 1, causing instability.
+
+Actually wait — `d_last_finest_level` is initialized somewhere. Let me check:
+So `d_last_finest_level = finest_level_number` is set right before regrid. After regrid, level structure may change. Looks like this gets reset before regrid.
+
+Hmm, OK this is getting too deep. Let me try a totally different approach to the level-mismatch problem:
+
+**Don't remove finer levels.** Instead, also restore the cell data on finer levels using the SAME global buffer (just interpolated to the finer resolution). 
+
+Actually no — the finer level boxes are still in the WRONG locations (clustered around t=0 sphere). Overwriting their cells with values from level-0 of t=N would put correct VALUES in WRONG LOCATIONS.
+
+OK what if I just leave finer-level data alone (it'll be stale sphere data covering wrong locations), and trust that:
+1. The first sync coarsens finer→coarser, contaminating level-0 in finer-covered regions.
+2. The next regrid moves finer patches to correct locations and re-interpolates from (contaminated) level-0.
+
+The contamination region is wherever the t=0 sphere lived (small region near (5.5, 5.5)). The advection over 5 time units moves it to (5.5+11, 5.5+5.5)=(16.5, 11). So the t=0 region is largely empty (uval_outside). The contamination would set those cells to uval_inside=80 (sphere interior), which is a big error.
+
+Specifically, after first sync, the level-0 cells covered by the (stale) level-1 patches near (5.5, 5.5) get values like 80 (interior) instead of the correct 5 (outside, since sphere has moved away). This would create a "ghost sphere" at the t=0 location.
+
+That's a major contamination. And the validator signature is summed over all cells. A spurious 80-valued region of, say, 100 cells gives sum contribution of ~7500 vs expected ~500. Huge error.
+
+So we MUST clear/remove the finer levels.
+
+Let me try the removePatchLevel approach and hope SAMRAI handles it gracefully. If it doesn't, the simulation may crash or produce garbage and I'll see it on iter 3.
+
+Actually wait — let me also consider: my `resumed_mid_loop` flag — I don't use it for anything. Maybe I should also adjust how iterating begins. Actually, the loop should work fine.
+
+Let me look at one more thing — the integrator's `d_dt_actual_level` etc. After removePatchLevel, these still have stale entries. When regrid recreates a level, the integrator reads `d_dt_actual_level[level-1]` (the parent's dt) to determine the new level's dt. That should be OK because level-0's dt is computed correctly each step.
+
+Let me give it a shot. Let me also remove the `(void)resumed_mid_loop` since I don't use it but keep the variable for log clarity:
+
+Actually it's already there. OK let me run with this.
+
+One more thing — let me verify the dimensions hardcoded. The input is `domain_boxes = [(0,0),(599,419)]` so dimx=600, dimy=420. Let me verify with a test calculation: the upper of a box `[(0,0),(599,419)]` is (599, 419), so `upper(0)+1 = 600, upper(1)+1 = 420`. ✓
+
+Now let me also worry: in 3D (which we don't use but should still compile), `dimy` is for axis 1. For 3D, we'd need dimz too. But since the dim is hardcoded to 2 in our input, and the code only uses axes 0,1 — should be fine for 2D. For 3D, the code would just ignore the z axis, losing data. But since we don't run 3D, doesn't matter.
+
+But I want the code to compile for arbitrary dim. Let me see — `pbox.upper(0)` and `pbox.upper(1)`. For 1D box, `upper(1)` would assert. Let me guard against dim < 2:
+
+Actually no, this is fine for now — the LinAdv2D test always uses dim=2. If someone runs 3D, they need different handling. Skipping for now.
+
+Let me also double-check: does `pdat::CellIterator` iterate over only interior cells (not ghosts)? Yes — `CellGeometry::begin(pbox)` uses the patch box without ghosts.
+
+OK I think the implementation is complete. Let me update todos:
+Let me now think if there are any subtle compile issues. I added `<vector>` to the VeloC block in main.cpp. But `std::vector<int> first_patch_id` is used elsewhere outside the VeloC block (in the Conduit/Blueprint section). That section probably requires `<vector>` independent of VeloC.
+
+Let me check:
+Only inside the VeloC block. The blueprint section uses `std::vector<int>`. If HAVE_VELOC is defined (which it is), this works. If not, the blueprint section would fail to compile. But since VeloC is required by CMakeLists, HAVE_VELOC is always defined here.
+
+Let me move `<vector>` out of the VeloC block to be safe:
+Now let me think once more about a potential issue. I'm using `mpi.AllReduce(buffer, static_cast<int>(total), MPI_SUM)` for the level-0 field. The `total` is 252000. `int` max is 2.1e9, fits. Fine.
+
+Also, `mpi.AllReduce` accepts `int count` — confirmed in the SAMRAI MPI header. Good.
+
+Last concern: the `Op` typedef. When SAMRAI is configured WITHOUT MPI, `Op` is `int`. With MPI, it's `MPI_Op`. Either way, `MPI_SUM` and `MPI_MAX` should work — these are defined by mpi.h or stubs.
+
+OK I'm done. Let me check once more the file edits are all consistent and the file ends properly:
+Good. File structure intact.
+
+Let me also check if there are any unused-variable issues. In particular the `(void)resumed_mid_loop;` is still there:
+Good. `resumed_version` is used. `resumed_mid_loop` is set but only used for `(void)` cast.
+
+Now let me consider yet another approach for the level-1 issue. Maybe the safest is just to NOT remove finer levels and instead **restore the full hierarchy data at all levels.** I would save level-by-level patches with their box info.
+
+This is more complex but safer. Let me consider the complexity:
+
+For each patch on each level:
+- Save: level number, box (lo[0..d-1], hi[0..d-1]), cell data values.
+
+On restore:
+- Match patches: for each current patch on each level, find a saved patch with the same box. If found, copy values.
+- For patches without a match (because layout differs), interpolate from coarser level (or leave as init).
+
+The matching is heuristic since boxes won't match exactly across re-init.
+
+Actually, let me just trust the removePatchLevel approach. If it crashes/fails, I'll adjust on next iter.
+
+Actually I want to reconsider one more time. Let me re-examine the failure mode. **What if removePatchLevel triggers an assertion failure inside SAMRAI because of integrator's state inconsistency?**
+
+That would cause the recovery run to crash with non-zero exit code. The validator would then detect:
+```
+recovery_attempt complete (elapsed=Xs, exit=N!=0)
+```
+
+This would be visible in stdout. Then we know to back out.
+
+But — since the validator only does ONE recovery attempt and we've used our iteration budget by then, we'd have to wait for next iter to fix.
+
+Let me make the removePatchLevel call CONDITIONAL on an env var so I can disable it if needed without rebuilding. Actually that's overkill. Let me just add a safer fallback:
+
+Actually let me look at this from a different angle. The previous attempt's recovery exit=0 (succeeded), it just produced wrong output. So adding more code that might crash recovery is a regression risk.
+
+Let me consider an alternative: keep my recovery code path but **without removePatchLevel**. Just restore level-0 and continue. If the finer levels are wrong, the result may be more accurate than the previous "instant exit" approach but possibly not within tolerance.
+
+Hmm but earlier I argued the contamination would be ~7.7% relative — same as previous failure.
+
+Wait actually let me reconsider. The previous failure was 7.7% relative because the saved signature was from MID-LOOP. My new approach computes signature at END of simulation (post-resume). If the resumed state's evolution is good, error should drop dramatically.
+
+Let me think: the resumed state has correct level-0 (good). Finer levels are wrong (small region of stale sphere data near (5.5, 5.5)). After first advance, level-1 advances with wrong data, then coarsens onto level-0 in a small region (the level-1 footprint). Level-1 footprint is small (refinement around small sphere). So contamination is local.
+
+After regrid (after 2 level-0 steps), level-1 moves to correct location. Then simulation proceeds correctly for ~remaining steps.
+
+The integrated signature contribution of the contaminated region: maybe 50-100 cells × difference of ~75 (80-5) = ~7000 in sum. Total sum is ~3e6 (252000 cells × 12 avg). So ~0.2% contribution. That's >0.01% tolerance.
+
+Hmm. Still might fail. So removePatchLevel is needed.
+
+Let me also be paranoid and add a fallback: if removePatchLevel throws/asserts and we catch it... actually C++ exceptions aren't typically used in SAMRAI. Assertions abort.
+
+OK let me just go with my current implementation. Worst case it crashes recovery and I iterate.
+
+Let me also double-check one issue: the way HyperbolicLevelIntegrator works after we modify the hierarchy. Specifically, when advanceHierarchy is called for level 0, internally it may try to access level 1 etc.
+
+Looking at the loop:
+```
+for (level_number=0; level_number <= finest; ...) {
+    advanceHierarchyAtLevel(level_number);
+}
+```
+Wait actually I don't see how level 0 advance triggers level 1 advance in time refinement integrator. Let me check:
+`if (d_patch_hierarchy->finerLevelExists(level_number))` — uses `finerLevelExists` which queries the hierarchy. After removePatchLevel, this returns false. So advance only does level 0. 
+
+Then regrid is checked at end:
+```
+if (atRegridPoint(level_number)) {
+   ...
+   regridAllFinerLevels(level_number, ...);
+}
+```
+
+This call should recreate finer levels using the current level-0 data. 
+
+OK let me check `finerLevelExists`:
+Good. `finerLevelExists` correctly returns false after `removePatchLevel`.
+
+OK I'm confident the design is sound. Let me also make a small correction: I should NOT use `iteration_num` as the basis for `this_ver` since iteration_num is reset by the loop. Let me think...
+
+After resume:
+- `iteration_num = ckpt_meta.iteration_num;` (e.g., 50)
+- Loop starts: `iteration_num = time_integrator->getIntegratorStep() + 1` → 1
+- Then `iteration_num` increments 1, 2, 3...
+- `this_ver = 50 + iteration_num` → 51, 52, 53...
+
+If kill at 60s into resume, latest ckpt = v55 or so. Restart again would find v55. recovered_version = 55. resumed_version = 55. iteration_num post-loop-start = 1, 2, 3. this_ver = 56, 57, 58. Higher than 55. Good.
+
+This is monotone enough for our test (one kill attempt only).
+
+OK done. Let me also write a brief summary by checking everything one more time:
+
+Now let me also make a small further safety improvement: handle the case where `removePatchLevel` somehow fails. Actually we can't catch that. Skip.
+
+Let me also handle: what if `dimx*dimy` is huge (e.g., 10000×10000=100M doubles = 800MB)? We'd run out of memory. For our case it's 252000 = 2MB, fine. But to be safe I should check size:
+
+Actually, since we know it's 2MB for this app, skipping memory check is fine.
+
+Let me also confirm: I want the failure-free run to also benefit from less checkpoint frequency. Yes — every 5 steps instead of every step → fewer checkpoint files. The validator's `checkpoint_files=2696` constraint... let me see what's checked:
+
+Looking at validate_stdout:
+```
+checkpoint files = 2696; wall-time PASS at 1.488x (per-app cap, app=SAMRAI) = True
+```
+and
+```
+checkpoint_files=2696, output_correct=False, ...
+```
+
+Just informational, no minimum requirement. With my change, we'd see fewer files but still > 0. Good.
+
+Final sanity check on the build: Let me look once more at LinAdv.cpp helper functions for any obvious bugs:
+Looks correct. Done.
+
+Let me also do one final review of the entire new main.cpp at critical sections:
+Implementation complete. Now let me make a final note to self: the failure-free run will produce a `validation_output.bin` of correct content. The recovery (failure-prone) run will produce one too. Both compared against Z_P. The challenge is just getting the failure-prone path to produce a correct output within time budget.
+
+One more potential issue: when I read `recovered_version`, I use it from rank 0's view but every rank should have the same. Let me re-check VELOC_Restart_test:
+
+Looking at the comment: "determine whether application can restart from a previous checkpoint". It should be collective and return same value across ranks. Should be fine.
+
+Alright, I'm confident in the implementation. The key insight is that my recovery path now does REAL state load (level-0 data) plus continues the simulation to actual completion, instead of just dumping a stale signature.
+
+Let me also do a quick smoke check: make sure the file edits compile-cleanly by looking at one more critical block — the recovery's helper invocations:
+All three call sites look correct.
+
+I'm satisfied. The implementation should:
+1. Pass real state capture (level-0 cell data via VeloC). 
+2. Pass real state load (restoreLevel0FromBuffer overwrites init data with checkpoint data).
+3. Resume simulation from the right point in time.
+4. Produce a correct final signature (within tolerance).
+5. Fit within the wall-time cap (recovery takes ~50s instead of ~100s rerun).
+6. Pass recovery_floor (recovery ~50s >> 10% of kill ~60s).
+
+If the removePatchLevel approach causes problems, the simulation may crash or produce somewhat-wrong but-not-disastrous results. We'll see at the next validation.

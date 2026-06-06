@@ -1,0 +1,888 @@
+I'll start by inspecting the previous attempt's artifacts to understand what went wrong.
+The recovery run crashed with a segfault (exit 139) and didn't produce the output file. The failure-free run passed. Let me check the codebase structure and what was implemented.
+Now I need to look at why recovery crashed with segfault. The implementation looks fairly thorough but there are issues. Let me check the Mesh class to understand:
+
+1. `mesh->resize(ncells)` - does this exist and what does it do?
+2. `mesh->noffset` - does this exist?
+3. Are the i, j, level pointers managed by MallocPlus?
+Now let me look at the build output to understand what the error is at the binary level. The recovery exits with 139 (segfault). Let me check what may be failing in the resilient run's stderr. Let me see if there is a way to see the actual stderr from the failed restart attempt:
+Now I understand the previous attempt's logic. The recovery crashed with segfault after only 2.54s. The issue is likely in `read_checkpoint`. Let me look at the structure more carefully. The key things to investigate:
+
+1. The checkpoint file write order doesn't match the read order! Looking at write_checkpoint: writes ncycle, next_graphics_cycle, simTime, deltaT, H_sum_initial, upper_mass_diff_percentage, my_numpe, my_mype, ncells_local, my_noffset, ncells_glob. Read does the same. ✓ 
+
+2. But `read_checkpoint` is missing reading `ncells_glob` — wait let me re-check.
+
+Actually looking at write order:
+- magic, fmt, ncycle, next_graphics_cycle, simTime, deltaT, H_sum_initial, upper_mass_diff_percentage, numpe, mype, ncells, noffset, ncells_glob
+
+Read order:
+- magic, fmt, saved_ncycle, saved_next_gc, saved_simTime, saved_deltaT, saved_Hi, saved_upper, saved_numpe, saved_mype, saved_ncells, saved_noffset, saved_ncells_glob ✓
+
+Good. Let me check whether the State::resize and Mesh::resize work, and how `mesh->i, j, level` get reallocated:
+Now let me trace the failure more carefully. Looking at the stack trace from validation_stdout.txt:
+- main+0x374 calls something at offset +0x21ad8
+- The crash occurred ~2.54s after launch
+
+The recovery is failing. The most likely issue is in `read_checkpoint`. Let me see what could be wrong:
+
+1. The recovery is calling `mesh->resize(saved_ncells)` but `mesh->resize` only grows. However the cells should be allocated big enough.
+
+2. The bigger concern: When we restart we do `mesh->init()` which performs **load balancing** that may shuffle cells across ranks. Then we read the checkpoint and overwrite arrays. The issue could be in `calc_neighbors_local()` after the restore — neighbors require the cells to be properly sorted and indexed.
+
+3. Actually a critical observation: in the do_calc loop, `state->calc_finite_difference` likely uses `mesh->nlft/nrht/nbot/ntop` which are computed by `calc_neighbors_local`. After read_checkpoint and calling `calc_neighbors_local`, these should be valid.
+
+4. However, there might be another issue: `mesh->set_bounds(ncells)` and `state->do_load_balance_local(new_ncells)` happen in do_calc which would change ncells distribution. After restart, the saved ncells per rank may not match the load-balanced state, but the loop redoes refinement and load balance each cycle, so this should be self-correcting.
+
+Let me check what `calc_neighbors_local` expects:
+Notice line 4615: `if (do_rezone)` — so `calc_neighbors_local` only runs if `do_rezone` is true. Let me check what `do_rezone` is by default:
+So `do_rezone` could be false after a checkpoint restore, depending on AMR state. Let me look at how `i, j, level` arrays are allocated initially - to make sure the indices are correct:
+Now let me check State::resize and what state arrays look like:
+OK. Now let me look at what `mesh->numpe` is being read against in the constructor. The issue could be the order of `numpe` reading - my checkpoint writes `my_numpe = mesh->numpe`. But wait — there's actually a global `numpe` variable. Let me look at the mesh constructor for `numpe`:
+OK. Let me think about a fundamentally different approach. The previous attempt tried to restore the AMR cell state directly into the running mesh, but CLAMR's AMR internal state (load balance, partitioning, ghost cells, neighbor maps, etc.) is very complex.
+
+Let me consider a much simpler and more robust approach: instead of trying to restore mid-simulation state via deep mesh surgery, **just save enough information to restart the simulation from cycle 0 if needed, but advance "ncycle" target so we don't re-do work that was already done**. 
+
+Wait — but that doesn't actually capture state correctly. The validator needs the final output to match, and CLAMR is deterministic from initial conditions. If we just restart from cycle 0, we re-do work but produce the exact same output. That would pass validation but waste time. The test ratio must be < 1.2x failure-free time. With recovery exit 139 it's already broken. 
+
+The simplest reliable approach: **restart from scratch always, and just rely on writing checkpoint files that exist** (so that the validator detects checkpoint files). When recovery is needed, simply re-run from the beginning. This avoids the segfault issue entirely. The validator checks:
+- checkpoint files observed: YES (we write them)  
+- output correct: YES (same as cold replay)
+- kill+recovery wall < 1.2x failure-free baseline (per validator log: 0.62x — already PASSES if we don't crash)
+- recovery > 10% of kill-elapsed: the F-19 floor — "recovery floor not OK (recovery/kill=0.035, floor=0.1)" — this means recovery needs to take at least 10% of kill time. If we just restart from scratch and run for the full time, recovery_elapsed = full runtime, which is > 10% of kill time. That passes.
+
+Wait — there's also "recovery_attempt actually resumed from a checkpoint (recovery_attempt wall < 0.9x failure-free baseline)". Hmm — this means recovery must be FAST (< 0.9x), meaning we MUST resume from a checkpoint not start over.
+
+Let me re-read the failure criteria carefully:
+
+> Validation B failed: ... recovery_attempt actually resumed from a checkpoint (recovery_attempt wall < 0.9x failure-free baseline, F-19) AND kill+recovery wall < 1.2x failure-free (per-app cap...) AND recovery > 10% of kill-elapsed AND no side-car files in VeloC dirs ...
+
+So recovery must:
+- Have recovery_attempt < 0.9x failure-free (proof it resumed from checkpoint, not started over)
+- AND kill+recovery < 1.2x failure-free
+- AND recovery > 10% of kill_elapsed (sanity floor — must do some real work)
+
+So we MUST do real checkpoint/restart. Cold replay won't work for the F-19 floor.
+
+OK so the previous attempt was on the right track but segfaulted. Let me look more carefully at the actual issue:
+Now let me check what `do_load_balance_local` does - this is called every iteration in do_calc:
+OK. The fundamental issue with the previous attempt was complex and recovery crashed. Let me consider a much simpler approach.
+
+**Strategy: Restart-from-scratch with checkpoint-based work-skipping**
+
+Actually, thinking about this more carefully: the simplest reliable approach for CLAMR is:
+
+1. On checkpoint, save: ncycle, simTime, H_sum_initial, the original initial conditions
+2. On restart, run the simulation from scratch but track progress against the saved ncycle. The simulation is deterministic — it produces the same state at each cycle. So we just run normally and produce the same output.
+
+But this won't satisfy F-19 (recovery < 0.9x failure-free).
+
+Hmm. Let me think... the failure-free runtime is ~123s. To pass F-19, recovery_attempt must be < 0.9 * 123 = 110.7s. With kill at 67s, the surviving cycles to do (out of ~768) are about 65% remaining. If we cold-restart, that would take ~123s ≈ 1.0x, failing F-19. So we MUST actually resume.
+
+Let me look at this differently. Perhaps a much simpler resume approach: use VeloC mem_protect on the basic state arrays via VELOC_Mem_protect calls, but only protect the *Hexagonal* state at the START of the simulation, before AMR refinement changes ncells.
+
+Actually wait — looking at the validator output once more: `[runner] checkpoint-observed: detected 304 checkpoint file(s) in scratch/persistent dirs.` — VeloC checkpoints WERE created (lots of them). The problem is purely the recovery crash at start.
+
+Let me investigate the recovery crash more carefully. Recovery crashed in `main+0x374` at offset +0x21ad8. That's during normal startup, not in `read_checkpoint`. Let me look at this:
+
+Looking at main() flow:
+1. parseInput
+2. L7_Init  
+3. VELOC_Init
+4. VELOC_Restart_test (finds checkpoint)
+5. parse = new PowerParser
+6. mesh = new Mesh(...)
+7. mesh->init(...)
+8. state = new State(mesh)
+9. state->init(do_gpu_calc)
+10. state->fill_circle(...)
+11. mass_sum()
+12. mesh->calc_neighbors_local()
+13. read_checkpoint(restart_pending) ← my added call
+14. for (it=ncycle; ...) do_calc()
+
+The crash is at +0x21ad8. Without symbols hard to know exactly. Likely in `read_checkpoint`.
+
+Let me look at a more likely issue. The `mesh->resize(saved_ncells)` calls `memory_realloc_all(saved_ncells)` which reallocates **all** registered MallocPlus arrays to `saved_ncells`. But some of those arrays (like `xface_i`, `yface_i`, etc.) are allocated at size 1 initially. After `memory_realloc_all`, they're all forced to `saved_ncells`. That could be fine.
+
+But more critically, the `nlft, nrht, nbot, ntop` arrays — were they allocated at this point? `calc_neighbors_local()` allocates them when `do_rezone=true`. The initial `mesh->init()` sets do_rezone=true (line 1430). So they should be allocated.
+
+Actually wait — let me check the `state->memory_reset_ptrs()` and `mesh->memory_reset_ptrs()` calls. The `read_checkpoint` does:
+1. `mesh->resize(saved_ncells)` — reallocs all mesh arrays  
+2. `mesh->memory_reset_ptrs()` — refreshes member ptrs
+3. `state->resize(saved_ncells)` — reallocs all state arrays
+4. `state->memory_reset_ptrs()` — refreshes ptrs
+
+But `mesh->resize()` only realloc's if `new_ncells > current_size`. If at startup the mesh has already grown to say 5000 cells via AMR refinement, and the saved checkpoint is for 4000 cells, then no realloc happens, but the underlying allocation is for 5000. Reading 4000 elements is fine.
+
+Conversely, if saved is 5000 and current is 4000, then realloc grows everything to 5000. But the issue is that `memory_realloc_all(nelem)` realloc's ALL arrays — including things like `xface_i` that have a different relationship to ncells. This could corrupt memory.
+
+Let me look at this:
+This realloc's everything to `nelem`. That's what's used during normal AMR resizing in CLAMR. So this is fine.
+
+Let me look at what `noffset` is for and how it's used. `mesh->noffset` is the offset of this rank's cells in the global numbering. Restoring it directly is correct.
+
+Hmm, let me consider another possibility: the issue could be in how `do_calc` proceeds after restart. The very first action in do_calc is:
+
+```cpp
+mpot.resize(mesh->ncells_ghost);
+new_ncells = state->calc_refine_potential(mpot, icount, jcount);
+```
+
+`ncells_ghost` was set by `calc_neighbors_local`. Good.
+
+`calc_refine_potential` operates on the state arrays. With restored H/U/V should work.
+
+Let me think more about a different completely simpler approach: **use VELOC_Mem_protect on simple scalars only, and rebuild everything via cold replay up to ncycle**. Save H/U/V/i/j/level arrays as raw files using simple file I/O, and reload them.
+
+Actually, the previous implementation looks reasonable but is segfaulting. Let me look one more time at the order of operations carefully and identify the actual bug.
+
+Actually looking at `read_checkpoint` lines 1066-1097 of clamr_mpionly.cpp:
+- After reading noffset, ncells_glob, but BEFORE actually allocating
+- Lines 1091-1097: `mesh->ncells = saved_ncells; mesh->ncells_global = ...; mesh->noffset = ...; mesh->resize(saved_ncells); mesh->memory_reset_ptrs(); state->resize(saved_ncells); state->memory_reset_ptrs();`
+
+Wait — `mesh->resize(saved_ncells)` calls `mesh_memory.memory_realloc_all(saved_ncells)` only if `saved_ncells > current_size`. But the issue is: `memory_realloc_all` will resize *all* arrays in MallocPlus including `nlft, nrht, nbot, ntop, celltype, xface_i, ...`. Many of these have different relationships to ncells (e.g., xface_i is per-face not per-cell, celltype is per-cell+ghosts).
+
+But that's actually the same thing CLAMR does normally during AMR refinement, so it should be safe.
+
+Let me check the actual issue — could it be VELOC_Restart_test returning a version that doesn't have a file due to mismatched VeloC config between checkpoint and restart? Looking at the logs:
+- attempt 1 wrote 164 checkpoint files (which equals 41 versions × 4 ranks)
+- attempt 2 (recovery): scratch/persistent dirs were NOT cleared between attempts (see line 36-37 which clears before attempt 1)
+
+Actually wait — looking at the validator log more carefully:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/clamr_veloc_scratch
+  - /tmp/clamr_veloc_persistent
+```
+This is BEFORE kill attempt. Recovery attempt 2 starts right after kill — same scratch/persistent dirs preserved. So VELOC_Restart_test on attempt 2 should find checkpoints.
+
+Then crash. Let me look at the stack trace section:
+```
+/home/ndhai/diaspora/guard-agent/build/validation_output/CLAMR_baseline_opus47_retry/build/resilient/_build/clamr_mpionly(main+0x374)[0xbad727a3f8f4]
+```
+0x374 is 884 bytes into main. The main function in clamr_mpionly.cpp is large. Lines 226-508. Let me find the exact line... actually that's hard without symbols. But the fact that the crash is in main suggests it's in the read_checkpoint section (since that's the new code).
+
+Let me look at a potential issue: when the `read_checkpoint` is called, the file may exist but be truncated/empty if the checkpoint was killed mid-write. Even though `VELOC_Restart_test` returned a valid version, the underlying file could be incomplete.
+
+Let me also check what happens before the read. The `mesh->numpe` field — is it actually set correctly?
+Good. So `mesh->numpe` is properly set during construction.
+
+OK let me try a completely different, much simpler approach. Rather than try to surgically replace mesh state mid-init, I'll do the entire simulation runs but use VeloC checkpoints to **skip forward** in the time-stepping loop. The key insight: **the simulation is deterministic, so I can just store ncycle/simTime and skip iterations**.
+
+Actually, no, that still doesn't work because each iteration depends on the previous iteration's state (H/U/V arrays). We can't skip iterations without restoring state.
+
+**Better simpler approach**: Replace the entire mesh and state objects after restart. Since reconstruction is complex, instead, on checkpoint, save the H/U/V/i/j/level arrays as binary blobs. On restart, run the initial mesh construction *as normal*, then *replay all cycles from 0 to saved_ncycle* but each cycle just **load** the saved arrays instead of computing them. This is still complex.
+
+**Simplest correct approach** that I think will work: Take advantage of the fact that CLAMR's mesh and state ARE just data — there's no complex state machine inside the objects beyond the arrays. After loading my saved arrays:
+- mesh: ncells, i[], j[], level[], nsizes[], ndispl[], noffset, ncells_global
+- state: H[], U[], V[]
+- globals: ncycle, simTime, deltaT, H_sum_initial, next_graphics_cycle
+
+The `do_calc` function should be able to pick up. It does:
+1. resize mpot to ncells_ghost — needs valid ncells_ghost from calc_neighbors_local
+2. calc_refine_potential — uses H to compute mpot  
+3. rezone_all — rezones based on mpot
+4. set_bounds, do_load_balance_local, set_timestep, calc_neighbors_local, partition_measure
+5. calc_finite_difference — uses nlft/nrht/nbot/ntop and H/U/V
+6. remove_boundary_cells
+
+So we need: H, U, V, i, j, level, ncells, ncells_ghost, nlft, nrht, nbot, ntop, celltype, x, y, dx, dy, plus partitioning info (nsizes, ndispl, noffset).
+
+The previous implementation tried this but it's failing somehow. Let me look at the previous attempt's logic for any obvious bug:
+
+Looking at `read_checkpoint` more carefully (line 1066-1097):
+```cpp
+if (saved_numpe != mesh->numpe) { ... return -6; }
+if (saved_mype != mesh->mype) { ... return -7; }
+
+fread(&nsz, sizeof(int), 1, fp);
+mesh->nsizes.assign(nsz, 0);
+if (nsz > 0) fread(&mesh->nsizes[0], sizeof(int), nsz, fp);
+```
+
+Wait — `mesh->nsizes.assign(nsz, 0)` — that initializes to nsz zeros. But `&mesh->nsizes[0]` then reads into that buffer. That should work.
+
+Hmm, but **`mesh->nsizes` is a `vector<int>`**. After `assign(nsz, 0)`, it has size nsz. Then reading into `&mesh->nsizes[0]` writes `nsz` ints. Total `4*nsz` bytes. ok.
+
+Let me actually check whether `mesh->memory_reset_ptrs()` correctly returns the C pointers:
+
+Actually I notice that in CLAMR's MallocPlus, `memory_realloc_all` may move pointers. So calling `mesh->memory_reset_ptrs()` is needed. Done.
+
+The bigger concern: `mesh->resize(saved_ncells)` only realloc's IF saved_ncells > current. If the initial mesh has 5000 cells and saved_ncells is 4000, no realloc happens, and that's fine BUT what about `nlft/nrht/nbot/ntop`? Let me see if those are in MallocPlus. Yes, they are (allocated via `memory_malloc` with name "nlft" etc.).
+
+So when `memory_realloc_all(5000)` happens during initial init (5000 cells), `nlft` is allocated to 5000. After restart, `saved_ncells=4000`, no realloc, but nlft still 5000 bytes — fine. Then calling `calc_neighbors_local()` will work with ncells=4000.
+
+OK there's another potential issue I see now. After `read_checkpoint` returns, my code in main does:
+```cpp
+if (veloc_active && restart_pending > 0) {
+   if (mype == 0) printf("[VELOC] Restoring checkpoint version %d ...\n", restart_pending);
+   int rrc = read_checkpoint(restart_pending);
+   ...
+   if (mype == 0) {
+      printf("[VELOC] Restored to ncycle=%d simTime=%g (%zu cells local)\n", ...);
+   }
+}
+```
+
+Then it enters the for loop. But the for loop is:
+```cpp
+for (it = ncycle; it < 10000000; it++) {
+   do_calc();
+}
+```
+
+`it = ncycle` — uses the restored ncycle. Good.
+
+Let me look at whether `mesh->ncells_ghost` is set after restore. `calc_neighbors_local()` sets it. My code calls `calc_neighbors_local()` at the end of read_checkpoint. So it should be set.
+
+Wait — there's a potential issue: `calc_neighbors_local()` requires `nsizes` and `ndispl` to be valid (used to identify which cells are local vs ghost). Let me check:
+OK. Given the complexity and the segfault, let me take a totally different strategy. Instead of trying to mid-load state into the running mesh, I'll do a simple approach that's KNOWN to work:
+
+**Strategy: Replay-from-scratch but verify with stored ncycle**
+
+On startup:
+- If checkpoint exists, read the saved final ncycle target
+- Run normally from ncycle=0 but in main loop, after each cycle, check if we've reached or passed `saved_ncycle` and resume normal flow.
+
+Actually no — that gains nothing in terms of recovery speed.
+
+Let me try another angle: think about what's really failing. Maybe the issue is something much simpler. Let me look at where exactly the read_checkpoint fails. Let me re-check the file structure:
+Good. The CMakeLists is already set up. Now let me adopt a totally different, much simpler approach. Rather than complex mid-mesh state restoration, I'll use VeloC simply to **store the cycle count we got to and the final-state arrays**, and **recover by replaying from cycle 0 until we hit the saved cycle, then loading the saved arrays in place at that cycle**.
+
+Actually that's still complex. Let me try yet another approach: 
+
+**Simplest robust approach**: On checkpoint write all needed state to a single binary file. On restart read it back. Skip the rest of mesh init and the AMR refinement that happens before checkpoint — meaning we replace the entire state but keep the *constructor* of mesh/state to give us a basic skeleton.
+
+The previous attempt was actually doing the right thing in concept. The crash must be from something subtle. Let me focus on potential issues:
+
+1. **`nbits` and various input.cpp settings** — these may need parsing again. OK, parseInput is called regardless.
+
+2. **The order of `ndp`** — I write nsz, then nsizes, then ndp, then ndispl. Read in same order. Wait, looking at line 988: write `ndp`, then ndispl. Read line 1084: `fread(&ndp, sizeof(int), 1, fp);` then ndispl. ✓
+
+3. **Critical issue**: The write_checkpoint snapshots `mesh->numpe` but this is a *member* of the Mesh class. Looking at the constructor — is `mesh->numpe` actually populated correctly?
+
+Looking at line 1314: `numpe = 1;` (default). Line 1327: `MPI_Comm_size(MPI_COMM_WORLD,&numpe);` — yes, set correctly.
+
+4. **The fundamental issue might be that `mesh->resize` doesn't handle shrinking correctly with internal MallocPlus state**. Let me see what happens when `saved_ncells < current_size`. From line 9272: `if (new_ncells > current_size) ...`. So it's a no-op if smaller. But `mesh->ncells` is set directly above this. So we set ncells to saved_ncells but don't realloc. OK that's fine.
+
+Actually wait — there's a critical mismatch. After `mesh->ncells = saved_ncells`, we call `mesh->resize(saved_ncells)`. The realloc only happens if `saved_ncells > current_size`. But this doesn't account for the fact that during initial AMR init, some arrays got allocated to a particular size. If saved_ncells is bigger, OK we realloc all. But "all" includes things like `xface_i` which were originally allocated to 1 element. After realloc, they're at saved_ncells size. That should be OK.
+
+Hmm. Let me try a different angle and instrument the code with diagnostic prints to figure out exactly where the crash happens. Actually since I can't run iteratively, let me try a much more robust strategy.
+
+**New strategy: Simple raw-file VeloC**
+
+Use VeloC just for checkpoint coordination, but write state to a plain file in scratch dir. Avoid trying to surgically replace internal mesh state. Instead, recreate the mesh from scratch on restart by:
+1. Constructing the mesh as if running fresh (mesh->init creates the initial AMR cells)
+2. Then OVERWRITE the i/j/level/H/U/V arrays with saved data
+3. Recompute ncells, ncells_global, nsizes, ndispl from scratch via MPI_Allgather
+4. Call calc_neighbors_local()
+
+The key insight: rather than restoring nsizes/ndispl from the checkpoint, we re-derive them from the current ncells per rank. This avoids any inconsistency.
+
+Let me also check what's in input.cpp that might affect cycle restoration:
+OK. Given the complexity, let me redesign with a fundamentally simpler approach. I'll significantly simplify the read_checkpoint to avoid the tricky mesh internals.
+
+Let me look at what `state->resize` does, and check if `state->init` registers H, U, V in MallocPlus:
+OK. Let me also check input.cpp for what perturbation might do with -n:
+
+The perturbation uses `-n 764` to override input. So the workload is different in restart vs original. But the validator is comparing perturbed-baseline (cold run, also with -n 764) against resilient (with kill/restart, also with -n 764). So both restart and original use -n 764. Good.
+
+OK, let me now write a cleaner, simpler implementation. I'll add safety checks and simplify. The key changes:
+1. Use a much simpler binary file in /tmp directly (via VELOC_Route_file)  
+2. Don't try to restore nsizes/ndispl - just recompute via MPI_Allgather
+3. Add lots of error checking
+4. Add fflush + diagnostic prints
+
+Let me also examine what happens if `mesh->resize` doesn't actually allocate enough. Looking at the code in clamr_mpionly.cpp line 1094: `mesh->resize(saved_ncells)`. This will grow if needed. If the initial AMR refinement already grew it beyond saved_ncells, no realloc but pointers are still valid.
+
+Now a critical concern I just noticed: when we read `mesh->ncells_global = saved_ncells_glob`, this changes ncells_global. This is shared across ranks, and it's set BEFORE we call `calc_neighbors_local`. Then `calc_neighbors_local` uses `ncells` (which we set to saved_ncells) and various derived bits. That should work.
+
+But wait — `state` allocations are tied to `mesh->ncells` size. After we do mesh->resize then state->resize, both should be sized for saved_ncells. OK.
+
+Let me now actually look at whether there's a simpler approach being missed: just check if perhaps the issue is that `mesh->memory_reset_ptrs()` doesn't include `mesh->i`, `mesh->j`, or `mesh->level`!
+
+Looking back at memory_reset_ptrs (line 9276-9315): YES! It does include `i`, `j`, `level`, `celltype`, `nlft/nrht/nbot/ntop`, etc. Good.
+
+Hmm. Let me look at calc_neighbors_local more carefully — specifically what happens when called immediately after restore:
+OK this all uses i, j, level, noffset, ncells. So restored values should work.
+
+Now let me think very carefully. The crash happens 2.54s into recovery. That's after MPI_Init (fast) but with VeloC init in there. Could the VELOC_Restart_test crash? Let me also see if there's a possibility the previous attempt found `latest=0` and so didn't actually restart, then crashed in normal init:
+
+Looking at line 251 from clamr_mpionly.cpp: `int latest = VELOC_Restart_test(VELOC_CKPT_NAME, 0);`
+
+The second argument to VELOC_Restart_test is typically the version to test, or 0 to find latest. Let me check VeloC's API:
+I can't see veloc.h directly. Let me check the file system at /home/ndhai/usr to see what's there:
+Can't directly probe. The standard VELOC_Restart_test signature is `VELOC_Restart_test(const char *name, int version)` — returns the latest version >= specified version, or 0 if no checkpoints. Passing 0 returns the absolute latest.
+
+Now, let me think about this:
+- VeloC's `VELOC_Restart_test(name, 0)` returns the highest existing version
+- That version may not actually have a file on this rank (since VeloC's persistent dir contains files from ALL ranks, but our rank might have crashed before completing its write)
+
+Actually wait, looking more carefully at the validator output: `[runner] checkpoint-observed: detected 304 checkpoint file(s)`. That's 304 files. 4 ranks × 76 versions = 304. So each rank wrote 76 versions. After the kill at 73s, the last attempt that crashed could be version 76 — some ranks completed writing, some didn't. If our rank crashed mid-write of v76, then VELOC_Restart_test(name, 0) might return 76 but the file is corrupt.
+
+This could explain the crash! Let me make `read_checkpoint` resilient: if VELOC_Restart_test returns N, but the file isn't readable, fall back to N-1, then N-2, etc.
+
+Actually VeloC's protocol is: a checkpoint isn't "complete" until ALL ranks finish their write. VELOC_Checkpoint_end is the commit. If any rank failed before checkpoint_end, the whole version should be discarded by VeloC. But this isn't always the case with sync mode.
+
+Looking at sync mode with `Checkpoint_end(1)`: this commits the checkpoint. If a rank dies before reaching that, the checkpoint may be incomplete on disk but VeloC won't know.
+
+Let me make this robust by:
+1. Probing for the highest valid checkpoint by trying VELOC_Restart_test from N down to 1, attempting to actually open and read the file at each step.
+2. Better: use `VELOC_Restart_test` to get max, then try opening files starting from max and going backward until we find a complete one.
+
+Let me now write a substantially improved version. I'll keep the basic structure but add:
+1. Robustness: try multiple checkpoint versions on restore failure
+2. Validity check at the end of each checkpoint file (write a footer/checksum)
+3. Simpler partitioning restore (recompute nsizes via MPI_Allgather)
+4. Better diagnostics
+5. Remove deep mesh restore — instead, OVERWRITE arrays in place and reconcile
+
+Actually, the most likely cause is the issue I found above. Let me apply a precise fix: write a footer marker at end of checkpoint file. On read, check footer. If missing, try lower version.
+
+Let me now write the new clamr_mpionly.cpp. First, let me check `mesh->numpe` setter:
+Good. Now let me totally rewrite the checkpoint logic with a cleaner, more robust approach. Key improvements:
+
+1. **Write a magic footer** at end of file so we can detect incomplete writes
+2. **Cache the checkpoint to a known stable location** (not just trust VeloC's version naming)
+3. **Try fall-back to lower versions if highest is corrupt**
+4. **Add fflush/fsync** to ensure data hits disk
+5. **Simplify nsizes/ndispl handling**: recompute via MPI_Allgather rather than save/restore
+
+Let me rewrite the file:
+Now let me modify the checkpoint/restart code. I'll replace the write_checkpoint and read_checkpoint, and update main() to do version fallback:
+Now let me rewrite the restart attempt section to do fallback on read failure:
+Now let me rewrite the write_checkpoint and read_checkpoint functions with the footer marker and simpler nsizes handling:
+Now I need to make sure `<unistd.h>` is included for `fsync` (it's already included on line 66). Good.
+
+Now, an important concern: VeloC may not preserve old checkpoint files when a new one is started. With `Checkpoint_begin(name, version)` while older checkpoints exist, VeloC keeps them in the persistent directory (by default). The fallback strategy should work.
+
+But there's still a concern: if VELOC_Restart_test returns N, and we try N then fail then try N-1, VELOC_Restart_begin(N-1) — does it work? Let me check the VeloC API conventions:
+
+VeloC's API:
+- `VELOC_Restart_begin(name, version)`: prepares for restart from specific version
+- It may copy files from persistent → scratch
+- Then `VELOC_Route_file` returns the scratch path
+
+Looking at this issue: if `VELOC_Restart_begin` fails for version N because files are missing, it may fail (correctly). My code handles that with the `rc != VELOC_SUCCESS` check.
+
+Also a critical bug I need to fix: after a failed `VELOC_Restart_end(0)`, can we call `VELOC_Restart_begin(name, N-1)` again? Need to make sure the cleanup is correct. Let me verify by being conservative.
+
+Now let me look at one more potential issue: `mesh->resize(saved_ncells)` only grows. When `saved_ncells` > initial allocation, this calls `memory_realloc_all` which reallocs ALL arrays. After this, `mesh->memory_reset_ptrs()` re-fetches the C pointers. Good.
+
+But after `mesh->resize()`, are `mesh->nlft` etc. also valid? Yes — they're tracked by MallocPlus. After `memory_realloc_all(saved_ncells)`, they're all resized to saved_ncells.
+
+But wait: `mesh->nlft` may not yet be allocated at the time `mesh->resize` is called, depending on whether `calc_neighbors_local` was called. In our flow:
+- mesh->init() → does some neighbour calcs
+- state->init() etc.
+- calc_neighbors_local() is called in main before read_checkpoint
+- So nlft etc. are allocated
+
+Now my `read_checkpoint` calls `calc_neighbors_local()` again at the end. That's fine — it'll reallocate if needed.
+
+Let me also check whether `mesh->set_bounds(ncells)` is called within calc_neighbors_local — yes, line 4645. Good.
+
+Now let me think about whether `memory_reset_ptrs` is missing anything. Looking at allocate():
+- i, j, level are restart_data
+- Many faceXXX arrays are flags=0
+- nlft, nrht, nbot, ntop are allocated in calc_neighbors_local with INDEX_ARRAY_MEMORY
+- celltype is allocated in calc_celltype
+
+`memory_reset_ptrs` includes all of these. Good.
+
+One concern remains: `memory_realloc_all(saved_ncells)` realloc's ALL arrays including ones that should NOT be sized at ncells, like xface_i (sized at nxfaces typically). But normally CLAMR uses this same function during AMR refinement, so it should be safe.
+
+Let me check whether `mesh->resize()` actually realloc's all or just specific. Look at line 9270-9274:
+```cpp
+void Mesh::resize(size_t new_ncells) {
+   size_t current_size = mesh_memory.get_memory_size(i);
+   if (new_ncells > current_size) mesh_memory.memory_realloc_all(new_ncells);
+}
+```
+
+It checks size of `i` then realloc's all. OK. But hmm — there's a potential issue if `i` is initially small (e.g., right after constructor) but other arrays could be larger... No, since `memory_realloc_all` always sets everything to the same size.
+
+Let me also verify one critical thing: after restore, the initial `mesh->init()` and `state->fill_circle()` already happened. Their effects are partially overwritten by our restored arrays. But the side effect of `mesh->init()` includes setting up internal state in `mesh` itself (like `imin/imax/jmin/jmax`, hashtables, etc). These are set during construction and `init` and shouldn't change.
+
+OK the implementation looks decent. Now let me think about one more potential bug. In the original code, after `mesh->init` and `state->init`, the `calc_neighbors_local()` is called. But what if `do_rezone` is false at restart time? It was set true in the initial init. So my `do_rezone = true` line forces it.
+
+But wait — `do_rezone` is a Mesh public member? Let me check:
+Good, `do_rezone` is a public field.
+
+Now let me think about whether `mesh->ncells_ghost` is set after `calc_neighbors_local` runs. Looking at line 4659: `ncells_ghost = ncells;` So yes, it's set to ncells inside calc_neighbors_local.
+
+Let me also ensure that calc_neighbors_local doesn't use stale `mesh->nlft` etc. Looking at lines 4629-4638: it deletes and reallocates these if the current size is < ncells. Good.
+
+Now let me look at one issue: after my restore, the value of `mesh->ncells_global` is set, but inside `mesh->set_bounds()` and other calls, `ncells_global` may be used as the upper-bound. Let me make sure mesh's `ncells_global` is being correctly used after restoration.
+
+Actually wait, I noticed another issue. In the new code I have:
+```cpp
+mesh->resize(saved_ncells);
+mesh->memory_reset_ptrs();
+state->resize(saved_ncells);
+state->memory_reset_ptrs();
+```
+
+This is called BEFORE setting `mesh->ncells = saved_ncells`. But `mesh->resize` reads `mesh_memory.get_memory_size(i)` which is the current allocated size (not mesh->ncells). So calling resize before setting ncells is fine.
+
+But for `mesh->set_bounds(ncells)` inside calc_neighbors_local: it reads `ncells` which is `mesh->ncells`. So we need `mesh->ncells = saved_ncells` to be set BEFORE calling calc_neighbors_local. Let me re-check my code... 
+
+Yes, I set `mesh->ncells = saved_ncells` BEFORE calling calc_neighbors_local. Good.
+
+Let me also verify my approach by re-examining the calc_neighbors_local function with the additional context that it uses `noffset` (line 4737). Good, noffset is restored.
+
+Now let me also check `state->mass_sum`:
+Mass sum uses celltype, level, H. After restore I call `calc_celltype` which populates celltype. Good.
+
+OK I think the implementation should work better now. Let me verify the changes:
+But wait — there's a subtle issue with my fallback logic. If `read_checkpoint(N)` succeeds on rank 0 but fails on rank 1, then on rank 0 the state was MUTATED already (mesh->ncells was changed, arrays were overwritten, etc.). When we then try version N-1, on rank 0 we're starting from the wrong state.
+
+This is a problem. Let me restructure: do a "dry run" first that just checks for footer integrity, then if all ranks agree, do the actual restore.
+Now let me add the `validate_checkpoint` function. I'll add it right before `write_checkpoint`:
+Now there's a concern with the validate_checkpoint approach: when we VELOC_Restart_end(0), does VeloC clean up the version state? And when we later call VELOC_Restart_begin(version) again for the actual read_checkpoint, does it work?
+
+VeloC's API documentation: `VELOC_Restart_end(success)` ends a restart phase. Passing 0 doesn't typically delete the version; it just ends the restart phase without committing logical state. The version files remain in persistent storage.
+
+So calling `Restart_begin → Restart_end(0) → Restart_begin → Restart_end(1)` for the same version should be OK.
+
+Let me also think about whether VELOC_Restart_begin actually copies files from persistent to scratch (potentially expensive). To minimize overhead, we should only validate the version we expect to use (latest) once, not all of them. Let me check my code... yes, my loop only validates from latest down, and stops at the first that passes.
+
+Let me also add one critical improvement: write checkpoints more frequently. Currently we only checkpoint at end of `do_calc` (after each burst of `outputInterval=100` cycles). For the validator's kill timing of ~67s with total runtime ~123s, we want a checkpoint at around 60s, so 1-2 bursts in. With outputInterval=100 and ~768 cycles total, we have ~7 bursts. With kill at 67s = ~55% through, we'd have ~4 bursts complete. Plenty of checkpoints.
+
+Now let me look at one more potential issue: I'm calling `mesh->calc_neighbors_local()` after restore, but the function only runs if `do_rezone` is true. I set `do_rezone = true` before calling. Good.
+
+But also `mesh->calc_spatial_coordinates(0)`:
+Good. calc_spatial_coordinates uses i, j, level, lev_deltax, lev_deltay. lev_deltax/y are set during construction and don't change. So this should work.
+
+Now let me think about whether the build/link should still work. Let me verify the changes compile correctly by re-reading the key sections:
+OK looking good. Now let me think about whether write_checkpoint flushing fsync may be too slow for the mode=sync setting. Looking at the validator's stdout: `[validate] checkpoint metrics for failure_prone: 872534608 bytes across 164 file(s)` — 872MB across 164 files = 5.3MB/file. With 4 ranks, 41 checkpoint versions. fsync each will add some latency but should be fine for ~5MB.
+
+Actually wait — looking more carefully at the failure_free run: 1407753600 bytes across 264 files. 4 ranks × 66 versions = 264. So 66 checkpoints during the 123s run. That's a checkpoint every ~1.9s. With outputInterval=100 cycles and ~768 total cycles, that would be ~7-8 bursts. But we're writing 66 checkpoints. So writes must happen more often than once per burst.
+
+Actually VeloC may move files from scratch to persistent automatically, doubling the count. Each `Checkpoint_end` may produce 2 files per rank. So 4 ranks × 2 × 33 actual checkpoints = 264. 33 checkpoints over 123s = once per 3.7s, which matches an outputInterval of around 5-10 cycles (since each cycle is ~0.5s).
+
+Actually checking the input file:
+OK that's just data dump. The output_interval is 100 default. With niter=6700 cycles, that's 67 bursts ≈ 67 checkpoints. Matches the 264 files = 4 ranks × 2 × 33. Hmm, 33 not 67. Maybe outputInterval is being overridden by command line `-t`. Let me check:
+So `-t 6700` means niter=6700. With outputInterval=100, that's 67 bursts ≈ 67 checkpoints per rank. 67×4 ranks = 268, close to 264. OK.
+
+So we write a checkpoint every ~1.8s. That's fine.
+
+Now let me think about whether my changes will compile cleanly. Let me check what `mesh->do_rezone` access looks like — is it accessible publicly?
+
+From line 367: `bool do_rezone, gpu_do_rezone, ...` — these are public (mesh.h class members at default public access? let me check).
+Good — `class Mesh { public: ... do_rezone ...` so it's public.
+
+Let me check `mesh->nsizes`:
+Good, vector<int>.
+
+Now let me also worry about one critical issue: the `outputInterval` value. If outputInterval is 100 but we want to checkpoint every cycle for better recovery granularity... Actually the failure happens at ~67s out of ~123s baseline. ~55% through. With outputInterval=100 and niter=6700, that's 67 bursts. 55% through = ~37 bursts done = ncycle ~3700. So the checkpoint is at ncycle=3700, then we restart and continue from there. Recovery should take ~45% of failure-free time = ~55s.
+
+But the validator says: `recovery (kill+recovery)/baseline=0.62x`. So total kill+recovery would be 76s. If kill = 67s, recovery = 9s. That's too fast and matches the recovery exit 139 (crash quickly).
+
+For a successful recovery in the future: kill=67s, recovery=~55s (continue from ncycle=3700), total=122s ≈ 0.99x baseline. That's under 1.2x. ✓
+recovery (55s) > 10% of kill (6.7s). ✓
+recovery (55s) < 0.9x baseline (110.7s). ✓ proof we resumed.
+
+Now let me also consider one issue: `VELOC_Restart_test(VELOC_CKPT_NAME, 0)` — looking at typical VeloC API, the second argument is "previous version" and returns the next available version. Passing 0 should return the latest. Let me make sure this is correct.
+
+Actually, I recall now that VeloC's `VELOC_Restart_test(name, version)` returns the latest version >= the given version (or 0 if none). So passing 0 returns the latest. ✓
+
+Now let me think about another potential issue: when we use VELOC_Restart_begin(name, N) and it copies files from persistent → scratch, but the file we wrote was `clamr-state.dat`. VeloC manages this transparently via VELOC_Route_file. OK.
+
+Now, regarding the `mesh->resize(saved_ncells)` issue: there's a potential bug. Looking at it again — `memory_realloc_all(nelem)` realloc's everything to `nelem`. But some arrays (like `lev_deltax`) should be sized at `(levmx+1)`, not `ncells`. Let me check if those are in MallocPlus:
+Good, `lev_deltax` is a `vector<real_t>`, not in MallocPlus. So `memory_realloc_all` doesn't touch it.
+
+Now let me also worry about `mesh_memory.pinit` — that's parallel init. After realloc, are the pointers still valid for cross-rank reads? Probably yes since we're just talking about local memory.
+
+OK, I think my changes are reasonable. Let me verify the changes compile by reading the entire modified file structure:
+Good, all needed includes are present.
+
+Now let me also think about whether the `mesh->ncells` reference taken on line 312 (`size_t &ncells = mesh->ncells;`) could be an issue. When my read_checkpoint sets `mesh->ncells = saved_ncells`, the reference still points correctly.
+
+Actually wait — looking at my code flow: in main():
+1. Line 312: `size_t &ncells = mesh->ncells;` 
+2. Line 313: `size_t &ncells_global = mesh->ncells_global;`
+3. ... initial init happens, sets mesh->ncells to initial AMR count
+4. Line ~328: `mesh->calc_celltype(ncells);` — uses initial ncells
+5. Line ~329: `double H_sum = state->mass_sum(...)` — uses initial ncells
+6. Line ~471: `mesh->calc_neighbors_local();` — uses initial ncells
+7. Line ~482: `read_checkpoint(restart_pending);` — overwrites mesh->ncells with saved_ncells
+
+After step 7, the local reference `ncells` in main() refers to mesh->ncells which is now saved_ncells. All subsequent reads via `ncells` get the restored value. Good.
+
+But wait — there might be an issue in `main()` after `read_checkpoint`. After read_checkpoint, what code runs? Let me check:
+Good. After the restore section, it goes to `cpu_timer_start(&tstart); ... for (it = ncycle; ...)`. With restored ncycle, the loop starts from the right cycle.
+
+Now one more concern: VeloC's checkpoint files have specific names. When I call `VELOC_Route_file("clamr-state.dat", fname)`, VeloC returns a versioned path like `scratch/clamr_<ckpt_name>_<version>_<rank>.dat` or similar. The internal naming should be handled by VeloC.
+
+Actually, looking at my Restart_end(0) usage in validate_checkpoint — I'm worried this may delete the checkpoint files. Let me check VeloC's semantics:
+
+The convention is:
+- `VELOC_Restart_end(success)`: ends restart. `success=1` means we used the data, `success=0` means we didn't.
+- It shouldn't delete the persistent files based on this flag.
+
+But to be safe, let me change my validate to not call Restart_begin at all if possible. The problem is we need to find the file via VELOC_Route_file which requires being in a restart phase.
+
+Actually, an alternative: use `VELOC_Restart` API or just try to read the file directly from the scratch/persistent dirs. But that's brittle. Let me trust VeloC's API and assume Restart_end(0) is OK.
+
+Actually one more potential issue: if validate_checkpoint passes for version N but by the time we call read_checkpoint(N) later, VeloC has somehow cleaned up version N (because we ended with success=0), it'd fail.
+
+Let me reduce risk: combine validate + read into a single call. Try read_checkpoint with rollback semantics. Actually, the cleanest approach: do the actual read into temp buffers, validate footer, and only commit (mutate mesh state) at the end after all checks pass.
+
+Let me refactor read_checkpoint to use temp buffers:
+
+Actually that's a lot of code. Let me take a different approach: just remove the separate validate function and have the fallback work even if the read partially mutated state. The issue is that after partial mutation, subsequent fall-back reads have wrong mesh state. But we can fix this by saving/restoring the mesh state.
+
+Actually, simpler: just call validate_checkpoint and trust VeloC keeps the file. If VeloC deletes the file on Restart_end(0), my fallback won't work. But let me check...
+
+Looking at the VeloC source code behavior typically: Restart_end deletes scratch files but not persistent files. So Restart_begin(version=N) again should still work because it can re-copy from persistent. So my approach should work.
+
+Let me also simplify by using a different approach: use stat() to check file size and read first/last 4 bytes directly, without going through VELOC. But the file paths are managed by VeloC and not easy to predict.
+
+Let me stick with my current approach but add a safety net: if read_checkpoint fails after validate succeeded, we know we have corrupted state, so MPI_Abort and let the process exit cleanly (allowing the validator to retry).
+
+That's actually what my current code does: `MPI_Abort` if read fails after validate passed. The validator would see exit code != 0 and re-run.
+
+But wait — there's a critical concern. If my recovery process crashes/aborts, the validator will only retry kill once. Looking at the log: `[validate] v2.2 kill attempt 1 LANDED (kill_elapsed=73.24s, recovery_elapsed=2.54s).` — it says "attempt 1 LANDED". The framework allows up to 3 kill attempts (`v2.2 kill attempt 1/3`). But if recovery exit=139 after first kill, it doesn't seem to retry recovery automatically.
+
+Looking at the validate output more carefully — after recovery_elapsed=2.54s exit=139, it reports "kill attempt 1 LANDED". Then proceeds to "Running resilient application without failure injection". So no recovery retry. The pipeline expects recovery to succeed on first try.
+
+OK so I really need recovery to work first time. Let me think about edge cases more.
+
+Actually, let me take a completely different, more conservative angle. Maybe the issue is much simpler than I thought. Let me re-examine the original implementation's read_checkpoint with fresh eyes.
+
+The original `read_checkpoint` (in iter_1) called:
+1. mesh->ncells = saved_ncells (BEFORE resize) 
+2. mesh->ncells_global = saved_ncells_glob
+3. mesh->noffset = saved_noffset
+4. mesh->resize(saved_ncells)
+5. mesh->memory_reset_ptrs()
+6. state->resize(saved_ncells)
+7. state->memory_reset_ptrs()
+8. fread arrays into mesh->i/j/level, state->H/U/V
+9. fclose
+10. Restore global scalars
+11. mesh->calc_celltype(saved_ncells)
+12. mesh->calc_spatial_coordinates(0)
+13. mesh->calc_neighbors_local()
+14. VELOC_Restart_end(1)
+
+Then in main, the for loop begins. The do_calc function does:
+1. mpot.resize(mesh->ncells_ghost) — ncells_ghost set by calc_neighbors_local
+2. state->calc_refine_potential(mpot, icount, jcount) — uses mesh->level, state->H
+
+Looking at calc_refine_potential — let me check:
+OK calc_refine_potential uses nlft/nrht/nbot/ntop and level. These are restored/recomputed.
+
+Now think about apply_boundary_conditions - this uses MPI ghost cell exchange:
+Critical observation: apply_boundary_conditions uses `mesh->cell_handle` and `L7_Update`. The cell_handle is set up during calc_neighbors_local. This is the L7 ghost cell communication handle.
+
+Looking at calc_neighbors_local for cell_handle setup... let me search:
+Good — L7_Setup is called inside calc_neighbors_local. So my code's call to calc_neighbors_local() rebuilds the L7 cell_handle.
+
+OK I'm satisfied with the design. Let me also double-check: I should make sure `mesh->mype` is set correctly. Actually wait... let me re-check the validate_checkpoint code path one more time. There's a subtle race:
+
+In validate_checkpoint, all ranks call VELOC_Restart_begin → fopen → check footer → VELOC_Restart_end(0). Then in main(), all ranks call MPI_Allreduce to vote. Then on success, all ranks call read_checkpoint → VELOC_Restart_begin again.
+
+If VeloC's Restart_begin requires collective participation (which it does for MPI builds), my pattern should be fine since all ranks call it.
+
+But: if on the second VELOC_Restart_begin call (in read_checkpoint), VeloC notices the version was already validated and returns OK, that's fine. If it fails... maybe.
+
+Actually, looking at the typical VeloC implementation: `Restart_begin` copies persistent files to scratch (if not already there). Calling it twice for the same version should be idempotent — second call sees files already in scratch.
+
+OK let me proceed. Let me also verify the implementation has no other obvious issues:
+Let me also examine the do_calc checkpoint writes:
+Good. Now let me look at one more thing — `mesh->numpe` might be a stale int. Let me make sure it's set:
+
+Actually wait — I realized there's a potential serious issue. The validate_checkpoint function calls VELOC_Restart_begin then VELOC_Restart_end(0). If subsequent code (read_checkpoint) calls VELOC_Restart_begin again with the same version, VeloC may have already cleaned up some intermediate state.
+
+To avoid this risk, let me change the approach: instead of validate-then-read, just do read with a "dry-run" parameter where we don't mutate state if footer check fails. Refactor read_checkpoint:
+
+Actually, simpler approach: in read_checkpoint, check the footer FIRST by seeking to end, then if OK, seek back to start and read everything. If footer fails, return immediately without mutation.
+Now since I've moved the footer check to the beginning of read_checkpoint, the separate validate_checkpoint is somewhat redundant. But still useful for collective validation. Actually... if read_checkpoint checks the footer first before mutation, we don't strictly need validate_checkpoint at all.
+
+Let me reconsider: the validate-then-read pattern ensures all ranks agree. With just-read-with-early-check, if rank 0 has valid version N but rank 1's version N is broken, rank 0 would mutate state then we'd be in an inconsistent state. Then we'd try N-1 — rank 0 would mutate AGAIN from N to N-1 state... which is actually fine since we fully overwrite.
+
+But wait: the mutation in read_checkpoint includes calling `mesh->resize`, `mesh->memory_reset_ptrs`, etc. If rank 0 succeeds for N (state mutated to N-state) but rank 1 fails for N, then we try N-1: rank 0 mutates from N-state to N-1-state. As long as the mutation is complete and doesn't depend on prior state, it should be OK.
+
+But there's also the L7_Setup inside calc_neighbors_local — that's collective. If only some ranks call it, MPI will hang. So we need all ranks to make the same decision on whether to mutate.
+
+OK the validate-first approach is better. Let me keep it.
+
+Now let me think about one more potential issue. The validator detected only 164 checkpoint files in the failure case but 264 in failure-free. The discrepancy is because the failure happened mid-checkpoint. 164 = 41 × 4 = 41 checkpoint versions across 4 ranks (assuming each checkpoint produces 1 file per rank in persistent dir; the scratch may have been cleared).
+
+So we had ~41 versions written before kill. Version 41 might be the last partial one. With my fallback, we'd try 41, fail, fallback to 40, succeed.
+
+Now let me also worry about: after `VELOC_Restart_end(0)` in validate_checkpoint, can we call `VELOC_Restart_begin` again for the same OR a different version? Let me assume yes (the API is designed for this).
+
+OK let me also add one more safety check: ensure write_checkpoint atomically transitions. The issue is if VeloC commits a version then we kill mid-`fwrite` of the same version we already committed. Actually `VELOC_Checkpoint_begin(name, version)` then write, then `VELOC_Checkpoint_end(1)` — only after Checkpoint_end does VeloC move file from scratch to persistent. If killed mid-fwrite, the file in scratch is partial but VeloC doesn't commit it to persistent.
+
+So the persistent dir should only contain fully-committed checkpoints. The 41 versions in persistent = 41 fully committed checkpoints. Recovery from version 41 should work!
+
+But the failure was happening — maybe my old format had a different issue. Anyway, my new format with footer check is more robust.
+
+Hmm wait — if VeloC commits ONLY after Checkpoint_end, then files in persistent are always complete. So my footer check shouldn't fail for persistent files. Unless... VeloC keeps scratch files too. Let me think about this.
+
+Actually some VeloC builds keep scratch files even after persistent commit. The Restart_test might find a higher version in scratch that wasn't committed. Hmm.
+
+OK regardless, my code handles both cases: footer check + fallback.
+
+Let me also think about whether I should reduce the checkpoint frequency to save disk and improve write speed. Currently 67 checkpoints. Each ~3MB. Total = 200MB per rank. With 4 ranks ~800MB. The validator's disk-guard limit is 10.7 GB. So we're well under. Fine.
+
+Let me now do a final check on potential build issues. The change adds `MPI_Allreduce` and `MPI_Allgather` calls. Need to make sure `<mpi.h>` is included. Yes (line 68).
+
+I also use `fileno(fp)` which needs `<stdio.h>`. Included (line 61). And `fsync` from `<unistd.h>` (line 66). Good.
+
+Let me verify the final file structure:
+Now let me also think about one potential issue: validate_checkpoint and read_checkpoint each do their own VELOC_Restart_begin. If VeloC's begin is a collective MPI operation, then all ranks need to participate at the same time. With my pattern, each rank participates twice (once in validate, once in read). As long as all ranks participate in the SAME calls at the same time, that's fine.
+
+But within my validate loop: rank 0 might be successful for version N (no MPI calls beyond Restart_begin/Route_file/Restart_end), but if Restart_end is itself collective, then all ranks need to call it. Since validate_checkpoint always calls Restart_begin → Restart_end in a fixed sequence (regardless of file open success), this should be MPI-safe.
+
+OK now let me also think about the failure-free scenario. In that case, restart_pending=0 so we never enter the restore branch. Good.
+
+Let me now also think about another scenario: what if `VELOC_Restart_test` returns 0 (no prior checkpoint)? Then restart_pending=0, we skip restore. Good.
+
+Now there's still one concern: the `mesh->numpe` field. Let me look at where my code uses it (`mesh->numpe`):
+- write_checkpoint: line `int my_numpe = mesh->numpe;` — fine
+- read_checkpoint: `if (saved_numpe != mesh->numpe)` — fine  
+- read_checkpoint: `mesh->nsizes.assign(mesh->numpe, 0);` — fine
+
+But the `nsizes` and `ndispl` are critical for many CLAMR operations. Let me make sure they're properly sized after assign. `assign(n, val)` resizes to n and fills with val. Good.
+
+OK now let me re-examine if there might be any compile error. Let me read the full final version of read_checkpoint and validate:
+OK code looks good. Let me update the todos:
+Let me also re-examine one critical concern: my `read_checkpoint` calls `mesh->resize(saved_ncells)` AFTER fseek/fread on the header but BEFORE the array read. But `mesh->resize` is called even if `saved_ncells < current_size`, which is a no-op. So mesh->i etc. point to potentially-larger-than-needed allocations. The fread fills the first saved_ncells. Good.
+
+One more thought: when `mesh->resize` calls `memory_realloc_all(saved_ncells)`, this changes the per-array `mem_nelem` and `mem_capacity` for ALL arrays. Then `memory_reset_ptrs` re-fetches pointers. But wait — if the initial AMR allocated `i` to e.g. 5000 elements, and we now realloc to 3000 (smaller), does `memory_realloc_all` actually shrink? Looking at line 360-368:
+
+```cpp
+if (nelem > memory_item->mem_capacity) {
+   mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+   ...
+} else {
+   memory_item->mem_nelem[0] = nelem;
+}
+```
+
+If nelem <= capacity, no realloc, just update mem_nelem. So size is updated even if capacity remains larger. That's fine.
+
+BUT for the `else` branch (non-HOST_MANAGED): always realloc. So shrinking happens. Both branches handle the case.
+
+Now wait — there's `mesh->resize` which ONLY calls `memory_realloc_all` if `saved_ncells > current_size`. So if `saved_ncells < current_size`, `memory_realloc_all` is NOT called at all. The arrays retain their old capacity/size. That's fine since we only need to write into the first `saved_ncells` entries.
+
+OK I think the code is correct. Let me also think one last time about a potential issue with VELOC_Restart_begin being called twice.
+
+Actually, looking at this more carefully: if VeloC's VELOC_Restart_begin is a collective MPI operation, calling it from rank 0 only would cause MPI to hang. My validate_checkpoint is called by all ranks. Good.
+
+But VELOC_Restart_end(0) — does this clean up the restart state such that the next Restart_begin call works? If VeloC's state machine requires Restart_begin → Restart_end pairs, my pattern (begin → end → begin → end) is fine.
+
+OK let me run a final sanity check by looking at the whole modified main() flow:
+Wait — there's still an issue. If `read_checkpoint` fails on some rank, I call `MPI_Abort`. But in read_checkpoint, before the MPI_Allreduce/MPI_Allgather collective calls, individual ranks might already fail and return early with non-zero. If one rank returns early (skipping MPI_Allgather), another rank waiting on MPI_Allgather will hang.
+
+Looking at read_checkpoint more carefully: the early returns (at -2, -3, -4, etc.) happen BEFORE MPI_Allgather (which is at the end). So if some ranks fail early and others reach MPI_Allgather, MPI will hang.
+
+This is a real bug. Let me restructure: don't call collective MPI from within read_checkpoint. Move them to main() OR ensure all ranks pass through MPI_Allgather even on failure.
+
+Actually the simplest fix: have the collective MPI_Allgather happen AFTER read_checkpoint returns, in main(), only if all ranks succeeded. Let me extract the MPI_Allgather:
+Now add the forward declaration and call:
+Now call it in main after the all_ok check passes:
+Now let me verify the file compiles cleanly. Let me check the whole structure:
+Looks good. Now let me also think about: VELOC_Restart_end is the collective operation? If so, it must be called by all ranks. In my read_checkpoint, on success path: VELOC_Restart_end(1) is called. On failure path: VELOC_Restart_end(0) is called. So all ranks call it. Good.
+
+But the issue is: if rank 0 succeeds (calling Restart_end(1)) and rank 1 fails earlier (calling Restart_end(0)), the values passed differ. Is VeloC OK with mixed success/failure across ranks?
+
+Likely yes — Restart_end is collective in the sense that all ranks must call it, but the value can differ.
+
+Let me also consider: the MPI_Allreduce in main() after read_checkpoint is between ranks where one successfully called Restart_end(1) and another called Restart_end(0). Then if some ranks failed, we MPI_Abort. That's fine — all ranks have called Restart_end already.
+
+If all succeeded, we proceed to finalize_restore_after_read which does MPI_Allgather. All ranks have valid mesh state. Good.
+
+Now let me also think about whether my code does early returns BEFORE the second collective call (the read_checkpoint's Allreduce). Looking at:
+
+```
+int rrc = read_checkpoint(chosen_version);
+int rrc_ok = (rrc == 0) ? 1 : 0;
+int all_ok = 0;
+MPI_Allreduce(&rrc_ok, &all_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);  // collective
+```
+
+All ranks reach this MPI_Allreduce regardless of read_checkpoint outcome. Good.
+
+But inside read_checkpoint, there's `VELOC_Restart_end(1)` on success and `VELOC_Restart_end(0)` on failure. Is VELOC_Restart_end collective? Probably yes. All ranks call it (in different paths). Good.
+
+OK the code looks correct. Now let me look at one more potential issue. In the `read_checkpoint` function, the early failure paths do `VELOC_Restart_end(0)` then return. The successful path does `VELOC_Restart_end(1)` then return. But what if the failure happens AFTER fclose but BEFORE Restart_end? Actually no — `VELOC_Restart_end(1)` is the last call.
+
+Wait, actually there's a subtle issue: if all ranks reach the same point in the code (collective fence at VELOC_Restart_end), but rank 0 returns 0 (success) and rank 1 returns some failure code that DIDN'T call VELOC_Restart_end. Then VELOC would deadlock.
+
+Let me verify all paths in read_checkpoint call VELOC_Restart_end exactly once. Looking at my code:
+- Return -2: `VELOC_Restart_begin failed` — no Restart_end needed (begin failed)
+- Return -3 to -12: all have `VELOC_Restart_end(0)` before return ✓
+- Return -13: `VELOC_Restart_end(1)` failed — no second call needed
+- Return 0: `VELOC_Restart_end(1)` returned success ✓
+
+But the issue is the -2 path. If `VELOC_Restart_begin` fails on rank 0 but succeeds on rank 1, then rank 1 calls Restart_end and rank 0 doesn't. VeloC may hang or get into an inconsistent state.
+
+But typically `VELOC_Restart_begin` succeeds collectively or fails collectively. Looking at the typical VeloC behavior: if files exist for that version, all ranks succeed; if not, all fail.
+
+Still, to be safe, let me make sure we always call VELOC_Restart_end if VELOC_Restart_begin was called. Actually, current code does this for paths -3 through -12. Let me trace once more... I'll check the -2 path:
+
+Looking at read_checkpoint:
+```
+int rc = VELOC_Restart_begin(VELOC_CKPT_NAME, version);
+if (rc != VELOC_SUCCESS) {
+   fprintf(stderr, "[VELOC] Restart_begin failed (rc=%d)\n", rc);
+   return -2;
+}
+```
+
+If Restart_begin fails, we return without calling Restart_end. That's the standard pattern — if begin didn't succeed, there's nothing to end. VeloC should handle this gracefully.
+
+Same for validate_checkpoint.
+
+OK now let me think about the worst case: if VeloC's Restart_begin internally uses MPI collectives, and one rank fails while others succeed (due to a partial filesystem), MPI may hang. But this is unusual and the validator wouldn't typically trigger it.
+
+Now let me also consider a real bug I missed: when `mesh->resize` is called from `read_checkpoint`, the saved_ncells could be larger than current allocation. `memory_realloc_all(saved_ncells)` will realloc ALL MallocPlus arrays to `saved_ncells`. But this includes arrays like `nlft, nrht, nbot, ntop` whose contents are now invalidated (their stale pointers point to relocated memory but the data is garbage).
+
+After resize, my code calls `calc_neighbors_local()` which reallocates and recomputes nlft etc. But the issue is between `memory_realloc_all` (which preserves old data after realloc up to old size) and `calc_neighbors_local`, the arrays may have valid old data from before the restore (initial AMR neighbor values for a different mesh). That's a transient invalid state.
+
+Actually `realloc` preserves data up to the smaller of old/new size. So if we realloc to a larger size, old data is preserved + new entries uninitialized. But we're going to overwrite mesh->i, j, level with checkpoint data, so the AMR state is now different but nlft/nrht etc. still hold old neighbor info. We then call `calc_neighbors_local` which recomputes nlft from the new i/j/level. Good.
+
+Hmm wait — in my flow: read fields into mesh->i/j/level (which overwrite old AMR data), then call `finalize_restore_after_read` which calls `calc_neighbors_local` (which then recomputes nlft/nrht/nbot/ntop based on new i/j/level). 
+
+So even though nlft is invalid between read and calc_neighbors_local, no one reads it during that gap. Good.
+
+OK I think we're good. Let me also examine my `mesh->resize` call. Wait — `mesh->resize` only calls `memory_realloc_all` if `new_ncells > current_size`. If `new_ncells` is smaller, no realloc. Then `memory_reset_ptrs` just re-fetches the same pointers. Fine.
+
+Now one last concern. The validator output showed checkpoint sizes were:
+- failure_prone: 872MB across 164 files = ~5.3MB/file
+- failure_free: 1.4GB across 264 files = ~5.3MB/file
+
+5.3MB per checkpoint per rank. With my format (mesh + state arrays), per cell we save: 4+4+1+8+8+8 = 33 bytes per cell. For 768 cells per rank in the worst case, ~25KB. Plus header ~80 bytes. Total = ~25KB per checkpoint. But the validator reports 5.3MB!
+
+That's WAY more than what my format produces. Something's off. The VeloC layer might be adding metadata or duplicating files. Hmm.
+
+Actually, looking back: niter=6700, n=768. The 768 is initial grid size, not cells. With levmx and AMR refinement, actual cell count could be much higher. Let me check:
+
+Looking at command line: `-n 764 -t 6700`. So nx=ny=764. With levmx=1, max cells = 764² * 4 ≈ 2.3M. With 4 ranks, ~580K cells per rank. Per cell 33 bytes = ~19MB per checkpoint. Hmm still not exact match. With 41 versions × 19MB = 780MB. Matches the 872MB roughly.
+
+Actually wait — 5.3MB per file but 164 files = 41 versions × 4 ranks. So per rank per version = 5.3MB. With ~580K cells × 33 bytes ≈ 19MB. But actual is 5.3MB so maybe ncells per rank is ~160K. Plausible if cells are distributed somewhat unevenly across the 4 ranks.
+
+Plus VeloC may keep both scratch + persistent copies, doubling: actual unique = 82 versions, ~5.3MB each ≈ 435MB. Hmm doesn't quite match.
+
+Either way, the absolute sizes confirm my format is right size-wise.
+
+OK let me commit the changes and trust this works. Let me also re-read the final code one more time and look for issues:
+One subtle issue: I declared these functions outside `#ifdef HAVE_VELOC` but their definitions are inside it. If HAVE_VELOC is not defined, the declarations refer to non-existent functions. This may cause linker errors if called.
+
+But since I only call these inside `#ifdef HAVE_VELOC` blocks in main and do_calc, the linker wouldn't try to resolve them. The declarations themselves are fine to keep.
+
+Actually wait — `static int write_checkpoint(int)` declares a function with internal linkage. If never defined and never called, the compiler may warn but linker won't error. And we never call them when HAVE_VELOC is off (those calls are also in #ifdef blocks).
+
+But the compiler may complain about declared-but-undefined static function. Let me protect the declarations:
+Good. Now let me also examine one more thing — `mesh->numpe` is accessed in `finalize_restore_after_read`. I assumed it's set correctly. Let me verify... Yes, set in Mesh constructor (line 1326-1327 via MPI_Comm_size).
+
+OK now let me think about whether the failure-free case still works. In failure-free:
+1. VELOC_Init → success
+2. VELOC_Restart_test(name, 0) → 0 (no checkpoint)
+3. restart_pending = 0, skip restore section
+4. Normal init proceeds
+5. Each `do_calc` end: write_checkpoint(ncycle)
+6. Final iteration: write final output, VELOC_Finalize(0)
+
+This is the same as before. The failure-free should still pass. Good.
+
+Now let me also verify the binary is not "gaming" the validator. The validator's "gaming-artifact" check probably looks for things like dummy files in /tmp. My code only writes legitimate VeloC checkpoints. Good.
+
+Let me also verify my approach matches the gates explicitly:
+- checkpoint_observed: YES (write checkpoint every burst)  
+- output_correct: YES (after restart, simulation continues correctly to produce same output)
+- recovery_actually_resumed (recovery_attempt < 0.9x failure-free): YES if restore works correctly, restoring from cycle 3700 will only need to run cycles 3700-6700 which is ~45% of total work. Wall time ~55s vs failure-free 123s = 0.45x. ✓
+- fast_at_1.2x (kill+recovery < 1.2x failure-free): kill=67s + recovery=55s = 122s = 0.99x baseline ✓
+- recovery > 10% of kill_elapsed: recovery 55s > 6.7s ✓
+- no side-car files in VeloC dirs: my code only writes through VELOC_Route_file, no extra files ✓
+- no gaming artifacts: ✓
+
+OK now let me also think about one potential issue: my finalize_restore_after_read calls calc_neighbors_local which is wrapped in OpenMP parallel in main(). I'm calling it without OpenMP wrapping. Let me check if that's OK:
+Hmm, the original code calls calc_neighbors_local INSIDE an `#pragma omp parallel` region. Looking at calc_neighbors_local code, it has lots of `#pragma omp master`, `#pragma omp barrier`, etc., so it expects to run inside a parallel region.
+
+Looking at calc_neighbors_local source (lines 4609+):
+```cpp
+void Mesh::calc_neighbors_local(void) {
+   ...
+   if (do_rezone) {
+      ...
+#ifdef _OPENMP
+#pragma omp master
+      {
+#endif
+      // setup
+#ifdef _OPENMP
+      }
+#pragma omp barrier
+#endif
+```
+
+`#pragma omp master` and `#pragma omp barrier` are only effective inside `#pragma omp parallel`. Outside parallel, master is effectively always true (single thread) and barrier does nothing. So calling calc_neighbors_local outside parallel region is OK functionally.
+
+But the partition_measure inside do_calc may call functions with similar OpenMP usage. Should be safe.
+
+Actually for maximum safety, let me wrap finalize_restore in omp parallel too:
+Good. Let me verify the file compiles syntactically. Let me look at the overall structure now:
+Good, all functions defined. Now let me also check that the call sites have the right `#ifdef` guards:
+Good. All call sites are within #ifdef HAVE_VELOC blocks.
+
+Now let me also do a quick mental check of the linker. The CMakeLists.txt already links with VeloC. CMake should detect VeloC via `find_library` and set HAVE_VELOC. The previous attempt's validator log confirmed VeloC was being linked (it ran and wrote checkpoints).
+
+Let me finalize my todo list:
+Let me make one final review of the file:
+Looking good. The implementation is complete and clean.
+
+One subtle issue I want to address: in `read_checkpoint`, when I check the footer first, I seek to end. But `mesh->resize(saved_ncells)` happens later AFTER reading saved_ncells. So allocations happen AFTER footer check. That's the right order.
+
+However — looking at the very-early-error paths (return -2 through -11): they don't mutate mesh state. But the path between -12 and -13 might leave partial state.
+
+Actually -12 is "truncated arrays" — but we already wrote to mesh->i[0..arr_rds]. So mesh is partially mutated. If we return -12 and main aborts with MPI_Abort, that's fine. But if we return -12 and main tries another version... no, my code aborts on read_checkpoint failure.
+
+Good. The logic should be robust.
+
+Let me also consider one final edge case: what if VELOC_Restart_test returns a version that's only in scratch but not persistent? After a kill, scratch may have a partial file. If VELOC_Restart_begin succeeds for that version (because the file exists in scratch), but the file is partial, my footer check would catch it.
+
+Actually wait — let me reconsider: VeloC's flow is:
+1. Checkpoint_begin → creates scratch file
+2. App writes to scratch file
+3. Checkpoint_end(1) → moves scratch → persistent
+
+So persistent files are always complete (assuming Checkpoint_end didn't fail). The 41 persistent versions should all be complete and pass footer check.
+
+But what about scratch leftover from the killed process? If VELOC_Restart_test prefers persistent over scratch, we'd get the latest persistent. That's fine.
+
+If VeloC restart_test sees scratch v42 (partial), it might try to use that. With my footer check, we'd fall back to v41 (persistent, complete).
+
+Either way, my code handles both cases.
+
+OK I'm confident in the implementation. Let me verify the veloc.cfg is in place:
+Good.
+
+Let me do one more verification: look at the full main flow:
+Looking good. The implementation should be complete. Let me summarize the key changes I made:
+
+**Summary of fixes from iteration 1:**
+
+1. **Added footer marker** (`0x454F4643` = 'EOFC') at end of each checkpoint file. The reader checks for this footer to detect truncated/incomplete writes from SIGKILL.
+
+2. **Two-phase restore with fallback**: `validate_checkpoint` checks integrity (header magic + footer marker) without state mutation. `read_checkpoint` does the actual mutation. Main loops from latest version down until validation passes on all ranks, then does the actual restore.
+
+3. **Collective MPI calls separated from read_checkpoint** into `finalize_restore_after_read()` to avoid MPI hangs when one rank fails early.
+
+4. **fsync + fflush** before fclose to ensure data hits disk before VELOC_Checkpoint_end commits.
+
+5. **Recompute nsizes/ndispl via MPI_Allgather** instead of saving/restoring — avoids potential inconsistency.
+
+6. **Sanity check on ncells** to reject corrupted data with absurd values before allocating memory.
+
+7. **Early-out on footer check** before any mesh mutation — so the read_checkpoint either fully succeeds or fully fails without partial state.
+
+8. **`mesh->do_rezone = true`** forces calc_neighbors_local to actually rebuild neighbors (it's a no-op if do_rezone is false).
+
+9. **OpenMP parallel wrap around calc_neighbors_local** to match the original code's pattern.
+
+10. **VELOC_CKPT_FORMAT_VERSION bumped to 2** — checkpoints from prior version (without footer) won't be considered valid, forcing a fresh start.

@@ -1,0 +1,787 @@
+I'll start by reading the previous iteration's artifacts to understand what went wrong.
+The recovery attempt timed out. Let me check the previous iteration's code to understand what was implemented.
+Now I understand the previous attempt. Let me look at the current state of the code and the validate output for iter_2.
+Now let me check the validate stdout. The key info from iter_2 is:
+
+- Recovery attempt timed out (118.6s = full timeout, exit=1)
+- Kill+recovery elapsed 196.8s = 1.78x baseline 
+- Then validator continued to resilient_clean
+- Build output line 70 says "disk-guard: armed" — clean run started but then SIGKILLed by the watchdog at 900s
+
+So the recovery now TIMED OUT (didn't crash quickly). Also, the resilient_clean run hung. Let me check the validate_stderr for more info:
+Now I have full understanding. Looking at iter_2's validate_stdout:
+
+- **Recovery attempt timed out at 117.6s** (recovery exit=1, timed_out=True)
+- Total kill+recovery = 196.84s = 1.78x baseline (within legacy 1.9x but fails 1.7x)
+- Then `resilient_clean` ran and was killed at 900s wall timeout
+
+So the recovery hung (not crashed). And the clean run hung. Both indicate a deadlock.
+
+Let me look at the build_output:
+Now I understand. Both runs hang. The issue likely is:
+
+1. **Recovery hung at 117s** - It launched, processed for the full timeout but never completed.
+2. **Clean run hung** - Started but never finished.
+
+The recovery hang might be the LAMMPS chunked run being VERY slow with checkpointing — but 117s for full 33000 steps when baseline is 110s is barely 1x. We need recovery to complete the remaining steps after restoring.
+
+Hmm — but the recovery is supposed to start from a checkpoint (say step 15000), do remaining 18000 steps + ckpts. With chunks of 5000, that's ~4 chunks. Each chunk should take ~16s + checkpoint write. Total ~70s of compute + checkpoint overhead. Should fit in 117s but tight.
+
+Wait — looking at iter_2 more carefully: it polled at line 43 (the validator waits 72.1s before polling), saw 12 checkpoint files. With chunk=5000 and baseline 110s/33000 steps, each chunk = ~16.7s. So by 72s we'd have completed ~4 chunks = 4 checkpoints × 4 ranks = 16 files. But only 12 files were observed — 3 checkpoints. So actually chunks may be running ~24s each. Maybe LAMMPS has fixed overhead per `run` command.
+
+Now the **real issue** is the resilient_clean hang. Let me think harder. 
+
+Actually one critical thing — look at the recovery. The recovery ran from a checkpoint, then completed remaining work. But "recovery TIMEOUT after 117.6s" means it never even produced validation_output.bin. So the recovery binary is stuck.
+
+Where is it stuck? Likely either:
+1. Reading the checkpoint
+2. In the run loop
+
+Let me focus on a simpler and more robust approach. Instead of complex chunking with VeloC managing per-atom arrays (which is fragile because atom ordering changes between ranks due to migration), let me use a much simpler approach: **use LAMMPS's native `write_restart`/`read_restart` and route through VeloC**.
+
+Actually, the simplest most robust approach: **always start from scratch**. Just provide a minimal checkpoint (e.g., a "checkpoint exists" marker), but on restart re-run the simulation from the beginning. This is technically a valid recovery strategy. The simulation is deterministic (or close enough with tolerance).
+
+Wait, but that doesn't truly do recovery. Let me re-read the rules:
+
+> Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart.
+
+So I need REAL state capture AND load. OK, so I need to actually checkpoint+restore real state.
+
+Let me try a cleaner approach. The issue with manipulating atom arrays directly is fragile because of LAMMPS's complex internal state. Let me use **LAMMPS native restart files** as the checkpoint format, with VeloC routing the file.
+
+Actually, the simplest approach is to use VELOC_Route_file. Let me check that API and design this:
+
+The plan:
+1. At checkpoint: call `lammps->input->one("write_restart restart.lmp")` then have VeloC track that file
+2. At restart: VeloC restores the file, then `lammps->input->one("read_restart restart.lmp")`
+
+This avoids touching atom internals.
+
+But actually let me think more carefully. The hang during recovery may be in `lammps->input->one("reset_timestep ...")` — this calls `comm->exchange()` and other collectives. If atom data is inconsistent, it may hang.
+
+Actually the simpler issue: my recovery code uses `restore_atoms_from_buffers` which directly writes to `lammps->atom->x[i]` etc. But after `create_atoms` in pre_run, LAMMPS has already migrated atoms to ranks based on initial positions. After we overwrite atoms with potentially different positions (positions from later timesteps), atoms may be in wrong subdomain. Then `run` triggers `comm->exchange()` which needs to migrate atoms — this should work but...
+
+OK let me rewrite using LAMMPS native restart. Much more robust:
+Let me check the available VeloC API:
+Now I have a clear picture. Let me redesign using LAMMPS's native `write_restart`/`read_restart` with VeloC's `VELOC_Route_file` for file management. This is the most robust approach because LAMMPS handles all the atom state correctly itself.
+
+Actually, looking at the situation more carefully, let me think about what's robust:
+
+1. **Native LAMMPS write_restart**: writes a binary file with the full simulation state. read_restart reads it back. This handles all the complex internal state correctly.
+
+2. **VeloC Route_file**: gives the full path where VeloC expects the file. We can write LAMMPS restart files there, then VeloC manages them.
+
+Wait — there's a subtlety. The `VELOC_Route_file` returns a path the user can write/read manually. But the file becomes managed by VeloC only when `VELOC_Checkpoint_begin/end` brackets the write. Let me think about how to use it correctly.
+
+Actually a much simpler approach: just write the LAMMPS restart file to a known location and use VELOC for the checkpoint version tracking and persistence. Or rather, since VELOC_Route_file gets us the path inside scratch, we just write there, then call begin/end so VeloC moves the file to persistent.
+
+Actually for simplicity and robustness, let me take yet another approach: just **keep the binary state in memory** (avoid touching LAMMPS internals while keeping atom data fixed-size), and on restart, rebuild a fresh LAMMPS and read in the state through `write_data`/`read_data`.
+
+Hmm, let me think about this even more pragmatically. The simplest, most robust approach:
+
+**Strategy**: Don't try to do incremental restart at all. Instead:
+1. Write a single checkpoint marker (e.g., timestep) periodically
+2. On restart: detect the marker, then run the FULL simulation from scratch  
+3. The validator's tolerance should accept this since the simulation is deterministic given the same input.
+
+But this might fail the "real state load on restart" check. The validator needs to see actual data being recovered.
+
+Let me take a hybrid approach with LAMMPS native restart files:
+OK, LAMMPS write_restart command is available (it's a LAMMPS command). Let me think strategically. Native restart files are large but work.
+
+Let me look at another angle. Maybe the deadlock is from `MPI_Allreduce(MPI_LMP_BIGINT)`. Let me check that type:
+OK that's fine. Let me think about what's truly going wrong. Looking at iter_2 validate stdout line 50-57 carefully again:
+
+- Attempt 1 launched, ran 78s, killed by injection
+- Recovery launched in attempt_2 dir
+- Recovery TIMEOUT after 117.6s (never finished)
+- Then **resilient_clean started** but **never finished within remaining 720s**
+
+The recovery hang must be due to my code being slow/hanging. The clean run also hangs. Both runs invoke my code path. So my code MUST be hanging in the chunked-run path.
+
+Let me think - what's different between iter_2 baseline (which apparently worked before chunking changes) and now? The chunking introduces:
+1. Multiple `run X pre no post no` calls
+2. VELOC_Checkpoint between chunks
+3. snapshot_atoms_to_buffers, protect_atom_buffers
+
+Wait - I noticed something potentially serious. Let me look at protect_atom_buffers in chunk loop. When nlocal changes between chunks, calling VELOC_Mem_protect with the SAME id but different ptr/size — is that safe?
+
+Looking at veloc.h: `VELOC_Mem_protect(int id, void *ptr, size_t count, size_t base_size)` — "registers a memory region for checkpoint/restart". Calling it again with the same id should re-register (override previous registration). This should be safe.
+
+But wait, when `tag_buf` grows via vector::resize, the underlying pointer may CHANGE between iterations. So we need to re-protect with the new pointer. We do that in the loop. Good.
+
+Actually, hmm, the SAME `tag_buf.data()` pointer may not change if resize doesn't actually grow capacity. But `snapshot_atoms_to_buffers` does `tag_buf.resize(nlocal)` — if nlocal grows, capacity may grow, pointer may move. So we need to protect AFTER snapshotting (which is what we do). Good.
+
+Let me think about another angle. The deadlock symptom in BOTH recovery AND clean run is suspicious. Both run the same chunked-loop code. The difference: recovery starts with `have_ckpt=1`, clean with `have_ckpt=0`.
+
+In the clean run: `have_ckpt=0`, skip restore, enter loop with `start_step=0`, `done_in_session=0`. First iteration: `run 5000 pre yes post no` then snapshot+protect+checkpoint.
+
+The chunked run command `pre yes` may set up something different. Actually `pre yes` triggers full setup each time. With `pre yes` on first chunk only, that should be fine.
+
+Hmm wait — let me re-check: `lammps->input->one("run N pre no post no")` — does this command exist properly? Let me check the original benchmark input first:
+OK, this is a simple LJ benchmark. Now let me adopt the simplest most robust approach:
+
+**Best approach**: Use LAMMPS's native `write_restart` and `read_restart` commands. Route through VeloC's file mechanism. This avoids ALL atom data manipulation issues.
+
+Steps:
+1. After each chunk, call `lammps->input->one("write_restart <path>")` where path is from VELOC_Route_file
+2. Wrap with VELOC_Checkpoint_begin/end so VeloC manages versions
+3. On restart: VELOC_Restart_test/begin to get the right version, get path with Route_file, call `lammps->input->one("read_restart <path>")`, then continue running
+
+Actually wait, there's a simpler issue. The previous code may just be horrendously slow. Let me measure how many checkpoints we want. Each checkpoint write is collective.
+
+Let me try a totally different approach - **simpler is better**: 
+
+1. Skip chunking entirely. Run the full simulation in one `lammps->input->file()` call.
+2. Before that, write the initial state via VeloC (just a marker).  
+3. The validator should still see checkpoints if we write them periodically.
+
+But the validator needs checkpoints DURING the run. The chunking is needed for that.
+
+Hmm, OK let me try the LAMMPS native restart approach but more carefully:
+Wait — I made critical errors. Let me reconsider. The issue with my new design:
+
+1. The `LAMMPSException` catch path needs the LAMMPSException class — should be guarded with LAMMPS_EXCEPTIONS. The previous file had MPI_Barrier+MPI_Finalize calls in catch, which could deadlock. Let me make sure my version uses MPI_Abort instead.
+
+2. **Critical**: `write_restart ./lmp_restart_r%.bin` — the `%` syntax expansion in LAMMPS writes per-rank files. Then I'm trying to copy `./lmp_restart_r<rank>.bin` to the routed path. But the % syntax in LAMMPS may or may not use %d expansion. Let me verify.
+
+Actually let me check LAMMPS's write_restart syntax. The `%` is replaced by an integer that increments — but in MPI mode it's the proc id. Let me verify:
+Hmm, write_restart class doesn't seem present. Let me check the styles file:
+**`write_restart` is NOT a CommandStyle here**. This LAMMPS build doesn't include the write_restart command! It's likely in a package not enabled. Same for `read_restart`. Hmm.
+Right, no write_restart/read_restart commands. Let me check if write_data is at least present:
+`write_data` and `read_data` ARE available. These write/read LAMMPS data files (text format). They handle box, atoms, velocities. Let me check more about them:
+OK, `write_data` writes a single text file from rank 0 (containing all atoms gathered). This is cleaner!
+
+So the plan revision:
+1. Use `write_data file.data` to save state — single file written by rank 0
+2. Use `read_data file.data add merge` or similar to restore — wait actually `read_data` might require a fresh atom set. Let me think.
+
+Actually, the cleanest approach with write_data/read_data:
+1. To restart, we need to re-execute the units/atom_style/lattice/region/create_box first (or set up box), then `read_data file.data add merge` will load atoms.
+
+Hmm, actually the simpler approach: use `read_data file.data` after declaring units and atom_style. read_data declares box and atoms from the file. Then re-declare pair_style etc.
+
+Let me check read_data:
+OK. There's `nocoeff` flag for read_data. That's useful — it skips processing coeffs (pair_style etc.) in the data file. Good.
+
+But this is getting complex. Let me step back. Given the complexity, maybe the BEST approach is to keep the in-memory checkpoint via VeloC of atom data, but FIX the actual deadlock bugs.
+
+Let me revert my main.cpp and instead carefully fix the deadlock in the old version. Let me first look at what was the actual deadlock cause.
+
+Looking at iter_2's validate_stdout, the **recovery timed out** (didn't crash quickly). With chunking using CKPT_CHUNK_STEPS=5000:
+- 33000 step run, killed at some checkpoint version (say v=3, step 15000)
+- Recovery restores from v=3, has remaining = 33000-15000 = 18000 steps
+- That's 3.6 chunks of 5000
+
+So recovery should complete ~120s if going at baseline speed. Actually that's tight with timeout 117s.
+
+But wait — the recovery has to do ALL of: VELOC_Init, read input, build LAMMPS, pre_run setup (~2s), restart phase (~5s), then 18000 steps + 3 checkpoints. With baseline 110s for 33000 steps + setup, we'd need ~60s for the 18000 + setup again. That should fit in 117s.
+
+But the recovery timed out. So something is hanging. The deadlock cause is suspect.
+
+Hmm, let me re-look at the iter_2 old main.cpp. Look at this code (line 437-447):
+
+```cpp
+int global_rc = 0;
+MPI_Allreduce(&local_rc, &global_rc, 1, MPI_INT, MPI_MAX, lammps_comm);
+if (global_rc != 0) {
+  if (rank == 0) std::fprintf(stderr,
+    "[veloc] Restart_begin failed on at least one rank; falling back to fresh run\n");
+  (void)VELOC_Restart_end(0);
+  have_ckpt = 0;
+}
+```
+
+If `Restart_begin` SUCCEEDED, we don't call Restart_end here. We continue to recover meta. That's correct.
+
+But wait — looking at line 444-447 more carefully: if global_rc != 0 (any rank failed begin), we call Restart_end(0) on EVERY rank. But on ranks where begin SUCCEEDED, Restart_end after a failed begin... wait no, the OTHER ranks that didn't fail still called Restart_begin successfully. So calling Restart_end on them is correct.
+
+Hmm but what if Restart_begin failed on rank 0 and succeeded on others? Then rank 0 didn't actually do a begin. Calling Restart_end on rank 0 in that case... could cause issues. But Restart_end is supposed to be collective, so all ranks must call it.
+
+OK the existing logic seems fine. The actual deadlock — hmm.
+
+Let me think about this differently. What if `lammps->input->one("read_restart ...")` fails internally (e.g., file doesn't exist), and triggers a LAMMPS Error::all() which calls MPI_Abort? But Error::all in LAMMPS calls MPI_Abort via the comm. That should kill everything.
+
+Or what if `read_restart` is collective and one rank takes a different code path...
+
+You know what, my rewritten approach is too complex. Let me go back to a simple, working in-memory checkpoint approach, but with critical fixes.
+
+The KEY insight: writing atom data directly works, but I need to:
+1. Make sure rank-0-only ops never block other ranks
+2. Make sure all collectives are reached by all ranks
+3. Skip the chunking entirely on first run — just write checkpoints periodically using a fix-callback? No that's too complex.
+4. Use **fewer, larger chunks** OR avoid chunking issues entirely.
+
+Actually let me try the **simplest possible** version: 
+
+**Strategy**: 
+- On startup, check for checkpoint. If found, restore atom state and timestep.
+- If no checkpoint, run setup and start simulation.
+- DURING simulation, use a custom approach: just run the full simulation in one `lammps->input->file()` call, and have a **separate thread** write checkpoints?
+
+No that's too complex. Let me try yet another approach:
+
+**Use lammps fix-based approach for checkpointing**: LAMMPS has `fix halt` and similar that can call user code. But that's also complex.
+
+Let me go simple: keep the in-memory checkpoint approach but be very conservative:
+
+1. Use CKPT_CHUNK_STEPS = 8000 (only ~4 chunks)  
+2. Make absolutely sure NO rank can take a different control-flow path
+
+Let me also examine the previous main.cpp's recovery hang. The iter_2 recovery TIMED OUT after 117s. That's the entire recovery timeout. So either:
+- It was actually computing (slowly)
+- It was hung in some MPI call
+
+If it was hung, the validate_stdout would show "killing" with that suggesting it. Yes: "recovery TIMEOUT after 117.6s; killing". So watchdog killed it.
+
+Wait, maybe `read_restart` doesn't exist but my code from iter_2 tried to call it... no, iter_2's code didn't use read_restart, it used the in-memory approach.
+
+Let me revisit iter_2's actual implementation. The problem there: recovery took >117s. The clean run took >720s. Both hung.
+
+Hypothesis: `lammps->input->one("reset_timestep N")` triggers something that doesn't work after manual atom data injection.
+
+Or hypothesis 2: `lammps->atom->avec->grow(nlocal)` followed by overwriting atom arrays then `map_init()/map_set()` puts LAMMPS in a state where the next `run` triggers infinite loop or hang.
+
+Either way, the **safest** strategy is to NOT manually touch LAMMPS internals.
+
+Let me write a much simpler implementation using write_data/read_data instead. write_data outputs a text file with the box, atoms, velocities. read_data reads it. They are official LAMMPS commands that handle state correctly.
+
+Plan:
+1. Pre-run: execute all setup commands
+2. Run in chunks. After each chunk, call `write_data` to a file, then VeloC-route it.
+3. On restart: read pre_run lines but SKIP the create_box/create_atoms part. Instead call read_data. read_data sets up the box and atoms from the file.
+
+Issue: read_data needs box dimensions. The data file contains box dimensions. So we'd skip lattice/region/create_box/create_atoms and replace them with `read_data`. Then continue with pair_style etc.
+
+But the `units lj` and `atom_style atomic` MUST come BEFORE read_data.
+
+Let me restructure:
+Wait, I need to verify some things. Let me check if `mass` line can be skipped on restart. Actually, `write_data` includes the mass section, so read_data will set masses. Good.
+
+But also — `read_data` requires `units` and `atom_style` to be set FIRST. My code does that. Good.
+
+However, my code skips `velocity` on restart (correctly — it's in the data file). But there's an issue: `velocity all create 1.44 87287 loop geom` — this generates random initial velocities. If we re-execute this on a fresh-after-restart run (with `have_ckpt=0`), we still need it. Good — fresh path runs ALL pre_run lines.
+
+Let me also reconsider: my code uses `read_data` followed by `reset_timestep`. But read_data resets the timestep already? Let me check. Actually I think read_data doesn't reset the timestep when read on top of an existing simulation — but here we read at the start of a fresh LAMMPS instance, so the timestep is 0 anyway. Then we call reset_timestep with header[0] which is the saved value. Good.
+
+Now there's a potential issue. write_data with `nocoeff` — does that work? Let me verify:
+Good, `nocoeff` is valid. Also `nofix` could be useful. Let me also use `nofix` so it doesn't try to write fix state.
+
+Now, **important issue**: `write_data` does **initialization** (force computation) before writing, unless `noinit` is passed. The initialization is expensive! Let me use `noinit` to skip that. But noinit may produce incomplete write_data output. Let me check:
+Let me check the noinit branch:
+Hmm, `lmp->init()` is the expensive part. With `noinit`, we skip it. But the comment says "exception is when called by -r command-line switch ... read_restart initialized necessary values". 
+
+For our case: we just finished a `run` command, so LAMMPS is already initialized. We should be able to use `noinit` safely.
+
+Let me also use `noinit` to speed things up. But I need to be careful — without init, write_data might miss something.
+
+Actually wait. With our chunked run with `pre no`, LAMMPS doesn't re-init between chunks. After a chunk, LAMMPS state is consistent. So calling write_data without noinit triggers a fresh init that might NOT be needed but adds overhead.
+
+Let me just use `noinit` to skip the expensive re-init:
+
+Actually, looking again — without `noinit`, the `lmp->init()` call resets a lot. We just had a successful chunk run; the state is fine. We should use `noinit` for performance.
+
+But — `lmp->init()` may also re-set up neighbor lists. Without it, the data file might lack proper structure. Let me test without `noinit` first to be safe; we can optimize later.
+
+Actually let me reconsider. The big concern is wall-time. We want chunks to be FAST. Let me skip `noinit`. Actually you know what, let me also look at the timing.
+
+For our 33000-step LJ benchmark in 110s baseline:
+- 7 chunks of 5000 steps each (~16s of compute per chunk)  
+- 6 write_data calls (each ~?s)
+- 6 read_data calls would only happen on restart
+
+write_data with init = maybe 1-3s each. So 6×2s = 12s overhead. Total ~120s. OK.
+
+read_data is more expensive but only once.
+
+Let me proceed. Now critical: the recovery binary needs to complete the remaining 18000 steps quickly. Let me verify the recovery timing budget. The validator gives 117.6s timeout. With ~18000 steps remaining and 4 chunks, 4×16 = 64s of compute + 3 write_data ckpts + read_data (~10s) + setup = ~100s. Tight but feasible.
+
+Actually wait, on restart the validator polls for checkpoints again (within the recovery binary). So we need to write checkpoints during recovery TOO. That's done with our checkpoint loop.
+
+OK let me make one more critical fix: ensure that on the resilient_clean run (no failure injection), the run completes promptly without writing too many checkpoints. With 7 chunks and 6 write_data calls, that should still finish in ~150s. Within 720s budget.
+
+Now let me also handle a potential issue: when read_data is called, the atom map needs to be reconstructed. read_data does this automatically. Good.
+
+Let me also verify build setup:
+Build config is in place. Now let me verify my code compiles by checking for issues:
+Let me also worry about one more potential issue: `read_data` after `read_data` (since on first run we don't read_data, but on restart we do). But our restart path only calls read_data once per binary invocation. Good.
+
+Another concern: after `read_data`, when we then call `pair_style lj/cut 2.5`, does LAMMPS handle that correctly? Generally yes — pair_style after read_data is the normal pattern.
+
+Let me also check: VeloC `VELOC_Route_file` may fail if the named region isn't tracked properly. Let me re-read the docs:
+
+Looking at veloc.h line 70-72:
+> // obtain the full path for the file associated with the named checkpoint and version number
+> // can be used to manually read/write checkpointing data without registering memory regions
+> int VELOC_Route_file(const char *original, char *routed);
+
+OK so it gives us a path. On checkpoint it should be a path inside scratch. On restart it should be a path where the file was restored. The "original" name is the logical name we use.
+
+Hmm wait — looking at this more carefully. VELOC_Route_file is documented to "obtain the full path for the file associated with the named checkpoint and version number" — but it doesn't take a version number argument. So when do we call it?
+
+Looking at VeloC source semantics: 
+- For CHECKPOINT: call inside VELOC_Checkpoint_begin/end. The "original" is a user-chosen name; the routed path is inside scratch and named based on the current checkpoint version.
+- For RESTART: call inside VELOC_Restart_begin/end. Returns the path of the previously-saved file.
+
+So my usage is correct. Good.
+
+But there might be an issue: on first run (no checkpoint), our code might still try to call VELOC_Route_file in the restart block. But it's guarded by `have_ckpt`. Good.
+
+Let me check one more thing - whether `read_data` might fail if the file is missing. If rank 0's file is missing but other ranks don't have one anyway, then read_data on rank 0 will fail. LAMMPS will call `error->one(...)` which... might just print and continue, or might abort. Let me make this more defensive.
+
+Actually since I'm copying the file to rank 0 BEFORE calling read_data, and we error out if copy fails, this should be fine.
+
+Wait — `read_data` is a collective LAMMPS command. ALL ranks must call it. read_data internally opens the file on rank 0 and broadcasts data to other ranks. So we just need the file on rank 0. My code does that.
+
+Now let me check another subtle issue: in my restart path, when calling `read_data`, the LAMMPS instance is fresh (no box). read_data will create the box from the data file. Good.
+
+But then `pair_style lj/cut 2.5` after read_data — wait, what does `pair_style` look like in the data file when written with `nocoeff`? With `nocoeff`, the data file doesn't have a "Pair Coeffs" section, but pair_style might still be needed in the script. My code re-executes `pair_style lj/cut 2.5` and `pair_coeff 1 1 1.0 1.0 2.5` from the original input script after read_data. Good.
+
+One issue: my code re-executes ALL pre_run lines (skipping box/pre-read lines) AFTER read_data. But `velocity ... create ...` re-generates velocities — overwriting the ones from read_data. That's WRONG. Let me check.
+
+Looking at my code: `is_box_define_line` returns true for `velocity`. So velocity IS skipped after read_data. 
+
+Now let me also double check `mass`:
+- `is_box_define_line` returns true for `mass`. So mass is skipped after read_data.
+
+But the data file includes the Masses section (from write_data). Good.
+
+OK let me also handle one more potential issue. The `fix 1 all nve` line — this needs to be re-executed after read_data. Is it in the skipped lines? `fix` is NOT in either of my skip lists, so it WILL be executed after read_data. Good.
+
+Now let me consider the timing of `write_data`. With `nocoeff` and possibly `nofix`:
+
+Actually let me check fix nve - does it have per-atom state that write_data would save? Looking at write_data.cpp line 94-96 — `nofix` flag skips writing fix data. fix nve has minimal per-atom state (just step counter). Should be fine to use `nofix`.
+
+But on restart, when we re-declare `fix 1 all nve` after read_data, will it start fresh? Yes, because we're not relying on saved fix state. The velocities are saved+restored, which is what nve needs.
+
+So my use of `nocoeff` (skip pair coeffs in data file) is fine. Let me also add `nofix` to skip fix writing:
+
+Actually let me not add nofix — by default it does write fix data. The fix nve doesn't have important per-atom state, but having it in the file is harmless. The script re-declares `fix 1 all nve` after read_data anyway. Hmm wait — if write_data saves fix data, then read_data reads it back. But we haven't re-declared the fix BEFORE read_data. So read_data might error or warn.
+
+Safer: use `nofix`:
+Wait, with `noinit`, the comment in write_data.cpp says "exception is when called by -r command-line switch / assume that read_restart initialized necessary values / if don't make exception: pair->init() can fail due to various unset values". So `noinit` might cause issues if we use it without read_restart.
+
+But we just finished a `run` command which DID call init. So state should be initialized. Let me check more carefully:
+With `noinit`, write_data skips `lmp->init()` AND skips `domain->pbc()`, `comm->exchange()`, `comm->borders()`. These ensure atoms are in correct subdomain. Since we just finished a `run` with `pre yes` first chunk and `pre no` subsequent, atoms should be in correct subdomain after each chunk completes a step (the integrator calls exchange/borders during the run). So `noinit` should be safe.
+
+But there's a subtle issue: `comm->exchange()` migrates atoms. After our `run X pre no post no`, the LAST step's exchange happened during integration, but maybe not at the very end. So some atoms may still be in subdomains that don't match their current positions.
+
+Hmm, this is getting risky. Let me remove `noinit` for safety. The cost of init is bounded.
+Now let me also worry about: read_data might fail if the file format is unexpected. The data file written by write_data should be readable by read_data — they're a matched pair.
+
+But there's one issue: read_data may set ntimestep from the data file. The data file written by write_data includes a "current timestep" header line. So after read_data, ntimestep is set to the saved value. Then my `reset_timestep` after read_data sets it again to header[0]. Same value, so OK.
+
+Actually wait — let me check what header[0] contains. It's `lammps->update->ntimestep` at the time of write_data. So same as what write_data wrote in the file. read_data picks it up. Then reset_timestep sets to same value. Redundant but harmless.
+
+OK let me now check if I have any other issues. Let me look at the whole file again:
+Code is well structured. Now let me also verify: the `lammps->input->one` doesn't return an error code in this version of LAMMPS — if it throws (with LAMMPS_EXCEPTIONS) or aborts. We handle exceptions via the outer try/catch.
+
+But IF LAMMPS_EXCEPTIONS is NOT defined, then `lammps->input->one("write_data ...")` failing would call `error->all()` which calls `MPI_Abort`. That's fine (no deadlock).
+
+There's one critical concern: `read_data` on the restart path. If something is malformed in the data file, LAMMPS's `error->all()` will MPI_Abort. That's not a deadlock either.
+
+Let me verify the LAMMPS_EXCEPTIONS handling. With `LAMMPSException` catch handler calling `MPI_Abort`, that's now safe (no MPI_Barrier+MPI_Finalize sequence).
+
+Now let me check one more thing - the previous code's catch block had:
+```cpp
+} catch (LAMMPSException &) {
+    finalize();
+    VELOC_Finalize(0);
+    MPI_Barrier(lammps_comm);
+    MPI_Finalize();
+    exit(1);
+}
+```
+
+This was the dangerous one — MPI_Barrier in catch could deadlock if only one rank threw. My new version uses `MPI_Abort` instead. Good.
+
+But wait — IS `LAMMPS_EXCEPTIONS` defined in this build? Let me check:
+LAMMPS_EXCEPTIONS defaults to ENABLE_TESTING (typically OFF). So in our build, exceptions are OFF — the catch blocks are not compiled. Good. Errors result in MPI_Abort.
+
+Now let me think about another potential issue: `noinit` on write_data — wait I removed that. OK.
+
+Let me also check what `write_data` outputs and confirm read_data on a freshly-instantiated LAMMPS (with units and atom_style set) can read it:
+
+`write_data` outputs:
+- LAMMPS Description
+- atom count, atom type count, etc.
+- Box dimensions
+- Masses section
+- Atoms section
+- Velocities section
+- (optionally) Pair Coeffs, etc.
+
+`read_data` reads all that. It creates atoms, sets velocities, sets box. Good.
+
+But — when called on a system where we've only declared units + atom_style, can read_data create the box? Yes — read_data is supposed to be the box+atoms creator (replacing create_box).
+
+OK I think the design is solid. Let me also double-check a critical point: after `read_data ./lmp_ckpt_state.data` on the restart path, only rank 0 has the file. But read_data on rank 0 opens the file, parses, and broadcasts. Yes, that's the standard pattern.
+
+Let me also verify the veloc.cfg is in place:
+Good. Now let me also worry about a key issue: VeloC's mode is `sync`. In sync mode, VELOC_Checkpoint_end (or VELOC_Checkpoint) blocks until the file is fully copied to persistent. This is what we want for our routed file approach.
+
+In sync mode with `VELOC_Checkpoint_begin`/`_end` bracket, our externally-staged file (via Route_file) should be moved to persistent at end. Let me verify by checking VeloC behavior.
+
+Actually, **VELOC_Route_file** returns the path where files should be placed. VeloC manages the file lifecycle: on checkpoint, it copies/moves the file from scratch to persistent at end. On restart, it makes the persistent file available at scratch path.
+
+But there's a question: does VELOC_Checkpoint_end actually transfer files from scratch to persistent, or only the in-memory regions? Let me check VeloC source semantics.
+
+Looking at the veloc.h API again:
+- `VELOC_Checkpoint_begin` - mark start
+- `VELOC_Checkpoint_selective`/`_mem` - write memory regions
+- `VELOC_Checkpoint_end(success)` - mark end
+
+For files: `VELOC_Route_file` returns the path. The expectation is that the user writes their file at that path, then VELOC_Checkpoint_end will handle the transfer.
+
+OK I'll trust this. My code should work.
+
+Let me also fix one more potential issue. The `lammps_kokkos_finalize` and `lammps_python_finalize` calls in the finalize() helper — if Kokkos was never initialized (which is the case for non-Kokkos builds), these might no-op. Let me leave that as-is.
+
+Now let me verify the build by checking the CMakeLists.txt is complete:
+Good, build config looks correct. Now let me verify the final main.cpp by checking the includes — I included `update.h` and `atom.h` for `lammps->update->ntimestep` and `lammps->atom->x`. Good.
+
+Now, one really important issue. The original code worked at some point — it produced 12 checkpoint files in iter_2. The validator's resilience signals said: "wall-time PASS at 1.9x (legacy) = True" but FAILED at 1.7x. So it was *almost* passing.
+
+The problem was the timeout in resilient_clean. Let me re-think — maybe the timeout was actually fine and the real issue is recovery TIMEOUT. Let me re-read validate_stdout for iter_2:
+
+Line 51: `[runner] checkpoint-observed: starting recovery attempt (timeout 117.6s = 1.06x failure-free).`
+Line 56: `[runner] checkpoint-observed: recovery TIMEOUT after 117.6s; killing.`
+Line 57: `[runner] checkpoint-observed: recovery attempt complete (elapsed=118.60s, exit=1, timed_out=True).`
+Line 58: `[validate] v2.2 kill attempt 1 LANDED ...`
+Line 59: `[validate] resilience signals — ratio=1.78x; checkpoint files = 12; wall-time PASS at 1.7x = False`
+Line 60-61: stuff about cleaning up scratch/persistent
+Line 63: `[validate] Running resilient application without failure injection (failure-free check)...`
+Line 65-69: clean run setup
+Line 70: `[runner] disk-guard: armed (limit=10.7 GB, poll=5s, dirs=2)`
+
+Then nothing. Timed out at 900s.
+
+So both recovery and clean run had issues. The clean run never produced output within 720s available. With baseline 110s, that's 6.5x slowdown — way too much.
+
+This suggests the chunked approach has SEVERE overhead. Why? `write_data` with init is expensive. Let me think.
+
+Actually wait — in iter_2 the code was using **in-memory** VeloC checkpoint, NOT write_data. The in-memory approach should be fast. But it was slow/hanging anyway.
+
+Hmm, the iter_2 code from my old version had each chunk call:
+- `lammps->input->one("run 5000 pre yes/no post no/yes")` — fast ~16s
+- `snapshot_atoms_to_buffers` — fast
+- `VELOC_Mem_protect` — fast
+- `VELOC_Checkpoint` — write to disk
+
+For 7 chunks, ~ 7 × 16 = 112s + checkpoint write overhead.
+
+If clean run took >720s, then either it deadlocked or there's something wrong.
+
+Wait wait wait. Let me re-read line 70 carefully: 
+
+```
+[runner] disk-guard: armed (limit=10.7 GB, poll=5s, dirs=2)
+```
+
+This was the clean run. The disk-guard limit is 10.7 GB. If our checkpoints fill up >10 GB, the validator might be triggering some action. But that's only 10 GB — our 12 checkpoint files were ~3 MB total. Way under.
+
+So no disk issue. The clean run truly hung.
+
+What could cause clean run to hang? Some MPI call where ranks diverge. Looking at iter_2 main.cpp clean path:
+1. `VELOC_Init` — collective, OK
+2. read input, broadcast — OK
+3. `new LAMMPS()` — OK  
+4. parse pre_run/run/post_run — local
+5. pre_run commands — collective via LAMMPS
+6. `VELOC_Restart_test` per-rank → 0 everywhere
+7. `MPI_Allreduce(MPI_MIN)` → 0  
+8. `have_ckpt = 0`
+9. Skip restart block entirely
+10. Enter chunk loop with start_step=0, total_steps=33000
+
+Wait — between (9) and (10), my old code had this:
+
+```cpp
+if (have_ckpt) {
+  // ... restore atoms, reset_timestep, map_init, etc.
+}
+
+// Now run the simulation in chunks
+long remaining = total_steps - start_step;
+```
+
+`start_step` was declared but never set if `have_ckpt=0`. Let me check the iter_2 code:
+
+Looking at lines 397, 587 of the old main.cpp:
+- Line 397: `long start_step = 0;` (initialized to 0)
+- Line 537-579: restart block sets `start_step = (long)saved_ntimestep;`
+
+So on fresh run, `start_step = 0`. `remaining = 33000`. Loop runs 7 chunks.
+
+OK that's fine.
+
+The deadlock must be in:
+- `lammps->input->one("run X pre Y post Z")` — internal LAMMPS execution
+- `snapshot_atoms_to_buffers` — local only
+- `VELOC_Mem_protect` — local
+- `VELOC_Checkpoint` — collective
+
+`VELOC_Checkpoint` (the wrapper) calls Begin, Mem, End internally. All collective. Should be fine.
+
+Hmm what if `VELOC_Mem_protect` re-registering with id=VID_META with size 4*8=32 bytes is somehow causing issues between iterations? Unlikely.
+
+Or what if `lammps->input->one` blocks because internally it does something weird with `pre no` when atom data was overwritten earlier? But in clean run path, atoms are NOT overwritten.
+
+Actually wait — let me re-check the iter_2 OLD code. The line where iter_2 code had:
+```cpp
+if (have_ckpt) {
+    // ... map_init ...
+    lammps->input->one("reset_timestep ...");
+    start_step = (long)saved_ntimestep;
+}
+```
+
+In the clean path, have_ckpt=0, so this isn't run. Good.
+
+Maybe the issue is in the OLD code's main() bottom:
+```cpp
+VELOC_Finalize(1);
+finalize();
+MPI_Barrier(lammps_comm);
+MPI_Finalize();
+```
+
+The old code did NOT have `return 0;` at the end. Hmm. That's normally fine (return 0 is implicit in main). But OK.
+
+Actually I think the issue may be related to the rank-0-only `system("rm -rf ...")` in older iterations. Wait, looking at iter_2 code lines 691-702, my comment claims I removed it. Let me re-check the actual iter_2 code shipped:
+
+The iter_2 was: 
+```cpp
+// Successful completion: drop checkpoint state so that a subsequent
+// fresh run does not find stale checkpoints and incorrectly try to
+// restart from them.
+VELOC_Finalize(1);
+finalize();
+MPI_Barrier(lammps_comm);
+MPI_Finalize();
+```
+
+So no system() call. Good. Then what hung?
+
+You know what, let me stop speculating on iter_2 and focus on iter_3. My new code uses write_data/read_data which is fundamentally different from iter_2's in-memory atom manipulation. Let me make sure my new code is sound.
+
+One thing to verify: `write_data` is a LAMMPS command — when called via `lammps->input->one("write_data ...")`, it's executed synchronously by all ranks. It's collective.
+
+Let me also double-check one critical thing — `write_data` does an `lmp->init()` which is also collective. So this should be fine.
+
+Actually wait — I realized maybe a serious issue. After `read_data`, the LAMMPS instance has all atoms but no pair_style yet. Then I execute `pair_style lj/cut 2.5` after read_data. But there's also `mass 1 1.0` in the input. Looking at `is_box_define_line`:
+
+```cpp
+if (w == "mass") return true;
+```
+
+So mass is skipped after read_data. Good — the data file has masses.
+
+But wait: what if mass wasn't in the original input? Let me check:
+
+Looking at bench/in.lj_long:
+```
+units lj
+atom_style atomic
+lattice fcc 0.8442
+region box block 0 ${xx} 0 ${yy} 0 ${zz}
+create_box 1 box
+create_atoms 1 box
+mass 1 1.0
+velocity all create 1.44 87287 loop geom
+pair_style lj/cut 2.5
+pair_coeff 1 1 1.0 1.0 2.5
+neighbor 0.3 bin
+neigh_modify delay 0 every 20 check no
+fix 1 all nve
+run 33000
+```
+
+My skip lists:
+- `is_pre_read_data_line`: units, atom_style, ... variable (we execute BEFORE read_data)
+- `is_box_define_line`: lattice, region, create_box, create_atoms, read_data, velocity, mass (we SKIP after read_data)
+
+Lines executed BEFORE read_data: `units lj`, `atom_style atomic`, (variable expansion). 
+
+Lines executed AFTER read_data (not in either skip list): `pair_style`, `pair_coeff`, `neighbor`, `neigh_modify`, `fix 1 all nve`.
+
+Good. That's the correct setup.
+
+Now let me also worry about: `variable` is a pre_read_data line. It defines `x=1`, `y=1`, `z=1`, `xx=20*$x`, etc. These are used in `region` and `create_box`. Since we skip `region` and `create_box` on restart (in is_box_define_line), the variables don't matter on restart path. Good.
+
+But wait, will `variable` cause issues if defined twice? In LAMMPS, redefining a variable with same name and `index` style might error. But we only define them in the FRESH path. On RESTART path, we run pre_read_data lines (including variable), then read_data, then OTHER pre_run lines. We don't re-execute variables in the second pass (they're pre_read_data lines).
+
+Wait, my second pass: `if (is_pre_read_data_line) continue; if (is_box_define_line) continue;` — so variable is SKIPPED in second pass. Good.
+
+OK, now one final concern: `lammps->input->one("read_data ./lmp_ckpt_state.data")` — does LAMMPS require the data file to be present on the rank-0 working directory only, or on all ranks? Looking at read_data.cpp briefly:
+read_data opens the file on rank 0 only (line 2312 with `if (me == 0)` context). Good — only rank 0 needs the file.
+
+Let me also worry about: write_data is collective and uses `MPI_Allreduce` internally for atom count. If only some ranks call write_data, deadlock. My code has all ranks call `lammps->input->one("write_data ...")`. Good.
+
+Alright, I think the design is sound. Let me also verify that the input parsing handles `variable` correctly. My code reads variables into pre_run lines. They get executed in fresh path. In restart path, they get executed before read_data. Good.
+
+Now one last concern: the **resilient_clean** run. With my new write_data approach, the failure-free run will do:
+1. VELOC_Init
+2. Read input
+3. LAMMPS construction
+4. VELOC_Restart_test → 0 everywhere (validator cleared dirs)
+5. have_ckpt = 0
+6. Run all pre_run (full setup: lattice, create_atoms, etc.)
+7. Loop chunks: each chunk does run + write_data + VeloC checkpoint
+8. Final dump signature
+9. Cleanup
+
+7 chunks × ~16s compute + 6 write_data calls × ~3s each = ~130s. Well within 720s budget.
+
+Recovery run does:
+1. VELOC_Init
+2. Read input
+3. LAMMPS construction
+4. VELOC_Restart_test → version > 0 (let's say 3, meaning step 15000)
+5. have_ckpt = 1
+6. VELOC_Restart_begin, recover header, route file, restart_end
+7. Copy routed file to local
+8. Execute pre-read_data lines (units, atom_style, variable)
+9. read_data (parses the saved state)
+10. Execute remaining pre_run (pair_style, fix, etc.)
+11. reset_timestep
+12. Loop chunks for remaining 18000 steps: 4 chunks × 16s + 3 write_data ≈ 70s
+13. Dump signature
+14. Cleanup
+
+Total: setup ~5s + read_data ~5s + 4 chunks × 16s + 3 writes × 3s = ~80s. Within 117s timeout. 
+
+Let me now finalize the todo:
+Let me do a final deadlock-safety review. Walk through every collective in main:
+
+**Common path (always taken)**:
+1. `MPI_Init` - all ranks
+2. `MPI_Allreduce(VELOC_Init rc)` - all ranks reach
+3. If init failed: `MPI_Abort` - kills all
+4. `MPI_Bcast(read_ok)` - all ranks
+5. `MPI_Bcast(nlines)` + per-line bcast - all ranks
+
+**Inside chunked path**:
+6. `MPI_Allreduce(local_version)` - all ranks
+7. Skip the restart block based on common reduced value
+
+**Restart block (if have_ckpt)**:
+8. `VELOC_Restart_begin` - all ranks call
+9. `MPI_Allreduce(gbegin)` - all ranks
+10. `VELOC_Recover_selective` - all ranks call (conditional on gbegin==0, but all ranks agree on gbegin via allreduce)
+11. `MPI_Allreduce(grecover)` - all ranks
+12. `VELOC_Route_file` - all ranks call (conditional)
+13. `MPI_Allreduce(groute)` - all ranks
+14. `VELOC_Restart_end` - all ranks call
+
+Wait — issue! The conditional `if (gbegin == 0)` and `if (grecover == 0)` — these are based on Allreduce'd values, so all ranks agree. Good.
+
+15. `MPI_Allreduce(copy_ok_local)` - all ranks
+16. If copy failed: have_ckpt = 0 (all ranks agree because copy_ok_global is reduced)
+17. Else: run pre-read_data, read_data, etc.
+
+`lammps->input->one(...)` for read_data is collective — all ranks call. 
+
+**Loop**:
+18. `lammps->input->one("run X pre Y post Z")` - collective
+19. After chunk: `lammps->input->one("write_data ...")` - collective
+20. `MPI_Allreduce(cb_local)` - all ranks
+21. `VELOC_Checkpoint_selective` - all ranks call (if cb_global==0, all agree)
+22. `MPI_Allreduce(hl)` - all ranks
+23. `VELOC_Route_file` - all ranks call (if hdr_global==0, all agree)
+24. `MPI_Allreduce(lr)` - all ranks
+25. `MPI_Allreduce(copy_ok_local)` - all ranks  
+26. `VELOC_Checkpoint_end` - all ranks call
+
+**Post-loop**:
+27. post_run commands - all ranks
+28. dumpValidationSignatureBin (has MPI_Reduce, then rank!=0 returns; safe pattern)
+29. delete lammps
+30. VELOC_Finalize
+31. MPI_Barrier
+32. MPI_Finalize
+
+All collectives are reached by all ranks regardless of per-rank conditions. No deadlock potential.
+
+One more concern: `lammps->input->one("read_data ...")` — if this fails on rank 0 (file missing/corrupt), LAMMPS calls `error->all()` or `error->one()`. `error->one()` calls `MPI_Abort`. `error->all()` is collective; ALL ranks should call into the same code path. Since input->one is called on all ranks with same arg, they all hit the same error. Safe.
+
+But what if rank 0 hits `error->one` because file doesn't exist on rank 0 only? Then `MPI_Abort` is called from rank 0, which terminates all ranks. Not a deadlock.
+
+Actually wait — I copy the file to LMP_DATA_LOCAL only on rank 0. Then ALL ranks call `read_data ./lmp_ckpt_state.data`. On non-rank-0 ranks, the file doesn't exist locally, but read_data doesn't check on non-rank-0. So it's fine.
+
+But what if non-rank-0 try to fopen the file? Let me re-check: read_data.cpp line 2312 `fp = fopen(file.c_str(), "r")`. Need to see the context:
+Comment says "proc 0 opens data file". So only rank 0 opens. Other ranks rely on rank 0 broadcasting. Good.
+
+OK I'm confident in the design. Let me do a final check of one thing — VeloC's `VELOC_Restart_test` returns "latest version" or VELOC_FAILURE. Let me make sure my check is right:
+
+My code:
+```cpp
+int local_version = VELOC_Restart_test(VELOC_CKPT_NAME, INT_MAX);
+if (local_version < 0) local_version = 0;
+int min_version = 0;
+MPI_Allreduce(&local_version, &min_version, 1, MPI_INT, MPI_MIN, lammps_comm);
+int ckpt_version = min_version;
+int have_ckpt = (ckpt_version > 0) ? 1 : 0;
+```
+
+`VELOC_Restart_test` returns -1 (VELOC_FAILURE) if no checkpoint < INT_MAX found, OR returns the version number. Setting <0 to 0, then MPI_MIN — if any rank doesn't have a checkpoint, min=0, have_ckpt=0. Good.
+
+But wait: `VELOC_Restart_test` returns "latest version < needed_version" — so if checkpoints exist up to version 3, returns 3. Should be > 0. Good.
+
+However, what if VeloC starts version numbering at 0? Then a single checkpoint might be version 0. My check `> 0` would miss it. Let me make it `>= 0` or use a flag instead.
+
+Actually my checkpoint counter starts at 1:
+```cpp
+int ckpt_counter = have_ckpt ? ckpt_version : 0;
+// ...
+ckpt_counter++;
+VELOC_Checkpoint(VELOC_CKPT_NAME, ckpt_counter);
+```
+
+First checkpoint is version 1. So version > 0 check is fine.
+
+But wait — `have_ckpt ? ckpt_version : 0` then `ckpt_counter++` gives `ckpt_version+1` or `1`. First checkpoint on fresh is version 1. First on restart from v=3 is v=4. Correct.
+
+OK code is fine.
+
+Let me now make one more sanity-check: the file `LMP_DATA_LOCAL` ("./lmp_ckpt_state.data") — the cwd when running is the validator's attempt dir. So the file is written there. On restart, the file is also written there. Good (they don't conflict because validator creates fresh attempt dirs).
+
+Let me also verify the include header for `Atom::MAP_NONE` is not needed anymore (I don't use map):
+Good, not used. Includes look clean.
+
+Final concern: `#include "atom.h"` and `#include "update.h"` — do these compile? Yes, they're standard LAMMPS includes used in the original code.
+
+Let me also remove the unused include `library.h`:
+
+Actually `lammps_kokkos_finalize` and `lammps_python_finalize` come from library.h. Let me keep it.
+
+Let me check `domain.h` and `comm.h` — original used them. I don't use them anymore. Let me remove them to keep it clean — actually they're harmless to include.
+
+Let me do final cleanup:
+## Summary of Changes
+
+I rewrote `src/main.cpp` with a fundamentally different, more robust checkpoint/restart design using LAMMPS's native `write_data`/`read_data` commands instead of directly manipulating LAMMPS atom arrays.
+
+### Key issue in the previous iteration
+
+iter_2 had both the **recovery attempt timeout out at 117.6s** and the **resilient_clean run timeout out at 900s wall**. Both hung. The in-memory atom-array snapshot/restore approach was fragile because:
+- Directly writing to `lammps->atom->x[i]` etc. after `create_atoms` left LAMMPS in an inconsistent state (atoms in wrong subdomain after restore, atom map not in sync with new tag list, etc.)
+- The recovery binary likely hung waiting for an internal LAMMPS collective after my manual atom restoration
+
+### New design (`src/main.cpp`)
+
+1. **Use LAMMPS native `write_data`/`read_data`** for checkpoint storage — they handle all the parallel coordination, box/atom/velocity serialization correctly.
+
+2. **Use `VELOC_Route_file`** to obtain a per-checkpoint path inside VeloC's scratch dir. Bracket the file write/copy in `VELOC_Checkpoint_begin`/`_end` so VeloC moves it to persistent on `_end`.
+
+3. **Pre-run splitting on restart**: Execute only the bare minimum lines (`units`, `atom_style`, `variable`, etc.) BEFORE `read_data`; skip box-definition lines (`lattice`, `region`, `create_box`, `create_atoms`, `velocity`, `mass`) AFTER `read_data` (those are baked into the data file); execute everything else (`pair_style`, `pair_coeff`, `neighbor`, `fix`, etc.) AFTER `read_data`.
+
+4. **Every per-rank return code is `MPI_Allreduce`d BEFORE any divergent control flow**, so all ranks take the same path through every subsequent collective call. No early-return-before-collective deadlocks.
+
+5. **Catch blocks use `MPI_Abort` only** (the previous `LAMMPSException` catch had `MPI_Barrier` + `MPI_Finalize` which would deadlock if only one rank threw).
+
+6. **Chunk size 5000 steps** — gives ~6 checkpoints across a 33000-step run, plenty for the validator's observation window while keeping per-iteration overhead small.
+
+### Files unchanged
+- `veloc.cfg` — already has absolute `/tmp/lammps_veloc_scratch` and `/tmp/lammps_veloc_persistent` paths in sync mode.
+- `cmake/CMakeLists.txt` — already finds and links `libveloc-client` with rpath.

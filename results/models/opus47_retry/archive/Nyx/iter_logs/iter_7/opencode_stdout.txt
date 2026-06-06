@@ -1,0 +1,1075 @@
+I'll start by examining the previous iteration's failure logs to understand what went wrong.
+The recovery exited with code 11 (segfault) and produced no validation output. The recovery walltime was only 3.10s (very short), and the message `VELOC_Restart_test('nyx',0) => 201 (using=0)` means restart_test returned 201 (no checkpoint version found). Let me investigate the previous code.
+Now I understand the structure. Let's look at the failure carefully:
+
+1. The validator detected 72 checkpoint files (good - checkpoints are being created)
+2. On recovery, `VELOC_Restart_test('nyx',0) => 201` - but the message says `(using=0)` meaning the code is interpreting 201 as not a valid version
+3. The code then says "No prior VeloC checkpoint" → fresh init, then ranks segfault
+
+Wait - 201 is the latest VeloC checkpoint version (the previous run had checkpointed at version 201). The bug is on line 813-826:
+
+```cpp
+int latest_raw = VELOC_Restart_test("nyx", 0);
+int latest = veloc_resumed_state ? 0 : latest_raw;
+...
+if (!veloc_resumed_state) {
+    if (latest <= 0) {
+        ...
+    }
+}
+```
+
+`latest=201` is positive, so the code SHOULDN'T have said "No prior VeloC checkpoint". Let me re-read...
+
+Actually `latest=201` enters the `if (latest > 0 && !veloc_resumed_state)` branch at line 856. It enters the walk-back loop. But none of versions 170-201 (the fallback window) had valid header/trailer. So it falls through to "No valid checkpoint found within fallback window".
+
+But the log shows: `[NyxVeloC] No prior VeloC checkpoint (Restart_test=0); doing fresh init`
+
+Hmm, that says `Restart_test=0` not `Restart_test=201`. But the log line earlier says `=> 201 (using=0)`. So `latest = veloc_resumed_state ? 0 : latest_raw` → if `veloc_resumed_state` is true, `latest=0`. So sidecar succeeded! But then we should NOT go into "No prior VeloC checkpoint" — that branch is in `else` of `if (latest > 0 && !veloc_resumed_state)`. 
+
+Wait if `veloc_resumed_state=true` then `latest=0`, so `if (latest > 0 && !veloc_resumed_state)` evaluates to `false`, and the `else` branch runs printing "No prior VeloC checkpoint". That's a logic bug but harmless since `veloc_resumed_state=true` means scatter happens.
+
+Actually wait... the output says:
+```
+[NyxVeloC] VELOC_Restart_test('nyx',0) => 201 (using=0)
+[NyxVeloC] No prior VeloC checkpoint (Restart_test=0); doing fresh init
+```
+
+The "using=0" means `latest=0` was set. That happens when `veloc_resumed_state=true`. So the sidecar must have been resumed. But then the next log line is misleading. Let me check what happens then.
+
+Then it segfaults. So the scatter path is causing the segfault. Let me look at what happened before this in the log — the lines before are stripped. The validator says "Last stderr lines" so we don't see the earlier `[NyxVeloC]` log lines (sidecar logs).
+
+Let me check the actual stderr files to understand the full picture:
+Key gates per stderr: "no side-car files in VeloC dirs AND no gaming-artifact files in /tmp". Our sidecar files ARE in VeloC dirs! That violates the gate. The sidecar approach is explicitly disallowed.
+
+Also from validate_stdout.txt: `sidecar_ok=True (informational under perturbation pipeline; n=0)` — currently informational under perturbation but the policy line says "no side-car files in VeloC dirs". So we should remove sidecar files from VeloC dirs.
+
+Let me check the other iters too:
+OK. Iter 5: recovery succeeded but ratio was 1.65x — too slow (gate cap 1.2x). Output was correct (matched baseline).
+
+Then iter 6 added the sidecar to speed up resume — but the resume scattered data into wrong-sized MultiFabs and crashed (segfault), OR more likely the sidecar approach broke something.
+
+Wait look at iter 6 again: it says checkpoint_observed=72 files (good), recovery walltime was 3.10s with exit=11 (segfault before producing output).
+
+So this means: sidecar resumed but the scattered data was bad/segfaulted. OR the sidecar didn't actually resume and the fresh init path crashed for some reason.
+
+The log says `(using=0)`, which is what happens when veloc_resumed_state is true. So sidecar succeeded. But then the AmrLevel scatter must have segfaulted.
+
+Why would the scatter segfault? Probably because at resume, the freshly init'd Amr has DIFFERENT MultiFab sizes than what was checkpointed. The `init` call would set up only level 0; if checkpoint has more levels, scatter into non-existent levels is bad.
+
+Actually looking at the code on line 1041-1088: it uses `nlev_now = amrptr->finestLevel() + 1` and `n_scatter = min(nlev_now, nlev_ckpt)`. So that's bounded. But maybe `get_new_data(0)` on a level returns a MultiFab with different layout than what was checkpointed.
+
+Actually I think the deeper issue is: the segfault is from AmrLevel using uninitialized state because Amr::init didn't initialize from level data, so when scatter populates, the AMReX integrator's other state (particles, gravity, etc) is inconsistent.
+
+But wait — iter 5 ran WITHOUT sidecar and recovered correctly. The output matched! So fresh init + scatter works. The only problem in iter 5 was performance (1.65x). The iter 6 added sidecar AND it crashed.
+
+Let me check iter_5 source approach vs iter_6:
+OK. Iter 5: ratio=1.65x with 64 checkpoint files (146MB), recovery took 111.84s (almost as long as the failure-free baseline). Issue: walltime cap 1.2x not met.
+
+The reason is the resumed AMReX run still runs through to stop_time but the resume should pick up CLOSE to where it left off. Looking at iter 5's recovery elapsed = 111.84s ≈ failure-free time. That means scatter didn't really resume — it ran the whole thing again.
+
+So iter 5 had a logic issue where the scatter happened but cumTime/levelSteps weren't properly applied — so AMReX still ran from t=0. Let me look at the iter 6 fix: setCumTime, setLevelSteps, setDtLevel, setTimeLevel are now called. So iter 6 enhanced this. But that introduced the segfault.
+
+Hmm. Let me think about this. The validator says recovery_elapsed=3.10s. So the binary started, did init, tried to resume from sidecar, segfaulted. Within 3 seconds, before producing output.
+
+Maybe the issue is with `setCumTime` or `setTimeLevel` — those calls cause AMReX downstream to crash because the next coarseTimeStep tries to compute dt from invalid state, or particles aren't set up to handle nonzero time.
+
+Let me look at the build output for iter 6:
+Now I have a clearer picture. The previous attempt added sidecar files in the VeloC dirs. The validator policy explicitly says "no side-car files in VeloC dirs". This causes the gate to fail.
+
+But also, the segfault in iter_6 suggests the sidecar resume path was actually entered, but then somehow crashed during scatter. Let me think...
+
+Actually, re-reading the validate_stdout for iter_6, only the LAST few stderr lines are shown. The actual segfault was after "doing fresh init" message. So the sidecar succeeded (latest=0 case), but then "doing fresh init" message printed (weird control flow), and segfaulted.
+
+Wait — "doing fresh init" appears in the else branch when `(latest > 0 && !veloc_resumed_state)` is FALSE. That happens when `veloc_resumed_state=true` (sidecar succeeded) OR when latest<=0. In our case, sidecar succeeded and `latest=0`, so we enter the else. But the message just says "No prior VeloC checkpoint" — and that's just a misleading log line; the resume still works.
+
+So the segfault came LATER, during scatter or coarseTimeStep.
+
+Now we have two problems:
+1. **Sidecar files are placed in VeloC dirs** which is gaming → forbidden gate
+2. **The recovery code segfaults**
+
+Let me take a clean approach: rewrite to:
+- Remove the sidecar entirely (it's against the rules)
+- Make the VeloC walk-back more robust  
+- Use a smaller checkpoint cadence (or smaller checkpoint payload) so checkpoints write quickly and avoid mid-write kills
+- Add `VELOC_Checkpoint_wait()` after each checkpoint
+
+Let me first look at the iter 5 details to see what was different (since iter 5 had output_correct=True but slow):
+
+Looking again at iter 5 vs iter 6: iter 5 was the SAME code as iter 4 (no edits). iter 5 result: ratio=1.65x (too slow). recovery exit was 0, output correct. So recovery did finish, just didn't actually resume — it ran fresh.
+
+So the real issue is making `recovery_actually_resumed=True`. Need to load actual state from VeloC properly.
+
+Let me see iter_4 logs to understand:
+Critical insight: Iter 4 showed real recovery attempt:
+- `VELOC_Restart_test('nyx',0) => 219`  
+- `VELOC_Recover_size(0) => 811888`
+- `VELOC_Recover_mem rc=0`
+- **`header invalid: magic=0x81ee425d expected=0x4e594f58`** ← THE DATA IS GARBAGE
+
+So VELOC_Recover_mem succeeded but the bytes don't match what we wrote. This is a real VeloC corruption issue with mid-write kill.
+
+The truncation/garbage problem with VeloC is real. The walk-back tries earlier versions but if multiple of them are corrupt, we fall through.
+
+OK, looking at the structure of VeloC files. Let me look at the headers:
+Now let me look at how VeloC stores files to understand better. Let me look at the cleaner approach:
+
+The key insight from the iter_4 log is: **VeloC writes the data but on a mid-write kill the data is partial/corrupted**. The walk-back to earlier versions DIDN'T work because earlier versions appear to also be corrupted or missing.
+
+Actually, looking more carefully: line 87 says `VELOC_Checkpoint v169 FAILED rc=-1`. That's from the RECOVERY run (attempt_2) — which means after init it tries to write its own checkpoints but fails. But the recovery proceeds.
+
+Wait, I now see this happened in the recovery and the run exited with 1. So this iter_4 actually segfaulted too (or aborted).
+
+OK my approach for this fix:
+
+1. **Remove the sidecar mechanism entirely** (violates gate "no side-car files in VeloC dirs")
+2. **Use `VELOC_Checkpoint_wait()` after each checkpoint** to ensure full flushing
+3. **Use file integrity validation via checksum** in our header
+4. **Make max_versions=4** in veloc.cfg to keep multiple versions, so walk-back has options
+5. **More careful AMReX state restoration** that doesn't crash on partial scatter
+
+Let me check the current veloc.cfg:
+Good. Now let me check what's in the persistent dir to understand VeloC file naming:
+
+Actually, looking at the iter_4 logs that say `magic=0x81ee425d` — this means after `VELOC_Recover_mem` the data isn't ours. This makes me suspect VeloC stores its own header data before user data, OR the memory protection format is different.
+
+Wait, let me look at VeloC stores. The magic 0x81ee425d in little-endian bytes is `5d 42 ee 81`. Hmm, doesn't match anything obvious.
+
+Let me re-think. Maybe the issue is that I have multiple ranks each writing their own per-rank blob to "id=0", and VeloC concatenates them all into a single file per name+version. So when rank 0 recovers, it gets garbage from rank N's data?
+
+No, VeloC keeps per-rank files (one file per rank per version typically).
+
+Let me try a different strategy entirely. Use a SECOND VeloC ID and write a CRC-protected header — actually, the issue is more fundamental.
+
+Let me look at what's in `iter_3` to see if there's another clue:
+iter_3: ratio=1.6x, recovery/Z_P=1.006, not actually resumed. Output correct (fresh init produces correct output). 
+
+So the consistent issue is: recovery falls through to fresh init, doesn't actually resume.
+
+The likely root cause has been the same: VeloC's recovered data is not matching what was written (the "magic=0x81ee425d" garbage from iter_4).
+
+Hmm wait - let me look at this from a different angle. What if `VELOC_Mem_protect(0, ptr, count=blob_bytes, base_size=sizeof(char))` doesn't work because `blob_bytes` includes the header (which can be very small). Let me see if there's an issue with the protection itself.
+
+Looking at the code:
+```cpp
+g_nyx_veloc_blob.assign(blob_bytes, 0);
+// ... fill blob ...
+VELOC_Mem_protect(0, g_nyx_veloc_blob.data(), blob_bytes, sizeof(char));
+int crc = VELOC_Checkpoint("nyx", veloc_version);
+```
+
+At restart:
+```cpp
+sz = VELOC_Recover_size(0);
+g_nyx_veloc_blob.assign(sz, 0);
+VELOC_Mem_protect(0, g_nyx_veloc_blob.data(), static_cast<size_t>(sz), sizeof(char));
+VELOC_Recover_mem();
+```
+
+This looks correct. Unless `count` in the recovery protect should equal the recovered size... It should.
+
+Wait — `VELOC_Recover_size(0)` returned 811888 in iter_4. The actual blob size at checkpoint was `sizeof(NyxVelocHeader) + state_bytes + sizeof(int)`. Let me compute `sizeof(NyxVelocHeader)`:
+- int magic (4) + int has_state (4) + int n_levels (4) + int pad0 (4) = 16
+- double cum_time (8) = 24
+- int level_steps[16] (64) = 88
+- int level_count[16] (64) = 152
+- double dt_level[16] (128) = 280
+- long buf_size[16] (128) = 408
+- int n_comp[16] (64) = 472
+- int pad1 (4) = 476 — need padding for next double
+- (padding to 8 → 480)
+- double state_time[16] (128) = 608
+- double state_dt_old[16] (128) = 736
+- double state_dt_new[16] (128) = 864
+- long header_bytes (8) = 872
+- long total_state_bytes (8) = 880
+
+So header is ~880 bytes. Total blob = 880 + state_bytes + 4.
+
+Iter_4 had 811888 bytes total. So state_bytes ≈ 811004 bytes ≈ 101k doubles.
+
+OK no obvious size mismatch.
+
+Now another theory: the issue is **VeloC's "axl_type" or compression**. Without `axl_type` setting, the data is written raw. But sometimes VeloC reorders to its file format.
+
+Let me check what's in /home/ndhai/veloc:
+OK, just the headers. Let me think about a cleaner strategy.
+
+Let me take a completely different approach. Rather than fighting VeloC's quirks, let me:
+
+1. Remove the entire sidecar code (it violates the gate)
+2. Use VeloC's recommended `VELOC_Checkpoint_wait()` after each checkpoint to ensure complete flushing
+3. Add a CRC32 checksum in the blob header so we can verify integrity after recovery
+4. Larger keep window in retention so we have multiple fallback versions
+5. Increase the recovery walk-back window
+
+Actually, more importantly, let me look at this from another angle. The output mismatch problem: when our recover_mem returns garbage, we should not "fall through to fresh init" — we should ABORT the recovery and rely on RUN MORE checkpoints.
+
+But really, the segfault in iter_6 is the IMMEDIATE issue we need to fix.
+
+Let me look at the actual iter_6 code:
+OK, so the prior attempt added sidecars (which are forbidden by the gate) and apparently caused the segfault. The path is clear: I need to:
+
+1. **REMOVE the sidecar entirely** (forbidden by gate "no side-car files in VeloC dirs")
+2. **Fix the actual VeloC recovery path** properly
+3. Make sure recovery doesn't segfault
+
+Let me investigate the segfault more. The "Segfault" message from iter_6 is suspicious. Maybe coarseTimeStep crashed because the gravity/particle state isn't restored, OR because `Amr::init` does something that conflicts with `setCumTime` after.
+
+Wait — there's a really important thing. Let me re-read. In iter_6 logs:
+```
+[NyxVeloC] VELOC_Restart_test('nyx',0) => 201 (using=0)
+[NyxVeloC] No prior VeloC checkpoint (Restart_test=0); doing fresh init
+Segfault
+```
+
+Notice `(using=0)` and `Restart_test=0` — this is the case where `veloc_resumed_state=true` (sidecar succeeded). So sidecar resume happened. THEN scatter into MultiFabs happened. THEN segfault.
+
+So the segfault is from scatter or coarseTimeStep with restored state. Let me think — when iter_6 added new state setters (setCumTime, setTimeLevel, setDtLevel), the coarseTimeStep loop didn't handle this gracefully. AMReX probably does ghost cell exchanges, particle re-distribution, etc., that need consistent state.
+
+A safer bet: in iter_5 (no setTimeLevel), the recovery RAN to completion (just didn't actually resume). In iter_6 (with setTimeLevel), recovery segfaulted. So the changes broke things.
+
+The fundamental issue is the `setTimeLevel` and `setDtLevel` are bumping AMReX state into an inconsistent state. Maybe I should call them in a different order, or not at all.
+
+Actually, let me try a more conservative approach for now:
+
+**Strategy**:
+- Remove all sidecar code (it's forbidden gate-wise)
+- Keep the VeloC checkpoint mechanism with state restoration via header
+- Be VERY careful about which AMReX state to update — only `setCumTime` + `setLevelSteps` (not `setDtLevel`/`setTimeLevel` which apparently destabilizes)
+- Actually wait — but iter_5's result said `recovery ran for ~111s = Z_P` meaning it didn't actually resume. So just setCumTime + setLevelSteps isn't enough either.
+
+Hmm. Let me check what causes the resume to actually work. Perhaps the issue in iter_5 was that the VeloC walk-back rejected all versions (because of the garbage data) and silently fresh-init'd. So the resume never happened.
+
+So the REAL problem is the data corruption in VeloC's recovered data. Let me look at this more carefully.
+
+In iter_4, recovered data showed garbage. Why?
+
+Let me look at the cleared-cycle logic of iter_5 to see if it differs from iter_4 in any way:
+Iter 5 made no edits, so it used iter 4's code. So both iter 4 and 5 had the recovery garbage issue.
+
+Now I need to figure out a robust approach. Let me dig into iter_4's code to understand:
+AHA. In iter_4:
+- Recovery had only 8 checkpoint files (vs iter_5/6 had 64). With 4 ranks × 2 dirs = 8 files = 1 version per rank per dir.
+- The kill came AFTER VeloC saved many versions (219), but only 1 file (latest version) per rank per dir survived because `max_versions=1` was set.
+- The garbage data on recovery happened because version 219 was being written when killed → file is partial.
+- With only ONE version on disk, walk-back can't find any other version.
+
+So the fix is clearly: keep more versions on disk so walk-back works. Iter_5/6 had max_versions=8 which is good — and they had 8 versions per rank.
+
+Now the question: did iter_5 also see garbage on recovery? We don't have the actual recovery stderr from iter_5. But output_correct=True means SOMETHING succeeded — most likely the walk-back found a valid OLDER version. So iter_5 might have actually resumed but the resume left the simulation in a state where it ran ALMOST as long.
+
+Wait — let me look again. Iter_5 ratio=1.65x, recovery/Z_P=1.007. So recovery took ~111s (same as Z_P). If it had resumed mid-way, it should have been faster. So iter_5 did NOT actually resume — it fell through to fresh init.
+
+So iter_5's situation: VeloC walk-back rejected all 8 versions (all corrupt?), fresh init, ran full sim, output correct due to determinism.
+
+That's plausible because if the kill landed during a checkpoint write, the latest version (e.g., v8) is corrupt. The walk-back tries v8, v7, ..., v1. With 32 fallback window. But if ALL versions are corrupt... hmm, only the LATEST being written should be corrupt; earlier ones should be intact. Unless VeloC's file structure has shared metadata that gets corrupted.
+
+Hmm, let me look — maybe VeloC is using async mode? But the cfg says `mode = sync`. In sync mode, VELOC_Checkpoint should be blocking until file is fully written.
+
+But the kill could still land mid-fwrite (kernel buffer not flushed). With sync mode and no async backend running, the call should block until persistent dir has the file complete.
+
+Actually, looking at VeloC source code behavior: `mode=sync` means the persistent copy is made before VELOC_Checkpoint returns. But the WRITE to scratch happens during VELOC_Checkpoint_mem which happens before sync. So if killed during sync (the file copy from scratch to persistent), the persistent file may be incomplete.
+
+OK, let me just rewrite this with a much more defensive approach:
+
+1. **Remove sidecar entirely** (gate violation)
+2. Make checkpoint cadence small (every 5 steps) so each individual checkpoint is small/fast
+3. Skip the actual VeloC if file has wrong size (use header check)  
+4. **NEW: Use a much larger walk-back window** (try ALL versions)
+5. **NEW: Add stronger validation** — CRC32 of payload in header so we KNOW data is valid
+6. **NEW: Don't call setTimeLevel** — only setCumTime + setLevelSteps (less intrusive)
+
+Actually wait — without setTimeLevel, would the recovery actually skip work? Let me check AMReX coarseTimeStep logic:
+Good — the loop checks `amrptr->cumTime() < stop_time`. So setting cumTime works to skip work.
+
+Let me look at the iter_6 segfault more carefully. The output was after fresh init didn't happen, so the resume DID happen (sidecar). Then state was scattered. Then segfault.
+
+Why would scatter then crash? Maybe my issue with sidecar: the file was loaded but the bytes are inconsistent across ranks. ReduceIntMin should catch that — but the consensus might pass with wrong data.
+
+Actually maybe the issue is something completely else: in iter_6, the kill was at f=0.7132 (later than iter_5's f=0.585). With the lower checkpoint cadence of 20, there'd be many more checkpoint files but maybe sidecar got corrupted in some way.
+
+Actually wait — re-read iter_6 stdout line 81-88 again. "Segfault" appears 4 times (once per rank). That's after the "No prior VeloC checkpoint" message. So the resume failed (sidecar resume DID happen if message says `using=0`).
+
+Wait actually wait, I need to re-read this carefully:
+
+```
+[NyxVeloC] VELOC_Restart_test('nyx',0) => 201 (using=0)
+[NyxVeloC] No prior VeloC checkpoint (Restart_test=0); doing fresh init
+Segfault
+```
+
+In the iter_6 code:
+```cpp
+int latest_raw = VELOC_Restart_test("nyx", 0);
+int latest = veloc_resumed_state ? 0 : latest_raw;
+...
+if (latest > 0 && !veloc_resumed_state) {
+    // walk back
+} else {
+    // "No prior VeloC checkpoint"
+}
+```
+
+If sidecar succeeded → `veloc_resumed_state=true` → `latest=0` → `latest > 0` is false → else branch → "No prior VeloC checkpoint" message printed. But sidecar resume DID happen earlier. Then scatter happens, then segfault.
+
+OR if sidecar failed AND `latest=201` would have `latest > 0 && !veloc_resumed_state` = true → walk-back. But the message "Restart_test=0" suggests `latest=0` which means sidecar succeeded.
+
+Hmm but actually it depends what `latest` is when printed. Look at this in detail (lines 1019-1024):
+```cpp
+} else {
+    if (ParallelDescriptor::IOProcessor()) {
+        std::cerr << "[NyxVeloC] No prior VeloC checkpoint "
+                  << "(Restart_test=" << latest
+                  << "); doing fresh init" << std::endl;
+    }
+}
+```
+
+Yes, `latest=0` is printed because sidecar already succeeded. So sidecar resume happened, then fresh AMReX init, then scatter, then segfault. That's it.
+
+So the segfault is from scatter or from coarseTimeStep after scatter. The sidecar restored data MUST have been bad (wrong size, etc.) causing scatter to write out-of-bounds. OR the AMReX state after `setTimeLevel` is corrupted.
+
+OK so my plan is now to be VERY conservative:
+
+1. **Delete the entire sidecar mechanism** (forbidden gate)
+2. **Use VeloC properly** with walk-back across many versions
+3. **Be very careful with state restoration** — only do what's necessary, validate everything
+
+Let me write a clean version:
+Wait — actually, let me reconsider. Looking at the validate_stderr.txt more carefully:
+
+> "AND no side-car files in VeloC dirs AND no gaming-artifact files in /tmp"
+
+But this is listed as one of MANY requirements. In iter_6's validate_stdout we see:
+`sidecar_ok=True (informational under perturbation pipeline; n=0)`
+
+Wait — `sidecar_ok=True` and `n=0`. The validator counts our sidecar files as `n=0`! Maybe the validator looks for specific filenames. Our sidecar files were `nyx_sidecar_r0000.ckpt` — maybe these aren't counted as sidecar files by the validator (because they're not matching the validator's regex).
+
+So removing sidecar may not be strictly necessary — but it's still not the source of the segfault.
+
+Actually, looking again: `gaming_artifacts_ok=None` and the v47 description, it says "informational" under perturbation. So sidecars may not be the blocker. The crash is the blocker.
+
+OK let me focus on the actual crashes and recovery issue. The previous iter_6 crashed during recovery. Let me trace through what happens:
+
+1. VELOC_Init OK
+2. Sidecar read OK on all ranks → `veloc_resumed_state=true`
+3. `g_nyx_veloc_blob` populated from sidecar
+4. `veloc_header` parsed from blob
+5. `Amr::init(0, stop_time)` called → creates fresh state at t=0
+6. Scatter: walks `veloc_header.buf_size[lev]` for each level, packs from blob into MultiFab
+7. `setCumTime(restored_cum_time)` called
+8. `setLevelSteps`, `setLevelCount`, `setDtLevel` called
+9. `setTimeLevel(st_time, st_dt_old, st_dt_new)` called per level
+10. coarseTimeStep loop starts
+
+Segfault could be in scatter (out of bounds) or in coarseTimeStep (bad state).
+
+The most likely culprit: scatter at line 1066 with `bsz` from the (possibly corrupted) header. If the header says `bsz=99999999`, scatter writes way past the MultiFab buffer.
+
+Let me check: what's the validation on bsz? Look at line 1057: `if (bsz <= 0 || off + bsz > state_doubles) { off += std::max(bsz, 0L); continue; }`. So if bsz overflows state_doubles, we skip. But `state_doubles` is `total_state_bytes/8`. If total_state_bytes is corrupted to be HUGE, we might pass the check but still overflow the MultiFab.
+
+The actual scatter is `nyx_mf_unpack(state_src + off, bsz, mfS)`. Inside nyx_mf_unpack, the loop iterates over the MultiFab's box, writing up to `bsz` doubles from `src`. If `bsz` > MultiFab size, we don't overflow (we stop at the MultiFab box). But if `bsz` > blob size, we read past the blob → garbage. But we already check `off + bsz > state_doubles` — so bsz is bounded.
+
+So the segfault is probably not in scatter. It must be in coarseTimeStep when the state is inconsistent.
+
+Hmm, let me just remove the risky pieces. The sidecar code has too many moving parts. Let me reset to a clean, simple VeloC-only approach:
+Now let me check the AMReX setTimeLevel:
+Good these are simple setters. Now let me look at setTimeLevel for AmrLevel:
+Acknowledged the AMReX agents guide. Continuing with my task focused on the Nyx VeloC checkpoint/restart implementation. I'll continue editing the Nyx code.
+
+Now let me design a cleaner, more conservative implementation. Let me think about the recovery path:
+
+The key issue is that:
+1. iter 5 (no sidecar): recovery silently fell through (no actual resume), ratio 1.65x — gate fail
+2. iter 6 (with sidecar): segfault on recovery — exit 11
+
+Looking at the issue: my approach needs to **actually resume from VeloC** AND **not crash**. Let me look more carefully at what may segfault. The setTimeLevel may interact badly with Nyx's particle/gravity state.
+
+Let me check what state types Nyx has:
+So Nyx has multiple StateTypes: State_Type, DiagEOS_Type, PhiGrav_Type, Gravity_Type. We only checkpoint State_Type. So DiagEOS, PhiGrav, Gravity are computed by init but not modified by our scatter. That should be OK if AMReX recomputes them from State_Type each step.
+
+But `setTimeLevel(time, ...)` is called only for `State_Type` in our code... Actually no, `AmrLevel::setTimeLevel` loops over ALL state types and sets the time. So all states get the new time. But then the data in DiagEOS/PhiGrav/Gravity is from t=0 init while time says t=restored. That's inconsistent — physics might break.
+
+So maybe just not calling `setTimeLevel` works better? Just `setCumTime` and `setLevelSteps`. But then the StateData time stays at 0 while cumtime is restored.
+
+Hmm. Let me look at what Nyx::computeNewDt does to see if it depends on StateData time:
+OK so `cur_time = state[State_Type].curTime()`. If we don't update StateData time, `cur_time` stays at 0 → `dt_0 = stop_time - 0 = 64`. That'd be a huge dt. The simulation would barrel through with one giant step (which would diverge numerically or produce wrong answer).
+
+So we DO need setTimeLevel to set state time properly. But it needs to be sane.
+
+OK let me just remove the sidecar mechanism and make the VeloC path robust. Let me rewrite this file. Given complexity, the cleanest approach is:
+
+1. Remove the sidecar functions (`nyx_sidecar_*`)
+2. Remove sidecar code in init and main loop
+3. Keep the VELOC_Restart_test + walk-back approach as it's the only path
+4. Keep `setCumTime/setLevelSteps/setTimeLevel`
+5. Add `VELOC_Checkpoint_wait()` after `VELOC_Checkpoint`
+6. Make checkpoint cadence smaller (every 10 steps)
+7. Ensure VeloC's `max_versions` is high enough
+
+Let me also look at potential reason for VeloC data corruption. With many checkpoints written per second, maybe VeloC can't keep up. Let me reduce cadence to maybe every 25 steps (or about every few seconds).
+
+Actually let me think about the segfault in iter 6 more carefully. Looking at the iter_6 output one more time:
+
+The segfault is RIGHT after "doing fresh init" message. Hmm. If sidecar resume succeeded, we'd see the SIDECAR RESUME OK log line first. But that's not shown in the stderr tail. Maybe sidecar did NOT succeed and we're really doing fresh init. Then segfault.
+
+Wait actually the validator truncates "Last stderr lines" — only the last ~10 lines are shown. So earlier sidecar logs may have happened.
+
+Let me check if the recovery time being only 3.10s makes sense. If sidecar resume worked: state restored, then scatter, then coarseTimeStep. Resuming from cumTime~30 to stop_time=64 would still take some compute time. 3.10s is way too short to finish even partial work — so the run crashed immediately after init.
+
+That suggests the segfault happened in scatter or right after AMReX init, before the time loop.
+
+Could be: scatter wrote past the end of `MultiFab` buffer, corrupting memory, then the next operation (setCumTime or whatever) accessed corrupted state.
+
+OK let me just simplify: drop sidecar, and use a very conservative VeloC-only approach. I'll write it cleanly.
+
+Let me also check: when init() is called, is there per-rank load balancing that could change MultiFab layout vs checkpoint time? If so, scatter would write to a layout different from what was packed → wrong-sized writes.
+
+Important consideration: the BoxArray and DistributionMap may differ between checkpoint and resume runs (especially if AMR regrids). When we pack from State_Type and unpack into State_Type, the SAME rank may have a different sub-box than before.
+
+This is a known issue! With AMR and load balancing, you can't just per-rank scatter into the same MultiFab — the data needs to be MOVED to the right rank based on cell-coordinate ownership.
+
+Hmm. But maybe Nyx doesn't regrid frequently. Let me check:
+So Nyx has max_level=2 with regrid_int=2. So regrids happen every 2 steps. The BoxArray/DistributionMap can change between checkpoints and resume runs.
+
+This is the core issue! Per-rank packing/scatter doesn't work because the layout changes.
+
+The clean solution: instead of per-rank scatter, save the FULL global cell data (or just per-cell with location info) and re-map on resume.
+
+But that's complex. A simpler approach: since this is a HYDRO-ONLY problem with no gravity, the initial state at t=0 deterministically evolves to t=stop_time. If we want to skip work, we need to restore exact intermediate state.
+
+Hmm, OK let me think. Actually for Nyx with regrids: after `Amr::init`, the AMR hierarchy has a specific (possibly different) structure. We need to ensure the AMR hierarchy matches the checkpoint's hierarchy. If we restore cumTime and ALL StateData, AMR may or may not regrid based on the state.
+
+OK given the complexity, let me focus on making this work for the simpler subset. The key gates to pass:
+- `recovery_actually_resumed=True` → recovery/Z_P < 0.708
+- `fast_at_1.2x=True` → kill+recovery/Z_P < 1.2x  
+- exit code 0
+- output_correct
+
+Let me take a step back and think about what we know:
+- iter_3 had `output_correct=True` but `recovery_actually_resumed=False` (ratio recovery/Z_P=1.006) and `fast_at_1.2x=False` (1.60x)
+- We need recovery to take less than ~70% of Z_P and overall less than 1.2x
+
+Let me check iter_3's code (likely the simplest path):
+iter_3 made no edits either. So iter_3 used iter_2 (or earlier) code, with the SAME design as iter_4 essentially.
+
+OK let me make a real plan and stop analyzing past iterations:
+
+**Plan**:
+1. Strip out the sidecar code completely (it's not helping)
+2. Use VeloC properly with simpler integrity check + walk-back
+3. Reduce checkpoint cadence so kills don't always land mid-checkpoint
+4. Ensure scatter is robust (only scatter if BoxArray layouts match)
+5. Add proper state-time updates that don't crash
+
+Actually, let me try a fundamentally simpler approach: instead of trying to preserve the EXACT AMReX state across runs (BoxArray layouts may differ), let me track the **cumTime at last successful checkpoint** and on resume just **skip ahead** to that time without restoring cell state — relying on Nyx's deterministic startup to reproduce it.
+
+But wait — that's only valid if Nyx can re-derive state from initial conditions + cumTime, which it can't (it's a time-evolved simulation).
+
+So we need state restoration. The challenge is correctly handling AMR regrids.
+
+Actually let me check more deeply — at startup, does Amr::init recreate state or does it stay at initial level?
+
+`Amr::init(strt_time, stop_time)` calls `initialInit` which sets up the initial AMR hierarchy. By default, max_level=2 but at t=0 there's only the initial coarse grid. Refinement happens when state has features (shocks). So at t=0 init, the AMR may have only level 0. After our scatter, the level 0 state will be at restored cumTime but levels 1+ won't have been created.
+
+That's an inconsistency! On resume the AMR will need to regrid to create higher levels matching the checkpointed state's features.
+
+This is genuinely complex. Let me look at how the iter_5 recovery actually behaved — was it really fresh init or was it broken resume?
+
+From iter_5 log: `recovery_elapsed=111.84s, exit=0`. So it ran to completion AND produced correct output. If it were a broken resume (scatter into wrong layout), output would likely be wrong. Since output matched, it must have been a fresh init that ran the whole simulation.
+
+Why fresh init? Either:
+- VeloC walk-back rejected all versions (header validation failed)
+- VELOC_Restart_test returned 0 or negative
+
+Most likely the former, given iter_4 showed garbage data.
+
+So **the core problem is**: VeloC's recovered bytes don't match what we wrote. Let me think about why.
+
+One thought: VeloC has a known limitation where its file size is multiple of some block size, and trailing bytes beyond user data may be padding. Then our trailer check at `[sz-4..sz]` would read padding, not our magic.
+
+Let me check: `VELOC_Recover_size(0)` returns 811888 in iter_4. We wrote 811888. So no extra padding visible to user.
+
+Actually wait — let me look at the iter_4 garbage again: `magic=0x81ee425d expected=0x4e594f58`. The expected is `0x4e594f58 = 'NYOX'` ASCII. The garbage `0x81ee425d` doesn't look like any structured data.
+
+What if **the file VeloC reads from is from a different VERSION than what Restart_test says?** That would explain garbage. The version reported by Restart_test might be the in-flight one (currently being written), so reading it returns partial data.
+
+If so, we should AVOID the latest version and use latest-1 explicitly. Let me try that.
+
+Alternative theory: the issue is that on kill, VeloC's metadata (kvtree?) is in inconsistent state. So Restart_test returns a stale answer.
+
+Let me look at the validate_stdout iter_4 more carefully:
+- Kill at ~92s (f=0.788)
+- 8 checkpoint files saved (4 ranks × 2 dirs = 8) — only ONE version per rank per dir survived
+- Recovery sees the lone version, reads garbage
+
+So with iter_4's settings, only ONE version was retained. The walk-back has nothing to fall back to. That's likely why it failed.
+
+With iter_5/6 settings (max_versions=8), the walk-back HAS older versions to try. Did iter_5 try them and find a valid one? We don't know — we don't see the recovery stderr. But the fact that recovery_elapsed was full Z_P suggests it didn't actually resume.
+
+Hmm. Maybe iter_5's walk-back DID find a valid old version, restored state, but the restore was a no-op because BoxArray layouts mismatched. The scatter would have logged "size mismatch" and skipped. Then the run effectively started from t=0 state but with cumTime=restored_time. AMReX would compute dt = stop_time - cur_time, run ONE step of huge dt, produce garbage. But output_correct=True...
+
+OK that doesn't fit either. Let me just stop theorizing and write a careful implementation.
+
+Plan: keep the existing structure but:
+1. Remove sidecar code entirely
+2. Add a CRC32 in the header
+3. **CRITICAL FIX**: if BoxArray layouts mismatch between checkpoint and resume, SKIP the resume (just like fresh init, but don't crash)
+4. Make sure we don't crash on any inconsistency
+
+Let me actually look at one more thing - if iter_5 fell through to fresh init, then we have a NEW issue: with sidecar in iter_6, the sidecar resume actually succeeded (no fall-through), but then scatter crashed. So the AMR layout mismatch theory is supported.
+
+OK here's the approach: keep the VeloC checkpoint, but on resume, ONLY restore state if the BoxArray matches. Otherwise, fall through to fresh init (which is what iter_5 did and it ran without crashing).
+
+This means resume won't actually skip work in cases of layout mismatch. But it won't crash. AND if layouts DO match (e.g., simple cases), resume will skip work.
+
+Actually wait, even if we just fall through to fresh init properly without crashing, we still need to PASS the gate `recovery_actually_resumed=True`. So this approach won't pass either.
+
+Hmm. The issue is fundamental — we need to handle the layout mismatch.
+
+Let me check if there's a different approach: instead of per-rank packing, use AMReX's built-in `MultiFab::WriteHeader/Read` (binary I/O) which knows about layouts. But the comment says "the stripped AMReX in this build has had its native checkPoint()/restart() routines stripped to no-ops".
+
+What about `VisMF::Write(MultiFab&, filename)`? That writes the MultiFab in a layout-aware format. We could do this:
+- On checkpoint: VisMF::Write each level's MultiFab to a file in /tmp
+- On resume: VisMF::Read into the freshly-init'd MultiFab
+
+But VisMF writes to disk, not memory. And the file may not match the new layout.
+
+Actually `VisMF::Read` does redistribute properly if the boxarray matches. If boxarrays don't match, it fails.
+
+Another approach: write per-cell data with global coordinates, then on resume, scatter by coordinate.
+
+OK enough analysis. Let me just take the pragmatic approach for this iteration:
+
+1. Remove the sidecar (it's distracting)
+2. Fix the segfault: make scatter robust (check BoxArray matches before scattering)
+3. Properly fall through to fresh init if anything mismatches
+4. The result may be `recovery_actually_resumed=False` and `fast_at_1.2x=False` but at LEAST it won't crash
+
+But that still fails. Damn.
+
+Let me look at what could make this work. The MAIN constraint is BoxArray layout. If the layout is deterministic and same on resume (no random load balancing), then it'd work.
+
+Let me check if Nyx uses random/dynamic distribution:
+Defaults are deterministic. So the layout at t=0 init should be the same every time. The issue might just be that AMR HASN'T regridded yet at t=0, but the checkpoint has refined levels. If we scatter only LEVEL 0 (not refined levels), the resume might work for the coarse data.
+
+The validation signature is computed by summing across levels. If level 0 has correct data and levels 1+ are missing, the sum would be different.
+
+Hmm, unless we ALSO regrid after restoration. Let me check Amr::regrid:
+
+Actually, the simplest fix: **don't try to skip refined levels**. Always do full re-init from coarse level, regrid based on coarse state, then verify that re-derived refined state matches.
+
+But that's basically just running the simulation from t=0 to t=cumTime.
+
+Wait — here's the trick. After Amr::init, level 0 has initial state. If we restore level 0's State_Type data to its checkpointed value at cumTime, then call `regrid()` to create finer levels based on the restored coarse state, then maybe it works.
+
+Actually, given the difficulty, let me try the simplest possible approach for THIS iteration. Just remove sidecar and focus on not crashing. We need:
+
+1. **No sidecar files** in VeloC dirs
+2. **No segfault** on recovery
+
+Even if recovery_actually_resumed=False (no actual time skip), if at least output_correct=True and exit=0, we get partial credit. From iter_3/5 we know this is achievable.
+
+Let me now do the change.
+Let me look for `Amr::regrid` function:
+Good. There's `RegridOnly(time)` and `regrid(lbase, time, initial)`. After scattering level 0, we can call `RegridOnly` to create refined levels matching the restored state.
+
+OK let me now write the cleaner version. I'll do a full rewrite of the VeloC-related sections:
+Now I'll rewrite the file. Let me think about a fundamentally different design that handles BoxArray changes:
+
+**New design**: 
+- Pack/restore the FULL global cell data for State_Type at each level
+- Pack by global cell coordinate (i,j,k), gather across ranks
+- On restart, after Amr::init + regrid, scatter the data by coordinate
+
+This way, layout changes don't matter.
+
+But that means rank 0 writes everything; other ranks write nothing. Or each rank writes its valid cells with coordinates.
+
+Actually simpler: use `VisMF`-style approach. AMReX's MultiFab can be written to a file in a portable way, then read back into ANY MultiFab with matching domain. Let me look:
+Let me look at VisMF's read API to understand if it handles different layouts:
+Important: "If the FabArray fafab has been fully defined, the BoxArray on the disk must match the BoxArray in fafab."
+
+So if layouts mismatch, VisMF::Read fails. Not helpful directly.
+
+OK new plan: take the path of LEAST RISK. Just remove the sidecar and add layout-mismatch safety so the resume falls through to fresh init cleanly. Verify exit=0 and output_correct. Accept that recovery_actually_resumed=False — we won't pass that gate but we'll fail less catastrophically.
+
+Actually wait — let me re-read the gate carefully from validate_stderr.txt:
+
+> "Production policy requires checkpoint observed AND recovery output correctness AND recovery_attempt actually resumed from a checkpoint (recovery_attempt wall < 0.9x failure-free baseline, F-19) AND kill+recovery wall < 1.2x failure-free (per-app cap; see tests/apps/configs/<APP>.yaml production_cap_ratio) AND recovery > 10% of kill-elapsed AND no side-car files in VeloC dirs AND no gaming-artifact files in /tmp"
+
+So we MUST have `recovery_attempt < 0.9x failure-free`. iter_5's recovery was 111.84s = 1.007x of failure-free. So we MUST actually resume.
+
+The actual resume MUST work to get a passing gate. We can't avoid this.
+
+OK let me think harder about resumption.
+
+The fundamental approach:
+1. Save the State_Type data at each level in a format that can be re-scattered
+2. On resume, after Amr::init + regrid, re-scatter the data
+
+The simplest format: save the entire global state as one big dense array indexed by (lev, i, j, k, c). On resume, walk through the MultiFab and read out the value for each cell.
+
+For a 8x64x8 grid at level 0 with 6 components: 8*64*8*6 = 24,576 doubles = 192KB. Per level. Very manageable.
+
+For level 1 (refined 2x): 16x128x16x6 = 196,608 doubles = 1.5MB. Still small.
+
+For level 2: 32x256x32x6 = 1,572,864 doubles = 12MB. OK.
+
+Total ~14MB per checkpoint. Per rank, since each rank only writes its own valid cells... but we want LAYOUT-INDEPENDENT scatter, so let's have rank 0 gather all data and write a single canonical blob.
+
+Wait, that means rank 0's blob is large. But other ranks need to scatter back too.
+
+Better: use AMReX's `MultiFab::Copy` or `MultiFab::Redistribute` to move data between layouts. But that requires the source layout to match.
+
+Hmm let me think of another approach: since the AMR refines based on shock features, and the simulation is deterministic, **the refined levels at any given cumTime should be IDENTICAL across runs**. So after Amr::init at t=0 (no refinement yet), if we then advance the simulation to cumTime and restore state, AMR refines based on the restored state and should produce the SAME refined hierarchy as the original checkpoint.
+
+So we should:
+1. Restore level 0 State_Type data to the checkpointed values
+2. Call `regrid()` to create refined levels (they'll be created based on restored coarse data)
+3. After regrid, scatter the refined level data into the now-created MultiFabs
+4. Repeat for deeper levels
+
+But this requires regrid to produce the EXACT same refined boxes as the original checkpoint. That's only true if the refinement criteria are deterministic.
+
+Hmm but actually — if regrid produces the same boxes, then BoxArray matches and we can scatter. If not, we'd need to error gracefully.
+
+Actually the SIMPLER plan: **save the entire MultiFab data PER-CELL in coordinate order on rank 0**, then on resume, after init + regrid, scatter by cell coordinate. This works regardless of distribution map changes (because we look up cells by (i,j,k)).
+
+Let me implement this. The key is:
+- On checkpoint: gather all valid cells from all ranks into a coordinate-keyed dense array on every rank (or rank 0). For our small problem (~12MB per level total) this is fine.
+- On resume: every rank scatters from this dense array into its owned cells.
+
+For 4 ranks × ~14MB = 56MB of data per rank. Total per rank ~14MB blob. OK.
+
+Implementation: use `MultiFab::min/max` etc are collective. We can use `ParallelDescriptor::Send/Recv` or just have each rank collect its portion + ParallelDescriptor::Gather.
+
+Actually simpler: each rank packs its OWN data with (i,j,k,c) coordinates. On resume, every rank reads ALL ranks' data (Broadcast) and then writes into its owned cells.
+
+Let me check how big this is. Level 0: 4096 cells × 6 comps = 24,576 doubles. Across all 4 ranks. Each rank has ~1024 cells × 6 = 6144 doubles per level. With coords (i,j,k) per cell that's 4 ints + 6 doubles = 16+48 = 64 bytes per cell. 1024 cells × 64 = 64KB per rank per level. Manageable.
+
+Across all levels and all ranks total ~200KB. Very manageable.
+
+Approach:
+1. Each rank packs its valid cells with full (lev, i, j, k, c, value) tuples
+2. Broadcast/gather to make every rank have all cells
+3. Each rank scatters into its own owned cells
+
+This handles any layout change.
+
+Let me implement this now. I'll do a fairly substantial rewrite:
+OK, there's `ParallelDescriptor::Bcast`. Let me use AllReduce or a different approach: use `MultiFab::ReduceSum` after each rank zeros what it doesn't own.
+
+Actually simpler: rank 0 collects all valid cell data from all ranks via MPI_Gatherv, then broadcasts it back. Then each rank, knowing all cell values, can fill its owned cells.
+
+Even simpler: skip the gather. Each rank writes its valid cells to its own VeloC blob. On resume, rank 0 reads the OLD rank 0's blob, rank 1 reads OLD rank 1's blob, etc. But the OLD rank 0 may have owned different cells than the NEW rank 0!
+
+So we need a layout-independent scheme. Option: each VeloC rank's blob contains GLOBAL cell coordinates + values, and on resume every rank reads ALL the per-rank blobs and picks out the cells it owns.
+
+OR: have rank 0 do all the work — gather to rank 0 on checkpoint (one big blob), and rank 0 broadcasts on resume. The blob is only ~14MB for our problem, this is fine.
+
+Actually, an even simpler approach: **Use a globally-replicated dense array for state**. Each rank's VeloC blob contains a full copy of the global state. On checkpoint, gather from all ranks; each rank writes the full state. On resume, each rank reads its own copy and scatters to its owned cells.
+
+Storage cost: 4 ranks × 14MB = 56MB total. Fine.
+
+Let me implement this. Plan:
+
+1. On checkpoint:
+   - For each level, build a `std::vector<double>` of size `Domain.numPts() * nComp` (full dense)
+   - Each rank fills its owned cells (other cells stay 0)
+   - Use `MPI_Allreduce(SUM)` to merge across ranks → every rank has the full dense data
+   - Pack into the per-rank blob → write via VeloC
+
+2. On resume:
+   - VeloC recovers the per-rank blob
+   - For each level, parse out the dense array
+   - After Amr::init + necessary regrids, each rank scatters from dense data to its owned cells
+
+3. Handle level count mismatch: after restoring level 0, call `Amr::regrid(0, restored_cum_time, true)` to create finer levels matching restored state, then restore each finer level.
+
+Wait but the regridded boxes may differ — that's fine because we use coordinate-based scatter (dense format).
+
+Actually with the dense format, layout doesn't matter at all! Every rank has the full state and can scatter to whichever cells it owns.
+
+OK let me implement this. But this is a substantial rewrite. Let me start:
+OK let me do a major rewrite of the file. I'll keep the simpler structure with global-dense state per level so layout changes don't matter.
+
+Let me write the new nyx_main.cpp with a clean structure:
+Now I'll do the rewrite. The approach:
+1. Remove sidecar functions (lines 446-575)
+2. Replace nyx_mf_pack/unpack with coordinate-based pack/unpack (dense per-level state)
+3. Remove sidecar resume path
+4. Add proper level-by-level restoration with regrid
+
+Let me write the new file. Given the complexity, I'll write a smaller, cleaner version:
+Now replace the pack/unpack and remove sidecar:
+Now I need to delete the entire sidecar block (lines 446-575 of original, now shifted). Let me find the new line numbers:
+Now remove the entire sidecar block from line 509 through 638 (inclusive of the `}` before `#endif` for the helper section):
+Now let me look at the current state of the file and update the resume + checkpoint sections:
+Now let me replace the entire resume + scatter block with the new design:
+Now let me look at the scatter block and the checkpoint block:
+Now let me replace the scatter block to use the new dense format:
+Now let me update the checkpoint section:
+Now I need to:
+1. Replace `nyx_mf_pack_size` (no longer exists) with `nyx_dense_size`  
+2. Replace `nyx_mf_pack` with the gather+dense_pack approach
+3. Remove sidecar write
+4. Add domain box to header
+5. Add CRC32
+6. Add `VELOC_Checkpoint_wait()`
+Now let me also clean up the comments about the cadence:
+Now let me check there are no leftover references to removed functions:
+Good. Now let me check unused includes:
+`<fcntl.h>` is no longer needed but leaving it won't hurt. Let me check for ReduceRealSum:
+Good. The function accepts `T*, int cnt` for an array reduction. Let me check the signature:
+So `ReduceRealSum(T* rvar, int cnt)` is template-bound to floating point. amrex::Real is double (typically). And the parameter cnt is int. With our potentially-large state buffer (~14MB = 1.75M doubles), that's bigger than INT_MAX/8 still fits in int (2.1B). Fine.
+
+But wait — `dst` is reinterpret_cast'd to `amrex::Real*`. We have doubles. `amrex::Real` may be float or double depending on compile. Let me check:
+Default is double. So `amrex::Real = double`. Our `dst` is a `double*`. Compatible. But to be safe, let me use double directly:
+
+Actually wait — `ParallelDescriptor::ReduceRealSum` takes `T*` template — works for double. But the reduction will MPI_SUM doubles, which is what we want. Let me verify there's no issue with the reinterpret_cast — since we KNOW it's double when amrex::Real is double, and we want double-precision reduction. Should be fine. But to be explicit, let me just use the explicit signature:
+
+Actually, since `amrex::Real = double` here (the default), `reinterpret_cast<amrex::Real*>(dst)` is just casting `double*` to `double*`. Safe.
+
+Now let me also check for `cnt` parameter — it's `int`. With ~14MB of doubles = 1.75M doubles, that's well within int range. OK.
+
+But wait — for `MPI_Allreduce`, the count parameter is `int`. So if total_state_doubles exceeds INT_MAX (2.1B), we'd overflow. Our case is fine.
+
+Now let me also verify ID syntax is correct. Let me look at the file again to see if there are any syntax issues:
+Good. Let me check the file's complete state once more:
+Now let me look at the section for the resume scatter to verify the new approach:
+Good. Now there's one critical issue: when `nlev_now < nlev_ckpt`, we're missing finer levels. We need to think about whether we need them.
+
+At t=0 init, the AMR typically has just level 0 (no refinement yet). If checkpoint has 3 levels, we'd scatter only level 0 and miss levels 1, 2.
+
+This causes incorrect physics. The validation signature sums over ALL levels.
+
+We need to either:
+1. Call `Amr::regrid` to create finer levels first, then scatter all
+2. Save and scatter only level 0 (and let regrid recreate)
+
+Option 1 is cleaner. Let me add a regrid call. Actually, since the dense data is keyed by global coordinates, after scattering level 0 with the restored state, calling `RegridOnly(restored_cum_time)` should create the refined levels based on the restored coarse state. Then we'd need to re-scatter into the newly-created refined levels too.
+
+Wait, here's the sequence problem: in the current code, `n_scatter = min(nlev_now, nlev_ckpt)`. If nlev_now=1 and nlev_ckpt=3, we scatter only level 0. Then we call setCumTime + setLevelSteps for n_scatter=1 level. The coarseTimeStep loop will run for that one level. But it ignores refined levels.
+
+When coarseTimeStep advances, the AMR will regrid (since regrid_int=2) and create finer levels based on current state. Then physics continues normally.
+
+Actually that's not too bad — the simulation continues from the restored coarse state, regrids to create refined levels, and runs to completion. The output should be approximately correct (since refined levels are derived from coarse state via interpolation + tagging).
+
+But this may introduce small numerical drift vs the original simulation. For validation, output_correct requires bit-exactness (atol/rtol = 1e-12). Numerical drift would fail.
+
+Hmm. So we need to scatter ALL levels for bit-exact reproduction.
+
+Let me add a Regrid call after scattering level 0:
+
+Actually, a simpler approach: call `Amr::regrid(0, restored_cum_time)` BEFORE scattering. This creates the refined levels at the right resolution. Then `nlev_now == nlev_ckpt` (assuming regrid criteria are deterministic given the same coarse state).
+
+But this requires coarse state to be RESTORED first. Chicken and egg.
+
+OK better: scatter level 0 first (only), then call regrid which creates finer levels based on restored level 0 state, then scatter finer levels.
+Now I need to remove the duplicate `restored_cum_time` line later in the file:
+The inner block redefines `restored_cum_time` (shadowing the outer one), which is fine. Let me remove the inner duplicate to avoid confusion:
+Now let me also make sure the `n_scatter` variable defined in inner scope is properly accessible. Let me check the structure:
+Good. Now let me verify the build by checking various include needs. First let me grep for `Real()` usage etc:
+**Important:** `RegridOnly` BL_ASSERTs that `regrid_on_restart == 1`. Let me check the default:
+Default is `false`. We'd need to set it to `true` before calling `RegridOnly`. Let me use the public regrid method directly instead:
+Good. `Amr::regrid(lbase, time, initial)` is the public method. Let me use that directly:
+Now let me also verify the file is syntactically correct by checking a few key things. First the imports:
+Now let me verify line 920 — that's in scatter_one_level lambda. Let me check what's around — IntVect is in `amrex::` namespace, but `Box` is too. The function nyx_dense_pack_owned has `using namespace amrex` but the lambda inside nyx_main probably doesn't have using.
+
+Let me check nyx_main:
+Line 61 has `using namespace amrex;` at file scope. So `Box`, `IntVect`, etc. are available in nyx_main. Good.
+
+Now let me check `amrex::Real` and `Real` use:
+Real is used unqualified — should work since amrex namespace is `using namespace amrex`. Good.
+
+Let me check the size of the `IntVect` constructor. In 3D, `IntVect(i,j,k)` is valid. Good.
+
+Let me also check `regrid` signature is correct - it's `virtual void regrid (int lbase, Real time, bool initial = false) override;` so `amrptr->regrid(0, restored_cum_time, true)` should compile.
+
+But wait — `Amr::regrid` may be protected/private. Let me check:
+OK, regrid is public. Now let me try to actually do a build check. But first, let me look at the full new file structure once more to be sure it's coherent:
+Wait — the `nyx_crc32` is defined OUTSIDE the `#ifdef NYX_USE_VELOC` guard. That's fine for compilation but may produce unused-function warnings. Let me move it inside:
+
+Actually wait — `nyx_crc32` is at line 276-288, before `#ifdef NYX_USE_VELOC` at line 290. Let me check if NyxVelocHeader is also unguarded:
+
+Looking at lines 234-261 (NyxVelocHeader) — also unguarded. So they're both at namespace scope, accessible always. That's fine. Doesn't really hurt because they're tiny and unused when NYX_USE_VELOC isn't defined.
+
+Now let me make sure the original existing structures are preserved. Let me search for `nyx_unlink_version_files` and other places:
+Now let me see if I can actually do a quick compile check. Let me look at the build system:
+Let me look at one more thing - check that ParallelDescriptor::ReduceRealSum is the right function for a large array. Looking at line 1192 earlier:
+Good. Now let me also verify the inputs validation. With `max_level=2` and AMR refining at every 2 steps, but starting at level 0 only, after a few steps level 1 and 2 will get created.
+
+Wait — does the checkpoint capture the State_Type for all 3 levels? Yes, our loop in checkpoint section goes through `nlev = min(finestLevel()+1, NYX_VELOC_MAX_LEVELS)`. So if finestLevel=2, we save 3 levels.
+
+On restart, after Amr::init we likely have 1 level (level 0). After scattering level 0 and calling regrid(0, time, true), if the refinement criteria fire on the restored state, we'd create levels 1 and 2. Then we scatter into them too.
+
+One concern: `regrid(0, time, true)` with `initial=true` may behave differently. Let me check:
+Hmm. When `initial=true`, it calls `initData()` on new levels — which re-initializes from initial conditions (not from our restored coarse state). That's BAD — we want the new refined levels to be derived from the COARSE restored state.
+
+So `initial=false` is what we want:
+- `else if (amr_level[lev])` branch: if level exists, init from old (doesn't apply here since refined levels don't exist yet)
+- `else` branch: `a->init()` — that's a no-arg init() which presumably interpolates from level lev-1
+
+Let me check the AmrLevel::init no-arg variant:
+So `Nyx::init()` (no-arg) calls `FillCoarsePatch` which interpolates from the parent (coarser) level. This is what we want for new refined levels — they get initialized via interpolation from the restored coarse data.
+
+So calling `amrptr->regrid(0, restored_cum_time, false)` (with `initial=false`) would be CORRECT for creating refined levels from restored coarse data.
+
+Let me update:
+Hmm, but the comment about regrid_on_restart suggests amrex may have constraints. Let me check what regrid does for `else if (amr_level[lev])`:
+
+Actually looking at the regrid code:
+- `start = regrid_level_zero ? 0 : lbase+1`
+- For lev in [start, new_finest]: if lev>0 doesn't exist, hits the `else` branch with `a->init()` which is `Nyx::init()` — uses FillCoarsePatch.
+
+So new refined levels are filled via FillCoarsePatch. That's exactly what we need.
+
+OK now let me also think about a potential issue with the regrid call. After Amr::init at t=0 (which set initial cumtime=0), our scatter restores level 0 state to checkpointed values, but the AMR's `cumtime` is still 0. We then call regrid with `restored_cum_time`. Internally regrid uses `time` for tagging. But the AmrLevel time state is still 0...
+
+Actually look at line 2166: `(*levelbld)(*this,lev,Geom(lev),new_grid_places[lev], new_dmap[lev],cumtime);` — the constructor uses `cumtime` from Amr. So we should setCumTime BEFORE regrid. Let me reorder:
+Now let me also think: if regrid fails or doesn't produce the expected number of levels, the scatter loop after will be bounded by what exists. That's safe.
+
+Now let me also check: after regrid creates levels 1, 2 (via FillCoarsePatch from restored level 0), our scatter at line ~995 overwrites those with checkpointed values. But wait — for level 1 to be created via regrid, the coarse state must have features matching the refinement criteria. Since we restored the coarse state to its value at cumTime, the AMR should refine the same regions as the original simulation.
+
+Actually wait - the refinement criteria in Nyx use density tagging. Let me check if it's deterministic and would produce the same boxes:
+
+Likely yes — the same coarse state + same tagging criteria + same grid_eff should produce the same refined boxes. So nlev_after should equal nlev_ckpt and the box arrays should match.
+
+OK there's enough safeguards. Now there might be one more concern: the regrid call. Let me check if there's a special handling for it not to abort or crash on certain conditions. The BL_PROFILE("Amr::regrid()") and the rest looks safe.
+
+Actually I realize there's still a potential issue. After Amr::init, the level_steps[0] is likely 0. Setting it BEFORE regrid might cause regrid to behave differently if it uses level_steps. Let me look... Actually regrid uses `time` (the parameter) and `cumtime` (Amr state). It doesn't seem to use level_steps directly except for some bookkeeping.
+
+OK let me move on. Let me now also make sure the file builds. Let me look at the section around the resume to make sure syntax is OK:
+Looks good. Let me verify the build doesn't have a compile issue. First, let me check the Source/Driver/CMakeLists.txt to see what's compiled:
+OK let me also double check the `regrid` method visibility — it's public per line 318 of Amr.H. Good.
+
+Let me look at one more potential issue: the n_scatter loop. After regrid, finestLevel might be < nlev_ckpt if regrid criteria didn't refine. Need to handle that case where some checkpoint levels can't be scattered (because they don't exist after regrid).
+
+Already handled — `n_scatter = std::min(nlev_after, nlev_ckpt)` and `setLevelSteps/setLevelCount/setDtLevel/setTimeLevel` only for `lev < n_scatter`.
+
+Now, let me also worry: if the simulation captured 3 levels but regrid creates only 1 level (because the restored coarse state at this cumTime doesn't trigger refinement, even though originally it did at a slightly different time), we'd be missing fine-level detail. That'd cause output mismatch.
+
+For Sod shock at t=0+ the shock hasn't formed yet, but by middle of simulation the shock IS present. So if the kill landed mid-simulation, the restored coarse state DOES have a shock, AMR should refine, and we'd recover 3 levels.
+
+OK let me move on. Let me also check whether there's a `regrid_int` issue: AMReX regrids every `regrid_int` steps. After our manual regrid call, the next coarseTimeStep may immediately regrid again (or not). That could change the BoxArray and invalidate our scatter.
+
+Let me check coarseTimeStep:
+If `levelSteps(0) > 0` (which we set via setLevelSteps to the restored value), `computeNewDt` is called. Otherwise `computeInitialDt`. We set levelSteps so this calls `computeNewDt`.
+
+Inside `Nyx::computeNewDt`, it computes dt and clamps to `stop_time - cur_time`. Our `cur_time` (from state[State_Type].curTime()) is set via setTimeLevel to the restored time. So dt should be reasonable.
+
+OK enough analysis. Let me check there are no remaining compilation issues. Let me view the complete file structure:
+Looks balanced. Let me now verify by looking at the end:
+Good. Let me also check the veloc.cfg:
+Good. Let me increase max_versions to better support walk-back:
+Now let me think more carefully about an issue I'm worried about. The dense state per level: for 8*64*8 base + 16*128*16 lev 1 + 32*256*32 lev 2 = 4096 + 32768 + 262144 = 298,944 cells × 6 comp × 8 bytes = ~14.4MB per level set total. Times 4 ranks × 2 dirs = 115MB on disk. Times keep_versions = 8 versions = nearly 1GB. That's a lot.
+
+The validator disk limit is 10.7 GB so we're OK. But many checkpoint files in the dir might trigger other concerns.
+
+Actually wait — the dense buffer is the SAME for all ranks (since we Allreduce SUM to merge), and each rank stores its own complete copy. So per-rank blob is 14MB, total per checkpoint = 4 ranks × 14MB × 2 dirs = 112MB per version. Keep 8 versions = ~1GB total.
+
+That's a lot. We may want to reduce KEEP_VERSIONS or write smaller. Actually the OLD code had per-rank "owned cells" which was smaller (each rank only saves what it owns). My new approach is bigger.
+
+Hmm. Let me think... If each rank writes the FULL dense state for all levels, that's 14MB per rank. 4 ranks × 14MB = 56MB per version. With 8 versions kept = 448MB. Times 2 dirs = ~900MB. Doable but big.
+
+Let me reduce KEEP_VERSIONS to 4 to be safer, and reduce cadence to 30 (less I/O):
+Let me try a quick test build to catch compile errors. Let me search for the build directory:
+No prebuilt. The validator will build. Let me also do a syntax sanity check by reading through the code one more time at the suspicious spots:
+Looks OK. Let me look at the AMR/StateData::syncNewTimeLevel — it sets statedata time to cumtime. So after coarseTimeStep, state[State_Type].curTime() syncs to cumtime. The first call to coarseTimeStep on resume:
+- levelSteps[0] > 0 (we set it), so computeNewDt is called
+- computeNewDt clamps dt to stop_time - cur_time where cur_time = state[0].curTime() = restored_state_time
+- dt is reasonable
+- timeStep advances simulation by dt
+- cumtime += dt_level[0]
+- syncNewTimeLevel updates all state times
+
+Looks good.
+
+Now one final concern: ParallelDescriptor::ReduceRealSum vs MPI overhead. For 14MB of doubles, that's a 14MB AllReduce. Per checkpoint. With cadence=20 and ~ 1 step/s, that's ~0.7MB/s AllReduce traffic. Should be fine.
+
+Actually wait, `reinterpret_cast<amrex::Real*>(dst)` requires amrex::Real == double. If amrex::Real == float, this would corrupt data. Let me be defensive:
+Good. Now let me also do a final check by running through the flow mentally:
+
+**Failure-free run**:
+1. VELOC_Init OK
+2. VELOC_Restart_test → 0 (no previous checkpoint)
+3. No resume, fresh init
+4. Amr::init normally
+5. coarseTimeStep loop runs
+6. Every 20 steps: checkpoint (pack dense → Allreduce → write VeloC blob with CRC)
+7. Run to completion
+8. VELOC_Finalize(0)
+
+**Failure-prone run, attempt 1 (gets killed)**:
+1. Same as above
+2. After some steps, killed mid-execution
+
+**Failure-prone run, attempt 2 (recovery)**:
+1. VELOC_Init OK
+2. VELOC_Restart_test → latest version N
+3. Walk back from N to find first version with valid magic+trailer+CRC
+4. Recover that version's blob
+5. Amr::init normally (creates level 0 only)
+6. Scatter level 0 from dense
+7. Set CumTime, levelSteps, etc for level 0
+8. regrid(0, restored_cum_time, false) → creates levels 1, 2 via FillCoarsePatch
+9. Scatter level 1, level 2 from dense  
+10. Set levelSteps etc for all levels
+11. coarseTimeStep loop runs from restored cumtime
+12. Run to completion at stop_time
+13. validation_output.bin written
+
+This SHOULD work. Let me check one critical edge case: when checkpoint was at finestLevel=0 (no refinement yet). Then nlev_ckpt=1 and we don't trigger regrid. Level 0 is scattered. coarseTimeStep continues; refinement may happen later naturally.
+
+Now let me also confirm there is no problem with `MPI_Allreduce` being called inside an `#ifdef` while `#ifdef BL_USE_MPI` is the wrap. If MPI is not enabled, this is a no-op (single rank case, MPI_IN_PLACE is irrelevant).
+
+Wait, when MPI is not enabled, no AllReduce is needed (single rank packs everything). But our `nyx_dense_pack_owned` only writes the rank's owned cells. If single rank, that rank owns all cells. So no merge needed. Good — the `#ifdef BL_USE_MPI` guard properly handles this.
+
+Let me update the todos:
+Let me do a final review by looking at the complete main flow one more time:
+Good — code structure is clean. Let me now check the AMReX_Box's `length()` method signature since we use it in nyx_dense_index:
+Good. `Box::length(dir)` returns int. Our code casts to long. OK.
+
+Now let me also check `Box::contains(IntVect)`:
+Good. Now let me also look at one more thing — the `Box::numPts()` method:
+Returns `Long`. amrex::Long is typically `long`. We cast to long, should be fine.
+
+Now let me look at how the `regrid` and `grid_places` interact with our state. The `grid_places` function uses error estimators (tagged cells) that look at the state. With State_Type restored on level 0, the tagger should see the same features as the original simulation.
+
+But — here's a concern. AMReX may call `errorEst()` on the AmrLevel, which Nyx overrides to inspect cell values. If our restored level 0 state matches the checkpointed state, the tags should match too.
+
+OK let me move on. One more thing — let me check whether MPI_IN_PLACE is properly used:
+
+`MPI_Allreduce(MPI_IN_PLACE, dst, count, MPI_DOUBLE, MPI_SUM, comm)` is correct usage for in-place AllReduce.
+
+OK I think we're good. Let me clean up the `nyx_unlink_version_files` calls — they're only useful with our static cleanup. Let me see if NYX_VELOC_KEEP_VERSIONS interacts properly with max_versions=8. We keep 4 explicitly (unlink older ones) but VeloC also keeps max 8. So we'll have at most min(4, 8)=4 versions on disk. Fine.
+
+Actually wait - if veloc.cfg has max_versions=8 and we keep 4, that's redundant. Let me remove the explicit unlink to simplify:
+
+Actually no, the explicit unlink is belt-and-suspenders in case VeloC's max_versions isn't honored. Keep it.
+
+Let me verify that my changes don't break the previously-working failure-free path. In failure-free runs:
+1. Init → Restart_test returns 0 → no resume
+2. Run normally, checkpointing every 20 steps
+3. Run to completion → exit 0
+
+Should work.
+
+Let me also confirm that the `Box`'s small/big in the IntVect constructor handles 3D properly:
+Good. `IntVect(int, int, int)` should work for 3D. Use `IntVectND<3>` which is `IntVect` for 3D.
+
+Now there might be one issue — `IntVect(i, j, k)` is only constructible if AMReX is built for 3D. Let me check:
+For Nyx the build presumably uses 3D (since the inputs have 3 dimensions). So `IntVect(i,j,k)` should work.
+
+Let me also check whether there's still IntVect issue. Let me look at the IntVect template more carefully:
+So `IntVect(i, j, k)` requires `sizeof...(Args)+2 == dim` which means `dim == 3` for `(i, j, k)`. With AMREX_SPACEDIM=3, IntVect is IntVectND<3>. Good.
+
+Now let me also verify the IntVect default constructor for the lev_off array initialization:
+
+Actually `Box per_lev_domain[NYX_VELOC_MAX_LEVELS]` requires Box to have a default constructor. Let me check:
+Yes, Box has default constructor. Good.
+
+OK I think the code should compile. Let me also do a quick sanity check on the structure of the file:
+Good. The function is defined cleanly.
+
+Now let me think about one more concern. The MPI_Allreduce uses `MPI_DOUBLE` but the buffer is from `std::vector<char>`. The reinterpret_cast<double*> may have alignment issues if `sizeof(NyxVelocHeader)` is not 8-byte aligned. Let me check NyxVelocHeader size:
+
+Let me compute manually:
+- int magic (4)
+- int has_state (4)  
+- int n_levels (4)
+- int pad0 (4)  -> 16
+- double cum_time (8) -> 24
+- int level_steps[16] (64) -> 88
+- int level_count[16] (64) -> 152
+- double dt_level[16] (128) -> 280 (aligned to 8 already since 152 is multiple of 8)
+- long buf_size[16] (128) -> 408 (still multiple of 8)
+- int n_comp[16] (64) -> 472
+- int dom_lo_x[16] (64) -> 536
+- int dom_lo_y[16] (64) -> 600
+- int dom_lo_z[16] (64) -> 664
+- int dom_hi_x[16] (64) -> 728
+- int dom_hi_y[16] (64) -> 792
+- int dom_hi_z[16] (64) -> 856
+- double state_time[16] (128) -> 984
+- double state_dt_old[16] (128) -> 1112
+- double state_dt_new[16] (128) -> 1240
+- long header_bytes (8) -> 1248
+- long total_state_bytes (8) -> 1256
+- unsigned int payload_crc32 (4) -> 1260
+- int pad2 (4) -> 1264
+
+So header is 1264 bytes, which is multiple of 8. Good, aligned.
+
+The blob is `std::vector<char>`. The header starts at offset 0. The state starts at offset sizeof(header) = 1264 (multiple of 8). The trailer at end is int.
+
+When we cast `g_nyx_veloc_blob.data() + sizeof(NyxVelocHeader)` to `double*`, alignment must be valid. `std::vector<char>::data()` may be only char-aligned (8 in libstdc++ usually 16 due to malloc). Actually, `new char[N]` is guaranteed to be at least max-align. So `vector<char>::data()` is max-aligned. Plus 1264 (multiple of 8) → still 8-byte aligned. Safe.
+
+OK now let me check the build by looking for any obvious issue. Let me check what nyx_dense_size returns vs what we use:
+Good. All called correctly.
+
+Now I'm going to make one final improvement. Let me check that we don't have a potential issue with `dom_ckpt` constructor when checkpoint data is garbage — IntVect with garbage int could be invalid. The CRC32 check should catch this BEFORE we use the data, since invalid header means CRC won't match. But if we got past the header check somehow, the IntVect constructor and Box constructor should not crash on weird values — they'd just create weird Boxes which would then fail the `dom_ckpt != dom_now` check.
+
+Actually, `Box(IntVect, IntVect)` constructs a Box. If smallEnd > bigEnd, the Box is "empty" but should not crash. `Box::numPts()` for empty Box returns 0. `Box::contains(IntVect)` returns false. So scatter would do nothing. Safe.
+
+OK final state looks good. Let me also make sure I don't have a problem with the cleanup of `n_scatter` and `restored_cum_time` references:
+`restored_cum_time` is declared at line 984 (above), and used here at 1022 and 1047. Variable in scope. Good.
+
+`n_scatter` is declared at line 1027, used at 1028 and 1048. In scope.
+
+I notice we're calling `setCumTime`, `setLevelSteps`, `setDtLevel`, `setTimeLevel` for level 0 twice — once before the regrid call, and once in the second block. That's harmless but redundant. Let me check if this causes any issue...
+
+Actually it's a duplicated call. The `setCumTime(restored_cum_time)` is called in both places. Second call is idempotent. Same for the others on level 0. No issue.
+
+But to be cleaner, let me modify the second loop to skip level 0:
+
+Actually no — the second loop sets all levels up to n_scatter. Including level 0 again is harmless. Leaving it as-is to keep code simple and uniform.
+
+Let me also make sure there's no issue with the regrid call when the regrid would change level 0's BoxArray. Looking at `regrid()` code lines 2099-2103:
+```cpp
+bool regrid_level_zero = (!initial) && (lbase == 0)
+    && ( loadbalance_with_workestimates || (new_grid_places[0] != amr_level[0]->boxArray()));
+```
+
+With `initial=false` and `lbase=0`, `regrid_level_zero` could be true if loadbalance is enabled OR if grid_places differ. If true, the start of the regrid loop is 0 (level 0 is regridded). That would re-init level 0 via `Nyx::init(old_level&)` which calls FillPatch from the OLD level. Our restored state would be preserved by FillPatch in this scenario.
+
+So even if regrid touches level 0, the data should be preserved.
+
+Let me check the time-keeping. After regrid, `cumtime` in Amr is unchanged. The new levels' StateData times are set by their constructors using `cumtime`. So they'd be at `cumtime=0` (since we set cumtime AFTER scatter but BEFORE regrid). 
+
+Wait no — I moved `setCumTime` to BEFORE the regrid. So at regrid time, `cumtime = restored_cum_time`. New AmrLevels constructed during regrid get `cumtime = restored_cum_time`. Their StateData times should be set correctly.
+
+OK, this looks solid. Let me also be careful about one more thing — `Nyx::init(AmrLevel& old)` for the case where regrid_level_zero is true:
+So `Nyx::init(old)` does FillPatch from the OLD level. If our level 0 had scattered data, the new level 0 (post-regrid) would get FillPatched from the old level 0's restored state. 
+
+OK I'm confident this is reasonable. Let me complete the file inspection.
+Summary of changes I made to fix the previous attempt:
+
+**Root causes identified from iter_6 logs:**
+1. The sidecar-file resume succeeded but then segfaulted during scatter/coarseTimeStep, likely from per-rank MFIter-order packing failing when DistributionMap/BoxArray changed between checkpoint and restart due to AMR regrids.
+2. The previous attempts also tried to recover from VeloC with bytes-mismatch (`magic=0x81ee425d expected=0x4e594f58`) — corrupt recovered data was treated as garbage and the run fell through to fresh init (slow recovery).
+
+**Changes to `Source/Driver/nyx_main.cpp`:**
+
+1. **Removed the entire sidecar mechanism** (`nyx_sidecar_path/write/read`, `NyxSidecarFileHdr`, sidecar resume path, sidecar write block).  Sidecars in VeloC dirs violate the "no side-car files in VeloC dirs" gate.
+
+2. **Replaced per-rank MFIter pack/unpack with layout-independent dense-per-level storage** (`nyx_dense_size`, `nyx_dense_index`, `nyx_dense_pack_owned`, `nyx_dense_scatter`).  Each rank writes its owned cells into a dense (Domain × nComp) array; a single `MPI_Allreduce(MPI_SUM, MPI_DOUBLE)` merges across ranks so every rank ends up with the complete dense state.  On restart, every rank reads the complete dense buffer and scatters by global cell coordinate — DistributionMap and BoxArray changes are tolerated.
+
+3. **Added per-level Domain box to header** (`dom_lo_x/y/z`, `dom_hi_x/y/z`) so the restart can validate dimensional consistency before scattering, and reject mismatched levels safely (returning 0 from `scatter_one_level`).
+
+4. **Added CRC32 of the payload** (`nyx_crc32`, `payload_crc32` header field).  On restart, recompute and compare; reject corrupt blobs even when magic+trailer happen to look valid.
+
+5. **Resume now scatters level 0 first, then triggers `amrptr->regrid(0, restored_cum_time, false)`** to create refined levels from the restored coarse state via FillCoarsePatch, then scatters the refined levels into the newly-created MultiFabs.  This handles the common AMR case where the freshly-init'd hierarchy has only level 0 at t=0 but the checkpoint had refined levels.
+
+6. **Sets per-level StateData time BEFORE the regrid call** so the new AmrLevel constructors and `Nyx::init()` (no-arg variant, called inside regrid for new levels) see the restored time rather than 0 — otherwise `computeNewDt` would clamp dt to `stop_time - 0` and burn through the simulation in one giant step.
+
+7. **`VELOC_Checkpoint_wait()` after each `VELOC_Checkpoint`** to flush any internal queue before the next coarseTimeStep, so the on-disk persistent file is durable before the next potential kill.
+
+8. **Increased fallback walk-back window to 64** (was 32) and added CRC to the rejection criteria so corrupt-but-magic-valid blobs are also rejected and walked past.
+
+9. **If no level scatters successfully (all geometry mismatch), reset `veloc_resumed_state=false`** so the run falls through to fresh init cleanly instead of advancing cumTime with empty state.
+
+**`veloc.cfg`** kept with absolute `/tmp/nyx_veloc_{scratch,persistent}` paths and `max_versions = 8` to support walk-back across multiple complete versions.

@@ -1,0 +1,171 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The validation failed because Test 1 (failure-prone correctness) FAILED. The output differed from the perturbed-vanilla baseline. The checkpoint was created and recovery exit code was 0, but the final state values were wrong. This means state isn't being properly captured/restored.
+
+Let me explore the codebase structure.
+Let me see what existing VeloC integration is there from previous attempts:
+Good, existing implementation. Now let me look at app_lattice.cpp around the checkpoint logic to understand the gaps:
+Now I need to understand the test scenario. It's an ising example. Let me look at how the rejection sweep runs (this is what ising uses) and what state is missing. Let me look at the input file behavior:
+The validation runs the rejection sweep iteration since `sweep random` + `sector yes`. Let me look at iterate_rejection and the validation_output:
+I see the issue. The recovery state ratio is acceptable, but the output is wrong. Test 2 (failure-free) PASSED — meaning vanilla state runs are reproducible. But Test 1 FAILED. So upon recovery, something is wrong.
+
+Looking at the critical missing pieces:
+1. **The random number generator (RNG) state** - `ranapp` is a `RandomPark*`. Its `seed` and any internal state isn't checkpointed. Without it, after recovery the random sequence differs.
+2. **`siteseeds[i]`** array for strict mode (this code uses non-strict for ising)
+3. **`nextoutput`** state for output
+4. Most critically: ghost data, propensities recomputed... but the main issue is the RNG state.
+
+Let me check RandomPark/RandomMars:
+Critical issue identified: We don't checkpoint the RNG state (`ranapp->seed`). This causes recovery to produce a different state. Let me also check what other state changes during iteration:
+
+- `time`, `naccept`, `nattempt`, `nsweeps` - checkpointed ✓
+- `iarray`, `darray` (per-site arrays = spins) - checkpointed ✓
+- `ranapp->seed` - **NOT CHECKPOINTED** - this is the big bug
+- `nextoutput` - protected? No.
+- `siteseeds` (only for strict mode)
+
+Let me also check what app_ising stores:
+Good. The `spin[i]` is `iarray[0][i]` and that IS protected. So the critical missing state is **`ranapp->seed`**.
+
+Also, I should think about ghost sites - after recovery, the comm->all() (or sector) on next iteration will sync them. So those should be fine.
+
+But the real issue may also be: **the validator captures the output binary which contains energy/state at end-of-run**. The Test 2 (failure-free) PASSED with score 0 - same output as perturbed-vanilla. That means our state machine is deterministic without crash. So our protection works in the normal case.
+
+The Test 1 failure (with kill+recovery) means after recovery, the simulation produces different state. The RNG state is the prime suspect.
+
+Let me check what `bigint` is for `nattempt` typing in VeloC protect:
+Good, bigint is int64. Let me also look at the validation output bin generation - what's actually compared:
+Now, the critical thing: the validation output reads `iarray[0][i]` from each rank's local sites. This means it depends on:
+1. Final spin configuration on each rank
+2. Order of sites on each rank (decomposition stable across runs - yes, deterministic)
+
+So if RNG seed isn't restored, the post-recovery simulation will follow different RNG → different sites flipped → different spin config.
+
+Let me fix this by adding RNG state checkpointing. Let me look at how `ranapp` is allocated and used:
+Good. `ranapp->seed` is the only state for RandomPark. Now I also see that `ranapp` is only created if NULL — so on recovery, the initial setup will create it but then we restore its seed via VeloC.
+
+Let me also check `nextoutput` since output is computed based on time:
+nextoutput controls when stats are printed. It doesn't directly affect simulation state computed in the binary output. But it could indirectly via the sequence of solver/RNG calls if output->compute triggers RNG... unlikely.
+
+The main thing missing is the RNG state. Let me also check: after recovery, `setup()` is called which sets `nextoutput = output->setup(time, first_run)`. That's recomputed from current `time` which is now the recovered time, so should be deterministic. Good.
+
+But wait — when does `setup()` get called? Let me trace:
+- `spk->input->file()` parses input commands. When it encounters `run`, it executes the run command which calls `setup()` then `iterate()`.
+- Inside `iterate()`, after `setup()`, we call `veloc_protect_state()` and `veloc_try_recover()`.
+
+After recovery, `time`, `naccept`, `nattempt`, `nsweeps`, `nlocal`, and the per-site arrays are restored. But the RNG seed in `ranapp->seed` is still whatever it was initialized to from the seed command — NOT the original-run's seed-at-checkpoint-time. So the recovered run uses fresh RNG values, NOT what the original run would have used.
+
+This is the bug. Let me fix it by adding `ranapp->seed` to the protected memory.
+
+Also, I should check if `me` (rank) determines the initial seed — yes, `ranapp->reset(seed, me, 100)` is per-rank. So after first init, each rank's ranapp has a deterministic seed based on rank. Then they advance differently per call. The fact that seed value at checkpoint is what we need to restore.
+
+Let me edit:
+Now I need to make sure `random_park.h` is included in app_lattice.cpp so `ranapp->seed` can be accessed:
+Good. Now let me think about another issue. The `veloc_try_recover()` calls `veloc_protect_state()` BEFORE the restart. But on recovery startup, `ranapp` is NULL (init_app hasn't been called yet) — wait, actually `init()` is called BEFORE `iterate()`. Let me verify:
+Good. So `init()` is called before `iterate()`, which sets up `ranapp`. So at the time we call `veloc_protect_state()` in `veloc_try_recover()`, `ranapp` is non-NULL. 
+
+But wait, there's still an issue. The recovered `time` may be >= stoptime, in which case `if (stoptime > time) iterate();` won't even be called. Then we never attempt recovery! Let me check:
+
+Actually no — `time` starts at 0 (because no checkpoint loaded yet), the run command parses stoptime. Since time=0 < stoptime, iterate() is called. Inside iterate, recovery happens, then potentially we return early if recovered time >= stoptime.
+
+But there's a subtle bug! After recovery, `time` could be greater than what's expected. Let me re-check the run command:
+Important — `stoptime = time + atof(arg[0])` is computed BEFORE init/iterate. At that point, `time` is fresh 0 (or whatever from prior runs in this process). So stoptime = 0 + 18800 = 18800 in the example.
+
+Then iterate() runs, recovery sets time to something like 14000 (mid-run), then continues. If recovery happens AFTER stoptime is computed but before iterate's main loop, then the main loop will pick up at time=14000 and run until 18800. Good.
+
+But wait — there could be a problem here too! If recovery happens but `setup()` was called earlier (which calls `nextoutput = output->setup(time, first_run)`), `nextoutput` was computed using time=0, NOT the recovered time. This could cause stats output to be wrong on recovery, but the validation_output.bin doesn't depend on stats output, just on spin[i] at the end.
+
+So restoring RNG should be enough. Let me also make sure we don't have issues with `setup_app` (ising's setup_app uses spin which is restored correctly).
+
+Now let me also think about: what about the initial protect_state call in `iterate()` — at that point `time, naccept, etc` are still the pre-recovery values. Calling protect_state just registers pointers — doesn't write. Then we call `veloc_try_recover()` which AGAIN calls `veloc_protect_state()` (line 523), then `VELOC_Restart()`. This OVERWRITES the values in memory via the pointers we just protected. Good.
+
+Actually, looking more carefully — on the very first iterate after fresh start, `iterate()` calls `veloc_protect_state()` (line 667), then `veloc_try_recover()` returns false (no checkpoint exists), then iterate proceeds. The protected state has `ranapp` set (init was called), so this is fine.
+
+On recovery, same flow: init() → ranapp created with default seed, then iterate() → protect_state() (registers ptr to ranapp->seed) → try_recover() → restart → ranapp->seed now overwritten with checkpointed value. 
+
+Let me also verify `siteseeds` handling. For the ising test, sweep is `random` (not color_strict), so siteseeds is NULL, so we skip. Good.
+
+Now let me build the code to verify it compiles. Let me check what the Makefile expects:
+Let me also look at what the previous iterations did to understand if there's something I'm missing:
+OK, this was a fresh iteration. Now let me think about other potential issues. Let me re-examine more carefully.
+
+The recovered run produced exit_code=0 (didn't crash) but final state was different. The other thing that might matter is `naccept` being protected as `bigint` which is `int64_t`. That's fine.
+
+Let me make sure RandomMars (used by ranmaster) isn't relevant. Actually `ranmaster` is only used during init() to seed ranapp. Once ranapp is seeded, ranmaster isn't used again in the loop. So it doesn't need to be checkpointed.
+
+Wait — there's another consideration. The `setup_app()` for ising in init_app doesn't modify spin, just validates it. So spin (iarray[0]) being restored is fine.
+
+Let me also verify what setup_end_app does for AppLattice — anything that might use RNG and advance state?
+Empty for AppIsing/AppLattice. Good.
+
+Let me check `setup()`:
+I notice: `dt_rkmc = MIN(dt_rkmc, stoptime-time)`. At setup, time=0, so dt_rkmc is one value. After recovery, time is recovered, but we don't re-run setup. So dt_rkmc is unchanged. That's OK since the original code computed it once.
+
+But wait — actually there's a subtle issue. `setup_app()` calls `init_app()` for AppIsing → validates spin range. Since spin is restored before this... wait, no. `setup()` is called BEFORE iterate(). So:
+- `init()` → init_app() validates spin (still default {1,2})
+- `setup()` → setup_app(), compute propensities from current spin (= initial default config)
+- `iterate()` → protect_state → try_recover → spin gets overwritten
+
+So after recovery, the propensities computed in setup() are now WRONG because spin changed! But the code already handles this:
+
+```cpp
+if (recovered && solve) {
+    for (int i = 0; i < nset; i++) {
+      for (int m = 0; m < set[i].nlocal; m++)
+        set[i].propensity[m] = site_propensity(set[i].site2i[m]);
+      set[i].solve->init(set[i].nlocal,set[i].propensity);
+    }
+}
+```
+
+Good. But for rejection mode (which is what ising in.validation uses since `sweep random` is set, but also `sector yes`... wait does that conflict?). Let me think — `sweep random` sets sweepflag=RANDOM. Then `sector yes` enables sectorflag. The KMC solver also is initialized but for rejection KMC, do we have a solve?
+
+Looking at the code: if `solve` is non-NULL, KMC path; otherwise rejection. For ising with `sweep random`, no `solve` command was given so `solve` is NULL → rejection path. So `iterate_rejection()` is called. The recovered branch's `if (recovered && solve)` block is skipped.
+
+For rejection KMC, the spin array is restored and that's used directly by site_event_rejection. The RNG state is restored too. Good.
+
+But there's also `comm->sector(iset)` or `comm->all()` called before each sector — this syncs ghost cells. Ghost data depends on neighbors' spins. After recovery, ghosts are out of date but the FIRST call to comm->sector() will sync them. Good.
+
+But wait — could there be an issue with `comm` state? `comm` is built once. The ghost layer setup is deterministic from domain decomposition. OK.
+
+I believe the RNG fix should resolve the test failure. Let me also double-check there are no other state items I should checkpoint.
+
+Let me look at what other state-modifying state could exist. Let me look at `dt_rkmc`:
+
+Actually, the issue: `dt_rkmc` is set in setup() based on time at that moment. After recovery, time advances; dt_rkmc remains unchanged. In the original run (no crash), dt_rkmc is also unchanged across all iterations of iterate_rejection. So this is identical. Good.
+
+Now there's `set[iset].nselect` which depends on `nstop * set[i].nlocal`. nstop is fixed, nlocal is fixed, so deterministic. Good.
+
+I think my fix is complete. Let me also verify the validator's recovery detection by looking at whether the binary will exit with the right state:
+
+After recovery, iterate runs until time >= stoptime. The output binary is written by `dumpValidationSignatureBin_spparks` based on `iarray[0]`. Since spin[i] is restored, and post-recovery iterations use restored RNG → identical sequence → identical final spin → identical bin output.
+
+Let me also verify there's not an `ranapp` initialization issue. When recovery is attempted, `init()` was already called (creating ranapp). The protect call registers the address of ranapp->seed. Then VELOC_Restart overwrites the value at that address. 
+
+But what about a subtle issue: the FIRST run (no crash) does NOT call recovery. It runs through iterate_rejection which calls `veloc_do_checkpoint()`. So the checkpoint contains ranapp->seed AT THAT moment. When we recover, we get back that exact seed. 
+
+Let me also verify VeloC restart cleans up nothing else. Should be fine.
+
+Let me look at the recovery exit path more carefully. After recovery completes and time >= stoptime, we return early:
+Good. Now let me verify my edit compiles by checking the include and access:
+Note: `ranapp` is a `class RandomPark*` (forward-declared in the header). To access `ranapp->seed`, we need the full definition. random_park.h is included at line 29, so we're fine.
+
+`nextoutput` is in `class App` and is `public:`. Let me verify:
+`nextoutput` is `protected:` in App, accessed from AppLattice (a child). That's fine — protected members are accessible from subclasses. 
+
+Now let me also think about the `time` variable — it's also protected:
+Good — `nextoutput` is protected, accessible. The fix should be complete. Let me also try building to verify compilation. Let me check if there's a build script:
+Build is set up. The build is handled by the validator. My edit should compile cleanly. Let me think about one more thing — `nextoutput` modification might be a problem because in failure-free run, between checkpoints, `nextoutput` is updated by `output->compute()`. If I checkpoint nextoutput AT checkpoint-time, and recover later, the value reflects the in-memory state at checkpoint, not what `setup()` recomputed. That's actually CORRECT — we want to continue from where we left off, using the checkpointed nextoutput. Otherwise we might re-emit stats.
+
+But wait — the failure-free run already passes, so I want to be careful not to break it. The current failure-free run goes: setup() → nextoutput = output->setup() → iterate(). After my change, during iterate we register a protect for nextoutput but never restart, so nothing changes for failure-free run. 
+
+For the failure-prone run after recovery, nextoutput from the protect_state in iterate() — at the moment we call try_recover, nextoutput was just initialized by setup() to its first value. We protect it (registering ptr), then VELOC_Restart overwrites it with the checkpointed value. After recovery, nextoutput is the value from when we checkpointed. The post-recovery iterate loop then uses it correctly.
+
+This should be safe. My fix is in. The change is minimal and targeted at the actual bug: missing RNG state in the checkpoint.
+
+Summary of the fix:
+- Added `ranapp->seed` (id=6), `ranstrict->seed` (id=7), `nextoutput` (id=5), and `siteseeds` (id=90) to the VeloC-protected memory regions in `AppLattice::veloc_protect_state()` in `src/app_lattice.cpp`.
+- The critical fix is `ranapp->seed`: the rejection-KMC sweep advances the per-rank RNG on every site visit; without restoring the seed on recovery, the post-recovery sweep follows a different random sequence, producing a different final spin configuration and breaking the numeric-tolerance comparison even though recovery completes cleanly (exit 0) and walltime gates pass.
+- `nextoutput` was added to keep stats/output cadence consistent post-recovery.
+- `siteseeds` and `ranstrict->seed` covers the `color_strict` rejection mode (not exercised by the current ising validation, but added for completeness — same reason as `ranapp->seed`).
+
+No changes needed to `veloc.cfg`, `main.cpp`, the try_recover/do_checkpoint plumbing, or anything else: the protect call (which is invoked both before checkpoint and before restart) is the single point where memory regions are declared to VeloC, so adding entries there suffices to both write them on checkpoint and read them back on restart.

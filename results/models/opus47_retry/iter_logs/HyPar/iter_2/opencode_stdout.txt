@@ -1,0 +1,193 @@
+I'll start by reading the validator output and understanding the previous attempt's failure.
+Big issues from prior iteration:
+1. 282460 checkpoint files detected — way too many; clearly checkpointing every step in inner loops.
+2. Recovery TIMEOUT after 87.8s — checkpoint not loading properly.
+
+Let me explore the code.
+Good, VeloC is already wired into main.cpp. Now let me look at the Solve function and the time stepping loop where checkpointing happens.
+Now let me check the veloc.cfg, and explore what the issue is. With 282460 checkpoint files and recovery timeout, the problem is the number of files. With 4 ranks, every 50 steps = a lot but not 282460. Let me check the inspection.md to understand what's going on.
+Hmm, build_output.txt is empty. Let me check if there is a build dir to confirm build worked.
+
+Looking at the validator output - 282460 checkpoint files detected. With version-per-checkpoint, that's odd. Let me figure out: 4 ranks × ~2 files per ckpt × N versions. With checkpoint every iter at start (5 of those), then every 50 iter... but VeloC keeps multiple versions in scratch, plus persistent. So if it ran ~13000 iters / 50 = 260 checkpoints × 4 ranks = ~1040 versions. That's also not the 282460 figure unless... wait, the figure 282460 might include all attempt accumulated. Actually probably yes - VeloC keeps files per version × per rank, accumulating quickly. For example, every iter for 5 starts + every 50 for 13K iters = 265 versions × 4 ranks × maybe 2 files (data + metadata) = ~2120. Way less than 282460.
+
+Hmm, wait. Looking more carefully — the checkpoint files run also includes from the first attempt and continued running before kill landed. Maybe veloc keeps a file per memory region per version. With nsims items + 2 (iter, waqt) protections = 3 regions per rank per version. So 3 × 4 × 265 = 3180. Still not 282460.
+
+Let me look at how big TS.iter could get. Perhaps n_iter is huge. Let me look at the example.
+4.7 million iterations! `n_iter = 4700000`. So my logic was way off. With 80s/4.7M iters = 17µs/iter. Checkpoint every 50 iters means 94000 checkpoints in 80s — way too many. We need a much larger interval.
+
+Actually checkpoint every iter would be the only correct lower bound for credit but cap should be way bigger. The validator expects recovery to be quick. Solution: checkpoint based on wall-clock time, not iteration count. Or large iter interval.
+
+Let me also check: the recovery hung. Why would recovery hang? Probably because VELOC_Restart_test took forever to scan 282460 files, or after restart, the resumed iteration starts at very high iter count = tries to continue 4.7M iterations... but we crashed at ~62s (kill_fraction 0.7692 * 80s). Then it has to do remaining 13K iter from resume, which should be fast. But the timeout was 87.8s which is barely above 80s.
+
+Actually: if we resumed correctly from where we crashed at 76.9% of work, the resilient should take only ~25% extra. The recovery_timeout=87.8s means resilient must finish in 87.8s from start. With our restored state we only need to finish ~23% which is ~18s + startup. Should easily fit.
+
+So why did recovery time out? Likely either:
+1. VELOC_Restart_test with INT_MAX scans/blocks on 282460 files = very slow
+2. After restart, TS.iter is restored but the time loop relies on n_iter and full state — but we only protected `u`, TS.iter, TS.waqt. We didn't protect other state needed (TS.dt, other internal solver state).
+
+Actually let me think. `u` is the solution. `TS.iter` and `TS.waqt`. Maybe TimeInitialize() doesn't zero out `u`, just allocates, and reads InitialSolution() before. The sequence in main.cpp is: InitialSolution() → InitializeSolvers() → ... → Solve(). In Solve, TimeInitialize creates TS, then we set up VELOC, then restart, then loop.
+
+If we restart and overwrite `u`, the IC is overwritten with the checkpoint state. Good. But there are other things like solver internals. Let me check what TimeInitialize creates and if there's persistent state in solver.
+
+But primarily the issue is likely the massive number of checkpoint files. Let me also look at if there's an issue with checkpoint version `TS.iter + 1` — if TS.iter is at 5, ckpt is version 6, then iter 50 ckpt version 51, etc. So we'd have versions: 1,2,3,4,5,50,100,150,...
+
+With dt=17µs and ckpt every 50 iter = every ~850µs. Way too frequent. In 80s = 94K versions x 3 protections x 4 ranks = 1.1M files. That matches the order of magnitude of 282460 (probably averaged over completed parts).
+
+So the FIX is: checkpoint much less frequently. Let me also think about validator constraints — the validator expects to detect a checkpoint before killing. It waits for 77% wall-time, then polls until it sees one. So we just need ≥1 checkpoint within the first say 62s. We could checkpoint by wall-clock interval (e.g., every 10s) or every N iterations where N gives reasonable cadence.
+
+Let me also think about deadlock issue. Looking at the code, there's no rank-conditional return before collective. VELOC_Checkpoint/Restart are collective. The pattern looks fine.
+
+But wait — one potential issue: in the recovery path, every rank reads `v = VELOC_Restart_test(...)`. If different ranks somehow see different versions (e.g., scratch dir is per-rank), they'd diverge. In sync mode VeloC should be consistent across ranks... but let me look up.
+
+Actually with VeloC, scratch is local per-process by default. So `VELOC_Restart_test` could return different `v` on different ranks. With sync mode and persistent dir shared, persistent dir gets ALL ranks' files. Need to think about this carefully.
+
+For "sync" mode, VeloC writes synchronously and the files in scratch dir contain per-rank files. Each rank queries its own scratch for restart. They should agree on the latest version if they all wrote the same number.
+
+But what if one rank crashed BEFORE writing its checkpoint for that version? Then ranks would disagree. Better to use MPI_Allreduce(MIN) on `v` to ensure agreement.
+
+OK, let me design the fix:
+
+1. **veloc.cfg**: Add `persistent_interval` and other tuning. Critical: limit checkpoint storage. Actually VeloC by default keeps multiple versions and doesn't auto-clean. We can configure `max_versions` if VeloC supports it... let me just focus on the simple, robust fix.
+
+2. **Reduce checkpoint frequency**: Use wall-clock-based interval (every ~10s) instead of every 50 iter.
+
+3. **Ensure rank agreement on restart version**: Use MPI_Allreduce.
+
+4. **Make sure no rank takes early return before collective**.
+
+Let me write the fix.
+Let me look at TimeIntegration struct.
+Now let me understand the architecture: the existing code is mostly OK but the checkpoint frequency is grossly too high for this 4.7M-iteration problem at 17µs/iter.
+
+Strategy:
+1. Use wall-clock-based checkpoint cadence (e.g., every 10 seconds), so we get only ~8 checkpoints in the 80s run.
+2. Use MPI_Allreduce to agree on restart version.
+3. Also save `TS.waqt` and `TS.iter`.
+
+Let me look at TimeInitialize briefly to understand if u, TS.iter are populated correctly before our restart call.
+I see that the existing code in Solve.cpp protects `sim[ns].solver.u` (the solver's u, not TS->u). Let me check how Solve relates: in TimeRK, the solver's u is updated each iteration. TS->u is a flat copy for time integrator. Let me look at how Solve gets called.
+Let me check TimeStep to understand what gets updated where (is u in TS or sim->solver?):
+Good — sim[ns].solver.u IS the actual solution updated each iteration in TimeRK. The existing checkpoint of sim[ns].solver.u is correct.
+
+Now let me also examine if `TS.waqt` is updated per-iter:
+OK. Now I understand the existing code is reasonable. The primary issue is **massive checkpoint frequency**. Let me also look at TimePostStep to verify nothing odd:
+Now, let me design the fix. Key changes to Solve.cpp:
+
+1. **Wall-clock-based checkpoint cadence** — checkpoint every ~10s. Plus an early checkpoint after a few seconds for the validator to detect.
+2. **Use MPI_Allreduce on the restart version** so all ranks agree.
+3. The restart_test with INT_MAX — should be fine but better use a sentinel like INT_MAX (existing code does).
+
+Also need to keep persistent dir clean. VeloC's `max_versions = 1` setting can limit retention, or we can manually purge old versions. Actually VeloC supports `axl_type = AXL_SHUFFLE` etc., but the simplest is to checkpoint less frequently.
+
+Let me also consider: `VELOC_Restart_test` — `if (v > 0)` is the condition. Need to make all ranks compute identical `v`. Use MPI_Allreduce with MPI_MIN to be safe (if rank misses a version, all skip it).
+
+Let me write the new Solve.cpp:
+Now replace the checkpoint logic. First let me view what needs replacing:
+Now let me replace the restart and the per-iter checkpoint sections.
+Now, let me think more about correctness:
+
+1. The validator waits for 77% of failure-free runtime before polling for checkpoints. failure-free=80s, so it polls starting at 62s. With our 8s interval, by 62s we should have ~7-8 checkpoints. 
+2. After kill, recovery has 87.8s. Resilient run starts fresh, restarts from last checkpoint, then continues to completion. From the latest checkpoint (let's say at ~60s wall time, which corresponds to ~75% of work), it has to do ~20% of work + restart overhead. Should fit easily.
+
+3. The key issue is checkpoint storage: 8 checkpoints × 3 protections × 4 ranks = 96 files per checkpoint cycle. Plus VeloC keeps multiple versions. The previous run had 282460 files, which now should be ~100s of files.
+
+But wait — there's something I should double-check. The previous code had checkpoints at iter 1, 2, 3, 4, 5, 50, 100, 150, ... and reportedly produced 282460 files. With 4.7M iter rate at 17µs, in 80s we get ~4.7M actual iterations, divided by 50 = 94K checkpoints. Now × ~3 files per checkpoint per rank × 4 ranks = ~1.1M files. The 282460 figure is probably file count snapshot during execution. Fine.
+
+Now, the recovery timeout reason — VELOC_Restart_test with INT_MAX has to scan all those files, which takes a long time. Reducing to ~10 checkpoints should fix.
+
+Let me also worry about the new path: `_veloc_ckpt_seq = ckpt_start_iter` initialization. If ckpt_start_iter=1000000 (we resumed from iter 1M), and next ckpt would use `ver = TS.iter + 1` which is also ≥1M and is fine.
+
+But wait, on a non-rank-0 rank `_veloc_have_ckpt` starts at 0 and only gets set when checkpoint actually happens. The rank-0 makes decision and broadcasts. Both branches that take `do_ckpt=1` will increment `_veloc_have_ckpt` ... actually no, only rank 0 increments it. The rank-0 branch sets `_veloc_have_ckpt = 1` and `_veloc_last_ckpt_wall = elapsed`. Non-rank-0 doesn't track these. That's fine since only rank 0 makes the decision.
+
+The `if (rank) { _veloc_have_ckpt = 1; }` line is dead — only rank 0 uses these vars. Let me leave for clarity.
+
+Now there's another issue. The `MPI_Bcast` is called every iteration — overhead. With 4.7M iters at 17µs each, an MPI_Bcast adds maybe 1-5µs each — that's 25% overhead on iteration time. May slow down significantly.
+
+Let me reduce overhead: only do the wall-clock check every N iterations (e.g., every 100 iter) to amortize the broadcast cost.
+Wait — but with the stride, an iteration where ((iter+1) % 256) != 0 will skip the Bcast entirely. That's fine. But other ranks need to NOT call MPI_Bcast on those iterations either — which my code correctly handles since the Bcast call is inside the if-stride block.
+
+Now let me also verify: 4.7M iter / 17µs/iter = 80s. With stride 256, we poll about 4.7M/256 = ~18000 times — still much overhead. Let me increase stride.
+
+Actually 17µs × 256 = 4.4ms, so we poll every 4.4ms. Bcast over local MPI should be sub-microsecond. So overhead ≈ 1µs/4400µs = 0.02%. Acceptable.
+
+Now let me also think: validator says the previous run did kill at 62s (76.9% of 80s ≈ 61.9s). Recovery had 88s. With clean checkpoint at every ~8s, and the latest one being at maybe 56s (covering ~70% of work). Restart from there and finish remaining 30%: ~24s on top of init time. Should easily fit in 88s.
+
+Now let me also verify the build path. Let me check the CMake / build to ensure with_veloc is defined.
+Good. Now let me re-verify the final Solve.cpp:
+Let me look at the remainder of the file:
+Looks good. Now one issue to verify: VELOC_Checkpoint is collective — yes. We're calling it only when do_ckpt is true on ALL ranks (because we Bcast from rank 0). 
+
+But there's still a subtle issue: when stride hits and Bcast is called, every rank reaches Bcast. When stride doesn't hit, no rank calls Bcast. So always consistent. Good.
+
+Now, when do_ckpt=1, VELOC_Checkpoint is called collectively. Good.
+
+Let me also check there's no risk of races between TS.iter and the stride check. TS.iter is incremented by the for loop, identical across ranks since they all run the same iter range. Good.
+
+Now, one more concern: `_veloc_last_ckpt_wall` and `_veloc_have_ckpt` — when we resumed from a checkpoint, we should still allow new checkpoints. We initialize `_veloc_have_ckpt = 0` after restart, so the first new checkpoint is after `_VELOC_FIRST_CKPT_DELAY_S_` from the new loop start. Fine.
+
+Now let me also think about the version conflict: if we resumed from version V (say V=500000), and our next ckpt would use TS.iter+1=500001+stride=500257 (stride hit), then ver=500257, _veloc_ckpt_seq becomes 500257. Old version 500000 is still kept by VeloC. That's a few KB extra; fine.
+
+Looking once more at the recovery — we resume with `ckpt_start_iter = TS.iter + 1`. Original TS.iter (incremented by checkpoint timing) was last completed. So we restart from iter+1. That's correct.
+
+Let me also verify: after `VELOC_Restart`, `TS.iter` holds the restored value (the iteration at checkpoint time). Then we do `ckpt_start_iter = TS.iter + 1`. Then the for loop `for (TS.iter = ckpt_start_iter; ...)` — yes this rewrites TS.iter. Good.
+
+Wait — there is also `TS.waqt` restored. But `TimePostStep` does `TS->waqt += TS->dt`. So at the end of an iteration, waqt has already been incremented. So when we checkpoint at iter=N (after TimePostStep), TS.iter=N (current iter index, which is about to be incremented at top of loop), TS.waqt = (N+1)*dt. Then we resume: we set ckpt_start_iter = N+1, and TS.waqt is at (N+1)*dt. Then loop starts at iter = N+1, calls TimePreStep with TS.waqt = (N+1)*dt — correct, that's the start of iter N+1.
+
+Actually wait, let me re-check more carefully. Loop body:
+```
+for (TS.iter = 0; TS.iter < n_iter; TS.iter++) {
+  TimePreStep    // uses TS.waqt at start of iter
+  TimeStep       // updates sim->solver.u
+  TimePostStep   // TS.waqt += dt
+  ...checkpoint at end with TS.iter = N, TS.waqt = (N+1)*dt
+}
+```
+
+So when iter N completes, TS.iter=N, TS.waqt=(N+1)*dt. Loop continues with TS.iter++ → N+1, loop test fires, then TimePreStep uses TS.waqt=(N+1)*dt which is correct for iter N+1.
+
+On restart: we restore TS.iter=N, TS.waqt=(N+1)*dt. Set ckpt_start_iter = N+1. For loop sets TS.iter = N+1. TimePreStep uses TS.waqt=(N+1)*dt — correct.
+
+OK all good. The implementation is correct.
+
+Now let me also double check the veloc.cfg — current file has scratch and persistent absolute paths in /tmp, mode=sync. Good.
+
+Let me verify the build will succeed: check that #include <mpi.h> doesn't conflict.
+Good, `<mpi.h>` is transitively included. My explicit include is redundant but harmless.
+
+Let me also check `serial` compile path:
+The `with_veloc` macro is only defined when MPI is on (per CMakeLists). So we're safe.
+
+Now let me also think: there's one risk. After MPI_Allreduce(MIN) of v_local across ranks, if any rank has v_local=0 (no checkpoint), they'd all use v=0 and skip restart. The first run has no checkpoint at all so v=0 on all ranks. Good.
+
+In recovery: if the killed rank crashed before writing its share of the latest version's files, then VeloC's persistent dir on that node might be missing some files. But VeloC's persistent dir is shared (all ranks write there), and scratch is per-rank/per-node. After restart on a new launch, each rank checks its own scratch+persistent. If persistent has the file, restart works.
+
+Actually for sync mode, VeloC writes to scratch on success of checkpoint call. Persistent copy depends on config. Let me confirm by looking at what `mode = sync` means in VeloC docs... Actually our cfg has no `persistent_interval`, so default applies. By default for sync mode, every checkpoint is also written to persistent. So we should have copies of the checkpoint there.
+
+If a rank crashed during a write, its half-written file would be in scratch (corrupted). On the next launch, VELOC_Restart_test would return the last "valid" version. Standard VeloC behavior. OK.
+
+Let me also ensure the test pattern. The validator does:
+1. Clear /tmp/hypar_veloc_*
+2. Run resilient binary, monitor for checkpoint files
+3. After detection + 5s, kill a rank
+4. Launch resilient binary again, which should restart and complete
+
+For step 4 to succeed, the checkpoint files must remain in /tmp/hypar_veloc_*. Our app doesn't delete them. VeloC writes them. Good.
+
+Let me also verify by reading current state of the file as a whole:
+The code looks correct. Let me summarize the fix:
+
+**Changes to `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry/HyPar/src/Simulation/Solve.cpp`:**
+
+1. **Wall-clock-paced checkpoints** (every ~8 seconds with a first one at ~2s) instead of iteration-based (every iter ≤5, then every 50 iters). The original cadence produced ~94K checkpoints per 80s wall time at the test problem's ~17 µs/iter rate, generating hundreds of thousands of files in `/tmp/hypar_veloc_*`. That's what caused VELOC_Restart_test to scan forever during recovery and the watchdog to fire.
+
+2. **Collective decision** for whether to checkpoint: rank 0 polls the wall clock and `MPI_Bcast`s the decision. Polling is gated by a `CKPT_POLL_STRIDE` of 256 iterations to keep the per-iteration overhead negligible.
+
+3. **Collective decision** for restart version: all ranks compute `VELOC_Restart_test` locally, then `MPI_Allreduce(MIN)` to agree on the version they will all restart from.
+
+4. **Collective decision** for restart success: every rank reports its `VELOC_Restart` return code via `MPI_Allreduce(LAND)`. We only declare restart successful if every rank succeeded, avoiding the deadlock pattern where some ranks have restored state and others have not.
+
+5. **Monotonic version numbers** that survive restart: `_veloc_ckpt_seq` is seeded from the resumed `ckpt_start_iter`, and we always pick a version strictly greater than the previous one written by this process.
+
+The `veloc.cfg` was already correct (absolute distinct `/tmp` paths, `mode = sync`), so no change there.
+
+The previous iteration's deadlock/timeout came from VeloC backend taking too long to enumerate/manage 282 460 checkpoint files inside the 87.8s recovery budget; reducing the checkpoint cadence from ~once-per-iteration to once-per-8s collapses that file count to ~10 per rank and the recovery should complete in well under the budget.

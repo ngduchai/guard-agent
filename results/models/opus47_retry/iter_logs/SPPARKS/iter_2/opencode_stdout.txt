@@ -1,0 +1,158 @@
+I'll start by reading the previous attempt's validation output to understand why it failed.
+The previous attempt failed because checkpoints are too large (10+ GB) and too many (44k+ files). The fix involves bounding checkpoint footprint. Let me explore the codebase first.
+Good - VeloC integration already exists. Let me understand the structure.
+Now I understand the bug. Checkpoint is invoked after EVERY KMC event in the global loop and after every sector pass. The validator wrote 53,752 files / 13GB during a clean run. We need to:
+
+1. **Bound checkpoint cadence** - checkpoint every N steps not every step.
+2. **Purge old checkpoint versions** (or use the cleaner option).
+3. Look for `rejection` loop too which is the most relevant for ising example.
+
+Let me check the rejection iterate function and the rest:
+Now let me check the header to see existing veloc-related fields:
+Now let me look at the input file to understand the workload:
+So the workload runs 18800 sweeps. After every sweep, a checkpoint is taken. With 500x500 = 250,000 sites per checkpoint = ~1MB per checkpoint, and likely 4 processes = ~4MB per sweep, x 18800 = ~75GB if we keep all versions. That's the bug.
+
+Now I'll fix:
+1. Throttle checkpoint cadence (every N seconds OR every M sweeps).
+2. After successful checkpoint, delete prior version files from scratch+persistent.
+
+Let me look at how to delete old checkpoint files. The standard approach is to either call `VELOC_Checkpoint_wait` and then unlink old version files.
+
+Let me check the header file fully:
+Now let me design the fix. I'll add:
+1. Cadence throttling - checkpoint every N seconds based on wallclock time.
+2. Purge prior version files after a new checkpoint completes (use VELOC_Checkpoint_wait followed by unlink of prior version's files).
+
+Let me look at how VeloC names files. Files are typically `<name>-<rank>-<version>.dat` in scratch dir and similar in persistent dir.
+
+Let me look at the build flow:
+Excellent! I can use `max_versions` and `scratch_versions` in `veloc.cfg` to bound the disk footprint. This is the cleanest solution.
+
+Let me also add cadence throttling in the code. Plan:
+
+1. **veloc.cfg**: Add `max_versions = 1` and `scratch_versions = 1` to retain only the latest checkpoint.
+2. **Throttle cadence**: Only checkpoint every ~5 seconds wallclock minimum.
+
+Let me update the cfg:
+Now, throttle the checkpoint cadence. I'll modify `veloc_do_checkpoint` to only checkpoint when enough wallclock time has passed since the last one. Plus, also explicitly unlink old version files as a belt-and-suspenders measure in case `max_versions` is honored only on persistent dir.
+
+Let me update the header to add timing field and a helper for purging:
+Now update `veloc_do_checkpoint` to throttle and purge old versions:
+Now I need to also rethink: even with throttling at 5s, after every iteration we still attempt. Good. But disk-guard fired at 22 seconds. Let me think more carefully:
+
+- Baseline runtime: 102.7s
+- Workload: 18800 sweeps in ~100s → ~188 sweeps/second
+- Without throttling, 1 checkpoint per sweep = 188 checkpoints/second
+- With max_versions=1 in cfg, VeloC should keep only the newest. But it didn't!
+
+Looking at validate output: `checkpoint metrics for failure_free: 13444020224 bytes across 53752 file(s)` - that's 53,752 files for ~100 seconds runtime. The runtime probably collapsed by disk guard. 
+
+Critical: the failure-free run died from disk guard at 13GB. With max_versions=1, this shouldn't happen *if* it's honored. Maybe in `sync` mode max_versions doesn't apply the same way. Let me lean on both throttling AND explicit unlinking.
+
+Also need to reconsider: the issue may be that the disk-guard armed limit is 10.7 GB. If each checkpoint = 4 ranks * ~2 MB = 8 MB, then we'd need 1300+ checkpoint versions accumulated to exceed 10.7 GB. With 5s throttle over 100s, that's only ~20 checkpoints = ~160 MB. 
+
+But wait — 13 GB / 53752 files = ~250 KB/file average — and 53k files = many versions. The unlink approach should work.
+
+Actually let me reconsider the size: 500x500 lattice / 4 ranks = 62,500 sites/rank → 62500 ints = 250 KB/rank. Plus metadata. So ~250 KB/file matches. We need to keep only 1 version.
+
+Let me check whether VeloC's sync mode honors max_versions = 1. Looking at VeloC docs/source quickly:
+I won't be able to verify VeloC's behaviour directly. Better to rely on explicit unlink + throttle. The explicit unlink is the most reliable guard.
+
+Let me also worry about cleanup happening only if `prev > 0` - this prevents on version 1 (since prev=0). But once we're at version 2 (prev=1), it tries to unlink version 1. Good. Actually let me simplify - call purge unconditionally for version >= 2:
+
+Actually looking again, the logic is correct. The condition `prev > 0` is when we've made at least one prior checkpoint. Wait that's wrong: at first checkpoint, `prev` was 0, `veloc_ckpt_version` becomes 1. We don't purge. Good. At second checkpoint, `prev=1`, `version=2`. We purge versions 1..1. Correct.
+
+Now let me also reconsider the throttling — with `min_interval=5s`, over 100s we still get 20 checkpoints. The issue is between throttle attempts; even when throttled, each checkpoint = ~1MB per rank = ~4MB. 20 checkpoints * 4MB = 80MB. Fine.
+
+But what about cleanup running properly? When validator kills mid-run, prior versions might still be on disk. That's okay, the disk-guard limit is per-run. We need fewer than ~10GB at any moment. With purge after each checkpoint, peak = 2 versions = ~8MB. Good.
+
+Let me also think: VELOC_Checkpoint internally writes scratch then maybe persistent. In sync mode it should be done by the time the function returns. So unlink right after should be safe.
+
+Now let me also double-check the `iterate_kmc_global` checkpoint location — it's inside the inner `while (!done)` loop, every event. Even with throttling, this is fine.
+
+Let me look at the failure-free output:
+- `non-zero exit on failure-free run: exit_code=1`
+- Disk guard terminated. So the binary itself was working, but disk got too big.
+
+With the fixes above, disk usage stays bounded. Good.
+
+Now, one concern: the kill_attempts also said `disk-guard: TERMINATE (10.74 GB > 10.74 GB limit)` at ~22 seconds — that means in 22 seconds of running, we generated 10+ GB. That's massive. 22s * 188 ckpts/s * ~1MB each * 4 ranks = ~16GB. Yes that fits.
+
+With our 5s throttle:
+- 22s / 5s = ~4 checkpoint cycles 
+- 4 ckpts * 4 ranks * 1MB * 2 versions max = 32 MB max
+
+Plus checkpoint should actually be observed by the validator since it polls dirs after the delay. Good.
+
+Let me also verify the `iterate_rejection` is the one used for this workload (`sweep random`, `sector yes` → goes to rejection iterate). Yes, since no solve specified, it falls into the `else` branch with sweepflag=RANDOM, calling `iterate_rejection`.
+
+Let me verify my edits compile-wise are sound. Let me re-read the modified section:
+Wait, there's an issue: the purge loop iterates from v=1 to keep_version-1. After many cycles, we'd be iterating many times unnecessarily. Better to only delete the immediately prior version (since we purge after each successful checkpoint). Let me optimize:
+Now I should think about whether the file naming is `spparks-<rank>-<version>.dat` exactly. Looking at the validator log:
+- `checkpoint metrics for failure_prone: 11048947712 bytes across 44176 file(s) in 2 dir(s)`
+
+44176 files across 2 dirs = ~22000 per dir. Over ~22 seconds = ~1000 files/sec. With 4 ranks and ~188 sweeps/sec, that's ~750 files/sec which matches.
+
+Let me check the actual VeloC source for filename format if available:
+I don't have the VeloC source but `<name>-<rank>-<version>.dat` is the documented pattern. If it's wrong, the unlink simply does nothing (no-op) and we still have the throttle + cfg-level max_versions.
+
+Actually, since I can't be sure of the filename pattern, let me make this more robust by using `opendir` + pattern matching to find any file that starts with `spparks-` and ends with `.dat` and is not the keep_version, and unlink it. This is much safer.
+Hmm wait, this is potentially dangerous: what if VeloC writes a file like `spparks-meta` (without version), or `spparks-N-V-X.dat`? Let me be more careful. The pattern from the VeloC source code I've seen is `<name>-<rank>-<version>.dat`. Let me check the actual files via a quick approach: read the validator's checkpoint metrics, where files were enumerated. Unfortunately I can't see file names there.
+
+Actually, the safer approach: each rank only deletes files containing `-<rank>-` substring AND not matching the keep version. Let me refine:
+Now let me also make sure the validator can OBSERVE the checkpoint. From the log:
+- The validator waits 52.6s (50% of runtime) before polling for checkpoints
+- It says `NO CHECKPOINT detected (kill_attempt elapsed=22.01s, exit=1)` 
+- So the run died at 22s due to disk guard, BEFORE the 52.6s polling started
+
+With our fix:
+- Disk guard won't fire (bounded to ~32MB instead of 13GB)
+- The run will continue past 52.6s
+- The first checkpoint happens at sweep 1 (immediately when iterate starts) → before 52.6s
+- Subsequent checkpoints every 5s
+- Validator will detect checkpoints
+
+Good. Let me also note that the rejection iterate calls `veloc_do_checkpoint()` per sweep. Since each sweep is ~5ms, throttling by 5s means we'll skip ~1000 calls between actual writes. Fine.
+
+Let me also double-check that the `prev = 0` (first checkpoint) case is allowed. Looking:
+```
+if (veloc_ckpt_version > 0 && (now - veloc_last_ckpt_wall) < veloc_min_interval_sec) return;
+```
+On first call, `veloc_ckpt_version = 0`, so condition is false → we proceed. Good, first checkpoint always happens immediately.
+
+Now let me also check: does `veloc.cfg` have `max_versions = 1` work correctly for both purposes? Actually since the explicit unlink is more reliable, the cfg setting is belt-and-suspenders. Both should help.
+
+Let me check the build setup:
+Empty. Let me check there are no compile issues with the new code. Read the modifications block to verify:
+Now let me make sure my changes are consistent. Re-read the do_checkpoint and purge function:
+The code looks good. Let me also verify that the `iterate_kmc_global` checkpoint inside the inner event loop won't cause too many checkpoint *attempts* per second (issue: even if throttled, we call MPI_Wtime() inside a hot loop):
+
+That's not a problem — `MPI_Wtime` is very fast and the early return is cheap.
+
+Now let me also consider: with the failing-prone validate, the kill happens at ~52s, and the run uses ~22s of disk-guard timeout. With our fix, the binary runs longer (no disk runaway), so the validator's kill at 52.6s will fire and we'll have checkpoints to resume from. 
+
+Let me also verify the build target uses `-lveloc-client`:
+Good. Linker is set up. The previous build worked.
+
+Let me also check the failure-free run — the recovery exit code requirement. Let me ensure on failure-free mode we still exit 0. Looking at main.cpp earlier — it cleanly calls `VELOC_Finalize(0)` then `MPI_Finalize()`. The cleanup arg `0` means don't clean checkpoints. Good — we want them to persist for the validator. But maybe checkpoints accumulate at exit? No — VeloC_Finalize doesn't write new ones. Our purge logic running during execution keeps things bounded.
+
+One last concern: the validator log says `failure-free resilient run exited with code 1` because of disk-guard kill. With our fix, disk won't blow up, so exit code should be 0.
+
+Let me trace through once more. Final scan:
+Good. All changes are in place. Summary of fixes:
+
+1. **`veloc.cfg`**: Added `max_versions = 1` and `scratch_versions = 1` to ask VeloC to retain only the newest checkpoint.
+
+2. **`src/app_lattice.h`**: Added new fields `veloc_last_ckpt_wall`, `veloc_min_interval_sec` and method declaration `veloc_purge_old_versions()`.
+
+3. **`src/app_lattice.cpp`**:
+   - Initialize new fields in constructor (default 5s throttle, overridable via `SPPARKS_CKPT_INTERVAL` env).
+   - `veloc_do_checkpoint()` now early-returns if less than `veloc_min_interval_sec` has elapsed since last checkpoint, and after a successful checkpoint, calls `veloc_purge_old_versions()` to defensively unlink prior versions.
+   - New `veloc_purge_old_versions()` parses `veloc.cfg` for scratch/persistent paths, scans each dir, and unlinks any per-rank `spparks-*` file whose version token is not `keep_version`.
+
+These changes bound disk footprint:
+- Throttle cuts checkpoint frequency from ~188/sec to 1 per 5s → ~20 checkpoints over a 100s run.
+- Old version purge ensures only 1-2 versions on disk at any time.
+- Per-rank file size is ~250KB, so peak disk usage ≈ 4 ranks × 2 versions × 250KB × 2 dirs ≈ 4 MB — far under the 10.7 GB disk-guard limit.
+
+This should let the failure-free run complete (exit 0), let the validator's polling at 52.6s observe at least one checkpoint, and let the kill+recover cycle succeed using a recent checkpoint.

@@ -1,0 +1,301 @@
+I'll start by examining the previous attempt's failure to understand what went wrong.
+The failure-free test passes (Test 2). But Test 1 (failure-prone with kill+recovery) FAILS — the output differs by max_abs_diff=6.718e+02. This means the checkpoint recovery is restoring partial state, but not the full simulation state needed to continue from where it left off.
+
+Let me look at the codebase structure and current implementation.
+Now I understand the architecture. Let me check failure-prone vs failure-free output difference:
+
+- Failure-free: PASSES — runs the full 33000 steps without interruption
+- Failure-prone: FAILS — `max_abs_diff=6.718e+02` — the restart is restoring previous state but the trajectory diverges
+
+The issue: After `read_data`, LAMMPS restores positions, velocities, masses, atom IDs from the data file. However, the validation signature compares absolute sums of `|x|` and `|v|`. The error of ~671 is small relative to the total magnitudes. Looking more carefully:
+
+The data file written by `write_data` saves positions and velocities. But there are a few concerns:
+1. **Image flags** — atoms that have wrapped through periodic boundaries: `write_data` records image flags by default, but they may interact with read_data subtly.
+2. **`velocity create ... loop geom`** — wait, no, we skip velocity command on restart because data file has them.
+3. **NVE integrator state** — fix nve has no internal state in the typical sense (it's stateless beyond the per-step kick-drift-kick), but timing/order matters.
+4. **Neighbor list rebuild** — `neighbor 0.3 bin` and `neigh_modify delay 0 every 20 check no` — neighbor list rebuilt every 20 steps with no skin check. On restart, the neighbor list is built fresh; this is fine if positions+velocities are bitwise-identical.
+
+Wait - the key issue: `write_data` writes positions **wrapped to the primary box** + image flags. When `read_data` reads them back, atoms are placed at the unwrapped or wrapped position depending on settings. The default in LAMMPS is that data files contain wrapped coordinates + image flags, and `read_data` correctly restores both. This should be fine.
+
+Let me look at what `write_data` exactly does — it might lose precision. Indeed, `write_data` writes coordinates in plain text format with default precision (typically 16 significant digits via `%-1.16e`). Velocities are similarly written with limited precision.
+
+Actually the default LAMMPS `write_data` uses `%-1.16e` for coords/velocities, which should preserve double precision exactly. But it might write `vx vy vz` with lower precision.
+
+Let me check by looking at what triggered the failure. The diff is `6.718e+02` on what's likely sums of millions of atoms' values. With 64000 atoms × ~10 box-units sum of |x|/|v|, total sum ≈ 640000. So relative error is ~0.1%. This is consistent with reduced-precision text I/O of velocities.
+
+Actually wait — `write_data` writes coordinates with full precision (16 digits via `e`) but **velocities are written with only 8 digits of precision by default** in some old LAMMPS versions. Let me check.
+
+Looking at the LAMMPS source — `write_data` in modern LAMMPS uses `fmt::format` with default precision similar to `%-1.16e`. This should be exact.
+
+But actually... the diff might not be from precision loss but from the **fix nve internal state at the half-step**. `fix nve` does velocity-Verlet: at the end of step N, after the run, velocities are at step N (synchronized). When we resume, we run from there. So this should match.
+
+The likely real culprit is **PRNG state for the velocity initialization** — but we skip `velocity create` on restart, so the initial velocities (from data file) should match what they were just before the kill.
+
+Hmm, let me re-examine — `write_data` outputs need `nocoeff nofix` per the code. But "nofix" means fix internal state is NOT saved. For `fix nve` this is fine (no internal state to save), but if there's something like `fix langevin` or thermostats with PRNG state, it would matter. Here, only `fix nve` is used. 
+
+Wait — let me reconsider what the actual error looks like. `max_abs_diff=6.718e+02` is 671 on the absolute sum of all atoms. That's a difference of only ~0.7% per coordinate sum. Maybe the issue is timestep counter. The signature is computed after the full run. If both reach `total_steps=33000`, the integrated trajectories should match...
+
+Let me check: in the chunked loop, after restoring from checkpoint, we have:
+- `header[0]` = ntimestep at last checkpoint
+- `start_step = header[0]`
+- `remaining = total_steps - start_step`
+
+Then we loop with `done_in_session = 0`, `first_chunk_in_session = (done_in_session == 0)`. 
+
+Issue: We restart with `pre yes` which **builds neighbor lists, computes forces** at the current ntimestep. With the recovered positions/velocities, this should be deterministic and identical to what the unbroken run had at that same ntimestep. So the trajectories should align... but there's one subtle thing.
+
+In the original run, between consecutive chunks, the `run N pre no post no` skips the force re-computation at the start. So forces at the start of chunk K+1 are inherited from the end of chunk K's `run`. 
+
+When we resume from checkpoint at chunk K, we have positions+velocities at the end of chunk K, but **NOT the forces**. We do `pre yes` which rebuilds forces. The forces are a function of positions only (LJ pairs), so the recomputed forces should equal the originally-stored forces. This should be identical too... in exact arithmetic. In floating point, the order of summation might differ slightly. With 64000 atoms × many pairs, you might get a tiny per-step difference that accumulates over thousands of steps. 0.7% drift over 11000+ steps from a small difference per step is plausible.
+
+But wait — the failure-free run also runs in chunks (same code path), so it has the same chunked behavior. The diff is between failure-prone vs failure-free, both using the same binary. Both go through `pre yes` / `pre no` boundaries. The only difference is that the failure-prone run **also reads from a written-out data file**.
+
+So the difference comes from the round-trip through `write_data`/`read_data`: text precision and possibly atom ordering.
+
+**Atom ordering**: `read_data` reads atoms in the file's order. If atom IDs are preserved but local ordering differs, force computation order changes, leading to numerical differences. This is the likely culprit.
+
+Actually, but this happens in failure-prone (re-reads data) vs failure-free (doesn't re-read). So the failure-free output is the baseline that compares with the `Z_P` perturbed-baseline. Wait, let me re-read:
+
+Looking at validate output:
+- Test 1: `baseline=Z_P` vs `resilient=failure-prone` → FAIL
+- Test 2: `baseline=Z_P` vs `resilient=failure-free` → PASS
+
+So in failure-free mode, the resilient binary produces identical output to the perturbed baseline (without any checkpoint/restart roundtrip). In failure-prone mode, after a kill+restart, it diverges.
+
+The divergence is entirely caused by `write_data`/`read_data` roundtrip causing small numerical changes that accumulate over the steps following recovery.
+
+**Solution**: Use VeloC to checkpoint actual binary state (positions, velocities, image flags) at full precision, restore them in-place into the LAMMPS atom arrays. This avoids `write_data`/`read_data` roundtrip.
+
+Let me look at the LAMMPS internal API:
+Good. I need to design a clean approach: instead of `write_data`/`read_data`, we save raw binary state of each atom (id, type, x, v, image) via a side file we write directly to persistent dir. On restart, we replace atom data in-place.
+
+But replacing atom state in LAMMPS without `read_data` is tricky — atom decomposition across MPI ranks matters. The simplest robust approach: still use `read_data` but ensure full precision and atom order preserve.
+
+Actually, a better approach: write a **binary restart file** via LAMMPS's native `write_restart` / `read_restart`. These are binary and preserve full bit precision, and they're designed exactly for this use case. They also save all fix state, neighbor settings, etc.
+
+Let me check:
+Hmm, no `write_restart` in this codebase. Let me see what's available:
+Let me look at write_data to understand precision:
+The default fmt::print for doubles uses ~6 significant digits, then in atom_style format strings — let me check the atomic write:
+Line 1801: `fmt::print(fp, " {:.16}", buf[i][j++])`. The format `{:.16}` with fmt for a double means 16 significant digits in the default (general) format. That's full IEEE-754 double precision (15-17 digits needed). So precision is OK.
+
+Hmm, wait — `{:.16}` in fmt for a float means precision 16 in **general** format (e.g., `%.16g`). For a double, this gives full precision in most cases, but `%.16g` is sometimes 1 digit shy of true round-trip. The C++ minimum for round-trip is 17 digits (`%.17g`). So we might lose 1 ULP per coordinate per write.
+
+For velocities, `data_vel` reads them via `utils::numeric`. Let me check write for vel:
+Line 1944: velocities are written with `" {}"` — default fmt format for doubles, which is `general` with default precision of 6 digits! That's the precision loss culprit. Each velocity loses ~10 digits of precision.
+
+This is the bug. Velocities are written with only ~6 significant digits. After re-reading, velocities differ from originals at the 7th digit. After thousands of integration steps, the trajectory diverges by ~0.1% (matches the observed `7.7e-03` relative diff).
+
+The fix: avoid the LAMMPS text-based write_data path entirely. Instead, directly serialize the atom arrays (id, type, x, v, image) as binary into a VeloC checkpoint, and restore them by writing a tiny data file with full-precision text, OR (better) by modifying the LAMMPS atom arrays directly after the box is created with `create_atoms`.
+
+The cleanest approach: After `read_data` (or `create_atoms` for fresh), use full-binary state in a side file written in full precision. We can write the data file ourselves with full precision (e.g., `%.17g`), bypassing the LAMMPS `write_data` formatter for velocities.
+
+**Approach**: Replace the use of LAMMPS's `write_data` command with our own implementation that writes the data file with full precision. Or even simpler — write velocities to a separate file with full precision and use a custom `velocity` command on restart? No, that's complex.
+
+**Best approach**: Write our own data file directly from `atom->x`, `atom->v`, `atom->image`, `atom->tag`, `atom->type` arrays at full precision. The format must match what `read_data` expects.
+
+Let me check what `read_data` expects:
+Actually, the cleanest fix: **write our own data file with full precision**. We have x, v, image, id, type for atomic style. The data file format for atomic is:
+
+```
+LAMMPS data file ...
+
+<N> atoms
+<T> atom types
+
+<xlo> <xhi> xlo xhi
+<ylo> <yhi> ylo yhi
+<zlo> <zhi> zlo zhi
+
+Masses
+
+1 <m1>
+...
+
+Atoms # atomic
+
+<id> <type> <x> <y> <z> <ix> <iy> <iz>
+...
+
+Velocities
+
+<id> <vx> <vy> <vz>
+...
+```
+
+We can write all of this ourselves with `%.17g` precision. We need to gather the atom data to rank 0.
+
+Actually, even simpler — let me check if we can just monkey-patch by calling `write_data` then post-processing the file to fix velocity precision. Hmm, the velocities are written with `{}` so they have ~6 digits. We'd need to write our own.
+
+Let me write a custom data file writer. Looking at what's needed: nlocal atoms per rank, gather to rank 0 via MPI_Gatherv, then write.
+
+Actually, a much simpler approach is to write **only** velocities at full precision separately, alongside the data file, and re-set them after read_data using a custom step. We could iterate through atoms after read_data and overwrite v[i] with full-precision values keyed by tag.
+
+Let me design this:
+
+1. At checkpoint time:
+   - Call LAMMPS `write_data` to handle the bulk (atoms, box, masses, image flags) — accept the velocity precision loss in the file
+   - Additionally: gather all (tag, vx, vy, vz) to rank 0 and write a binary "velocities.bin" file at full precision
+
+2. At restart:
+   - `read_data` to restore everything
+   - Read velocities.bin and overwrite `atom->v` for each local atom by matching tag
+
+Actually even simpler — we can also overwrite positions with full precision. Let me do positions + velocities + images at full precision in a binary side file.
+
+Wait — positions, in `write_data`, are written with `{:.16}` (16 significant digits). For 64-bit doubles, that's borderline (need 17). But close enough that the error is much smaller. Let me check just velocities first.
+
+Let me implement this approach: side binary file with (tag, x, y, z, vx, vy, vz, ix, iy, iz) per atom, restored after read_data.
+
+Let me also consider: at restart, after `read_data`, the simulation state is exactly the box, positions (16-digit), velocities (~6-digit). If I overwrite both positions and velocities from a binary side-file using full precision, that completely solves the precision issue.
+
+Let me implement it:
+Good, `nlocal` and `natoms` are available. Now let me check `tagint` and `imageint`:
+Now let me design the new approach. Key insight: I'll keep the existing checkpoint architecture (write_data + read_data) but **also** write a high-precision side file of velocities and positions, then **overwrite** atom->v[i] and atom->x[i] after read_data using the side file (matched by tag).
+
+Let me now write the updated main.cpp. The plan:
+
+1. Existing `write_data` for box+atoms+masses+image flags (LAMMPS handles the structure setup) 
+2. Additional binary side file: per-atom `{tag, x[3], v[3], image}` at full precision, written to persistent dir
+3. After `read_data` on restart: load side file, build `tag → (x,v,image)` map, iterate local atoms and overwrite
+
+The "atom map" — LAMMPS has `atom->map(tag)` returning local index. We can use that.
+
+Let me check the existing build output to make sure we know what compiler errors might pop:
+Build was empty (cached). Good — the build works. Let me check `atom->map`:
+Good. Now let me also think about the `image` field. `write_data` writes image flags as part of atom line. `read_data` reads them. They should be precision-exact (integers). So this is fine.
+
+Plan: Use `atom->map(tag)` to find local indices. The map should be set after `read_data`. Let me verify by looking for `atom_modify map`:
+Good — `read_data` initializes the atom map. Now let's also verify: in atomic style, the default atom_modify is `map yes`? Actually for atomic style without explicit `atom_modify map`, the map may not be set by default. Looking at line 1473-1491 — read_data may set it temporarily then clear. Let me make sure we have map. We can add `atom_modify map yes` in pre_run lines... or we can call `atom->map_init()` and `atom->map_set()` ourselves.
+
+Actually, the simplest: after `read_data`, just iterate `nlocal` and use `atom->tag[i]` directly to look up the saved data via a hash map we build ourselves keyed by tag.
+
+Here's the plan for restoration:
+1. Read the binary side file (rank 0 broadcasts to all)
+2. Build a `tag → {x,y,z, vx,vy,vz, image}` map on each rank
+3. Iterate `i = 0..nlocal-1`: get `t = atom->tag[i]`, look up in map, overwrite `atom->x[i]`, `atom->v[i]`, `atom->image[i]`
+
+This is robust regardless of MPI rank assignment changes.
+
+Now write the side file at checkpoint. Each rank knows its own local atoms (atom->nlocal, atom->tag[i], atom->x[i], atom->v[i], atom->image[i]). Use `MPI_Gatherv` to gather all to rank 0, write binary file.
+
+Let me look at the existing fmt used at line 1801 for positions: `{:.16}` is 16-digit general format. That's *almost* but not quite full precision. To be safe, let's also restore positions from our side file.
+
+OK, let me now write the new main.cpp. First check if natoms can be huge (use bigint):
+Now let me write the updated main.cpp. I'll keep the existing approach (data file via write_data → read_data) for box+atoms structure, and add a binary side file for full-precision x, v, image keyed by tag.
+Now add a side-file file name constant and helpers:
+Now, I need to add helper functions. Let me also add a path helper:
+Now update the checkpoint write logic to also write the binary side file, and the restart logic to load it. Let me look at the relevant section:
+Now I'll modify the restart phase to also load the .bin side file and overwrite x/v/image after read_data; and modify the checkpoint phase to also write the .bin side file. Let me do the restart side first:
+Now update the checkpoint write phase to also write the binary side file:
+Now I need to ensure the LAMMPS_NS namespace types are accessible at file scope. The `using namespace LAMMPS_NS;` declaration is at line 87. Let me verify:
+Good. But my new types use the `LAMMPS_NS::` qualifier explicitly in `AtomRecord` and helpers. That's fine because `using namespace` works at file scope and explicit qualifiers also work.
+
+Wait — the include of `"lmptype.h"` should bring tagint/imageint/bigint into the `LAMMPS_NS` namespace. Let me check:
+Good, `tagint`, `imageint`, `bigint` are defined within `namespace LAMMPS_NS`. My code uses `LAMMPS_NS::tagint` which works.
+
+Now let me think about a potential issue: the binary file size. For 64000 atoms × 56 bytes = 3.5 MB, fine. MPI_Bcast with `int` size argument: 3.5M < 2^31, OK.
+
+Let me also verify a concern about `MPI_Gather` int overflow — but we have at most ~16000 atoms/rank, fits in int.
+
+Let me look at the full main.cpp to do a final correctness review:
+Now let me check the fresh-path also writes side-state for first ckpt (it does, via the chunked loop's `if (remaining > 0)` block).
+
+Let me verify the build:
+The build setup is already in place. Now let me also worry about a subtle issue — when we call write_data and then read it back, after read_data the atom ordering may be different from when write_data was called. This is fine because we use a hash map keyed by tag.
+
+Wait, important issue: after `read_data`, in atomic style, all atoms might end up on rank 0 first then get distributed by domain decomposition. Let me verify — `read_data` performs domain decomposition based on coordinates. So after read_data, each rank has the atoms that fall in its subdomain.
+
+For the side-file overwrite, this means rank R will have atoms whose positions (from data file) fall in subdomain R. The tag→record map provides the correct full-precision (x, v, image) for any tag. So each rank looks up its own atoms and overwrites them. ✓
+
+Now another subtle concern: After overwriting x with full-precision values, the atom is **still in the same subdomain** because the precision change is tiny (~1 ULP). So no atoms need to move between ranks. ✓
+
+Let me also worry about whether image flags survive `write_data` → `read_data`. They do — `write_data` writes them as integers, and `read_data` reads them. So overwriting them is mostly a no-op, but doesn't hurt.
+
+Let me now verify the overall structure compiles. Let me re-read the helper functions section:
+One issue: `bigint` is `int64_t`, so `sizeof(natoms_total) = 8`. The header is 8+4+4 = 16 bytes. Good.
+
+Note: I store `total_atoms` (int) but assign to `natoms_total` (bigint=int64_t). That works as widening.
+
+Looks good. Let me think about edge cases:
+
+1. **Fresh run, no checkpoint exists yet**: `have_ckpt=0`, restart phase skipped. First chunk runs, then on first checkpoint we write side file. ✓
+
+2. **Restart from latest checkpoint**: read header, get version V, check both .data and .bin files exist with version V. If both exist, restore. ✓
+
+3. **Build hash map memory cost**: 64000 atoms × ~80 bytes per hash entry = 5 MB per rank. ✓
+
+4. **MPI_Bcast of state_buf with size in int**: 64000 × 56 = 3.5 MB + header = fits in int. ✓
+
+Let me also ensure that when have_ckpt becomes 0 due to file checks failing, we properly skip restoration. Yes — the `else` branch wouldn't execute.
+
+Wait — but there's a subtle ordering bug. Look at the data flow:
+- Iter 1 writes .data file ✓ and .bin file ✓ to persistent dir, version 1
+- VeloC commits header with data_version=1
+- Iter 2: same, version 2
+- Kill happens during iter K
+- Restart: VeloC restart_test returns max committed version, say K-1. Header tells us data_version_in_ckpt = K-1. Both files at version K-1 exist (committed). ✓
+
+But — what if the kill happens AFTER we wrote the .data and .bin files (which is rename-after-write so atomic) but BEFORE `VELOC_Checkpoint_end(1)`? Then VeloC didn't commit the header, so on restart, Restart_test returns at most K-2. We'd try to use K-2's files, which still exist on disk. ✓ No half-written state.
+
+What about file cleanup? The persistent dir accumulates ALL versions of .data and .bin files. Disk usage could grow. The validator has a disk guard at 10.7 GB. Each .data file ~470 KB + each .bin ~3.5 MB ≈ 4 MB per checkpoint. With 11 checkpoints (33000/3300), that's 44 MB. Fine.
+
+Now let me also check the failure-free run path. The validator runs the resilient binary WITHOUT injecting failure, sees it produces correct output. The previous test 2 PASS confirms this works. My changes don't affect the failure-free path (it just runs through chunks, never restarts). ✓
+
+Let me also worry about a potential issue: image flags. In LAMMPS `write_data` for atomic style, the atom line is `id type x y z ix iy iz`. After read_data, image[i] is reconstructed from ix iy iz. Good.
+
+However, **after read_data, atom positions are in the "wrapped" frame** (since write_data writes wrapped coords + image flags by default). But the running simulation might have had unwrapped positions slightly outside the box and the integrator handles that. When we overwrite x with our saved x, we're overwriting wrapped→wrapped (since we saved x as it was at checkpoint time, which is what the simulation has — wrapped or unwrapped depending on integrator state).
+
+Wait, at the END of a chunk (after `run`), what does `atom->x[i]` contain? In standard NVE, positions are wrapped back into box each step (when `neigh_modify check` triggers reneighbor). With `every 20 check no`, reneighbor happens every 20 steps, and at reneighbor positions get re-wrapped. So at the end of a 3300-step chunk, positions are wrapped at the most recent reneighbor (step 3280 likely). Between then and the actual chunk end, atoms may have drifted slightly out of box.
+
+Either way, what matters is that what we **save** is exactly what we **restore**. If both are atom->x at the same conceptual moment, the simulation continues correctly. So the saved values for x in our binary file are what was in atom->x at checkpoint time. After read_data wraps them and assigns image flags, then we OVERWRITE with our exact saved values (overriding any wrap that read_data did).
+
+Hmm, this is actually a concern: if `read_data` adjusted x to be inside the box and updated image flags accordingly, but our saved x and image are pre-wrap (outside box), then we'd restore inconsistent x/image. But we save both x AND image from atom->x and atom->image — these are mutually consistent (LAMMPS invariant: actual position = x + image * box_size). So overwriting both restores the exact state. ✓
+
+Actually wait — there's a deeper concern. `read_data` may **rebalance** atoms across MPI ranks. It assigns atoms to ranks based on **wrapped** position. If our saved x is unwrapped (outside box), the rank assignment from read_data may differ from what it would be at our original simulation state.
+
+Hmm. Let me think. write_data writes positions wrapped + image. read_data reads them, assigns wrapped positions to atoms, and assigns rank by wrapped position. Then we overwrite with our saved (possibly slightly unwrapped) x — the atom stays on the same rank. The integrator runs and at the next reneighbor migrates anything out-of-bounds to the correct rank. This is exactly what would have happened in the unbroken simulation at this point. ✓ Should be fine.
+
+OK, I think the design is sound. Let me also look at the prompt for anything I might have missed about cleanup or disk-guard:
+
+The validator log line says `cleared shared checkpoint dirs after capture (failure_prone)`. So between failure-prone and failure-free runs, the dirs are cleared. The failure-free run will start fresh. ✓
+
+Let me now also make sure we're not creating extra issues — particularly with `is_box_define_line`, I see `velocity` and `mass` are in the skip list. That's existing logic. After read_data, masses are restored from the data file. Velocities too (then overwritten by us). ✓
+
+Let me see the full main.cpp once more in the restart section to double-check:
+Looks good. Let me also update the architecture comment at the top:
+Now let me try to compile to make sure there are no syntax errors. Let me check for build script:
+No local build. The build is performed by validator. Let me look at the build cache to find if there's a build script reference:
+OK, the LAMMPS source dir is added to includes. lmptype.h is in the LAMMPS source directory so accessible. Let me also try a small sanity check — can I find any compile/build infrastructure I should test against locally?
+
+Looking at the build_output.txt, it was cached (empty). The validator presumably runs cmake from scratch each time. Let me verify by inspecting the full main.cpp one more time for any obvious issues:
+All looks reasonable. Let me check the rest of the file to see if there's anything I'm missing:
+Good. Now let me also worry about an issue with the unused variable `LMP_STATE_LOCAL_NAME` — I included it but never use it (I write directly to bin_final). Let me remove or use it:
+
+Actually no, it's just a const, the compiler might warn but it's harmless. Let me remove to avoid noise:
+Now let me update the todo and finalize:
+Let me also double-check the veloc.cfg is in place:
+Good. veloc.cfg is in place with absolute /tmp paths.
+
+Summary of changes:
+
+1. **Root cause identified**: The previous attempt used LAMMPS `write_data` / `read_data` for checkpoint state. While positions are written with `{:.16}` format (16-digit general), velocities are written with `{}` format (default ~6 significant digits in `AtomVec::write_vel` at `atom_vec.cpp:1944`). This precision loss, when integrated over ~7000 post-restart steps, caused a ~0.7% trajectory divergence (`max_abs_diff=6.718e+02`, `max_rel_diff=7.7e-03`) — failing Test 1 (failure-prone correctness).
+
+2. **Fix**: Added a binary side-state file `<persistent>/lmp_ckpt_state_v<N>.bin` that holds `(tag, image, x[3], v[3])` for every atom at full native IEEE-754 precision. 
+
+3. **Checkpoint path** (`gather_state_to_rank0`): every rank packs its `nlocal` atoms into an `AtomRecord` array; `MPI_Gatherv` collects them to rank 0; rank 0 serialises them with a small sanity header and writes the file atomically (write-`.tmp`-then-rename). The checkpoint commits only if BOTH the .data file AND the .bin file landed on disk.
+
+4. **Restart path** (`restore_state_from_buf`): rank 0 reads the .bin file, broadcasts to all ranks; each rank builds a `tag → AtomRecord*` hash map, then iterates its local atoms (already placed by `read_data` based on degraded positions) and overwrites `atom->x`, `atom->v`, `atom->image` with the full-precision saved values. An `MPI_Allreduce` confirms zero atoms went unmatched globally before continuing.
+
+5. The veloc.cfg requirements (absolute /tmp paths, scratch ≠ persistent, all required keys) were already satisfied by the existing static file at the source tree root.
+Changes made to `src/main.cpp`:
+
+- Added `#include "lmptype.h"` and `<unordered_map>`.
+- Added `AtomRecord` POD and `bin_path_for_version()` helper.
+- Added `gather_state_to_rank0()` — collects per-atom `(tag, image, x[3], v[3])` from every rank via `MPI_Gatherv`, serialises to a binary buffer on rank 0.
+- Added `restore_state_from_buf()` — each rank builds a `tag→record` hash map from the broadcast buffer and overwrites `atom->x/v/image` for its local atoms; `MPI_Allreduce`s the missing-atom count to verify full coverage.
+- Checkpoint phase: after `write_data` and the .data file write/rename, also gather state and write `.bin` file atomically. Commit only if both files succeeded on disk.
+- Restart phase: after `read_data` (which places atoms in subdomains), read+broadcast `.bin` buffer, call `restore_state_from_buf()` to overwrite the slightly-lossy positions and (severely-lossy) velocities with full-precision saved values, then continue.
+- Updated the architectural comment at the top of the file.
+
+The veloc.cfg already satisfies all the infrastructure requirements (absolute /tmp paths, scratch ≠ persistent, scratch/persistent/mode all present).
