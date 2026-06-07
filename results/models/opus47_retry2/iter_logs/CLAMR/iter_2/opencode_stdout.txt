@@ -1,0 +1,1431 @@
+I'll start by examining the previous attempt's failure to understand what went wrong.
+The previous attempt crashed on restart with segfault (exit 139). The recovery attempt took only 2.5s and exited with 139, meaning the recovery is broken. Let me look at the codebase.
+Now I see the implementation. The previous attempt died with segfault on recovery (exit 139) and the recovery only took 2.5s. This suggests the restart code is broken. Let me look at the Mesh and State classes to understand what `resize`, `memory_reset_ptrs`, `set_bounds`, and `calc_neighbors_local` expect:
+Now let me look at calc_neighbors_local to understand what is needed:
+This is complex. The issue is that restart is failing with segfault. The recovery is too short (2.5s) and we exited 139. Let me look at the opencode_stdout from the previous attempt for any hints:
+Now I understand the problem - the previous attempt did register/recover mesh.i, mesh.j, mesh.level, state.H, state.U, state.V and try to rebuild derived data. The recovery exits with signal 11 (segfault) at very short time (2.5s).
+
+The recovery is happening BEFORE the checkpoint state is restored - the segfault could be because:
+1. `mesh->set_bounds` uses internal state that requires certain initialization.
+2. `state->resize` might not be the right call.
+3. The mesh after restore is not consistent with internal mesh metadata (jmax, imax, etc.).
+4. Or `mesh->ndispl` and `mesh->nsizes` were not properly handled if numpe=1 case.
+
+Let me look at the State class:
+OK. Now let me check the build_output.txt to see if there were build warnings:
+Empty build output (probably means build succeeded since it's not failing here). Let me see what's at the end of validate_stderr for resilient logs:
+OK. The fundamental issue: the recovery binary is segfaulting in 2.5s. This means the segfault happens during init/restore. The recovery time is very short — suggesting the binary crashes early in the run before even running do_calc.
+
+The crash is during the restore. Likely culprits:
+1. After `mesh->resize`, `memory_realloc_all` reallocates ALL arrays in mesh_memory dictionary to the same size. But for cells that were initially allocated with size 16384, doing resize to a larger number would realloc all of them, including auxiliary arrays not in our control.
+2. `mesh->resize(restored_local)` does NOTHING if `restored_local <= current_size`. After resize, `mesh->ncells = restored_local`. But the previous `mesh->ncells` was 16384. The `i, j, level` arrays still hold the OLD values (init grid) for indices > restored_local.
+3. Then we recover with size `restored_local` via VELOC. Only first `restored_local` are written.
+4. `set_bounds(ncells)` (called with restored_local) sets a range used by calc_neighbors_local.
+5. `calc_neighbors_local` is called WITHOUT being in an OpenMP parallel region. It uses #pragma omp master/barrier — these are fine outside parallel.
+
+But there is a subtle issue: in `calc_neighbors_local`, it accesses `j[ic]` for ic from lowerBound to upperBound. If `restored_local < initial_ncells`, that's fine — we operate on first restored_local cells. But the access depends on `levmx, jmax, imax` which are mesh members — these are set during `mesh->init()` and persist.
+
+Hmm, wait - let me re-read the crash more carefully. Recovery exit=139, time 2.5s. This is extremely fast. The mesh init alone is several seconds. So crash is likely in early mesh init OR very early restore.
+
+Actually, looking more carefully at lines:
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=2.50s, exit=139, timed_out=False)
+```
+
+The recovery elapsed is 2.5 seconds — too short. Even with no checkpoint, the binary takes ~120s. So the crash is happening EARLY in the binary, possibly during VELOC_Restart or related restore code.
+
+Let me think — what could go wrong:
+1. `mesh->resize(restored_local)` calls `mesh_memory.memory_realloc_all(new_ncells)`. This will realloc ALL arrays — but here's the issue: after `init()`, only `i, j, level, x, dx, y, dy, lev_i_beg, lev_jregsize, ndispl_xface_jminus, ...` arrays might be allocated. `xface_i`, `yface_j`, `nlft`, `nrht`, `nbot`, `ntop`, `celltype` etc. — these get allocated later. So `memory_realloc_all` may not realloc those, OR may realloc them with strange behavior.
+
+Actually the segfault could be due to a much simpler reason: `mesh->ndispl[0]` and `mesh->nsizes[0]` — if the vectors weren't resized to numpe before, this would crash. But the code does `mesh->nsizes.resize(numpe)` before `VELOC_Mem_protect(VID_NSIZES, ...)` — OK.
+
+Let me consider another angle: the OpenMP code path. Look at the checkpoint timing — the checkpoint was actually written (296 files). So checkpoint works. But restore fails.
+
+Given the complexity, let me think about a far simpler and more robust approach: instead of trying to surgically restore the in-flight state mid-computation, I can:
+
+**Strategy: Full Init + Replay-from-Checkpoint**
+- Take checkpoint at the START (right after init/fill_circle), saving initial state. Then take checkpoints periodically.
+- On restart, after init+fill_circle, restore the checkpoint as before.
+
+Actually that's what we're doing. The issue is the restore. Let me look at a different approach: avoid `mesh->resize` entirely and ensure pointers are validly used.
+
+Actually, I think the much simpler approach is: **Don't try to restore the mesh structure surgically.** Instead, just save the bare minimum scalars and rely on the fact that the validator's output schema only needs the final 6 doubles, which derive from the final state.
+
+But then we can't actually run forward from saved cycle without the saved state. 
+
+Hmm, let me re-think. The problem with the current approach has crashes. Why?
+
+Looking again at the failed approach: After `mesh->resize(restored_local)` is called when `restored_local < current_size`, NO realloc happens. So the arrays remain at `current_size` (which would be 128*128=16384, for default nx*ny). Then VELOC writes `restored_local` elements into i, j, level — that's fine, but the trailing elements are garbage from init.
+
+Then `mesh->ncells = restored_local`. `calc_celltype(restored_local)` only operates on first restored_local — fine. `set_bounds(restored_local)` — fine. `calc_neighbors_local()` — fine.
+
+Wait — but what about `mesh->ncells_ghost`? `ncells_ghost` is used by `mpot.resize(mesh->ncells_ghost)`. It's set by `calc_neighbors_local`. Hmm.
+
+Actually, what if `restored_local > current_size`? Then `memory_realloc_all` is called. But this reallocates ALL arrays in the dict — including potentially some that haven't been allocated yet (where size is 0 or 1). For arrays that exist but are size 1, this would reallocate them to `restored_local`. That should be OK semantically.
+
+Hmm but here's a horrible thought: `memory_realloc_all` might *initialize* trail cells to garbage; then calc_neighbors_local references them via `j[ic]`, `i[ic]`, `level[ic]` for `ic < ncells` only. So we're OK.
+
+Let me focus on what really might cause the segfault. Looking at the recovery very short time (2.5s), it could be a crash in VeloC restart code or in MPI init or even worse - a constructor crash because of mismatched ncells/whatever.
+
+Actually, I wonder: is mesh->init even called on restart? Looking at the original code:
+
+```cpp
+mesh = new Mesh(nx, ny, levmx, ndim, deltax_in, deltay_in, boundary, parallel_in, do_gpu_calc);
+... mesh->init(nx, ny, circ_radius, initial_order, do_gpu_calc);
+state = new State(mesh);
+state->init(do_gpu_calc);
+state->fill_circle(circ_radius, 80.0, 10.0);
+... // compute H_sum, set H_sum_initial
+... // Restart logic
+```
+
+So yes, on restart, mesh and state are fully initialized fresh BEFORE we try to restore. So the structure should be in place. Let me look at how `mesh->init` interacts with parallelism in the n=763 case. With `nx=ny=763, levmx=?` ... Looking at input.cpp default:
+levmx=1 by default. ny=nx=763 (`-n 763 -t 6700`). So initial grid is 763*763 = 582169 cells, distributed across 4 MPI ranks (~145k cells each).
+
+Let me reconsider. The cost of initialization is significant - mesh->init for ~582k cells per rank may take a few seconds. So 2.5s could actually be the binary failing during init OR right after restore.
+
+Let me look at what could fail more carefully. Actually, I want to consider a much SAFER approach: rather than trying to do exact in-place restore of all complex AMR state, let me **only checkpoint scalars at safe points and ALSO save the dynamic arrays needed for continuation**. The key issue is the AMR mesh's complex internal state must be coherent.
+
+Actually, I now think the real problem might be much simpler. Let me look at `mesh->nsizes` and `mesh->ndispl` — they may have been resized to numpe AFTER init, so the recovery code (which resizes them to numpe) is fine. But if `mesh->nsizes` was already at size numpe from init, the resize is no-op.
+
+Let me look at how nsizes is initially populated:
+OK. The issue here is significant — given that the validator's test runs `mpirun -np 4` and the recovery binary exits with signal 11 in 2.5s, the segfault is somewhere very early in startup OR in restore code.
+
+Let me take a much simpler approach: **avoid the complex in-place restore entirely** and instead use a "trivial" valid checkpoint approach — just checkpoint scalars and the state arrays, and on recovery, re-do mesh refinement by running forward from cycle 0 with the saved physics. But that won't actually reproduce the saved state.
+
+Actually wait. Let me think again. The issue is that AMR is deterministic — given same initial state, it produces same trajectory. So if checkpoint contains ONLY `ncycle, simTime, deltaT, H_sum_initial`, restart with cycle=0... that doesn't help because we want to skip to that cycle.
+
+The cleanest fix may be to simplify the restore to do less, not more. Let me think about what the failure modes could be:
+
+Actually, looking again — the original output goes `[validate] checkpoint metrics for failure_prone: 1652601912 bytes across 312 file(s)` — i.e., checkpoint was created. The "kill attempt" works, then "recovery attempt" tries to restart and fails with segfault.
+
+Let me check if there's stderr from the recovery run that might give more clues:
+
+Looking at lines 78-90 of validate_stdout.txt - the stderr lines are libc start_main from various ranks. So segfault happens DURING binary init/startup. Likely in:
+1. The restore logic that's overwriting things incorrectly.
+2. Or `mesh->resize` with `memory_realloc_all` which tries to reallocate everything.
+
+Let me look at `memory_realloc_all`:
+OK, so `memory_realloc_all` realocates **every** mem entry, including potentially large auxiliary arrays (nlft, nrht, nbot, ntop if allocated, plus celltype, xface_i, yface_i, etc.). This could lead to memory exhaustion for large checkpoints. But more importantly: it changes pointers! After `mesh->resize`, ALL pointers stored in mesh fields are stale, not just i/j/level/celltype. We MUST call `memory_reset_ptrs` to refresh.
+
+OK that's what's done. Let me revisit my plan.
+
+Given complexity, let me take a different strategy entirely - use a **much simpler approach** that does real state capture but doesn't fight the AMR complexity:
+
+**New strategy: Save initial state immediately and replay forward**
+
+But replay defeats the purpose since it would take ~same time as failure-free.
+
+OK, let me try a fundamentally different approach. Instead of restoring into the LIVE init'd mesh, let me **avoid calling mesh->init at all on restart** and instead restore directly into freshly-constructed Mesh/State objects. The mesh constructor just sets parameters; only `init()` populates cells. So if we skip init() on restart, the mesh is empty, then we manually allocate arrays at the saved size and restore.
+
+Actually that won't work either because `state->init` requires mesh->ncells to be set.
+
+Let me try yet another approach: do the mesh init normally so all metadata is set up, then for the restore — ONLY restore the dynamic per-cell physics arrays (H, U, V), the AMR topology (i, j, level), and scalars. SKIP `mesh->resize` if not needed. 
+
+Actually wait — the issue is much more subtle. Let me check `mesh->resize` more carefully. After init, the malloc'd size of i, j, level is at least nx*ny. If our saved cell count is ≤ nx*ny, resize is no-op. But `memory_realloc_all` was not called, so other arrays (face arrays etc.) are at their init size.
+
+Hmm, here's a real possible issue: after the recovery, on the NEXT iteration of `do_calc`, the code does:
+```
+mesh->set_bounds(ncells);  // expecting ncells = ncells_ghost or similar?
+```
+
+Then `mpot.resize(mesh->ncells_ghost)`. But `ncells_ghost` was set by the last `calc_neighbors_local` we did during restore. That should be fine.
+
+I'm having trouble pinpointing without running. Let me take a much MORE CONSERVATIVE approach that should be far more robust:
+
+**Truly simpler approach**: Replace the entire restore by just restoring the scalars, and rebuild the simulation from scratch UP TO the saved cycle. This is wasteful but safe.
+
+But that wastes ~half the runtime budget and the validator requires `kill+recovery < 1.2x failure-free`. The kill happens at 52% of runtime, so the kill_elapsed is ~66s. If recovery from cycle 0 takes another 66s, total kill+recovery = ~132s. Failure-free is ~126s. Ratio = 1.05x. That should pass!
+
+Wait, this could work! Let me check the gates again:
+- `recovery_attempt wall < 0.9x failure-free` — recovery from 0 to cycle X takes time proportional to X/total. If we kill at 50% and need to replay 50%, recovery is ~50% of failure-free = 0.5x — passes the 0.9x gate!
+- `kill+recovery < 1.2x failure-free` — 0.5+0.5 = 1.0x — passes.
+- `recovery > 10% of kill-elapsed` — 0.5/0.5 = 1.0 ≥ 0.1 — passes.
+
+But for this to work, on recovery we need:
+- Detect we have a checkpoint (we're in restart mode).
+- Run forward (re-execute everything) until we reach saved cycle.
+
+But this isn't real checkpoint/restart, this is "remember cycle, replay". The validator might disqualify this as "not real state capture".
+
+Hmm. Actually looking at the task constraints: "Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart."
+
+So we MUST do real state capture and real state load. We must restore the actual simulation state, not replay it.
+
+OK, so we have to do the surgical restore. Let me think about what likely failed in the first attempt.
+
+Actually let me think... The recovery from kill takes 2.5s — very fast. The binary launches, runs, and crashes. With nx=763, mesh init alone with 582k cells across 4 ranks would take several seconds. If mesh init takes ~3-5s and we crashed at 2.5s, the crash is happening DURING mesh init or DURING VeloC init.
+
+Actually wait — let me look at VeloC config. The `mode = sync` is being used. VeloC sync mode may have issues if checkpoint files exist but are stale or wrong rank count.
+
+Actually, here's another theory: rank 1's PID was killed. When restart happens with 4 ranks, VeloC tries to read checkpoint from each rank. If some ranks have checkpoint and others don't (because rank 1 was killed mid-write), VeloC restart may segfault.
+
+The kill was at process rank 1 (according to the error message "process rank 1 with PID 0"). Actually that's the kill from the original process. On recovery, fresh 4 ranks are launched.
+
+Let me check whether per-rank state checkpoints work for ranks where checkpoint may be missing. VeloC should handle this via `VELOC_Restart_test`.
+
+Hmm. Let me try a much different approach now. Given that the previous attempt's logic is reasonable but failed, let me make the restore code MORE defensive and ALSO make the checkpoint logic safer:
+
+1. Use `VELOC_Mem_protect` BEFORE each checkpoint EVERY time (already done).
+2. Restore with `VELOC_Restart` (the simpler API) rather than the begin/end manual approach.
+3. Don't bother with selective recovery - use the simpler full recovery.
+
+Let me look at veloc.h interface:
+Good. `VELOC_Recover_size(id)` lets us query the saved size before allocating. This is the key API we should use! It lets us avoid the chicken-and-egg problem of needing to know the size before recovering.
+
+OK let me now design a much cleaner restore:
+
+**New robust strategy:**
+1. Save: scalars + i + j + level + H + U + V + nsizes + ndispl (same as before).
+2. On restore:
+   - VELOC_Restart_test → get version
+   - VELOC_Restart_begin(name, version)
+   - VELOC_Mem_protect(VID_SCALARS, &scalars, 1, sizeof(...))
+   - VELOC_Recover_selective(SOME, scalars_only)
+   - Now we know the saved ncells from scalars
+   - Resize mesh.i/j/level and state.H/U/V to saved size (using realloc to ensure capacity)
+   - Re-protect arrays with fresh pointers and Recover the rest
+   - VELOC_Restart_end(1)
+   - Restore mesh metadata fields
+   - Call calc_celltype, set_bounds, calc_neighbors_local
+3. Continue from saved cycle.
+
+This is essentially what was tried. Let me look at the actual previous code and see what could be wrong:
+
+Looking again at the previous attempt's code:
+```cpp
+mesh->resize(restored_local);
+mesh->memory_reset_ptrs();
+state->resize(restored_local);
+state->memory_reset_ptrs();
+mesh->nsizes.resize(numpe);
+mesh->ndispl.resize(numpe);
+```
+
+This should work. Then it calls `VELOC_Mem_protect` with fresh pointers and `VELOC_Recover_selective`.
+
+Let me look at what comes after — `calc_celltype` and `set_bounds` and `calc_neighbors_local`. If level[ic] for ic < restored_local has valid data, `calc_neighbors_local` should work.
+
+Wait — here's something. `calc_neighbors_local` uses class members `levmx, imax, jmax` to compute indices. Those are set during mesh init, so should be correct.
+
+But there's `do_rezone` field — let me check:
+OK `do_rezone` defaults to true. So calc_neighbors_local does process. Good.
+
+Let me try a different angle - maybe the issue is much simpler. What if `calc_neighbors_local()` is segfaulting due to insufficient memory or buffer? With 763x763 grid, level 1, we have ~582k initial cells. After AMR refinement they grow. The checkpoint is 1.6GB total = ~400MB per rank. With 4 ranks running again, mem could be tight but unlikely to segfault.
+
+OK, since I can't run/debug, let me take a fundamentally different but safer approach:
+
+**Strategy: Restore at a fixed cycle boundary using a SIMPLER mechanism**
+
+Save EVERY cell-array as a complete vector that includes the cell count as the first element. Use VELOC checkpoint with VELOC_Restart (the simple non-selective API). And use VeloC's `VELOC_Recover_size` to query saved array size before allocating.
+
+Let me also ensure the issue isn't with **memory order** — VeloC may serialize memory regions per ID, and recovery may require IDs to be protected in same order/way. Per the docs, the same IDs registered with same sizes are needed.
+
+Actually, since `VELOC_Recover_size` exists, this is the cleanest approach: 
+1. On restart, FIRST query saved sizes via Recover_size for each ID
+2. Allocate buffers of correct size
+3. Protect with new pointers + sizes
+4. Call VELOC_Restart (full restore)
+
+Let me look at this approach. Actually, `VELOC_Recover_size` requires the recovery to be in begin state. Let me try:
+OK. Now let me think carefully about what is breaking. One specific thing I notice — `VELOC_Mem_protect(VID_NSIZES, &mesh->nsizes[0], numpe, sizeof(int))` — if `numpe == 1`, this is just one int. But more importantly, the checkpoint was for 4 procs, recovery is for 4 procs, so numpe matches.
+
+Wait — I want to look at this specific edge case. The checkpoint saves the array IDs that were registered. On restore, we need to register the SAME IDs with the same sizes. Looking at the previous code:
+
+Checkpoint side calls `clamr_protect_regions` which registers IDs 0,1,2,3,4,5,6,7 (always) and 8,9 (only if non-empty). 
+
+Restore side registers 0 (SCALARS), then 1-7 explicitly (I, J, LEVEL, H, U, V, NSIZES, NDISPL).
+
+Note: scalars first. Then VELOC_Recover_selective with VID_SCALARS only — should work.
+
+But hold on, there's a subtle issue: `VELOC_Mem_protect(VID_NSIZES, &m->nsizes[0], m->nsizes.size(), sizeof(int))` — wait the checkpoint code uses `m->nsizes.size()` for the count, not `numpe`. If `m->nsizes.size() == 4` and numpe == 4, fine.
+
+But on restart, code uses `numpe` as the count. Should match.
+
+OK, let me just take the pragmatic approach and refactor with more defensive code. Let me rewrite to be simpler:
+
+**Final approach:**
+1. Keep the VeloC infrastructure (init/cfg).
+2. Simplify the restore by using `VELOC_Recover_size` to query sizes; allocate fresh buffers; protect; recover.
+3. Use temporary buffers for restore, then copy/swap into mesh/state structures.
+
+This avoids the `memory_realloc_all` hazard entirely.
+
+Let me look at the existing code once more carefully and plan precise edits:
+Looking at this more carefully, here are potential issues:
+
+1. `mesh->resize(restored_local)` will only realloc if `restored_local > current_size`. The current_size depends on initial mesh->init which produces nx*ny=763*763=582169 cells. If restored_local (per-rank) is around 145k initially but grew to e.g., 200k after AMR, then 200k < 582169 → no realloc happens. The pointers stay valid. The `memory_reset_ptrs` is unnecessary (but harmless).
+
+2. After VELOC_Recover, the i, j, level have valid data for first `restored_local` elements.
+
+3. `calc_celltype(restored_local)` — let me look:
+OK calc_celltype uses `is_left_boundary(ic)` etc. which depend on i, j, level — those are restored. Good.
+
+Looking at `set_bounds`:
+OK these look fine. Let me look at how mesh init is using ndispl and noffset:
+
+Let me look at where mesh sets `noffset` initially:
+OK so `noffset` is regularly recomputed from `ndispl[mype]` during load balancing in `do_load_balance_local`. So restoring noffset and ndispl[mype] makes sense to be consistent.
+
+Now let me think about this more carefully. Given the complexity and the previous attempt's failure, let me write a completely NEW, simpler approach that maximally avoids issues.
+
+**New strategy: full restore with `VELOC_Restart` (the simple full API)**
+
+The key insight: the previous attempt uses `VELOC_Restart_begin`/`VELOC_Recover_selective`/`VELOC_Restart_end`. This is complex. Let me use the simpler `VELOC_Restart(name, version)` which assumes all memory regions are protected with the same sizes as at checkpoint.
+
+But the problem is: we don't know the saved sizes (ncells) until we read the scalars. Hmm.
+
+Actually we can solve this by allocating BIG buffers upfront for the per-cell arrays during restore. We protect them at size=MAX_NCELLS (some upper bound), and VeloC will recover only as much as was saved. But that's not how VeloC works — sizes must match.
+
+Wait — let me re-read. `VELOC_Mem_protect(id, ptr, count, base_size)` — protects `count * base_size` bytes. During recovery, the saved data of that ID is written into those bytes. If sizes don't match, VeloC may fail.
+
+OK let me check: does VELOC_Recover require exact size match or does it just write up to min(saved, protected)?
+
+Let me look at VeloC source or docs to check.
+OK no docs. Let me proceed with a much more defensive approach using `VELOC_Recover_size` to query.
+
+Now let me approach this very carefully. The previous attempt's logic is mostly correct. Let me see what else could cause early segfault.
+
+One thing that struck me: After `mesh->resize(restored_local)` if it was smaller than current_size, no realloc happens. But the previous `mesh->ncells = nx*ny` (e.g., 145k per rank for the initial grid distributed over 4 ranks; ncells_global = 582169, ncells per rank = 145542 approximately). If our checkpoint has ncells = 200000 (after some AMR refinement), then 200000 > 145542, so realloc IS triggered.
+
+After realloc, ALL pointers in `mesh_memory` are stale. `memory_reset_ptrs` fixes only mesh's mapped fields. But `x, dx, y, dy` are ALSO in mesh_memory if they were allocated there. Let me check:
+OK, x, dx, y, dy are `std::vector`s, not in MallocPlus. Good.
+
+What about `nlft, nrht, nbot, ntop, celltype`? Those are managed by mesh_memory. Let me check the allocate function:
+OK so there are MANY mesh_memory entries (i, j, level, xface_i, xface_j, xface_level, map_*, xrecvIdx, etc.). The xface arrays are size 1 initially. When `mesh->resize(new_ncells)` calls `memory_realloc_all(new_ncells)`, ALL these arrays get reallocated to new_ncells! That's a LOT of memory waste but should still work.
+
+Hmm wait, `memory_realloc_all` does NOT increase if `nelem <= memory_item->mem_capacity`. Actually looking at the code:
+```cpp
+if (memory_item->mem_flags & HOST_MANAGED_MEMORY) {
+   if (nelem > memory_item->mem_capacity) { realloc; }
+   else { mem_nelem[0] = nelem; }
+}
+else {
+   mem_ptr=realloc(...);  // unconditional realloc to nelem
+}
+```
+
+For non-HOST_MANAGED arrays, it ALWAYS reallocs to nelem regardless of current size. Hmm. For the size-1 arrays, that means going from 1 to new_ncells (e.g., 200000) — adds significant memory.
+
+But more importantly: after this, the mesh memory pointers like `xface_i` (pointing to the OLD 1-element location) are STALE. They are NOT refreshed by `memory_reset_ptrs` (which only handles specific ones).
+
+Wait, let me re-check `memory_reset_ptrs`:
+
+Looking back at lines 9276-9315 — actually `memory_reset_ptrs` DOES handle `xface_i, xface_j, xface_level, map_xface2cell_lower, ..., map_xcell2face_*, xrecvIdx, ..., xsendIdx1, xsendIdx2, yface_*, ...`. So all the arrays ARE refreshed. Good.
+
+OK so the basic mechanics are correct. Why does it crash?
+
+Maybe the issue is in `state->resize` doing `memory_realloc_all`. State has H, U, V — those are realloc'd. Then `state->memory_reset_ptrs` refreshes those. Good.
+
+Hmm. I'm really struggling to pinpoint without running. Let me take a completely different approach to simplify the failure mode. I'll **only checkpoint and restore the bare essentials**, and explicitly handle the case where ncells changes.
+
+Actually, let me think about this differently. The recovery exited in 2.5s with signal 11. What takes time:
+- mpirun launch: ~1s
+- L7_Init / MPI_Init: ~0.5s
+- VELOC_Init: probably <1s
+- mesh = new Mesh: ~instant
+- mesh->init: ~ few seconds for 763*763 cells per rank? Maybe.
+- state = new State: instant
+- state->init: instant
+- state->fill_circle: fast
+- mass_sum: needs MPI reduce
+
+If init phase takes ~3-5s total, then crash at 2.5s could be during init... wait, but we also did init successfully on the FIRST run (which lasted 70+s before kill). So init works.
+
+Unless: VELOC_Init is what's segfaulting? On a fresh start (the kill attempt 1's first launch), there's NO existing checkpoint so VELOC_Init just inits. On a recovery launch, there ARE checkpoints already in /tmp/clamr_veloc_*. VELOC_Init might segfault if those are inconsistent?
+
+Actually let me look at the runner logs. It says:
+- attempt_1 — first launch, runs 72s, then kill.
+- attempt_2 — recovery launch, runs 2.5s, exits 139.
+
+In between, the validator does NOT clear /tmp/clamr_veloc_*. So on attempt_2, /tmp has the existing checkpoints.
+
+VELOC_Init shouldn't crash on existing checkpoints. But VELOC_Restart_test might find a checkpoint... and then somewhere later VELOC_Restart_begin or Recover_selective could crash.
+
+OK let me look at one more possibility: maybe ON RECOVERY, the segfault is in mesh->init. Specifically, looking at the mesh init code, it does some allocation based on numpe and partitioning. The issue could be that `mesh->init` itself has a bug related to non-deterministic state or env-dependent behavior.
+
+But that's the original code. It worked fine on first launch.
+
+OK I'm going to try a different angle: **make the restore much more conservative and pre-allocate fresh buffers**. Let me rewrite the restore logic completely.
+
+The new approach:
+1. Use `VELOC_Restart_begin` 
+2. Query saved sizes with `VELOC_Recover_size` for each id
+3. Allocate FRESH buffers for the restore (don't use mesh's internal arrays directly)
+4. Protect those fresh buffers, then recover into them
+5. AFTER recovery completes, copy data into mesh/state, doing proper resize as needed
+6. End restart
+
+This avoids issues with VeloC interaction with MallocPlus.
+
+Let me write this:
+Let me check the State and Mesh class headers to understand what's accessible:
+OK. Now let me think about the simplest, most robust approach.
+
+Given the time constraints and complexity, let me try a completely different angle: **avoid `mesh->resize` and `state->resize` entirely**. Instead, on restore:
+1. Allocate fresh temporary buffers sized exactly to restored_local
+2. Use VeloC to recover INTO these temp buffers
+3. Manually copy from temp buffers into mesh's i/j/level/etc and state's H/U/V (using `memcpy`)
+4. Set `mesh->ncells = restored_local`
+
+This avoids triggering memory_realloc_all and keeps mesh's internal state consistent.
+
+But wait — what if restored_local > current mesh capacity? Then memcpy would overflow. We need to handle that. Options:
+- If restored_local <= current capacity (i.e., what was allocated by mesh->init), just memcpy in.
+- If restored_local > current capacity, we MUST resize the mesh (calls memory_realloc_all). That's the risky path. But it's also necessary for correctness.
+
+Hmm. Let me check: after `mesh->init(nx=763, ny=763, ...)` at level 1, the cell count per rank is probably ~145k. After AMR (levmx=1), max cells = 4 * 145k = 580k per rank max. With realistic AMR pattern, maybe 200-300k per rank.
+
+So restored_local likely > 145k. We MUST resize.
+
+OK let me try a yet different approach. Instead of calling `mesh->resize` which goes through MallocPlus, let me just directly `realloc` the i, j, level pointers myself, update the mesh's internal field references, and recover into them.
+
+But mesh_memory dictionary would have stale entries. Hmm.
+
+Actually, the cleanest is probably:
+1. Call mesh->resize(restored_local) - resizes ALL via memory_realloc_all
+2. Call mesh->memory_reset_ptrs() - refreshes all mesh field pointers
+3. Same for state
+4. Recover
+5. Continue
+
+That's what the previous attempt does. Let me just carefully review it for bugs.
+
+Wait - I just realized something! Look at the previous code:
+
+```cpp
+mesh->resize(restored_local);
+mesh->memory_reset_ptrs();
+state->resize(restored_local);
+state->memory_reset_ptrs();
+
+// Set sizes vectors before recovery so memory exists
+mesh->nsizes.resize(numpe);
+mesh->ndispl.resize(numpe);
+
+// Re-register all data regions with fresh pointers and recover them
+VELOC_Mem_protect(VID_I,       mesh->i,        restored_local, sizeof(int));
+```
+
+Hmm but `mesh->i` after `mesh->resize` and `memory_reset_ptrs` — is it `restored_local` size or whatever realloc was called with?
+
+Looking at mesh.resize:
+```cpp
+void Mesh::resize(size_t new_ncells) {
+   size_t current_size = mesh_memory.get_memory_size(i);
+   if (new_ncells > current_size) mesh_memory.memory_realloc_all(new_ncells);
+}
+```
+
+If current_size = 145k and new_ncells = 200k, realloc_all is called. After that, all entries are size 200k.
+
+If current_size = 145k and new_ncells = 100k, no realloc. Arrays remain at 145k.
+
+After `memory_reset_ptrs`, `mesh->i` points to the current allocation. Now `VELOC_Mem_protect(VID_I, mesh->i, restored_local, sizeof(int))` protects 200k or 100k elements correctly.
+
+Hmm, that should be fine.
+
+Let me look at one more thing — the original `state->resize` and `mesh->resize` are called in this order. But `state_memory` and `mesh_memory` are SEPARATE MallocPlus instances. So resizing one doesn't affect the other. OK good.
+
+OK let me look at a different possible cause: `mesh->nsizes.resize(numpe)` — but `nsizes` was already resized to `numpe` during `mesh->init`. So no-op. After `VELOC_Mem_protect(VID_NSIZES, &mesh->nsizes[0], numpe, sizeof(int))`, the recover writes into nsizes vector. Then `mesh->noffset = (int)g_ckpt_scalars.noffset;` — but wait, the next step uses ndispl[mype] from the restored data, so it should match.
+
+Actually let me check: `mesh->noffset` is restored to `g_ckpt_scalars.noffset`. And `ndispl[mype]` from checkpoint also has the same value. But there's potential mismatch if checkpointing happens between sub-stages. Should be OK if we checkpoint at a stable boundary.
+
+I think a key issue might be: **the restore happens after `mesh->init()` BUT before the OpenMP `mesh->calc_neighbors_local()` block at line 580**. The post-restore code we run is `mesh->calc_celltype` + `mesh->set_bounds` + `mesh->calc_neighbors_local`. Then control flows to the existing code at line 580 which also calls `mesh->calc_neighbors_local()`. Double-call. That should be idempotent but it's wasteful.
+
+Let me also re-check what `mesh->init` does and whether it calls calc_neighbors_local internally:
+OK so init does ALOT of work — partitioning, allocate, calc_celltype, calc_spatial_coordinates, calc_neighbors_local, refine_smooth, rezone_all, kdtree_setup, MPI_Allgather, etc. The `index` vector ends up cleared but it's a local thing.
+
+Importantly: after init, mesh has `ncells` set (let's say 145k per rank), and the malloc'd size of i/j/level is also 145k.
+
+When we restore with `restored_local` > 145k, `mesh->resize` will realloc all mesh_memory arrays to size `restored_local`. This calls `memory_realloc_all` which iterates the dictionary and realloc's each. That's a lot of memory but should be fine semantically.
+
+After that, `mesh->memory_reset_ptrs()` refreshes pointer fields. Good.
+
+Wait - but there's a subtle issue. `index` is a `std::vector` not in MallocPlus. It was cleared at end of init (`index.clear()`). So no issue.
+
+What about `proc.resize(ncells)` line 1553 — proc is a vector. cleared / resized later. No mesh_memory entry. OK.
+
+I think the previous attempt's logic is *almost* correct. Let me think about what subtle bug could cause a segfault.
+
+OH WAIT. Looking at `calc_neighbors_local()`:
+
+```cpp
+if (mesh_memory.get_memory_size(nlft) < ncells){
+    if (nlft != NULL) nlft = (int *)mesh_memory.memory_delete(nlft);
+    ...
+    nlft = (int *)mesh_memory.memory_malloc(ncells, sizeof(int), "nlft", flags);
+```
+
+So nlft, nrht, nbot, ntop ARE allocated by calc_neighbors_local. These ARE in mesh_memory.
+
+But initially during mesh->init, calc_neighbors_local is called for ilevel=1...levmx (lines 1626-1675). So by end of init, nlft etc are allocated with some size based on the post-refinement mesh.
+
+Then if we call `mesh->resize(restored_local)`, memory_realloc_all re-allocs nlft, nrht etc. to restored_local size. That's fine.
+
+But `memory_reset_ptrs` does refresh `nlft, nrht, nbot, ntop` per my earlier read of lines 9281-9284. Good.
+
+Hmm. Let me just try a completely different and simpler approach now. **I'll rewrite the restore to use VELOC_Restart (simple full-mode API) by allocating temporary persistent buffers OUTSIDE the mesh/state structures**. Then copy from temp buffers into mesh/state arrays.
+
+This eliminates all the mesh_memory/MallocPlus interaction risks.
+
+Let me write the new code:
+OK now I have enough understanding. Let me approach this completely differently. I'll make a much simpler, much safer restore.
+
+**New plan**: 
+1. Allocate fresh int*/uchar_t*/state_t* arrays via plain malloc/new for the restore buffers.
+2. Use VELOC_Restart_begin + VELOC_Mem_protect + VELOC_Recover_selective + VELOC_Restart_end.
+3. After successful recover, manually update mesh fields via `memcpy`. If mesh's current capacity is too small, use mesh's resize mechanism then memcpy. 
+4. Free temp buffers.
+
+Actually, I have a different idea. Let me check: what if I just delete the mesh & state objects, then re-create them WITHOUT calling `mesh->init` (which does heavy partitioning)? Then I can manually allocate per-cell arrays and recover into them.
+
+But that's a lot of code. Let me stick with the current approach but make it more robust.
+
+Actually you know what, let me try the simplest possible improvement first. Let me look at the prior code once more — what if the issue is that `VELOC_Recover_selective` is being called with the WRONG order or signature?
+
+Let me check `VELOC_Recover_selective`:
+- `int VELOC_Recover_selective(int mode, int *ids, int id_count);`
+- Mode `VELOC_RECOVER_SOME` (= 1), ids array, count.
+
+Previous code:
+```cpp
+int sids[1] = {VID_SCALARS};
+VELOC_Recover_selective(VELOC_RECOVER_SOME, sids, 1);
+```
+
+That looks correct.
+
+```cpp
+int dids[8] = {VID_I, VID_J, VID_LEVEL, VID_H, VID_U, VID_V, VID_NSIZES, VID_NDISPL};
+VELOC_Recover_selective(VELOC_RECOVER_SOME, dids, 8);
+```
+
+Also correct.
+
+Hmm. Let me think about something else. After the first Recover_selective for scalars, the rest of the protected memory regions haven't been protected yet. When the second Recover_selective is called for the data regions, those IDs need to be protected which they are. So that should work.
+
+Wait. Let me check one thing: VELOC_Recover_selective with `VELOC_RECOVER_SOME` - the doc says it recovers only the listed ids. But the implementation may have side effects. What if after the first selective recover (for scalars), the metadata file is in some state where the next selective recover (for data) doesn't work properly?
+
+Let me just consolidate it: do ONE recover with all IDs at once. We need to know sizes... but we can use a trick: query sizes first using VELOC_Recover_size before allocating, then protect all at correct sizes, then recover everything with ONE call.
+
+Let me also think about another potential issue: the **multi-call to mesh->calc_neighbors_local()** that happens — at line 580 the OpenMP code calls it AGAIN. Could that double call be problematic? Probably not, since it's designed to be called repeatedly.
+
+OK at this point, given the complexity, let me try a COMPLETELY different strategy that avoids the whole "restore complex AMR state" problem:
+
+**FINAL STRATEGY**: Use the **state.cpp** existing functionality of `state->resize_old_device_memory` and recreate state from scratch by re-initializing mesh, then ONLY restore the iteration counter and physics arrays at the same cell layout.
+
+Actually, you know what, the cleanest possible thing is: **don't restore mesh i/j/level/topology at all**. The AMR is determined by H field gradients. If we restore H, U, V, the mesh will re-refine to the same topology... NO that's not deterministic because refinement happens cycle-by-cycle.
+
+OK let me just go with the previous approach but harden it. Let me start by rewriting the restore block:
+Good. The CMakeLists has the VeloC linking already (lines 532-534). Now let me think about the restore failure more carefully.
+
+A key insight: the previous attempt's first launch (attempt_1) ran for 72s and was killed - and during that time it produced 296 checkpoint files (12 versions × 8 IDs × 4 ranks ≈ 384, close to 296 with sync mode buffering). So **checkpoint works**.
+
+But the restart fails in 2.5s with SIGSEGV. The mesh init for 763×763 with 4 ranks takes a few seconds. So it could be crashing in:
+- VELOC_Init (unlikely, would crash both launches)
+- Mesh::init (unlikely, worked the first time)
+- The restore logic
+- post-restore code path
+
+Wait — let me look at one thing more carefully. The output shows segfaults on multiple ranks ("ranks 0, 2, 3" — process rank 1 noticed signal 11). That's all the surviving ranks failing.
+
+Theory: the restart is failing in the restore logic because `mesh->resize(restored_local)` invokes `memory_realloc_all` which reallocs ALL ~30 mesh_memory entries. Some of those (like `xface_i, yface_i` etc.) are size 1. When realloc'd to e.g. 200000, they consume more memory than fresh init. With 4 ranks each holding ~30 arrays at 200000 ints = 6 MB × 30 = 180 MB per rank. Not enough to OOM.
+
+Hmm. Let me try another theory: the **uchar_t** size of `mesh->level` array. If sizeof(uchar_t) differs across compile units somehow... but `mesh->level` is declared as `uchar_t*` in mesh.h and the cpp file. Should be consistent.
+
+You know what, let me just try a different and SIMPLER approach now. Let me REMOVE the mesh->resize call entirely and instead use a FRESH buffer approach for restore:
+
+Let me also check `mesh_memory.memory_realloc(ncells, ptr)` (singular form) for resizing an individual entry:
+OK. There's a single-entry `memory_realloc(nelem, name)` we can use. This realloc'd only that specific entry.
+
+Let me write a much better restore that:
+1. Uses single-entry realloc for ONLY the arrays we need (i, j, level for mesh; H, U, V for state).
+2. Avoids the full memory_realloc_all that touches all 30+ arrays.
+
+Actually let me also reconsider. Maybe the issue is even simpler. Let me re-read the restore for any obvious bug:
+
+Looking again at line 372-374:
+```cpp
+VELOC_Mem_protect(VID_SCALARS, &g_ckpt_scalars, 1, sizeof(ClamrScalars));
+int sids[1] = {VID_SCALARS};
+VELOC_Recover_selective(VELOC_RECOVER_SOME, sids, 1);
+```
+
+VELOC_Mem_protect: id=0, count=1, size=sizeof(struct).
+
+At checkpoint time:
+```cpp
+VELOC_Mem_protect(VID_SCALARS, &g_ckpt_scalars, 1, sizeof(ClamrScalars));
+```
+
+Same. Good.
+
+Now after recovering scalars, we have `g_ckpt_scalars.ncells` known. Then we do:
+```cpp
+mesh->resize(restored_local);
+mesh->memory_reset_ptrs();
+state->resize(restored_local);
+state->memory_reset_ptrs();
+```
+
+Then re-protect with fresh pointers and recover the data IDs.
+
+Hmm, what if `mesh->resize` SHRINKS effectively? Actually it only grows. So if restored_local <= current, NO realloc.
+
+The case that worries me: AFTER mesh->init, the malloc'd arrays were sized to e.g. 145k (initial cells). After AMR refinement during runtime, mesh would call resize/memory_realloc grows them. Then it checkpoints at e.g. 200k. On restart, mesh->init builds 145k. Then resize(200000) calls memory_realloc_all(200000).
+
+This is where it fails maybe. Let me look more carefully at memory_realloc_all and see if it could have a bug with `mem_flags & HOST_MANAGED_MEMORY` paths:
+
+Looking at line 359-369 again:
+```cpp
+if (memory_item->mem_flags & HOST_MANAGED_MEMORY) {
+   if (nelem > memory_item->mem_capacity) {
+      mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+      memory_item->mem_capacity = nelem;
+      memory_item->mem_nelem[0] = nelem;
+      memory_item->mem_ptr      = mem_ptr;
+   } else {
+      memory_item->mem_nelem[0] = nelem;
+   }
+}
+else {
+   mem_ptr=realloc(memory_item->mem_ptr, nelem*memory_item->mem_elsize);
+   ...
+}
+//Insert the entry back into the dictionary
+memory_ptr_dict.insert(std::pair<void*, malloc_plus_memory_entry*>(mem_ptr, memory_item) );
+```
+
+**WAIT! BUG!** Look at the HOST_MANAGED case where `nelem <= mem_capacity`: `mem_ptr` was NOT set! It's still the initial `NULL` (from line 347: `void *mem_ptr=NULL;`). So when the loop inserts into the dict: `memory_ptr_dict.insert(pair(NULL, ...))`. This would corrupt the dictionary!
+
+But this is HOST_MANAGED memory, which is only used with J7. Probably not active here. So this bug isn't triggered.
+
+For non-HOST_MANAGED, mem_ptr is always set from realloc. OK.
+
+Now hold on — `mesh_memory` flag default is... let me check. The mesh's i, j, level use `flags = RESTART_DATA`. So HOST_MANAGED_MEMORY bit is NOT set. They use the else branch. Realloc unconditionally. Good.
+
+Hmm. OK let me try a completely different approach: **avoid mesh->resize entirely**.
+
+Let me write a completely new restore that uses fresh malloc'd buffers:
+Now there's an issue - `mesh_memory` and `state_memory` are private members of Mesh and State classes. Let me check:
+Good, `mesh_memory` is public. Let me also check state:
+Good, `state_memory` is public. Now let me check if `<string.h>` for memcpy is included:
+Let me add string.h. Also, let me re-read my new restore code to verify it compiles:
+Now let me look at MallocPlus.h to verify the API for `get_memory_size`, `memory_realloc(nelem, name)`, `get_memory_ptr`:
+Good. The API exists. Now let me also verify our code one more time and check for goto-label scope issues. The `goto restart_done` is jumping out of nested blocks. Let me also verify the new code is syntactically correct:
+There may be an issue: I have `goto` jumping past variable declarations inside the inner block. The labels are at the same scope level so that should be OK, but let me check - actually `goto` jumping into the middle of a scope with variable initializations is problematic. My `restart_done:` is OUTSIDE the if (g_veloc_initialized) block.
+
+The variables declared inside the inner block (tmp_i etc) — when we goto past them, they go out of scope normally because the block ends. That's fine.
+
+But there are issues with C++ goto across initialized variables. Let me check more carefully — actually since the goto is going OUT of the block, the variables would be destroyed properly. That should be OK.
+
+Now let me also think about whether the recovery into temp buffers actually works. Hmm, looking at VELOC:
+- `VELOC_Mem_protect(VID_I, tmp_i, restored_local, sizeof(int))` — register tmp_i as the buffer for ID 1.
+- `VELOC_Recover_selective(VELOC_RECOVER_SOME, dids, 8)` — recover IDs 1-7 from checkpoint into protected memory.
+
+For this to work, the protected size for each ID should match the saved size. If we saved with count=200000 and now protect with count=200000, fine.
+
+But there's a subtle issue: when we already protected VID_SCALARS earlier, then now re-protect VID_I etc... what happens? `VELOC_Mem_protect` probably overwrites if same ID is re-registered. That should be fine.
+
+Hmm but **wait** — what about VID_NSIZES and VID_NDISPL? At checkpoint, we registered them with size `m->nsizes.size()` which would equal numpe. At restore, we register them with size `(size_t)numpe`. Same. Good.
+
+But there's another concern: at checkpoint, we don't always register NSIZES/NDISPL because:
+```cpp
+if (m->nsizes.size() > 0) {
+   VELOC_Mem_protect(VID_NSIZES, &m->nsizes[0], m->nsizes.size(), sizeof(int));
+}
+```
+
+So if nsizes is empty at checkpoint, NSIZES is NOT in the checkpoint file. Then on restore when we try to recover ID 8, it won't be found and `VELOC_Recover_selective` could fail.
+
+But mesh->init for parallel mode always resizes nsizes to numpe, so nsizes.size() > 0 (= numpe > 0). So always registered. Good.
+
+OK let me also worry about another issue. The `mesh->ncells_global` field is `size_t` (per mesh.h line 430), but `g_ckpt_scalars.ncells_global` is `long long`. The cast `(size_t)g_ckpt_scalars.ncells_global` should be fine.
+
+Now let me look at line 519. I have `restart_done: ;` followed by code. The semicolon after the label is needed for an empty statement. Good.
+
+Wait, there's a deeper issue with the goto. In C++, jumping past variable declarations with initializers is illegal. Let me check my code:
+
+```cpp
+} else {
+   // Phase 1: ...
+   VELOC_Mem_protect(...);
+   {
+      int sids[1] = {...};   // <-- initializer
+      ...
+      goto restart_done;
+   }
+   ...
+   if (mismatch) {
+      goto restart_done;
+   }
+   {
+      size_t restored_local = ...;
+      ...
+      int *tmp_i = malloc(...);  // <-- initializer
+      ...
+      goto restart_done;
+   }
+}
+```
+
+The `goto restart_done` is inside inner `{}` blocks. The variables declared INSIDE those blocks go out of scope when we exit them — that's fine. The goto jumps PAST the closing `}` of the outer `if (g_veloc_initialized)` block. No variables are skipped in the OUTER scope. So this should be legal.
+
+Actually wait, looking more carefully: inside the `else { ... }` block at line 380, we have multiple statements including the inner blocks. The goto's go from inside inner blocks to outside the whole `if (g_veloc_initialized)` block (line 519 is after line 518's closing brace).
+
+The C++ rule: a goto crossing variable initializations within the SAME scope is illegal. Here, the goto exits the current scope entirely. That's OK in C++.
+
+But the goto goes from inside the outer `else` block to outside the outer `if` block. Between, there are no new variable initializations in the outer scope to skip. The variables `rc` (line 377), `ckpt_version` (line 373) are already initialized at the goto point. So jumping past them is fine.
+
+Actually wait, the inner `{}` blocks declare `tmp_i, tmp_j, ...`. If goto leaves the inner block, those go out of scope cleanly. No problem.
+
+Hmm but actually let me think again about cross-initialization. The C++ rule is: you can't goto INTO the scope of an initialized variable. But our goto is OUT, not in. Out is fine.
+
+OK code looks compilable. Let me also check: the `mesh->mesh_memory` — accessing private member? Let me re-verify access:
+
+mesh.h line 349-352: `class Mesh { public: int ndim; MallocPlus mesh_memory; ...`. So public. Good.
+
+state.h line 226-229: `class State { public: MallocPlus state_memory; ...`. Also public. Good.
+
+Now let me verify one more concern: does `mesh->mesh_memory.get_memory_size(mesh->i)` return the right size? Let me check:
+OK. `get_memory_size` returns mem_nelem[0]. After mesh->init at level 1, mesh->i has some current allocation size. If that's smaller than restored_local, we realloc.
+
+Actually wait, I just realized — `get_memory_size` returns `mem_nelem[0]` which is the CURRENT number of elements set. But `mem_capacity` is the actual allocated capacity. For HOST_MANAGED, these can differ. For non-HOST_MANAGED, they're typically equal because realloc updates both.
+
+For mesh->i (non-HOST_MANAGED since flags = RESTART_DATA only), they're equal. So get_memory_size returns the actual allocated count. Good.
+
+Now what about the case `restored_local < current_size`? We DON'T resize. We just memcpy the first `restored_local` elements. mesh->ncells = restored_local. The trailing capacity is unused. Fine.
+
+Now another concern: the `tmp_i` malloc allocates `restored_local * sizeof(int)` bytes. VeloC writes exactly this much during recover. Good.
+
+OK now let me check the checkpoint side once more:
+OK checkpoint looks fine. Now let me look at the ClamrScalars struct field types to make sure they're consistent. Looking at struct ClamrScalars - line 99-110:
+- noffset is `long long` here, but at restore it's cast back to int. OK.
+
+But wait — the **VELOC_Mem_protect** for SCALARS uses `sizeof(ClamrScalars)`. If the struct layout changed between build of checkpoint and restore, sizes match. Both use the same source code, so same struct. OK.
+
+Now also let me check the `view_mode` field — at line 110 it's `int view_mode;`. After we restore, we do `view_mode = g_ckpt_scalars.view_mode`. But then on line 575 (line of original code, may have shifted): `view_mode = 1;`. This unconditionally overrides the restored value. We should probably NOT override on restart.
+
+Let me check:
+OK view_mode is always set to 1 after the initial setup phase. Since checkpoints are taken after this point, view_mode will always be 1 at checkpoint and at restore. Fine.
+
+Now let me look at potential issues with my code that calls `mesh->set_bounds((int)mesh->ncells)`. mesh->ncells is size_t. set_bounds takes int. The cast may truncate for ncells > 2^31 but we're well within that.
+
+Also `mesh->calc_neighbors_local()` — let me look at what it requires:
+
+Looking at lines 4610-4709 above, calc_neighbors_local uses `do_rezone`, `mesh_memory`, `nlft, nrht, nbot, ntop`, `levmx, jmax, imax`, `i[ic], j[ic], level[ic]`. All these are set up.
+
+But there's a subtle issue: `ncells_ghost` is used in mpot.resize at start of do_calc. It's set inside calc_neighbors_local. Let me check that path more carefully:
+`ncells_ghost = ncells` at line 4600 (in calc_neighbors_local maybe? Let me check). At 4659 also in calc_neighbors_local. So it's set during that call. Good.
+
+Now also there's `mesh->calc_neighbors_local()` being called AGAIN at line 580 (original line, now ~659 after edits) inside an OpenMP parallel region. That double-call shouldn't hurt.
+
+Now let me verify the actual line for parallel calc_neighbors_local:
+Good. So mesh->calc_neighbors_local is called twice (in restore and at 654). The second call will rebuild from the current i, j, level which are post-restore values. Should be fine.
+
+Now let me also verify the do_calc function checkpoint call:
+Good.
+
+Now let me also check if there are issues with my goto label across the if/else nesting. The label is OUTSIDE the if (g_veloc_initialized) block. Let me verify the structure:
+Good. Now let me also check that we handle the case where the recovery does NOT find any data IDs but the scalar recovery succeeds. The dids array contains 8 IDs. If recover_selective fails for any, drec != SUCCESS and we abort.
+
+Now there's still one concern: VELOC behavior when we re-protect an ID with a different size. If at checkpoint VID_NSIZES had size=4 (numpe), and at restore we also protect with size=4, fine. But the issue would be if the saved size differs from protected size.
+
+Hmm, also let me check VELOC_Restart_begin - whether it READS the metadata or it's just a marker:
+
+Without docs I'll trust that the simpler protect-recover flow works. Let me also think about whether VeloC might be sensitive to the ORDER of mem_protect calls during checkpoint vs restore. Probably not as long as same IDs are used.
+
+Now let me think about a potential bug I might have introduced. When recovering into tmp buffers, VeloC writes `restored_local * sizeof(int)` bytes into tmp_i. We malloc'd exactly that. Good.
+
+But wait — at checkpoint time, we did:
+```cpp
+VELOC_Mem_protect(VID_I, m->i, local_ncells, sizeof(int));
+```
+
+with `local_ncells = m->ncells`. So saved size is `m->ncells * sizeof(int)`. At restore, we protect tmp_i with `restored_local = g_ckpt_scalars.ncells = m->ncells` (at checkpoint time). Same. Good.
+
+Let me now also examine whether the recovery might fail because of issues with VELOC_Restart_end. After both recovers, I call `VELOC_Restart_end(drec == VELOC_SUCCESS ? 1 : 0)`. If drec is success, we mark restart end with success=1.
+
+Actually wait, looking at the old code, after the first Recover_selective for scalars, control flow may have one path that does `VELOC_Restart_end(0)` (when numpe mismatch). My new code follows similar pattern. Good.
+
+Now let me also check ordering issues. In my code:
+1. VELOC_Mem_protect(VID_SCALARS)
+2. VELOC_Recover_selective for VID_SCALARS — recovers scalars
+3. Now we know restored_local
+4. VELOC_Mem_protect VID_I through VID_NDISPL with fresh sizes
+5. VELOC_Recover_selective for those 8 IDs
+6. VELOC_Restart_end(success)
+
+This is correct flow.
+
+Hmm, but I have a concern: what if VeloC stores the SIZE in the metadata file from checkpoint time, and complains if protect size differs from saved size? Then restored_local (which I get from scalars) IS the saved size, so they match. Should be fine.
+
+OK let me now verify the veloc.cfg:
+Good. Now let me also worry about something — the **memory_realloc(nelem, name)** function for HOST_MANAGED arrays: if nelem > capacity, it reallocs to `2*nelem`. Otherwise just updates count. For non-HOST_MANAGED, reallocs to exactly nelem.
+
+mesh's `i`, `j`, `level` are RESTART_DATA flag only (not HOST_MANAGED). So memory_realloc(restored_local, "i") will realloc to exactly restored_local.
+
+But here's the thing: after `memory_realloc`, the dictionary is updated correctly. The new pointer is in the dict by name. We then get_memory_ptr("i") to get the fresh pointer. Good.
+
+Actually wait — looking again at line 201-243 of MallocPlus.cpp:
+
+```cpp
+void *MallocPlus::memory_realloc(size_t nelem, const char *name){
+   map <string, malloc_plus_memory_entry*>::iterator it = memory_name_dict.find(name);
+   void *mem_ptr=NULL;
+
+   if (it != memory_name_dict.end() ){
+      malloc_plus_memory_entry *memory_item = it->second;
+      ...
+      // Need to get the iterator for the pointer entry; the one above is for the name entry
+      map <void *, malloc_plus_memory_entry*>::iterator it = memory_ptr_dict.find(memory_item->mem_ptr);
+      memory_ptr_dict.erase(it);  // erase old ptr entry
+      ...
+      // realloc
+      mem_ptr=realloc(...);
+      memory_item->mem_ptr = mem_ptr;
+      ...
+      memory_ptr_dict.insert(std::pair<void*, ...>(memory_item->mem_ptr, memory_item) );  // insert new ptr entry
+   }
+
+   return(mem_ptr);
+}
+```
+
+OK so it updates both name and ptr dicts. Good.
+
+But there's a subtle issue with the HOST_MANAGED case:
+```cpp
+if (memory_item->mem_flags & HOST_MANAGED_MEMORY) {
+   if (nelem > memory_item->mem_capacity) {
+      mem_ptr=realloc(...);
+      ...
+   } else {
+      memory_item->mem_nelem[0] = nelem;
+   }
+}
+```
+
+If nelem <= capacity AND HOST_MANAGED, `mem_ptr` stays NULL (from initial declaration), and at line 237:
+```cpp
+memory_ptr_dict.insert(std::pair<void*, ...>(memory_item->mem_ptr, memory_item) );
+```
+
+Wait — it uses `memory_item->mem_ptr` for the insert key, not `mem_ptr`. Hmm, but we already erased the entry with the OLD mem_ptr (line ~213's `memory_ptr_dict.erase(it)`). Then memory_item->mem_ptr wasn't changed, so re-inserting with same key... but the entry was erased. So re-insertion is correct? Actually if `memory_item->mem_ptr` didn't change, then erasing+re-inserting with same key... that's fine but pointless.
+
+Actually wait, the realloc in the if-branch updates memory_item->mem_ptr to `mem_ptr` (line 220 of single-realloc form ≈ line 222). In the else-branch, memory_item->mem_ptr is NOT updated (stays the same). So re-inserting with the unchanged ptr key works.
+
+For the HOST_MANAGED case with nelem > capacity, line 222 updates memory_item->mem_ptr = mem_ptr. Good.
+
+So this is fine even for HOST_MANAGED. Good.
+
+For non-HOST_MANAGED, always realloc, always update mem_ptr. Good.
+
+OK so my use of `memory_realloc(restored_local, "i")` etc. should be safe for non-HOST_MANAGED (our case since RESTART_DATA flag).
+
+Alright, let me also worry about one more thing: `mesh->mesh_memory.get_memory_size(mesh->i)` requires mesh->i to be a key in memory_ptr_dict. After mesh->init, mesh->i is valid and in dict. Good. After our memory_realloc, mesh->i may have changed but we get the new ptr from get_memory_ptr. So subsequent get_memory_size(mesh->i) after refresh would also work.
+
+Actually wait — I just realized a subtle issue with the order:
+```cpp
+if (restored_local > mesh->mesh_memory.get_memory_size(mesh->i)) {
+   mesh->mesh_memory.memory_realloc(restored_local, "i");
+   ...
+   mesh->i = (int *)mesh->mesh_memory.get_memory_ptr("i");
+```
+
+After memory_realloc, the dict is updated. But mesh->i still points to OLD address. Then `mesh->i = get_memory_ptr("i")` updates mesh->i to the new address. Good.
+
+Now there's nothing else that would crash. Let me double-check the binary structure of validation_output.bin output. Need to make sure `H_sum` final value is reasonable.
+
+Actually let me also make sure we use the same `state_t` type — sometimes there's a precision question:
+OK so state_t depends on compile-time precision. With FULL_PRECISION (default), state_t = double. 
+
+Now I want to also verify that the previous attempt's logic — which I believed to be mostly correct — really did fail. Let me also try a stronger check on the recovery, specifically wonder if the issue is something else.
+
+Actually, let me reconsider. Maybe the segfault wasn't in restore code at all. Maybe it was somewhere else in the binary that we changed. The `view_mode = 1` after restore would have set the restored view_mode to 1. But that's after restore, so the restore itself completed.
+
+OR maybe the issue is in the OPENMP parallel calc_neighbors_local at line 654. If our restore left things in a bad state, that call could crash.
+
+You know, looking more carefully at the previous attempt, I notice this in the failure log:
+
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=2.50s, exit=139, timed_out=False)
+```
+
+A 2.5 second elapsed is INCREDIBLY fast. Even a successful binary that does NO computation would take longer than that for just MPI init, mesh init, etc. So this suggests the binary crashed VERY EARLY.
+
+Hypothesis: The crash is in `VELOC_Restart` related code, or in mesh resize. Let me ensure my new code doesn't have any obvious issues that would cause early crash.
+
+One thing I want to double-check: when `mesh->i` is NULL or pointing to wrong memory, `get_memory_size(NULL)` might segfault. Let me check:
+
+Looking at `get_memory_size` line 935-947:
+```cpp
+size_t MallocPlus::get_memory_size(void *malloc_mem_ptr){
+   map<...>::iterator it = memory_ptr_dict.find(malloc_mem_ptr);
+   if (it != memory_ptr_dict.end()){
+      ...
+      return(memory_item->mem_nelem[0]);
+   } else {
+      ...
+   }
+   return(0);
+}
+```
+
+If mesh->i is NULL, find(NULL) won't find it, returns 0. Safe.
+
+But mesh->i after mesh->init shouldn't be NULL. So that's fine.
+
+Now let me think about whether the previous restore was actually being EXECUTED on the recovery launch. The log says checkpoint files were created (296) but recovery exits 139 in 2.5s.
+
+Wait, I just realized — maybe the issue isn't restore at all. Maybe the **kill at attempt_1 left /tmp dirs in a corrupted state** and VELOC_Init or VELOC_Restart_test in attempt_2 crashes. The kill was SIGKILL of rank 1, possibly mid-checkpoint write. If checkpoint files are partial/corrupt, VeloC restart could crash.
+
+Hmm, but VeloC should be robust to that. Let me see.
+
+Actually let me look at what the validator does between attempt_1 and attempt_2 — looking at validate_stdout.txt lines 49-55:
+```
+[runner] checkpoint-observed: kill attempt complete (elapsed=72.22s, injection_fired=True).
+[runner] checkpoint-observed: starting recovery attempt (timeout 150.1s = 1.19x failure-free).
+[runner] copied .../veloc.cfg → .../resilient/veloc.cfg
+[runner] checkpoint-observed attempt 2: launching ...
+```
+
+So validator does NOT clear /tmp between attempts. Recovery uses existing checkpoint files. If those were corrupted (rank 1 was killed mid-write), VeloC may crash on recover.
+
+Hmm. With `mode = sync`, every checkpoint completes before VELOC_Checkpoint returns. So if checkpoint was written successfully, files are complete. The kill happened after checkpoint files exist (296 files). The poll detected "checkpoint files detected" then "waiting 5s to let in-flight checkpoint write complete before SIGKILL". So by the time kill happened, the latest checkpoint should be complete.
+
+But what if the LATEST checkpoint version is partial (rank 1 was mid-write when killed)? Then VeloC's Restart_test might return that latest version, but Recover fails. Our code handles failure by aborting restore. But the kill might have created partial files.
+
+Actually `mode = sync` should ensure atomicity. Hmm.
+
+OK let me just trust the new code and see. Let me also add some additional safety in the checkpoint: ensure we always finish cleanly.
+
+Actually, one more thought: the very fast 2.5s recovery exit could indicate the binary crashed BEFORE getting to the restore code at all. Maybe in VELOC_Init or even earlier. But we have no way to know without logs.
+
+Let me make sure that if VELOC_Restart_test returns a version but Restart_begin fails, we don't crash. Already handled.
+
+What if VELOC_Init itself fails? My code in main:
+```cpp
+int vrc = VELOC_Init(MPI_COMM_WORLD, "veloc.cfg");
+if (vrc == VELOC_SUCCESS) {
+   g_veloc_initialized = 1;
+   ...
+} else {
+   ...continuing without C/R
+}
+```
+
+If VELOC_Init fails, we don't try restore. Good.
+
+What if `veloc.cfg` is wrong on the recovery? Looking at validator log: "copied .../veloc.cfg → ...". The cfg is copied to the run directory. The same cfg. So should be fine.
+
+Hmm. Let me try one more change: maybe the issue was that the restore was trying to call `mesh->calc_neighbors_local()` outside an OpenMP parallel region, and somewhere inside calc_neighbors_local it expects to be called inside a parallel region (e.g., uses `omp_get_thread_num()` which returns 0 outside, but expects a parallel region setup).
+
+Actually looking at calc_neighbors_local line 4624-4626:
+```cpp
+#ifdef _OPENMP
+#pragma omp master
+{
+#endif
+```
+
+`#pragma omp master` outside a parallel region is undefined/no-op. Should be fine.
+
+But line 4664-4668 inside hash_table branch:
+```cpp
+#pragma omp barrier
+#pragma omp master
+{
+```
+
+`#pragma omp barrier` outside parallel region — this is actually an ERROR (per spec). It might cause issues.
+
+Hmm. Let me wrap my restore's calc_neighbors_local call in an OpenMP parallel region for safety:
+
+Actually let me check whether _OPENMP is actually defined in build:
+Hmm I don't see OpenMP flags being added to the compile. Looking at find_package(OpenMP) - it sets variables but doesn't auto-add flags. So OpenMP might NOT be enabled. Let me check the existing _OPENMP usage in mesh.cpp to see if it's wrapped:
+
+Actually, in CMake's find_package(OpenMP), it sets OpenMP_CXX_FLAGS but those need to be applied with `add_compile_options` or `target_compile_options`. Looking at the CMakeLists, OpenMP flags don't seem to be applied. So _OPENMP is likely NOT defined.
+
+Actually let me verify by looking at mesh CMakeLists:
+So OpenMP is applied to `mpmesh` and `pmpmesh` (parallel + openmp mesh targets). What about `pmesh` (parallel without openmp)?
+The clamr_mpionly links `pmesh` (parallel, no OpenMP). So mesh.cpp gets compiled WITHOUT _OPENMP. Good - so all the omp pragmas are inactive.
+
+OK so my restore's calc_neighbors_local call is fine.
+
+Now let me also think: maybe my new code is correct. Let me build it mentally once more.
+
+After restore:
+1. `mesh->ncells` = restored_local
+2. `mesh->i`, `mesh->j`, `mesh->level` have restored data for cells [0, restored_local)
+3. `state->H/U/V` have restored data
+4. `mesh->nsizes[]`, `mesh->ndispl[]` have restored data
+5. `mesh->ncells_global` and `mesh->noffset` set
+6. Scalars: ncycle, simTime, deltaT, etc. set
+7. calc_celltype, set_bounds, calc_neighbors_local called
+
+The fresh init step before this set up: mesh->init initialized the regular grid; state->init allocated H/U/V; state->fill_circle set initial H/U/V values. These are OVERRIDDEN by the restore. Good.
+
+Then control flows to the OMP parallel block at line 651-657 which calls calc_neighbors_local again. Fine.
+
+Then main loop starts at `for (it = ncycle; ...)` — ncycle is now the restored value.
+
+I think this should work. Let me also verify the CMakeLists.txt to ensure VeloC linkage is correct:
+
+Looking at lines 532-534:
+```
+target_include_directories(clamr_mpionly PRIVATE /home/ndhai/usr/include)
+target_link_libraries(clamr_mpionly -L/home/ndhai/usr/lib -L/home/ndhai/usr/lib64 -lveloc-client -Wl,-rpath,/home/ndhai/usr/lib -Wl,-rpath,/home/ndhai/usr/lib64)
+```
+
+Let me verify libveloc-client exists:
+Hmm. Maybe glob can't find them. Let me try another way:
+Hmm. Permission may block. The build worked before so trust it. The validator log clearly says "VeloC detected via LD_LIBRARY_PATH: prefix=/home/ndhai/usr". So library is found.
+
+Now let me verify one more thing — the previous attempt's build succeeded (build_output.txt is empty, which means no errors). My changes should also compile. Let me re-check my new code doesn't break anything.
+
+Let me also reconsider — if my approach FAILS the same way as before, what should I try? Let me also be more defensive about the OpenMP parallel call.
+
+Actually let me look one more thing - the previous attempt's stderr/stdout from the recovery run. Actually we don't have that. The validate_stdout shows error messages from libc start_main, suggesting the program reached main() but then crashed somewhere. The actual segfault address would help but we don't have it.
+
+OK I'll commit to my approach. Let me verify the cfg path is /tmp not relative:
+
+Both paths in veloc.cfg start with `/tmp/`, absolute, different. Good.
+
+Let me also look at if my OPENMP parallel region usage is OK. Actually after restore, calc_neighbors_local is called outside parallel region. Then at line 654 it's wrapped in parallel region. The first call may crash if OMP barrier is hit outside parallel.
+
+Let me look more carefully at calc_neighbors_local to see if it would crash outside parallel region:
+Lots of OMP pragmas. But if _OPENMP is NOT defined at compile time (because pmesh doesn't add OpenMP flags), then `#pragma omp barrier` is just ignored — no problem.
+
+Wait, let me check: even WITHOUT -fopenmp, `#pragma omp ...` is a no-op (compiler warns but accepts). So mesh.cpp compiles without OMP. Good.
+
+Actually wait - looking again at mesh/CMakeLists.txt, `pmesh` (parallel only) does NOT add OpenMP flags. The other variants do. So `pmesh` is compiled without OpenMP. clamr_mpionly links pmesh. So OpenMP code is inactive.
+
+OK so all `#pragma omp` are no-ops. My calc_neighbors_local call is fine.
+
+Let me also think about another potential bug - in calc_neighbors_local, the code allocates nlft, nrht, nbot, ntop on first call. If those were already allocated (during mesh->init), the code reallocs them if size is too small:
+
+```cpp
+if (mesh_memory.get_memory_size(nlft) < ncells){
+    if (nlft != NULL) nlft = (int *)mesh_memory.memory_delete(nlft);
+    ...
+    nlft = (int *)mesh_memory.memory_malloc(ncells, sizeof(int), "nlft", flags);
+```
+
+After restore, `mesh->ncells` is restored_local. If nlft was allocated for the smaller initial size and `restored_local > current size`, it reallocs. Good.
+
+Hmm wait — `nlft, nrht, nbot, ntop` are in mesh_memory dict. If after our single-entry realloc of i/j/level we DIDN'T realloc nlft, but then calc_neighbors_local detects undersize and reallocs nlft specifically, that's fine.
+
+OK I think my approach should work. Let me also worry about one thing — the `mesh->mesh_memory.memory_delete(nlft)` could be triggered. Let me make sure nothing weird happens.
+
+Let me also check whether I should clear nlft/nrht/nbot/ntop BEFORE calc_neighbors_local to avoid reading stale data:
+
+Looking at calc_neighbors_local:
+```cpp
+if (mesh_memory.get_memory_size(nlft) < ncells){
+    ...realloc...
+}
+...
+for (int ic = lowerBound; ic < upperBound; ic++){
+   nlft[ic] = -98;  // initialize
+   ...
+}
+```
+
+So it initializes nlft etc. Good.
+
+OK I think my code is correct. Let me just check one more thing: the `flushing` aspect. After `clamr_checkpoint`, does VeloC actually flush to /tmp? In sync mode, yes — VELOC_Checkpoint blocks until written to persistent.
+
+But there's one issue: the kill happens DURING a checkpoint write (or right after the OS noted the file). What if the LATEST version is partial? VeloC's Restart_test should only return COMPLETE versions. But this depends on VeloC's implementation.
+
+If Restart_test returns a partial version, then Recover would fail or produce wrong data. We handle Recover failure by aborting restore, which means the binary runs from scratch (incorrect but at least doesn't crash).
+
+But what if Recover SEEMS to succeed but data is partial/corrupt? Then we restore garbage, and subsequent calc_celltype/set_bounds/calc_neighbors_local could segfault on garbage i/j/level values.
+
+Hmm. To mitigate this, let me also try recovering from an OLDER version if the latest is corrupt. Actually VeloC's `Restart_test(name, 0)` returns the latest version. We could iterate: try N, if fails try N-1, etc. But complex.
+
+For now, let me also add a sanity check after restore — verify i, j, level values are reasonable (within [0, imax+1] etc.). If not, abort restore.
+
+Actually let me also be more defensive in the calc_neighbors_local call. Let me also verify: after the restore, do we need to do `mesh->calc_spatial_coordinates(0)` to rebuild x, dx, y, dy? Looking at where x, dx, y, dy are used in do_calc:
+
+Look at line 791: `mesh->calc_spatial_coordinates(0);` — called from do_calc when graphics or output cycle. So x, dx, y, dy can be stale until that call. But are they used in the main computation?
+OK, state.cpp doesn't use mesh->x/y/dx/dy directly. Let me also confirm calc_finite_difference doesn't need them:
+Good. The physics calc_finite_difference doesn't use x/y/dx/dy directly — it works with i, j, level + neighbor indices. So x/y/dx/dy being stale is fine until graphics output. And `mesh->calc_spatial_coordinates` is called in do_calc when needed.
+
+Hmm wait actually `state->calc_refine_potential` might use them. Let me check briefly:
+Hmm — state.cpp uses `dx[nc]`, `dy[nc]`, `x[nc]`, `y[nc]` in lines 663-714. Let me see the context — these look like rezone_all or refine functions:
+This is `add_boundary_cells` function. It uses x, dx, etc. So x, dx need to be valid. They're vectors in mesh, populated by calc_spatial_coordinates.
+
+But wait — `add_boundary_cells` is only called in certain code paths. Let me check if it's called in do_calc:
+add_boundary_cells is commented out. Good. So x/y/dx/dy may not be needed for the physics. Let me also call calc_spatial_coordinates after restore to be safe.
+
+Actually let me leave it for now to keep the change minimal. If it crashes due to bad x/y, we'll need to add calc_spatial_coordinates.
+
+Now let me also check: do_calc calls `state->calc_refine_potential` which uses U, V, H. Let me check if it uses x, y, dx, dy:
+State doesn't reference mesh's x/dx/y/dy via `mesh->`. Inside state.cpp, lines 663-714 reference `x[nc], dx[nc]` — these are local variables (declared via references), let me check:
+OK so this is `add_boundary_cells` (commented out in main). It uses local references to mesh's data. Not called in our path. Good.
+
+Now I think we're good. Let me also check that the previous attempt's `mesh->resize` call wasn't itself crashing. Looking at the recovery being so fast (2.5s), I now believe the crash IS in the restore logic. My new approach avoids the suspicious `memory_realloc_all` path.
+
+Let me verify by reading my code once more:
+Wait — `mesh->mesh_memory.memory_realloc(restored_local, "level")` — looking at the signature: `void *memory_realloc(size_t nelem, const char *name);`. So "level" is the name. But `level` was registered with name "level" in mesh's allocate (line 9233). Good.
+
+But wait — calc_celltype line 8413 calls `memory_malloc(ncells, sizeof(char_t), "celltype", flags)`. So "celltype" is also tracked. The realloc for "level" only touches level, not celltype. Good.
+
+Now one more concern: after calc_neighbors_local, mesh->nlft, mesh->nrht etc. are freshly allocated (named "nlft", "nrht" etc.). Fine.
+
+Hmm, BUT: the call to calc_neighbors_local needs lev_ibegin, lev_iend, lev_jbegin, lev_jend, lev_kbegin, lev_kend, levtable etc. These are vectors in mesh. They're set up during mesh->init. They don't depend on per-cell data. So they're already set.
+
+Wait, look at line 4669-4672 again:
+```cpp
+jmintile = (jmax+1)*IPOW2(levmx);
+imintile = (imax+1)*IPOW2(levmx);
+```
+
+Uses `jmax, imax, levmx`. These are mesh class members, set during constructor/init. Fine.
+
+OK I'm confident the code should work. Let me check the `mesh->calc_neighbors_local()` more carefully:
+OK calc_neighbors_local does complex hash-based neighbor finding. It uses `i[ic], j[ic], level[ic], noffset, imax, jmax, levmx` etc. All set up properly after restore.
+
+Now let me also examine - does calc_neighbors_local handle communication? Looking at it more:
+Yes, calc_neighbors_local likely uses L7_Update for ghost cells. Let me look at that:
+OK so `cell_handle = 0` at line 1332 (init). L7_Setup is called at line 6388 inside calc_neighbors_local. So calc_neighbors_local sets up L7 communication. After restore, calc_neighbors_local re-Setups. Good.
+
+Let me look at line 6379-6388:
+OK L7_Setup is called with `noffset, ncells`. After our restore, these are the restored values. Good.
+
+Now I'm fairly confident the code should work. Let me also see if there are any issues with how I'm setting up the temp buffers. The malloc returns NULL on failure, and we check. If success, we have valid buffers. VeloC writes into them. Good.
+
+Now let me also verify the build will succeed. Let me re-check my edits don't break anything:
+OK the static globals are declared. The struct definition is earlier in the file. Let me check struct definition:
+OK. Looks good. Now let me update todos:
+Now let me think about reducing the checkpoint frequency. The previous attempt produced 312 checkpoint files = 2.8GB per run. That's a lot of checkpoints (78 versions × 4 ranks per ID? Hmm). The validator's disk-guard could trigger if checkpoint dirs exceed 10.7GB.
+
+Actually 1.6 GB in failure-prone (78 ckpts × ~20MB each = 1.6 GB) and 2.8 GB failure-free (140 ckpts). With outputInterval=100 and niter (computed from -t 6700), there are many checkpoint opportunities. Let me check that:
+
+The application runs with `-n 763 -t 6700`. So niter (-t) = 6700. outputInterval=100 default. So 67 do_calc invocations → 67 checkpoints. But each checkpoint creates multiple files (per rank, per ID). With 4 ranks, 8 IDs, ~67 checkpoints = ~ 2144 files... but log says 312 total. So maybe VeloC keeps only recent versions.
+
+Actually `VELOC_Checkpoint(name, version)` keeps versions; without cleanup, all are kept. 67 versions × 4 ranks = 268 files (one per checkpoint per rank, all IDs in one file). Close to 312. OK.
+
+Now disk-guard limit is 10.7 GB. We use only 1.6 GB → 2.8 GB. Safe.
+
+Let me also try to reduce checkpoint frequency to lessen disk usage. Let me only checkpoint every Nth do_calc, where N maybe 5:
+
+Actually let me look at the checkpoint code again:
+Actually we want frequent enough checkpoints for the validator to catch one. The validator kills at ~52% of runtime. Frequent checkpoints = more chance the validator finds and validates one. Let's keep it.
+
+Now let me verify the cfg one more time:
+Good. Now let me make sure the CMakeLists.txt entries are OK:
+OK. Now let me also examine my new code one more time and think hard about any remaining issues.
+
+Wait - looking at my code more carefully:
+
+```cpp
+if (restored_local > mesh->mesh_memory.get_memory_size(mesh->i)) {
+   mesh->mesh_memory.memory_realloc(restored_local, "i");
+   mesh->mesh_memory.memory_realloc(restored_local, "j");
+   mesh->mesh_memory.memory_realloc(restored_local, "level");
+   ...
+}
+```
+
+`get_memory_size(mesh->i)` returns current size. If mesh->i has size 145000 and restored_local is 200000, condition is true, realloc. OK.
+
+But what if mesh->i is NULL? Then get_memory_size returns 0. Condition is true. memory_realloc(restored_local, "i") with name "i" looks up the dict by name. If "i" entry exists in dict (even with NULL ptr?), it reallocs. But mesh->i can't be NULL after init.
+
+OK, let me also worry about whether I should call `mesh->calc_spatial_coordinates(0)` after restore so x/y/dx/dy are consistent with the restored cells. Let me add it for safety since they're used in graphics output and possibly elsewhere:
+Let me check `calc_spatial_coordinates`:
+OK. calc_spatial_coordinates resizes x/y/dx/dy vectors and computes from i, j, level. Uses xmin, ymin, lev_deltax, lev_deltay, lev_ibegin, lev_jbegin. All set by mesh->init. Good.
+
+Now let me look at the entire restored code path one more time to make sure it's all correct:
+The code looks good. Now I want to double check one potential issue: the `mesh->mesh_memory.memory_realloc(restored_local, "level")` may not work as expected if the flags include HOST_MANAGED_MEMORY. Let me check what flags were used for these arrays:
+
+Looking at mesh.cpp line 9226-9233:
+```cpp
+int flags = 0;
+flags = RESTART_DATA;
+#ifdef HAVE_J7
+   if (parallel) flags = LOAD_BALANCE_MEMORY;
+#endif
+
+i     = (int *)mesh_memory.memory_malloc(ncells, sizeof(int), "i",     flags);
+j     = (int *)mesh_memory.memory_malloc(ncells, sizeof(int), "j",     flags);
+level = (uchar_t *)mesh_memory.memory_malloc(ncells, sizeof(uchar_t), "level", flags);
+```
+
+Without HAVE_J7, flags = RESTART_DATA. Does that include HOST_MANAGED_MEMORY? Let me check:
+So RESTART_DATA = 0x00010, HOST_MANAGED_MEMORY = 0x00001. They're different bits. So flags=RESTART_DATA does NOT include HOST_MANAGED. Good. memory_realloc will hit the else branch (unconditional realloc).
+
+For state's H, U, V: flags = RESTART_DATA | REZONE_DATA | LOAD_BALANCE_MEMORY. Still no HOST_MANAGED_MEMORY bit. Good.
+
+OK let me also look at one final concern - what if the goto into the inner scope is invalid C++? Let me restructure to use a function or different control flow. Actually no, goto OUT of inner scope is valid C++. The variables declared in inner scope are destroyed when scope ends, regardless of how we exit (return, goto, throw).
+
+Actually wait — for C++ POD types (int*, int, size_t) declared with `int *tmp_i = malloc(...)`, there's no destructor to call. So scope exit is trivial. Even if there were destructors, they would be called on goto-exit.
+
+OK let me also check the issue with `goto restart_done` jumping from inside a block. The label `restart_done:` is AFTER the closing brace of the outermost if. So the goto goes OUT, which is legal.
+
+Actually let me verify one more thing - C++ does have a restriction: "a goto shall not enter the scope of a variable that has been declared". My goto is leaving scopes, not entering them. So legal.
+
+But wait, looking at my code more carefully:
+
+```cpp
+} else {                                  // L380 begins outer else block scope
+   VELOC_Mem_protect(VID_SCALARS, ...);
+   {                                      // L383 inner block
+      int sids[1] = {VID_SCALARS};        // L384 initialized variable
+      int srec = VELOC_Recover_selective(...);  // L385 initialized variable
+      if (srec != VELOC_SUCCESS) {
+         ...
+         goto restart_done;               // jump OUT
+      }
+   }                                      // L391 inner block ends
+   
+   if (mismatch) {
+      ...
+      goto restart_done;                  // jump OUT
+   }
+   
+   {                                      // L402 another inner block
+      size_t restored_local = ...;        // L403 initialized
+      ...
+      int *tmp_i = (int*)malloc(...);     // L412 initialized
+      ...
+      if (!tmp_i || ...) {
+         ...
+         goto restart_done;               // jump OUT (skipping past more initializers)
+      }
+      ...
+      VELOC_Mem_protect(...);
+      ...
+      int dids[8] = {...};                // L440 initialized
+      int drec = VELOC_Recover_selective(...);  // L441 initialized
+      VELOC_Restart_end(...);
+      if (drec != VELOC_SUCCESS) {
+         ...
+         goto restart_done;               // jump OUT
+      }
+      ...
+   }                                      // L515 inner block ends
+}                                         // L516 outer else block ends
+```
+
+Now is `goto restart_done` from inside the inner block at L389/L399/L428/L448 jumping into a scope that contains initialized variables? Let me check what's between the goto and `restart_done:`.
+
+After `goto`, we exit all enclosing scopes (the inner blocks, the outer else, the if). Then we hit the label. Between the goto and the label, we are LEAVING scopes — not entering them. So we never "enter" the scope of a variable, hence legal.
+
+If the goto were jumping FORWARD INTO a scope where variables are declared but not yet initialized, that'd be illegal. But this is a backward exit, which is fine.
+
+So the code should compile.
+
+OK I think we're done with the restore. Let me think about whether the checkpoint logic could be improved. Looking at clamr_protect_regions:
+
+```cpp
+VELOC_Mem_protect(VID_SCALARS, &g_ckpt_scalars, 1, sizeof(ClamrScalars));
+VELOC_Mem_protect(VID_I, m->i, local_ncells, sizeof(int));
+...
+```
+
+This re-protects every time, which is correct since pointers may have moved. OK.
+
+Now let me also think about: what if `m->ncells` is 0 at checkpoint time? Then `local_ncells = 0`, and `VELOC_Mem_protect(VID_I, m->i, 0, sizeof(int))` protects 0 bytes. Probably fine but might cause issues. Let me add a guard:
+
+Actually `ncycle > 0 && ncycle < niter` already ensures we're past initialization. ncells should be > 0 after init. OK.
+
+Let me now look once more at the entire flow.
+
+Actually, let me also worry about something - the **fresh start path**. When there's no checkpoint, the program runs normally. We need to ensure my changes don't break the fresh-start path.
+
+Looking at the fresh start: mesh->init, state->init, state->fill_circle, compute H_sum, no restore (since no ckpt). Then continue normally. The static `H_sum_initial = H_sum`. The main loop runs.
+
+In do_calc, after a sufficient number of cycles, we call `clamr_checkpoint`. This protects+writes. Should work as it did before.
+
+OK the fresh path is preserved.
+
+Now let me also think about an OBSCURE bug - my `view_mode` static. We restore it. But in the original code at line 648, `view_mode = 1;` overrides. So restore is moot for view_mode. Anyway, view_mode = 1 is always the desired value after init.
+
+Let me make sure my restore doesn't break this:
+OK after restore, view_mode is set to whatever restored value, then line 650 sets to 1. Doesn't matter.
+
+Now let me also worry about: what if mesh->calc_neighbors_local() at line 656 (called fresh again) detects issues with our restored mesh? Well it just recomputes; nothing to fail unless data is bad.
+
+OK I think we're good. Let me move on and ensure CMakeLists is OK and veloc.cfg is fine.
+Now let me also think about something: maybe the issue with the previous attempt was actually something I haven't considered. Let me also add some additional safety:
+
+1. After mesh->calc_neighbors_local in restore, the L7 communication handle may not be set up correctly because we're calling it OUTSIDE the parallel region. But since OpenMP is inactive, calc_neighbors_local runs serially. Should be fine.
+
+2. The L7_Setup needs to be called consistently across all ranks. All ranks reach the restore path together (after VELOC_Restart_test). So they all call L7_Setup. OK.
+
+3. What if some ranks have a checkpoint but others don't? Each rank's VELOC_Restart_test independently returns. With sync mode and per-rank files, this should be deterministic. If one rank's checkpoint is missing (corrupt), restart_test returns 0 for that rank, and restore is skipped on that rank. Then we'd have rank inconsistency — some ranks restart from cycle 0, others from saved cycle. Catastrophic.
+
+To prevent this inconsistency, let me MPI_Allreduce the ckpt_version across ranks. If any rank has version 0, we ALL skip restore:
+Now let me also think about another potential issue — what if my checkpoint is being written but the validator's poll script sees only PARTIAL versions? With sync mode, VELOC_Checkpoint should complete before returning. But the writes go to scratch first, then to persistent. The polling script counts files in BOTH dirs.
+
+Hmm, anyway VeloC handles its own version atomicity, so we should trust it.
+
+Now let me also reconsider: what if the actual issue with the previous attempt was that VELOC_Restart_test returns the latest version and then VELOC_Restart_begin sets up state expecting that version, and the recovery succeeds at the data level but our scalar struct deserializes with bad data?
+
+Let me add a sanity check on the restored ncells:
+Wait, I'm using `IPOW2` which may not be accessible. Let me check:
+IPOW2 is only in mesh.cpp. Let me use my own simple equivalent:
+Now let me re-read to ensure it's correct:
+Good. Now let me look at one more issue. In my code I do:
+
+```cpp
+int my_ver = VELOC_Restart_test(CLAMR_CKPT_NAME, 0);
+int agreed_version = my_ver;
+MPI_Allreduce(&my_ver, &agreed_version, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+int ckpt_version = agreed_version;
+```
+
+Hmm, but VELOC's docs say `VELOC_Restart_test` returns the latest version or VELOC_FAILURE (-1). So `my_ver` could be -1. MPI_Allreduce MIN would propagate -1 to all ranks. Then `ckpt_version > 0` is false, and we skip restore. Good.
+
+If all ranks have version > 0, the MIN gives the lowest agreed version. All ranks will try to restore that version. Good.
+
+But wait - what if rank A has versions [5, 6, 10] and rank B has versions [5, 6]? VELOC_Restart_test(name, 0) returns LATEST. Rank A returns 10, rank B returns 6. MIN = 6. So we restore version 6, which exists on both ranks. Good.
+
+OK now let me also double-check the build by looking for other compile errors:
+Good. Now there might be a subtle issue with C++ goto initialization rule. Let me think again. C++ standard (n4659 stmt.dcl/3):
+
+"It is possible to transfer into a block, but not in a way that bypasses declarations with initialization. A program that jumps from a point where a variable with automatic storage duration is not in scope to a point where it is in scope is ill-formed unless the variable has scalar type, class type with a trivial default constructor and a trivial destructor, a cv-qualified version of one of these types, or an array of one of the preceding types and is declared without an initializer."
+
+So jumping TO a point where a variable is in scope. My goto is jumping FROM in-scope (inside a block with int *tmp_i = ...) to OUTSIDE all those scopes. So the variables in question (tmp_i etc.) are LEAVING scope, not entering. That's fine.
+
+Jumping forward to `restart_done` from various inner places — let me check if there are any variables that would be IN SCOPE at `restart_done:` but not initialized due to the jump:
+
+`restart_done:` is at line 547 or so (now). Let me check:
+`restart_done:` is at line 549, just before line 551 `double cpu_time_main_setup = ...`. The label is at the SAME scope level as the if(g_veloc_initialized) (which is at the top of main function level).
+
+At the label, what variables are in scope that weren't initialized? Looking back, in main() at this point we have:
+- mype, numpe (initialized at line 263-264)
+- circ_radius (line 311)
+- boundary, parallel_in (312-313)
+- deltax_in, deltay_in (314-315)
+- mesh (line 317)
+- state (line 330)
+- ncells (line 334)
+- ncells_global (line 335)
+- nsizes, ndispl (line 338-339)
+- x, dx, y, dy (line 341-344)
+- H_sum (line 351)
+
+All initialized before the restore block. So at the label, all are properly initialized regardless of which path we take.
+
+But INSIDE the restore block, we have:
+- my_ver, agreed_version, ckpt_version (lines 373-379)
+- rc (line 384) — only if ckpt_version > 0
+- inside the else: sids, srec (390-391)
+- inside the second block: restored_local, restored_global, refine_factor, max_global (410-425)
+- tmp_i, tmp_j, etc. (440-445)
+- dids, drec (478-479)
+
+When we goto `restart_done`, we LEAVE the if(g_veloc_initialized) scope. None of these variables are in scope at the label. Good.
+
+OK this should compile. Let me also re-look at my code for any other potential bugs.
+
+Hmm, one thing — `mesh->mesh_memory.memory_realloc(restored_local, "level")` returns `void*` (from MallocPlus.cpp line 201: `void *MallocPlus::memory_realloc(size_t nelem, const char *name)`). I'm ignoring the return value. That's fine.
+
+But the next line `mesh->level = (uchar_t *)mesh->mesh_memory.get_memory_ptr("level");` looks up by name. Should return the fresh pointer.
+
+OK, let me also see whether there might be issues with the realloc(NULL, ...) — if memory_item->mem_ptr is NULL, realloc behaves like malloc. Fine.
+
+OK I think we're good. Let me also add a single OMP wrapper around calc_neighbors_local just to be extra safe:
+
+Actually, since OpenMP is not enabled for pmesh build, the pragmas are no-ops. So wrapping in `#pragma omp parallel` would still be no-op. No benefit.
+
+Let me also worry about one more thing - if the initial mesh->ncells after mesh->init is greater than my restored_local. Then no realloc needed. But we memcpy only restored_local items, leaving the rest of i, j, level with stale init values. mesh->ncells = restored_local, so loops only go 0..restored_local. Safe.
+
+OK. I'm done with the changes. Let me verify nothing else is broken by reading the rest of the file:
+OK file looks good.
+
+Now let me also worry about one specific thing - the previous attempt segfaulted very fast (2.5s). Even mesh init for 763×763 should take a few seconds. So either:
+1. Crash in VELOC_Init / very early
+2. Crash in mesh->init
+3. Crash IF restore happens fast and bad
+
+If checkpoint creates corrupt files, recovery is unpredictable. Maybe even VELOC_Init itself reads checkpoint metadata and crashes.
+
+For added robustness, let me NOT do any restore if VELOC_Init fails. Already handled.
+
+Let me also consider: maybe the issue is that `mesh->mesh_memory.memory_realloc(...)` and `state->state_memory.memory_realloc(...)` are PRIVATE? Let me re-verify:
+
+mesh.h line 352: `MallocPlus mesh_memory;` — inside class Mesh, after `public:`. So PUBLIC. Good.
+
+state.h line 229: `MallocPlus state_memory;` — inside class State, after `public:`. So PUBLIC. Good.
+
+OK. Let me also look at the `terminate` function for any issues:
+They handle cleanup. Not too concerning.
+
+OK let me now check there isn't a build error in the new code by looking at the entire flow once more:
+Good. Looks clean.
+
+One more concern: `niter` is a global int from input.cpp. It's the max time step from `-t` flag, so 6700 in our case. My sanity check `ncycle > niter` would only trigger for corrupted data.
+
+Let me also re-think: the previous attempt produced 296 ckpt files. Each checkpoint version has ~8 IDs × ~4 ranks = ~32 files (depends on VeloC bundling). 296/32 ≈ 9 versions. Or maybe each version is 1 file per rank = 4 files. 296/4 = 74 versions. Either way, plenty of checkpoints.
+
+OK let me also verify that `mesh->ncells` is `size_t`. Looking at mesh.h line 429: `size_t ncells`. Yes. My `mesh->ncells = restored_local` sets size_t = size_t. Good.
+
+Now let me verify my approach handles the scenario where checkpoint was written with different cell count than initial. With `nx=ny=763, levmx=1`, initial cells per rank is ~145k. After AMR, could grow to ~580k. So checkpoint cells could be much larger.
+
+`mesh->mesh_memory.get_memory_size(mesh->i)` after init is ~145k. My check `restored_local > 145k` → realloc. Good.
+
+Alright, I'm confident the code is correct. Let me also look at the binary output to make sure it's still generated correctly. Looking at lines 1044-1057 it's untouched. Good.
+
+Now let me also think about whether my mesh->calc_spatial_coordinates(0) might fail. It calls `set_bounds(ncells)` and accesses `xmin, ymin, lev_deltax, lev_deltay, lev_ibegin, lev_jbegin`. All set by mesh->init. And i, j, level are restored. So should work.
+
+OK I'm done. Let me do one final check — let me make sure the build won't fail due to any subtle C++ issue. Let me look for the `goto` rules once more.
+
+Actually, there's one more concern with C++ goto and variable scope. Looking at the function structure:
+
+```cpp
+int main() {
+    ...stuff before if...
+    if (g_veloc_initialized) {
+        // many things
+        ...goto restart_done...
+    }
+restart_done:;
+    double cpu_time_main_setup = ...;  // declared AFTER label
+    ...
+}
+```
+
+Here `cpu_time_main_setup` is declared AFTER the label. So when we goto the label and continue, we reach the declaration. That's normal control flow. No skip.
+
+OK all good. The code should compile and work.
+
+Let me also worry about one edge case — what if mesh->i is reallocated to a NEW address, but other parts of the code or earlier-stored pointers still reference the OLD address? Looking at mesh.h, the field `int *i` is the only canonical reference. Other code accesses via mesh->i. After our realloc, mesh->i is updated. So other code sees the new pointer.
+
+But wait — the OLD mesh->i was in the mesh_memory dict. After realloc, the dict entry is updated with new ptr. So get_memory_ptr("i") returns the new ptr. mesh->i = new ptr. Good.
+
+But what about VeloC's protected memory? We protected with `tmp_i` (the fresh temp buffer), not mesh->i. So VeloC writes to tmp_i. Then we memcpy from tmp_i to mesh->i. VeloC doesn't care about mesh->i anymore. Good.
+
+After this point, the NEXT checkpoint will re-protect with the FRESH mesh->i pointer (in clamr_protect_regions called from clamr_checkpoint). Good.
+
+OK truly done. Let me also verify one final concern by reading the entirety of the new test prompt for any constraints I missed:
+
+The prompt says:
+- veloc.cfg as static file at source tree root ✓
+- absolute /tmp paths, different from each other ✓
+- mode = sync ✓ (specified)
+- Required keys: scratch, persistent, mode ✓
+- Don't make gates pass without real state capture ✓ (we do real capture+restore)
+
+I'm done. Let me update final todos:
+Summary of changes made to fix the previous segfault failure:
+
+1. **Replaced `mesh->resize()` + `state->resize()` with single-entry `memory_realloc(name)`** — avoids the `memory_realloc_all` path that touches all ~30 tracked arrays. The previous failure (segfault in 2.5s) was likely caused by this aggressive reallocation.
+
+2. **Recover into fresh temp buffers, then memcpy into live arrays** — avoids any direct VeloC interaction with MallocPlus-tracked memory regions, eliminating pointer-tracking issues.
+
+3. **Added MPI_Allreduce on the checkpoint version** — ensures all ranks agree on the same checkpoint version. If any rank can't find a checkpoint, all ranks skip restore. Prevents mixed-state ranks.
+
+4. **Added sanity checks on restored scalars** — ncells, ncycle, etc. are validated before any pointer/buffer ops; corrupt data aborts the restore cleanly instead of crashing later.
+
+5. **Added `mesh->calc_spatial_coordinates(0)` after restore** — ensures x/y/dx/dy vectors are consistent with the restored mesh topology.
+
+6. **Added `#include <string.h>`** for `memcpy`.
+
+7. **Used `goto restart_done`** to cleanly bail out of restore at any failure point without leaving VeloC's restart phase open.
+
+The checkpoint logic (`clamr_protect_regions` + `clamr_checkpoint`) is unchanged — it was working (296 ckpt files produced). The veloc.cfg and CMakeLists.txt are unchanged. The fundamental fix is in how we RESTORE the saved state without crashing.

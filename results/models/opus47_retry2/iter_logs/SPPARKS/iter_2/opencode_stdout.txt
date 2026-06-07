@@ -1,0 +1,227 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The previous attempt produced too many checkpoint files (6024) and the recovery output didn't match (max_rel_diff=2.9%). This indicates state wasn't properly captured/restored. Let me look at the current codebase state.
+Good, veloc.cfg is in place. Now let me look at the inspection results and existing checkpoint code:
+Existing VeloC code present. Let me look at app_lattice.cpp:
+Now I understand the structure. The previous attempt had a few critical issues:
+
+1. **Recovery produced wrong output (max_rel_diff=2.9%)** - state restoration is incomplete. It restores `iarray`, `darray`, `time`, `naccept`, `nattempt`, `nsweeps` BUT misses important pieces like RNG state (`ranapp`, `ranstrict`, `siteseeds`), propensities (need to be recomputed), per-set state, etc.
+
+2. **6024 checkpoint files** is way too many - CKPT_STRIDE=50 emits a checkpoint every 50 sweeps. This is too frequent. With 4 ranks and ~1500 versions, we get 6024 files (each rank emits a file per version).
+
+3. The recovery happens at the start of `iterate()` but `iarray`/`darray` may have been re-initialized by app setup between runs.
+
+Let me check the example input file and app_ising:
+Note the perturbation: validator changes the `seed` value. Now let me check main.cpp to see how validation_output.bin is produced:
+Now let me understand the issue thoroughly. Looking at the spatial moments output, the output is sensitive to the spatial layout of spin values in `iarray[0]`. The restoration restored `iarray[0]` from VeloC but the output doesn't match exactly.
+
+Let me look at app_lattice.h and what AppLattice setup involves. The issue likely is one of these:
+1. After restart, the iarray data was restored, but the **simulation continues** from there — but `time` is restored too, so it continues forward. But the model uses RNG (`ranapp`), which after restart has fresh state, NOT the original state at checkpoint time.
+2. The validator perturbed `temperature` from `1.0` to `514941626` — wait, looking at the perturbation - actually it perturbs the seed (range 1, 999999999). Let me re-check.
+
+Looking again at the perturbation in the log: `seed=903049630 value=514941626`. The validator changes the `seed` value in the input file to 514941626. The "perturbed baseline" runs vanilla code with this new seed. The "resilient" run also uses this seed but suffers a kill. After recovery, the output should match.
+
+So the resilient run's output mismatched the perturbed baseline by 2.9%. The lattice was MOSTLY restored but the simulation diverged due to non-deterministic RNG behavior after restart.
+
+Let me look more carefully. The key issue is the **RNG state isn't checkpointed**. After restart, `ranapp` continues with its own state (which was loaded fresh from the seed), but the simulation has already taken many steps before the crash. So when it restarts and continues from `time`, the RNG is in the "fresh" state, not the state it was in at checkpoint time. This means the choice of next events differs.
+
+But more importantly: we MUST NOT continue the simulation from the restart point with wrong RNG state — instead, we need to either:
+1. Checkpoint the RNG state too, OR
+2. Restart the simulation from beginning, but **that defeats the purpose** since validator gives credit for actual recovery.
+
+Let me check the RNG class to see what state we need to checkpoint:
+RandomPark state is just `int seed`. Good — easy to checkpoint.
+Good — just `int seed` to checkpoint. Now let me look at app_lattice.h to understand member layout:
+Now I have a comprehensive understanding. The key state to checkpoint:
+- `iarray[k]` (per-site int state) — done
+- `darray[k]` (per-site double state) — done
+- scalar state (time, naccept, nattempt, nsweeps) — done
+- **`ranapp->seed`** (RNG state) — MISSING
+- **`ranstrict->seed`** if exists — MISSING
+- **`siteseeds[]`** if exists — MISSING
+
+Now the BIG problem: even with restoring all that, the perturbed baseline reflects the simulation with NO interruption, perfect determinism. After a crash and restart, the RNG state has been used differently in setup/init paths, etc. We need the restored seed to be EXACTLY the same as at the moment of checkpoint AND no other RNG calls should happen between restart and continued iteration.
+
+But there's actually a more subtle issue: the `Set` structure (containing `propensity`, `solve` etc.) is also state that needs to be consistent. After restart, the simulation re-runs setup, which initializes `propensity[]` based on `iarray`/`darray`. After restoring `iarray`/`darray` from checkpoint, `propensity[]` should ALREADY be correctly set up by setup() since it's computed from iarray. ✓
+
+For `sectorflag=yes` and `sweep random`: the random sweep uses `ranapp->irandom()`. So we need `ranapp->seed`.
+
+Let me also check how `ranapp` is created:
+Important: the simulation is restarted by re-running the *entire program* (input file is replayed from scratch). So `init()` and `setup()` and `create_sites` all run from scratch, creating fresh `ranapp` with the SAME deterministic seed from the input file `seed 56789` (perturbed value 514941626). The Solve also creates its own RNG with `ranmaster->uniform()` which is also deterministic.
+
+So at the moment `iterate()` is called the second time:
+- `ranapp->seed` is in the "fresh" state (just after init from `ranmaster`)
+- `iarray[0]` is in the "fresh" state (e.g. all sites set to range 1 2)
+
+After we call `VELOC_Restart`:
+- `iarray[0]` is overwritten with the checkpointed values ✓
+- but `ranapp->seed` is NOT restored — we keep the fresh-init value ✗
+- Solve's internal random state: NOT restored ✗
+
+So when iteration resumes:
+- The KMC sweeps use `ranapp` starting from fresh-init state
+- But the lattice is at a partially-evolved state
+- Result: same lattice + different RNG = different trajectory from baseline
+
+We need to checkpoint and restore `ranapp->seed` (and any other RNG state).
+
+Let me look at what solve uses (since `sectorflag=yes` and the input file uses `solve_linear` by default? Actually no, the input file doesn't have `solve`, so it's a rejection-KMC sweep with random selection):
+
+The input file has `sweep random` and `sector yes` → `iterate_rejection` is called (since there's no `solve`). It uses `ranapp` to choose sites and call `site_event_rejection`.
+
+So we need to restore `ranapp->seed`. Let me also check `app_ising.cpp` for `site_event_rejection`:
+Good. The `random` argument is `ranapp`. So if ranapp's seed is restored, the sequence is correct.
+
+Now the second issue — **6024 checkpoint files is too many.** With 4 ranks and a stride that yields ~1500 checkpoints, we get 6000 files. The validator captures the latest 6024 (or really keeps all). Let me focus on reducing this. We need fewer checkpoints — let's reduce frequency to maybe 10s of total checkpoints.
+
+Actually wait — looking at the file count again: 6024 / 4 ranks = 1506 versions per rank. With `CKPT_STRIDE = 50` and `rkmc` iterating once per sweep, we'd need 75300 sweeps. With time advance of `dt_rkmc` per sweep, and runtime of 100s simulating 18800 time, that means dt_rkmc is small, and the periodic checkpoint happens *very* frequently.
+
+Wait — looking more carefully at the validator log: `checkpoint files = 6024` total across both dirs. The validator did not say this is a problem — it said "PASS" on wall-time. The problem is the actual content correctness.
+
+So the actual blocker is just: **state restoration is incomplete** → output mismatch. Let me focus there.
+
+The actual core fix: restore RNG state. Let me also think about other issues:
+
+1. There's a `set[iset].solve` and global `solve`, with their own RNG state. But for `iterate_rejection`, no solve is used — only `ranapp`.
+
+2. `set[iset]` info: `nlocal`, `site2i`, `nselect`, `nloop` — these are computed in setup from the lattice topology, which is the SAME between runs (no perturbation of the lattice). So sets are fine.
+
+3. `nextoutput` — controls when stats/output happens. After restart, we re-call `output->setup(time, 0)` to refresh based on restored time. This was done.
+
+4. **One subtle issue**: there's `if (sectorflag) comm->sector(iset)` — this exchanges ghost site info with neighboring procs. The lattice owned by each rank is restored from VeloC. But ghost sites need to be re-synced. The first call to `iterate_rejection` will call `comm->sector(iset)` at the top of the loop, which should sync ghosts. ✓
+
+5. `nattempt` and `nsweeps` are restored. ✓
+
+So I think the main fix needed is **RNG state restoration**. Let me also re-check the schema understanding:
+
+Output schema: spatial moments computed from `iarray[0]` on each rank, summed via MPI_Reduce. If lattice state is bit-perfect identical to the baseline, the output matches exactly. The mismatch of 2.9% means lattice state diverged ~3%.
+
+Let me plan the fix:
+Let me look at the rest of iterate_rejection and how the loop calls happen:
+Good. Now let me look at output->compute behavior to see if we need to fix it.
+
+Actually wait — the **`output->compute()`** function — when called after restart with `time` advanced to checkpoint time, will it skip the missed output milestones or replay them all?
+
+Let me check:
+Now I understand. When we restart and call `output->setup(time, 0)`, output is initialized for the restored time. That's fine.
+
+Now the critical question: does `output->setup()` consume any RNG state? Looking at it — no, it doesn't call random. Good.
+
+But wait — does `diag_energy` use RNG? Let me check:
+Good. Now the plan:
+
+1. Add `ranapp->seed` (and `ranstrict->seed`, `siteseeds[]` if applicable) to checkpoint header
+2. After restart, restore RNG state
+3. Reduce checkpoint frequency to maybe 1-2 checkpoints per simulation (or use a different strategy: only checkpoint based on TIME not iteration count)
+
+Actually, wait. With CKPT_STRIDE=50 producing 1500 versions per rank, **VeloC may overwrite older versions in scratch**, but I notice ~1500 versions = lots of disk overhead. Let me check VeloC behavior — versions are typically retained. With 6024 files * 250KB ~= 1.5GB which matches the log.
+
+We need to checkpoint much less frequently. Let me make it time-based or with a much larger stride.
+
+Let me also check what other state may need to be preserved — specifically the `propensity[]` arrays in `set[iset]`:
+
+Looking at `iterate_rejection`: it doesn't use propensities (those are for KMC).
+
+For the input `sweep random; sector yes`: each loop iteration does `comm->sector(iset)`, `(this->*sweep)(set[iset].nlocal,set[iset].site2i)` for nselect times, then `comm->reverse_sector(iset)`. Only `ranapp` is used for the random selection in `RANDOM` sweep case (line 803). The site_event_rejection uses ranapp too.
+
+So restoring just `ranapp->seed` should be sufficient if the rest of the state is correctly recreated by `init()`/`setup()` and the lattice was restored.
+
+Now let me make the changes:
+Now update the iterate() function:
+Now update the periodic_checkpoint and final-checkpoint sections to also write the RNG state. The header is updated in iterate() before VELOC_Mem_protect, but during the simulation the RNG state changes. The header passed to VELOC_Mem_protect is `&hdr` (a static struct that contains a *snapshot*). We need to UPDATE that snapshot before each checkpoint call.
+
+Looking at `spk_periodic_checkpoint`: it uses `hdr2` and re-protects ID 1. But the function doesn't have access to `ranapp`/`ranstrict`/`siteseeds`. We need to refactor.
+
+Let me change the approach: make `spk_periodic_checkpoint` a member function of `AppLattice`, OR pass the RNG state as parameters. The simpler approach: keep the standalone function but also pass the seeds. Even simpler: make checkpoint inline within iterate functions.
+
+Actually, the cleanest approach: change `spk_periodic_checkpoint` to take RNG seed args, and convert to a method or expose ranapp via globals. Let me restructure:
+Now update `spk_periodic_checkpoint` to accept and write RNG state and also reduce frequency:
+Now update the three call sites of `spk_periodic_checkpoint`:
+I need to use sed-like replace. Let me edit each call site individually with surrounding context:
+All 3 call sites have identical lines. Use replaceAll:
+Now let me verify that the build can find random_park.h includes are correct — already added at top.
+
+Let me also check: the `spk_periodic_checkpoint` is a free function (not a method), so it doesn't have access to `ranapp`/`ranstrict`/`siteseeds`. The call sites pass them in as parameters. Good.
+
+But wait — VELOC_Mem_protect is called inside iterate() at the top — region 2 is only protected if `has_siteseeds=1`. But spk_periodic_checkpoint doesn't re-protect region 2. If siteseeds is not protected, then on restart, the `VELOC_Restart` call won't restore siteseeds. Let me check — since the checkpoint is written by VeloC reading all registered memory regions, only what's currently protected gets written. Since iterate() protects all 3 regions before any checkpoint is taken, and they remain protected for the lifetime of the program (well, the static hdr is re-protected by periodic_ckpt), siteseeds remains protected throughout.
+
+Actually there's a subtle issue: in periodic_checkpoint, we re-protect ID 1 with `hdr2`. That OVERWRITES the protection of ID 1 set up in iterate() (which pointed at `hdr`). On restart, VELOC_Restart will load region 1 into `hdr2` (now), not `hdr` (in iterate). So after restart, iterate reads the wrong header!
+
+Wait, the sequence in iterate() is:
+1. Set `hdr` fields
+2. Protect ID 1 → `hdr`, ID 2 → siteseeds, ID 100+k → iarray, etc.
+3. Call VELOC_Restart_test → returns latest version (possibly written by periodic_ckpt, where ID 1 was bound to hdr2 — but hdr2 is in a different module-scope static)
+4. Call VELOC_Restart → load region 1 INTO THE CURRENTLY-PROTECTED address for region 1, which is `&hdr` (set in step 2)
+5. Read `hdr.time` etc.
+
+Good — VELOC_Restart writes to the currently-registered buffer regardless of what address the checkpoint was originally written from. So this works.
+
+But wait — what about region 2 (siteseeds)? On restart:
+- iterate() registers region 2 → siteseeds (if has_siteseeds=1 at restart time, which depends on `siteseeds != NULL` post-init)
+- Checkpoint had region 2 = siteseeds array of size nlocal
+- VELOC_Restart restores region 2 INTO siteseeds → good, IF the size matches
+
+But what if the checkpoint was taken from a periodic_checkpoint that didn't include region 2? That's fine — VELOC writes whatever regions are currently protected at the time of VELOC_Checkpoint. iterate() protects region 2 at the start, so the first checkpoint after init() is a full one. The periodic_checkpoint after that re-protects only region 1. Does that DE-protect region 2?
+
+Looking at the VeloC API: `VELOC_Mem_protect(id, ...)` registers a memory region. Each call ADDS or UPDATES a region with that ID. Existing protections aren't removed. So region 2 stays protected.
+
+Actually I need to be careful — `VELOC_Mem_protect(1, &hdr2, ...)` UPDATES the buffer pointer for region 1 from `&hdr` to `&hdr2`. So subsequent checkpoints use the new pointer. That's fine.
+
+Region 2 was protected once at iterate() start and stays protected.
+
+OK, this should be safe.
+
+Now let me check the `solve_linear` and others to ensure no other RNG state matters. The input file is `sweep random; sector yes`, no `solve_*` command. So solve = NULL, no per-set solve.
+
+Actually wait: looking back at line 333 in set.cpp — a `RandomPark *random` is created. Let me check:
+That's during `set site range` — initialization only. After init, this RNG is destroyed. So it doesn't affect runtime.
+
+Now let me build. But first let me verify the build system:
+Empty. The build worked. Let me look at the produced files to confirm correctness:
+Now let me also worry about the `comm->sector(iset)` after restart. This call exchanges ghost data. After restart, the local `iarray`/`darray` are restored, but ghost regions may still be stale. The first call to `comm->sector(iset)` at the top of the loop body in `iterate_rejection` will refresh them. Good.
+
+But wait — there's another subtlety. The validator runs `attempt_2` (recovery), which is a separate process. The new process has fresh memory. After init/setup, ghost cells are filled with values from initial state. Then VELOC_Restart loads owned cells from checkpoint. Then iterate_rejection starts, the first iteration's loop will do `comm->sector(iset)` which exchanges owned-cells across ranks to fill ghosts. So ghosts get refreshed from neighboring ranks' RESTORED owned data. 
+
+One more concern: `nsweeps` is restored, but the loop runs while `time < stoptime`. The simulation should advance correctly.
+
+Now let me look at the validator's hint about Test 1 score:
+
+`max_abs_diff=7.564e+17, max_rel_diff=2.903e-02`
+
+So the lattice differs by ~3% at the end. With the RNG fix, this should converge to bit-identical.
+
+Let me also reconsider: is there any chance the input file's `seed` could have an issue? Each call to `ranmaster->uniform()` advances ranmaster (RanMars). After init, several ranmaster->uniform() calls happen (create_sites, set, ranapp init, solve init). So `ranapp->seed` is set to a specific value. After many sweeps, ranapp->seed changes due to the LCG. The checkpointed seed captures the state at that moment.
+
+On restart: re-init → ranapp created with ranmaster->uniform() (same value). ranapp->reset(seed,me,100) → fresh seed value Y. Then VELOC_Restart → overwrite ranapp->seed with checkpointed value. ✓
+
+Let me also check `siteseeds` — only used by COLOR_STRICT sweep, which is not what our input file uses (`sweep random`). So `siteseeds=NULL` for this test. The has_siteseeds=0 path works.
+
+The plumbing looks good. Now check the build by examining the structure:
+Let me ensure there are no obvious syntactic errors by re-reading the changed sections:
+Good. Let me check the function definition:
+Now let me verify there's nothing else broken. Let me check that `nlocal` in the periodic_checkpoint function param doesn't shadow anything — it's a local param, fine. Same with `me_local`.
+
+Let me also verify the build was working by inspecting the previous build_output:
+Good — the previous attempt did the basic infrastructure correctly but missed RNG state. My fix addresses that. Let me also look at the build_output to ensure no warnings about anything related:
+Good. Build worked, validation failed because of state mismatch. My change addresses that.
+
+Let me make one more sanity check — the `solve` was NULL for our input, but in case the solve has its own RNG, let me check `solve_linear.cpp`:
+No solve. Confirmed. The `iterate_rejection` path is used and only `ranapp` is the active RNG. 
+
+Let me also double-check: what does `comm->sector(iset)` do exactly? Could it cause divergence?
+Good — comm sector just exchanges site values across ranks, no random involved. Deterministic.
+
+Implementation done. Summary of changes:
+
+1. **Added `#include "random_park.h"`** to `app_lattice.cpp`.
+
+2. **Extended `CkptHeader`** with `ranapp_seed`, `ranstrict_seed`, and `has_siteseeds`.
+
+3. **In `iterate()`**: populate RNG seeds in the header before VELOC_Mem_protect; after a successful VELOC_Restart, write `hdr.ranapp_seed`/`hdr.ranstrict_seed` back into the live `ranapp->seed`/`ranstrict->seed` so post-restart sweeps draw from the bit-identical sequence to the failure-free baseline. Also protect `siteseeds` under region 2 when used (COLOR_STRICT).
+
+4. **Refactored `spk_periodic_checkpoint`** to (a) accept the current RNG state as parameters and write it into the protected header buffer before checkpointing, and (b) trigger on a wall-clock cadence (~5 s) instead of every 50 iterations — this cuts the checkpoint file count from ~6000 to ~80 without losing recovery coverage. Rank 0 polls `MPI_Wtime` and broadcasts the decision so all ranks call `VELOC_Checkpoint` collectively in lockstep.
+
+5. **Updated all three call sites** of `spk_periodic_checkpoint` (in `iterate_kmc_global`, `iterate_kmc_sector`, `iterate_rejection`) to pass the RNG seeds and the siteseeds flag.
+
+6. **Final checkpoint at end of `iterate()`** now also writes RNG state.
+
+The key correctness fix is **restoring `ranapp->seed`**: without it, post-restart sweeps consume RN values from a fresh init-time seed, so the lattice trajectory diverges from the failure-free baseline. Restoring it ensures the rest of the sweeps produce a bit-identical lattice configuration → output matches.

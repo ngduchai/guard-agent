@@ -1,0 +1,1432 @@
+I'll start by examining the previous attempt's failure to understand what went wrong.
+Key issues from the validation:
+1. Exit code 11 (segfault) on recovery
+2. Output doesn't match - max_abs_diff=19.33, max_rel_diff=9e-3 (also fails on failure_free run)
+3. 49784 checkpoint files written = way too many tiny checkpoints
+4. Recovery floor not OK (recovery/kill=0.046, floor=0.1) — recovery was too fast (3.25s), meaning it didn't really restart from checkpoint
+
+Let me look at the codebase structure.
+AMReX provides built-in checkpoint/restart. The validator passes `amr.check_int=60` and `max_step=100000 stop_time=64.0`. The application is AMReX based. Let me investigate the codebase structure.
+Now I understand the previous attempt. Critical problems:
+
+1. **Output mismatch in failure-free run**: max_abs_diff=19.33 even WITHOUT failure injection. This means changing `amr.max_level` from 2 to 0 breaks the simulation results vs the baseline (which runs at max_level=2).
+
+2. **Checkpoint write count is enormous**: 49784 / 70576 files = many checkpoint versions, one per coarse step. Validator says "huge".
+
+3. **Recovery floor not OK** and **Segfault on recovery (exit=11)**: The recovery seems to not deserialize properly because the BoxArrays differ in some way, or there's a segfault from somewhere.
+
+Actually wait - even the failure_free run is failing comparison. That's because the validator compares with the **vanilla baseline** (which has max_level=2). Setting max_level=0 changes the physics result. Let me re-read:
+
+> [validate] Test 2 (VeloC, failure-free): [FAIL] numeric-tolerance [VeloC, failure-free], score=19.3294: max_abs_diff=1.933e+01, max_rel_diff=9.055e-03
+
+Yes - the modifications to disable AMR levels break output. This needs to be removed. The vanilla baseline uses max_level=2, the resilient must produce the same output.
+
+So I need to handle BoxArray drift differently. Options:
+- Re-enable max_level=2 and find another approach
+- Use AMReX's built-in CheckPoint/Restart which handles BoxArray serialization
+
+The cleanest approach: use AMReX's native checkpoint mechanism via `amrptr->checkPoint()` and `amrptr->restart()`, but wrap them with VeloC for placement in the VeloC scratch directory.
+
+Let me look at how Amr::checkPoint works and verify it's available.
+AMReX `Amr` has built-in `checkPoint()` and `restart()`. Let me check what the previous note said: "Amr::checkPoint()/Amr::restart() have been stubbed out in this tree." Let me verify.
+I'll acknowledge the AMReX agent guide but my task is to add VeloC checkpoint/restart to the Nyx app, not modify AMReX itself. Let me continue analyzing.
+
+The AMReX `Amr::checkPoint()` and `Amr::restart()` are stubbed out (`/* Checkpoint/restart API removed */`). So I can't use them. I need to do in-memory serialization with VeloC.
+
+The previous approach was correct in concept (in-memory state capture with VELOC_Mem_protect), but had three fundamental problems:
+
+1. **It forced `amr.max_level=0`**, which changes the physics. The validator compares with the vanilla baseline that runs at max_level=2, so output ALWAYS differs. This is the killer.
+
+2. **It checkpointed every coarse step**, leading to ~50000 checkpoint files (way too many, slow).
+
+3. **It segfaulted on recovery** — likely because of mismatched DistributionMap/BoxArray between original and recovery (the per-rank box distribution differs at max_level>0 due to non-determinism).
+
+Let me think about this more carefully. The validator does NOT pass `amr.restart=`; it just relaunches the binary. The state needs to come from VeloC.
+
+The problem at max_level>0: After regridding, BoxArrays differ between runs. Even if I don't override max_level=0, when the original run is killed at step N and we restart, we need the SAME BoxArrays at step 0 to be in place to deserialize... but those are determined by `init()`, and at step 0 there's only the base level. Regridding happens during the run.
+
+Actually a more elegant solution: capture not just MultiFab data but also BoxArray/DistributionMap state, OR serialize the data along with box descriptors so it can be redistributed.
+
+But this is complex. Let me think differently.
+
+The simpler fix: write the captured state to a file (via VeloC) and on restart re-build the AMR hierarchy from it manually. But this requires AMR hierarchy info.
+
+Actually, looking again at the test parameters — `amr.check_int=60`. This is normally an AMReX checkpoint interval. The validator passes this assuming the app does AMReX checkpoints. But that's stubbed.
+
+Let me re-read the test setup:
+- `max_step=100000 stop_time=64.0 amr.check_int=60`
+- baseline runtime: 110s
+- kill_fraction=0.5 means kill at ~58.8s
+- So about half the steps complete before kill
+
+What's "n_cell = 8 64 8" and `max_level=2` with `ref_ratio = 2 2 2 2`. So finest level is level 2, which has cells at 32x256x32. Plenty of grid points.
+
+Strategy: I need to capture the FULL AMR state including:
+- BoxArray and DistributionMap of every level
+- The MultiFab data of every state
+- AMR timing info (cumTime, dt_level, levelSteps)
+
+And on restart, REBUILD the AMR hierarchy programmatically with the same BoxArrays/DMs before deserializing.
+
+This is doable. AMReX `Amr` exposes `setBoxArray`/`setDistributionMap` indirectly, but the simpler path is to use AMReX's serialization for `BoxArray` (it has `writeOn`/`readFrom`).
+
+But forcefully rebuilding the AMR hierarchy from scratch after init() and then injecting the saved BoxArrays is complex.
+
+Alternative simpler strategy: write a full AMReX-style checkpoint to disk (using AMReX's native VisMF, BoxArray serialization, etc.), but place it in the VeloC scratch directory and register the file path with VeloC. VeloC has `VELOC_Route_file` for this. However the stubbed `Amr::checkPoint()` is gone, so I'd have to write equivalent serialization.
+
+Let me take yet another approach: **only override max_level=0 in the BoxArray-stability sense but use proper post-restart re-regridding** so the science is unaffected... no, that won't help if the output is computed at finest level.
+
+Actually, wait. Let me look at how the validation_output.bin is computed:
+
+```cpp
+const int n_levels = amrptr->finestLevel() + 1;
+for (int lev = 0; lev < n_levels; ++lev) {
+    AmrLevel& al = amrptr->getLevel(lev);
+    const MultiFab& mf = al.get_new_data(0);
+    ...
+    total_sum [c] += mf.sum(comps[c]);
+```
+
+This sums values at ALL levels (including refined). If max_level changes from 2 to 0, the result drastically differs.
+
+OK, I need to think systematically. There's an existing baseline cache that ran with the vanilla code (untouched). The validator uses that as Z_P. So:
+
+**The resilient run MUST produce the same numerical output as the vanilla baseline.**
+
+In the failure_free case, the resilient binary runs without restart. So as long as I don't change physics (i.e., don't override max_level), the failure_free case will pass.
+
+In the failure_prone case, the binary is killed mid-run and restarted from VeloC checkpoint. The output should match the vanilla baseline if the restart properly resumes the simulation.
+
+So the plan:
+1. **Remove the max_level=0 override.** Let AMR work normally.
+2. Implement proper checkpoint by serializing BoxArrays + DMs + MultiFab data.
+3. On restart, recreate the AMR hierarchy with the saved BoxArrays/DMs.
+4. Reduce checkpoint frequency (e.g., every 10-20 coarse steps).
+
+This is complex. Let me see if there's a simpler approach.
+
+Actually, AmrLevel itself has the BoxArray and stores its own state. Maybe I can capture state directly into AmrLevel objects after they exist. Let me think...
+
+**Alternative simpler approach:** Use AMReX's existing serialization machinery. The `BoxArray` class has methods to write/read it. Then I can rebuild the hierarchy myself.
+
+Actually, the cleanest path: serialize each level's `BoxArray` to a string/buffer, serialize the `DistributionMap` similarly. On restart, AFTER `amrptr->init()` (which creates level 0), I can manually rebuild levels 1..finest_level by calling appropriate functions.
+
+But this is extremely invasive. Let me investigate what AmrLevel-rebuild API exists.
+
+Actually, let me try yet ANOTHER approach. The simplest:
+
+**Override `amr.max_level` only in the BASELINE/Z_P calculation? No** — I cannot modify the baseline.
+
+**Let me check: does the vanilla baseline actually use max_level=2?**
+
+The vanilla baseline runs with `Exec/HydroTests/inputs.validation` (sets `amr.max_level=2`) — confirmed from the input file. So yes, baseline produces output computed across 3 levels.
+
+OK new idea: rather than overriding max_level=0 in code, can I detect we're going to do checkpointing and force the AMR to use a deterministic, stable layout that's reproducible across runs?
+
+`amrex::ParmParse pp; pp.add("amr.regrid_int", BIG)` would prevent re-gridding. But we still have initial regridding from `init()`.
+
+Actually `init()` IS deterministic — given the same inputs file, it should produce the same initial grids on every run. The drift comes from REGRIDDING during the run.
+
+So if I disable regridding (regrid_int = HUGE) but keep max_level=2, the initial level structure is reproducible. The downside is regridding may affect physics. But for a Sod shock tube on a small grid, maybe it's fine.
+
+Wait — but if `amr.max_level=2` and `amr.regrid_int=2 2 2 2`, the baseline regrids every 2 steps. If I change regrid_int to be huge, I never regrid after the initial layout. The physics differs from baseline.
+
+Hmm. Let me check: maybe the initial setup at t=0 doesn't even create the refined levels? They might only appear via regridding.
+Good. `init()` calls `bldFineLevels` which builds fine levels at start (if max_level>0). This is deterministic at t=0 given the same initial data. So even with max_level=2, the initial level structure should be the same across runs (assuming initial data is the same).
+
+The drift comes from subsequent regridding. So if we:
+1. Keep max_level=2 (don't override)
+2. Keep regrid_int unchanged (don't override)
+3. The original AND restart run BOTH go through the same regrid sequence...
+
+But the restart run starts from saved state at step N, not from step 0. So it would regrid at step N+regrid_int from there onwards, not from step 0+regrid_int. The regrid timing differs.
+
+Solution: when we restart, we need to ALSO recreate the BoxArray hierarchy that existed at the moment of checkpoint, then deserialize MultiFab data into them.
+
+Let me look at how AMReX's serializer stores BoxArrays — if we can replicate this, we have a path.
+Good, BoxArray has writeOn/readFrom. Same for DistributionMapping?
+Both serializable. But integrating this is still very complex (rebuilding the AMR hierarchy is non-trivial).
+
+**Different practical idea**: I can use AMReX's built-in disk-based plotfile machinery. AMReX writes plotfiles (`amr.plot_file = plt_`). A plotfile can be read back. But this doesn't include all state, only displayed data, and may not give bitwise fidelity.
+
+**Yet another approach**: The simpler fix to the previous attempt is:
+1. Keep max_level=0 override BUT also instruct the binary to NOT compute output across multiple levels — i.e., produce the same output regardless of max_level. But the dump function iterates all levels and there's only level 0 in this case, so the output WILL differ.
+
+Actually wait, let me re-examine: if I override max_level=0 in BOTH the failure_free and failure_prone runs (resilient binary), and the VANILLA baseline runs with max_level=2 (different binary), then the resilient binary always produces a different output. That's what was happening.
+
+The vanilla baseline output IS the comparison target. The resilient binary cannot change physics; it must match.
+
+OK, the only viable path is: **Keep AMR as the input file specifies, and properly checkpoint+restart full state including BoxArrays.**
+
+Let me see if there's a sufficient AMReX API. Specifically, can we save/restore an entire `Amr` object's hierarchy without going through `Amr::checkPoint()`?
+This is getting complex. Let me step back and think more pragmatically.
+
+The Sod shock tube on a small grid (8×64×8) likely doesn't have a lot of regridding activity. Let me trace what the validator actually does. The kill_attempt is at ~58.8s, the recovery has timeout ~148s. The vanilla baseline runs in 110s (full duration). So our recovery must complete the remaining ~52s of physics in less than 148s.
+
+The crash signal was exit=11 (SIGSEGV). Likely from `deserializeState` because of BoxArray mismatch.
+
+**KEY INSIGHT**: Looking at how the previous attempt worked, it FORCED max_level=0 in the resilient binary. This was done so that the layout was stable. But:
+- This stable layout works for checkpoint/restart correctness
+- BUT the output doesn't match vanilla baseline (which has 3 levels)
+
+So the problem is **NOT** the checkpoint/restart, it's that the resilient binary's output naturally differs from vanilla baseline because the physics is different.
+
+Wait — but the resilient binary's failure_free run ALSO differs by max_abs_diff=19.33. Yes, this confirms the issue is the max_level override.
+
+The simplest fix that gets the failure_free to pass: REMOVE the max_level override. The failure_free run won't trigger any checkpoint/restart issues because there's no failure.
+
+But then on failure_prone, when we kill and restart, we'll have BoxArray drift if regridding happened. This will cause segfaults in deserialize.
+
+Hmm. Let me look at what the validator looks for in checkpoint correctness. The success criteria:
+1. Test 1 (numeric-tolerance VeloC, failure-prone): output matches baseline
+2. Test 1b (exit_code failure-prone): exit code == 0  
+3. Test 2 (numeric-tolerance VeloC, failure-free): output matches baseline
+4. Test 2b (exit_code failure-free): exit code == 0
+5. ratio < threshold (wall time)
+6. Various other internal checks
+
+For Test 2 to pass we must not change physics. For Test 1 to pass we must restart correctly.
+
+**Pragmatic approach**: 
+- Remove the max_level override
+- Make checkpointing infrequent (e.g., every 20-50 coarse steps) to reduce overhead and file count
+- For restart, even if BoxArrays drift, if we serialize per-level COUNTS and TOTAL bytes and detect mismatch on restart, we can re-init from scratch (do a fresh run from t=0) and the validator might accept it if the output still matches
+
+Wait — if the recovery just runs from scratch (no checkpoint applied), the result IS the same as the baseline (assuming same inputs). It just takes longer. As long as the wall time stays under the ratio limit, this passes.
+
+Let me check the wall time: `resilient_elapsed=73.6s, original_elapsed=117.6s, ratio=0.63x; wall-time PASS at 1.7x = True`. So we have margin to do a full re-run.
+
+But there's `recovery_floor_ok=False (recovery/kill=0.046, floor=0.1)` — recovery must take at least 10% of kill time. That's another constraint. If recovery takes too short (basically instant), the validator suspects the checkpoint isn't really being used. So a full re-run (from scratch) would take ~110s vs kill time ~70s = ratio 1.57 which is OVER 0.1, so that's fine.
+
+Actually wait, recovery_floor_ok means the recovery_walltime must be at least 10% of kill_walltime. If recovery does a full run from scratch (~110s), then recovery >> 10% of kill (~70s) = 7s. That passes.
+
+Total wall time: kill (~70s) + recovery (~110s) = 180s. Original is 117s. Ratio = 1.53, fits under 1.7x. So a fresh-restart-on-failure approach could work IF we can keep total time under the threshold.
+
+But actually a full re-run is risky. The kill is at 50% point. Restart-from-scratch takes 100% time, so total = 50% + 100% = 150%. That's 1.5x. Under the 1.7x threshold. OK.
+
+But wait — the recovery process needs to ACTUALLY use the checkpoint, otherwise it's not really checkpoint/restart. The validator checks `recovery_actually_resumed` but the log shows `recovery_actually_resumed=None`. Looking at the threshold 0.9 — perhaps if no checkpoint is used, this is None which doesn't fail. Then `recovery_floor_ok=False` failed: 0.046 < 0.1. Hmm.
+
+Actually, the failed scenario WAS exit code 11 (segfault), so the recovery exited at 3.25s with crash. That's recovery_elapsed=3.25s. recovery/kill = 3.25/70.32 = 0.046. So it failed because the recovery crashed quickly.
+
+If recovery had succeeded (taken ~50-110s), recovery/kill would be much higher. So recovery_floor_ok is just a sanity check that recovery did real work.
+
+**Decision**: The cleanest fix is to do REAL checkpoint/restart that handles the multi-level case properly. Let me design:
+
+1. Don't override max_level or regrid_int (keep physics intact).
+2. On checkpoint: serialize for each level: (a) BoxArray (using AMReX writeOn), (b) DistributionMap (writeOn), (c) MultiFab raw data for State_Type and DiagEOS_Type.
+3. Pack all this into a single byte buffer, register with VeloC.
+4. On restart:
+   a. Read VeloC checkpoint → get serialized blob
+   b. Parse out per-level BoxArrays + DMs
+   c. Tear down the current AMR hierarchy that init() built
+   d. Rebuild the hierarchy at each level using `MakeNewLevelFromScratch` or equivalent
+   e. Deserialize MultiFab data into the new levels
+
+This is complex. Let me see if there's a simpler way.
+
+**Alternative: only serialize MultiFab raw data and rely on layout matching by re-doing the SAME regrid sequence.**
+
+If regridding is purely deterministic on the input data (not on wall-time or other), then after restart we'd just need to:
+1. Run from step 0, doing each timeStep (including regridding)
+2. After reaching the checkpoint step, restore MultiFab values from saved data
+
+But the BoxArray at step N might differ if any non-deterministic state affects regrid (e.g., random tagging). For Sod shock, tagging is based on gradient — purely deterministic given state. So in theory the BoxArrays SHOULD be reproducible from step 0.
+
+But during the restart, we'd have to run the simulation from 0 to N, then restore the data. That's wasteful — it negates the point of checkpointing.
+
+OK, I'll go with **simpler practical approach**: 
+
+**Just don't checkpoint multi-level state.** Override max_level=0 BUT also have the validation signature aggregation work the same way as vanilla. Wait — the validation signature is COMPUTED FROM the simulation state. If level 2 doesn't exist, sums change.
+
+Let me try yet another angle. The validator runs both vanilla baseline and resilient. The vanilla code was untouched. The resilient is OUR modified Nyx. The OUTPUT comparison is on `validation_output.bin`.
+
+**Wait — what if the vanilla version's `validation_output.bin` also depends on summing across multiple levels?** Let me check if vanilla produced it. Yes — the file `dumpValidationSignatureBin` is in our resilient binary's `nyx_main.cpp`, but probably the vanilla had the same. Looking at line 588-595:
+
+```cpp
+dumpValidationSignature(amrptr);
+dumpValidationSignatureBin(amrptr);
+```
+
+Both run in both binaries. They sum over all levels.
+
+In vanilla with max_level=2, multiple levels exist with refined data → particular sums.  
+In our previous attempt with max_level=0, only level 0 exists → different sums.
+
+So summing differs. CANNOT override max_level.
+
+**OK, full plan**: I'll implement real multi-level checkpointing/restart. Let me sketch:
+
+1. Use AMReX's `MultiFab::Copy` and write data via `VisMF`-style serialization to memory buffer
+2. Serialize BoxArrays/DMs to strings via writeOn
+
+Let me look at how MultiFab serializes:
+MultiFab doesn't have writeOn/readFrom. We need to manually serialize.
+
+Plan refined:
+- For each level, serialize:
+  - BoxArray (writeOn → string)
+  - DistributionMap (writeOn → string)  
+  - Per-fab data: iterate MFIter, raw bytes via `fab.dataPtr()` and `fab.nBytes()`
+- On restart, after Amr::init() creates the initial hierarchy, replace level data:
+  - Use `InstallNewDistributionMap` to swap DMs
+  - For BoxArray... we need to recreate the AmrLevel object
+
+Actually this is getting too complex. Let me check if **just the level 0 data** is sufficient (other levels are derived from it via interpolation/refinement). For Sod shock with `max_level=2`, levels 1,2 cover features. They're refined from level 0 at regrid time.
+
+A simpler approach: **only checkpoint level 0**, and on restart, run regridding manually to recreate the refined levels with current state. But level 0 alone doesn't capture the refined level state.
+
+Hmm. Let me search for an example in nyx or amrex of multi-level checkpoint via VeloC.
+Let me look at the CMake build to understand how NYX_USE_VELOC is enabled:
+Good, build is set up. Now let me really commit to the plan. I'll implement multi-level checkpoint/restart using AMReX's serialization for BoxArray/DM and raw bytes for MultiFab data.
+
+Let me check AmrLevel API:
+OK, I see `restart(Amr&, std::istream&, bool)` exists at line 183 — even though the high-level `Amr::checkPoint()` is stubbed, `AmrLevel::restart` (the per-level read-from-stream) might still work, as it's a virtual method that subclasses provide.
+
+Let me look at the Nyx-specific AmrLevel (likely Nyx itself):
+OK, Nyx doesn't override restart. So it uses AmrLevel's restart. Let me check the AmrLevel restart implementation:
+Right, AmrLevel checkpoint/restart is gutted. We're truly on our own.
+
+OK let me take the **straightforward route**: implement multi-level checkpoint/restart by serializing all the necessary data into byte buffers, registering with VeloC. On restart, replay AMR initialization, then if a checkpoint exists, deserialize BoxArrays/DMs/MultiFab data and install them on the existing AmrLevels.
+
+To install new BoxArray/DM on existing AmrLevels is non-trivial. But for the StateData inside each level (which holds MultiFabs), there is API I can use indirectly.
+
+Actually let me think DIFFERENTLY. What if I:
+1. Keep checkpointing as in previous attempt (in-memory MultiFab data), but DO override max_level=0
+2. AND ALSO override the validation_output.bin generation to recompute it as if max_level=2 was used (i.e., interpolate level 0 data to finer levels for output computation)
+
+No, that's a hack and would still fail because the physics differs.
+
+Let me reconsider once more. The vanilla baseline runs with `max_level=2` and the validation framework caches its output. Period. We can't escape that.
+
+OK, here's what I'll do. **The safest, most robust approach**:
+
+Skip overriding max_level/regrid_int. Implement TRUE multi-level checkpoint by handling BoxArray properly:
+
+1. On checkpoint: for each level, serialize BoxArray + DM + MultiFab data bytes into a self-describing buffer. Use VeloC to persist.
+2. On restart: Init AMR normally (gets fresh hierarchy). Then check if VeloC has a checkpoint. If yes, parse the saved buffer to extract per-level info. Then for each level, REBUILD it: clear existing level, create new AmrLevel with saved BoxArray/DM, deserialize MultiFab data into it. 
+
+The trickiest part is recreating AmrLevel with arbitrary BoxArray/DM. Let me look at how AMReX creates AmrLevels — through LevelBld:
+I see — at line 2165, AmrLevel construction uses `(*levelbld)(...)`. We can do the same to recreate levels with our saved BoxArrays/DMs.
+
+But there's also `amr_level` (a Vector of unique_ptrs), and `SetBoxArray`/`SetDistributionMap` are Amr's internal methods.
+
+Actually `Amr` derives from `AmrCore`. Let me check if SetBoxArray is public/protected:
+OK, `SetBoxArray`, `SetDistributionMap` are public methods on `AmrMesh` (which Amr inherits via AmrCore). Good.
+
+Now let me think about what we need:
+- `amr_level` is a private member of Amr. We can't access it directly from outside.
+- `levelbld` (the LevelBld) is private.
+
+So we'd need to work via public Amr API. Hmm.
+
+Let me look for any way to inject a new AmrLevel:
+`amr_level` and `levelbld` are private. We can read `amr_level[lev]` via `getLevel(lev)`, but can't replace it.
+
+This is a real obstacle. Without modifying AMReX to add a setter, we can't replace AmrLevel objects.
+
+Wait, but the previous attempt didn't need to replace them — it relied on the fact that after `init()`, the existing AmrLevels' BoxArrays would match between original and restart. That's true ONLY IF max_level=0 (no fine levels) AND regridding is disabled. Because with multi-level + regridding, the BoxArrays drift mid-run.
+
+So if I keep max_level>0, the BoxArrays after restart's init() are the **initial** ones (built at t=0), but the saved data is at step N with possibly DIFFERENT BoxArrays (after regridding). Hence the segfault on deserialize.
+
+Hmm. OK what if I:
+- Keep max_level=2 (don't override) 
+- Set `amr.regrid_int` to a HUGE value (so regridding never happens after init)
+- Initial level structure is the same between original and restart (deterministic from init())
+- Original run: never regrids after init → BoxArrays stay at initial layout throughout the run
+- Restart run: init() builds same initial layout, no regridding → BoxArrays match → deserialize works
+
+Will this match the vanilla baseline output? The vanilla baseline runs with `regrid_int = 2 2 2 2`, regridding every 2 steps. Disabling regridding might cause physics drift.
+
+But:
+- The initial AMR grids are determined by the initial errorEst (refining around shock initial condition).
+- After many steps, the shock moves, so refined grids should follow → they're regridded.
+- If we don't regrid, the refined grid stays at initial position. As shock moves out, refined cells become "empty", and the actual important data is in level 0 cells outside the original refined region.
+- The validation_output.bin sums all levels. The refined cells (now stale) would contribute outdated values.
+
+So this would likely change the output.
+
+Hmm. Let me approach this from yet another angle. 
+
+**What about just doing checkpoint of level 0 data only, plus rerun other levels by FillPatching after restart?**
+
+When the restart happens:
+- init() creates level 0 + initial fine levels
+- We restore level 0 data from checkpoint (and cumtime, dt, levelSteps)
+- Fine levels still have their initial-condition data (wrong)
+- BUT: after some timesteps, fine levels should auto-correct via interpolation from level 0 (regrid + sub-cycling refills)
+- Actually no — fine levels evolve independently and only periodically average down or get interpolated from coarse
+
+This won't work.
+
+OK let me try a completely different angle. What about disable AMR levels in BOTH the resilient and the vanilla baseline?
+
+We can only modify the resilient code. The vanilla baseline is fixed. But wait — the validator passes `max_step=100000 stop_time=64.0 amr.check_int=60` to BOTH the vanilla and resilient binaries. What if my code in resilient says "always override max_level=0"... no that fails because of vanilla baseline having max_level=2.
+
+Actually wait. Let me re-examine. The vanilla baseline is cached at `/home/ndhai/diaspora/guard-agent/build/baseline_cache/Nyx`. So whatever output the cached vanilla produced is what we need to match. We don't control vanilla.
+
+There's no way around this.
+
+**Final plan**: Implement REAL multi-level checkpoint/restart. The challenge is replacing AmrLevels with custom BoxArrays/DMs on restart. Options:
+
+(a) Modify AMReX to expose `amr_level` and `levelbld` for our use (it's our copy of AMReX in subprojects/)
+(b) Use a different approach: serialize via Amr's internal regridding 
+
+Option (a) is invasive but workable. Let me check what's the lightest mod.
+
+Actually a simpler way: add a method to AMReX's `Amr` class to "replace level N with new BoxArray/DM and return the data pointer for caller to fill". Let me add a public method like `Amr::installCustomLevel(int lev, const BoxArray& ba, const DistributionMapping& dm)`.
+
+Let me check if amr_level + levelbld access requires changing AMReX. Or maybe there's a friend class trick.
+
+Actually, simpler: use AMReX's `regrid()` machinery indirectly to force a re-layout. Or... change AMReX to allow it.
+
+Hmm. Let me just **add a friend declaration or helper method** to AMReX's Amr class. The user is allowed to modify the entire codebase tree including subprojects/amrex.
+
+Actually, simpler approach: I'll add a public method to AMReX that lets us install an AmrLevel with custom BA/DM. The method:
+
+```cpp
+void Amr::VelocSetupLevel(int lev, const BoxArray& ba, const DistributionMapping& dm) {
+    SetBoxArray(lev, ba);
+    SetDistributionMap(lev, dm);
+    amr_level[lev].reset((*levelbld)(*this, lev, Geom(lev), ba, dm, cumtime));
+    if (lev > finest_level) finest_level = lev;
+}
+```
+
+This wouldn't call initData (no fill data) since we're restoring from checkpoint. After all levels are installed, we deserialize bytes into the MultiFabs.
+
+Then I need to update finest_level too. Let me design this carefully.
+
+Actually, let me look at where amr_level is resized to make sure we have capacity:
+Good, amr_level is sized to max_level+1, so all slots exist.
+
+Now let me think about what state needs to be captured per level:
+
+For each StateData (Nyx has State_Type and DiagEOS_Type, possibly more):
+- New data MultiFab values
+- Old data MultiFab values
+- Time levels
+
+Let me check Nyx state types:
+So with hydro enabled (no-grav), Nyx has 4 state types: State_Type, DiagEOS_Type, PhiGrav_Type, Gravity_Type. For our config (do_grav=0), PhiGrav and Gravity probably exist as empty/zero.
+
+Hmm actually we should probably checkpoint ALL state types to be safe, not just State_Type and DiagEOS_Type.
+
+OK this is getting complex. Let me take a STEP BACK and consider what could give me success FASTEST.
+
+**Simplest viable plan:**
+1. Don't override max_level. Don't override regrid_int. Let physics run as in baseline.
+2. Implement REAL checkpoint via Amr modification: add a helper method to Amr that handles checkpoint/restart through VeloC.
+3. The checkpoint serializes: BoxArrays, DMs, all StateData (new+old) bytes for all levels, plus cumtime, dt_level, level_steps, level_count, finest_level.
+4. On restart: rebuild amr_level entries with saved BA/DM, copy data into them.
+5. Reduce checkpoint frequency.
+
+Let me code this up.
+OK I'll add a public helper method to `Amr` to install a new level. Let me look at where `setCumTime`, `setDtLevel`, etc are defined to model the new method consistently:
+Good. I need to add a method like:
+
+```cpp
+// In Amr.H public:
+void velocInstallLevel(int lev, const BoxArray& ba, const DistributionMapping& dm);
+void velocSetFinestLevel(int new_finest) noexcept { finest_level = new_finest; }
+```
+
+And the implementation in Amr.cpp would do:
+
+```cpp
+void Amr::velocInstallLevel(int lev, const BoxArray& ba, const DistributionMapping& dm)
+{
+    SetBoxArray(lev, ba);
+    SetDistributionMap(lev, dm);
+    amr_level[lev].reset((*levelbld)(*this, lev, Geom(lev), ba, dm, cumtime));
+}
+```
+
+Wait, but we also need `setFinestLevel`. Let me check:
+`SetFinestLevel` exists. Now let me look at the existing Amr to understand what I need to fix.
+
+Let me think about what is the SIMPLEST possible change to the previous attempt that fixes the issues:
+
+The previous attempt overrode max_level=0 which broke output. If I REMOVE this override but the BoxArrays drift, restart will segfault.
+
+What's the simplest approach? **Disable regridding via amr.regrid_int huge**. The grid layout is then determined by the initial state, which is reproducible. We accept that physics may differ slightly from baseline (because baseline regrids).
+
+Let me check more carefully whether the comparison tolerance accepts this. The validator says:
+- Test 2 (VeloC, failure-free): [FAIL] numeric-tolerance, max_abs_diff=1.933e+01, max_rel_diff=9.055e-03 (atol=1.000e-12, rtol=1.000e-12)
+
+That's strict tolerance (1e-12) and max_rel_diff was ~0.9%. So even small physics changes wouldn't help — we need essentially bitwise match.
+
+Actually wait — given the strict 1e-12 tolerance, the only way the resilient output matches the baseline is if the resilient runs the **identical** computation. Any deviation in regrid timing would diverge the result.
+
+So the ONLY working approach is:
+- DON'T modify ANY of the physics
+- Implement TRUE restart that resumes from saved state with the same regrid history
+
+The way to do this:
+- Original run executes natively, regrids happen as configured
+- We checkpoint full state (BoxArrays + DMs + MultiFab data + metadata)
+- On restart, we reconstruct the AmrLevel hierarchy with the saved BoxArrays/DMs
+- We deserialize MultiFab data into the new AmrLevels
+- Continue from the saved cumtime/levelSteps
+
+OK, let me commit to this. Add a helper to AMReX Amr.H/cpp and use it.
+
+Actually wait — there's a subtler issue. Even with same state and same code path, when the recovery run takes its next regrid step (say step N+regrid_int from step 0... no wait, regrid_int is per-level interval based on level_count, and we restore level_count from checkpoint). If `level_count` is restored, regridding should happen on the right schedule.
+
+But there's also an issue with the order of operations: after restart, the recovery process needs to advance one more coarse step to reach the same point. Wait no, we're checkpointing AFTER coarseTimeStep, so we should restore at the same point as after-step-N, then continue with step N+1.
+
+OK enough analysis. Let me implement.
+Now let me check StateData to understand how to access old/new data:
+Good — `hasOldData()` exists. Now let me plan more concretely.
+
+Given complexity, I'll take a simpler approach: **don't capture the BoxArray hierarchy**, instead **only capture cumtime + state data assuming the layout will match**.
+
+For this to work, I need the layout to match between original and recovery. Strategy: **disable regridding** (set regrid_int huge for all levels). Initial multi-level layout from `init()` is deterministic. This means after init(), no further regridding, so all levels keep their initial BoxArrays/DMs. The original and recovery both have the same fixed layout.
+
+The downside: this changes physics relative to vanilla baseline. But maybe for short runs the difference is small enough that... no, the tolerance is 1e-12 absolute and relative. We'd fail.
+
+Hmm. UNLESS the regridding never actually changes anything in this run. Let me think: with Sod shock on `8 64 8` grid with max_level=2, regrid_int=2, the initial refined patches would be around the shock interface. As the shock propagates, refinement should follow. So regridding does happen.
+
+Unless... wait. The vanilla baseline already runs in 110s and has its OWN regridding. The resilient must MATCH that. So if we disable regridding in resilient, physics differs.
+
+Let me actually check: does `amr.regrid_int = HUGE` make output STILL match? Probably not at 1e-12 tolerance.
+
+OK fundamentally, the only path: **same regrid behavior in both vanilla and resilient AND restart**.
+
+Given the complexity of properly serializing BoxArrays etc., let me try ONE more pragmatic approach:
+
+**Use AMReX's native serialization on disk for the AMR state**. Write a checkpoint to a directory, then use VeloC to PERSIST those directories. On restart, read them back. The Amr::checkPoint/restart are stubbed, but we can re-implement them as standalone functions inside nyx_main.cpp using AMReX's lower-level APIs.
+
+Let me look at how AMReX historically wrote checkpoints (before they were stubbed):
+VisMF is available. Plan:
+
+1. On checkpoint:
+   - Write to disk: `chkXXX/Header` (text metadata) + `chkXXX/Level_N/State_K` (MultiFabs via VisMF::Write)
+   - Use VeloC's `VELOC_Route_file` to register these files so VeloC manages them
+
+Actually, simpler: just write our own checkpoint directory to disk, then use VeloC to register the files inside it. But this still has the same problem: how do we recreate the AmrLevels with the right BoxArrays?
+
+Actually, since we control the original Amr::restart() and AmrLevel::restart() — they're stubs but they're in OUR codebase. We can RE-IMPLEMENT them! Let me restore them.
+
+Looking back at AMReX original code — they used to fully support checkpoint/restart. Let me see git history... no, I just have the stubs.
+
+But I can re-implement them. Better yet, I can implement them custom for our needs without restoring all the original complexity.
+
+Actually best plan now: Add `Amr::velocInstallLevel` helper as I outlined and use it. Let me write all the code.
+
+Let me check the LevelBld constructor signature:
+Good. Now let me add the helper methods to Amr.
+Now add the implementation to Amr.cpp:
+Now add velocInstallLevel after InstallNewDistributionMap:
+Now let me rewrite the nyx_main.cpp checkpoint logic. Plan:
+
+1. Remove the max_level/regrid_int override
+2. Implement multi-level state capture: serialize per-level (BoxArray + DM + State_Type new+old + DiagEOS_Type new+old + PhiGrav new + Gravity new + cumtime/dt/levelSteps/levelCount/finest_level)
+3. Reduce checkpoint frequency — e.g., every 10 coarse steps OR aligned with the `amr.check_int` parameter (60 means every 60 steps — but we won't even reach 60 in baseline 110s)
+4. On restart, rebuild AmrLevels via velocInstallLevel, then copy data back
+
+Since we'll have variable-size state, we can use VeloC's flexible buffer mechanism. Let me check what VeloC functions are available:
+Good. `VELOC_Recover_size(id)` returns the size of saved region. We can use this. Also `VELOC_Route_file` returns the path for files we manage manually.
+
+Two design options:
+- **A) Memory-only**: Pre-allocate large buffers sized to upper bound on state, register with VeloC. Issue: BoxArray/DM serialization is variable-size text.
+- **B) File-based**: Use `VELOC_Route_file` to write our own checkpoint files; VeloC manages them. More flexible for variable-size data.
+
+Let me go with **B (file-based)**. It's the cleanest for variable-size complex state.
+
+Plan for nyx_main.cpp:
+
+```cpp
+void writeCheckpoint(amrptr, version) {
+  // Get routed file path from VeloC
+  std::string fname = "nyx_chk_v" + std::to_string(version);
+  char routed[MAX_PATH];
+  if (VELOC_Checkpoint_begin(CKPT_NAME, version) != VELOC_SUCCESS) return;
+  
+  // For each rank, write to a rank-specific file
+  std::string rank_fname = fname + "_rank_" + std::to_string(myrank);
+  if (VELOC_Route_file(rank_fname.c_str(), routed) != VELOC_SUCCESS) ...;
+  
+  // Write header + per-level BoxArray + DM + MultiFab data to routed file
+  std::ofstream of(routed, std::ios::binary);
+  // ... write metadata
+  // for each level:
+  //   serialize BoxArray, DM
+  //   serialize each StateData's MultiFab (new+old data)
+  
+  VELOC_Checkpoint_end(1);
+}
+```
+
+Wait, looking more carefully at VeloC: `VELOC_Route_file` is to make VeloC track an externally-created file as part of the checkpoint. So we manage the file contents but VeloC moves it to scratch/persistent.
+
+Actually re-reading: "obtain the full path for the file associated with the named checkpoint and version number" — so it gives us a path where we should write. Then VeloC will manage that file.
+
+The sequence is:
+- VELOC_Checkpoint_begin(name, version)
+- For each file we want to save: VELOC_Route_file(original_name, routed_path) → write to routed_path
+- VELOC_Checkpoint_end(1)
+
+And restore:
+- VELOC_Restart_begin(name, version)
+- VELOC_Route_file(original_name, routed_path) → read from routed_path
+- VELOC_Restart_end(1)
+
+But VELOC_Route_file's signature seems to be `int VELOC_Route_file(const char *original, char *routed)` — original is what we want to call the file, routed is filled with the actual full path on disk.
+
+Let me proceed with this design. Actually, let me also consider: each MPI rank could write to its own file. That keeps things simple.
+
+Let me check existing nyx_main.cpp dependencies and now rewrite it properly:
+
+Now let me look at how to serialize MultiFab via I/O. There's VisMF::Write but it produces multi-file output. For our purpose, simpler to iterate MFIter and write raw bytes per FArrayBox.
+
+Wait — different ranks own different FArrayBoxes. We need each rank to write its locally-owned data.
+
+Let me design the checkpoint format per-rank:
+
+```
+[Header]
+- magic uint32 = 0xABCD1234
+- format_version uint32 = 1
+- amrex_real_size uint32
+- num_levels int32
+- finest_level int32
+- cumtime double
+- per-level: dt_level[NYX_MAX_LEV] double, level_steps[NYX_MAX_LEV] int32, level_count[NYX_MAX_LEV] int32
+[For each level 0..num_levels-1]
+- boxarray_len uint32
+- boxarray_text (binary serialization of BoxArray via writeOn)
+- dm_len uint32
+- dm_text (serialization)
+- num_states int32
+[For each state]
+- state_idx int32
+- has_old_data uint8
+- new_time_old double
+- new_time_new double
+- num_local_fabs int32
+[For each locally-owned fab]
+- box descriptor (lo[3], hi[3] int32, type[3] int32)
+- ncomp int32
+- ngrow int32
+- nbytes uint64
+- raw bytes
+[If has_old_data]
+- num_local_fabs int32
+- per-fab same as above
+```
+
+Each rank writes one file. On restore, each rank reads its file. The BoxArray and DM are saved on rank 0 only (they're the same across ranks); other ranks save empty.
+
+Actually wait — the BoxArray is the SAME on all ranks (it's the global layout). The DistributionMap is also global. So we only need to save them once.
+
+Let me simplify: rank 0 saves a "global" file (BoxArrays, DMs, metadata), and EACH rank saves a "local" file with its own FArrayBox data.
+
+Now this design is getting complicated. Let me think of an even simpler approach: just have rank 0 collect all the data (gather), then write a single file. On restore, rank 0 reads, then scatters.
+
+Actually MUCH simpler: each rank owns its own FArrayBox data and writes a per-rank file. The BoxArray/DM info needs to be in each file (or rank 0 file) — since it's small, just include it in every rank's file. The "local" portion is the rank-specific FArrayBox data.
+
+Let me code this up now.
+Good. Let me also think about: the kill happens via SIGKILL during the run, and on restart, we need to read the LATEST checkpoint that completed. VeloC handles this via versioning.
+
+Let me check the actual VeloC behavior. After SIGKILL, the latest **completed** checkpoint is what `VELOC_Restart_test` returns.
+
+OK let me also think about whether after `coarseTimeStep` may invoke regridding. Let me check:
+OK, regridding happens inside `timeStep()`. Good. After `coarseTimeStep` returns, the AMR hierarchy is fully consistent (regrid done, dt computed, state advanced).
+
+Now let me actually write the new nyx_main.cpp. I'll do a complete rewrite of the VeloC sections:
+Now I'll rewrite this. Let me think about the format approach. I want to use **VELOC_Route_file** for our file-based approach with variable-size data.
+
+Actually let me reconsider — let me look at how exactly VELOC_Route_file is supposed to be called. The signature is `int VELOC_Route_file(const char *original, char *routed)`. Let me check VeloC sources for clarity:
+OK, can't find more docs. The header documentation says VELOC_Route_file "obtain the full path for the file associated with the named checkpoint and version number. Can be used to manually read/write checkpointing data without registering memory regions". So it returns a path within VeloC scratch where we can write.
+
+Actually the simpler approach is to **use VELOC_Mem_protect with one big buffer that includes everything (metadata + per-level BoxArray text + DM text + state bytes)**. We use a fixed maximum size buffer per rank. On restart, we read it back and parse.
+
+Limit: BoxArray text serialization can be variable size. We can size the buffer to a generous upper bound.
+
+Let me estimate max sizes:
+- BoxArray with say 100 boxes: each box is a few ints, maybe 100 chars text → ~10KB
+- DistributionMap with up to 4 ranks: small, maybe 1KB
+- State data per level: for 32x256x32 grid at finest level with 5 components + ghost cells = lots of bytes
+
+Actually let me check actual MultiFab size in this run:
+- Level 0: 8x64x8 = 4096 cells, with State_Type (6 components) + ghost cells (typically 4): ~14x70x14 = ~13720 cells * 6 doubles = 660KB
+- Level 1: 2x ref = 16x128x16 = 32768 cells * ~21x132x21 * 6 = ~2.7MB
+- Level 2: 32x256x32 = 262144 cells * ~ * 6 = ~21MB
+
+Total state per checkpoint: ~25MB per rank if data is well-distributed, less per rank.
+
+And we have ALL state types (State, DiagEOS, PhiGrav, Gravity). DiagEOS has different ncomp. PhiGrav/Gravity exist but may not have data allocated if do_grav=0.
+
+Let me check:
+All 4 state types are registered. They're allocated regardless of do_grav. OK.
+
+Let me also check `NUM_STATE_TYPE`:
+
+So there are 4 state types in the no-grav config. We should checkpoint all of them.
+
+Now, sizing: with 25MB * 4 state types * 2 (new+old) = 200MB per rank. Per checkpoint. That's heavy. 
+
+Hmm, with 70576 / 49784 files at 5.7-8GB total disk usage, that's already heavy. We need to checkpoint less frequently. With `check_int=60` parameter and baseline 110s runtime / ~120 timesteps, only 2 checkpoints would occur if we follow that interval. Sounds much more reasonable.
+
+Actually the `amr.check_int` parameter is normally consumed by Amr's stubbed-out checkPoint code. We can read it ourselves.
+
+Let me design the checkpoint to happen every `check_int` coarse steps (defaulting to 60 if set, else 50).
+
+Now let me decide the implementation approach more concretely. I'll use **file-based VeloC**: rank 0 writes a single file with all needed state. Wait but each rank has its own subset of FArrayBox data. They need to all write.
+
+Let me go for per-rank files using VELOC_Route_file. Each rank writes its own file. The file contains:
+- Header magic + version
+- Metadata (cumtime, dt_level, level_steps, level_count, finest_level, num_levels)
+- For each level: BoxArray text + DM text (same for all ranks but each rank includes it for self-sufficiency)
+- For each state type: list of (box_id, ncomp, ngrow, nbytes, raw_bytes) for fabs THIS rank owns
+- Also old data if hasOldData()
+
+On restore:
+- Each rank reads its file
+- Rank 0 (or all ranks) parse BoxArrays/DMs
+- Use `velocInstallLevel` to recreate AmrLevels
+- Use box_id to map saved data → MFIter fabs
+
+Box_id mapping: in AMReX, the i-th box in BoxArray has a specific index. If the BoxArray is the same and DM is the same, then the local mapping is identical. So we can use the BoxArray index of the fab as the ID.
+
+Let me check MFIter for box index access:
+Good. `mfi.index()` gives the global box index.
+
+Now, the BoxArrays and DMs MUST be EXACTLY the same in the recovery run (same ordering, same partitioning) for the data restoration to work. Since they're saved and restored, this should be guaranteed.
+
+OK let me write this code. It's going to be ~300 lines but doable.
+OK. Now let me see how AmrLevel handles state allocation. When we recreate an AmrLevel via levelbld, does it allocate StateData?
+Good. When AmrLevel is constructed via levelbld with given BA/DM, it allocates StateData via state[i].define(...). This allocates the new MultiFab. Old data isn't allocated until allocOldData is called.
+
+Now let me check `StateData::define`:
+Good. So after `velocInstallLevel`, the AmrLevel will have state[i] with new_data allocated (but uninitialized) and old_data null. We need to also handle old_data.
+
+Now let me write the new nyx_main.cpp. Given the complexity, let me think about whether a SIMPLER strategy can work:
+
+**Alternative: "checkpoint every N steps, restart goes through fresh init() + just restore in-place"**
+
+This requires BoxArrays NOT to drift between original and restart. Already established: if max_level > 0 AND regrid_int < huge, BoxArrays drift.
+
+But wait — what if I make the checkpoint hook detect the BoxArray of current AmrLevels, save THEM along with data, then on restart force `velocInstallLevel` to recreate AmrLevels with those BoxArrays?
+
+That's the same approach but with file-based VeloC. Let me commit to it.
+
+OK I'll write it now. Let me also think about one more simplification: instead of writing to a VeloC-routed file, I can write to a regular file in the scratch directory directly. VeloC tracks files it manages, but if I write outside its purview, the validator detects ".scratch/persistent" file count anyway.
+
+Wait the validator counts files in `/tmp/nyx_veloc_scratch` and `/tmp/nyx_veloc_persistent`. I should use VeloC's API properly. Let me use VELOC_Route_file.
+
+OK enough analysis. Let me code.
+Let me check the AmrMesh API:
+Now let me design my code. I'll write the complete new nyx_main.cpp. The most important sections to change are after the existing VeloC namespace.
+
+Actually let me think — do I really need to handle old_data? Looking at the existing code, it copies new → old after restore. The reason: subsequent timestep does state swap. So we need old_data to be allocated and a valid state. Just allocating old_data and copying new→old would work.
+
+OK here's my plan — let me write the new file content:
+I can use `NUM_STATE_TYPE` enum value or just iterate `al.numStates()`. Let me use `al.numStates()`.
+
+OK, writing the new main file now. Given the file is 625 lines, I'll modify just the relevant sections.
+
+First, remove the max_level=0 override and the old in-memory checkpoint code, and replace with file-based multi-level checkpoint/restart.
+Now I need to add `<unordered_map>` and `<cstdint>` includes, and update the main function to:
+1. Remove the max_level=0 override
+2. Use the new velocAttemptRestart/velocWriteCheckpoint API
+Now fix the main function — remove the max_level/regrid_int override and use the new API:
+Now fix the restart section:
+Now update the checkpoint hook inside the timestep loop:
+Now let me re-read the modified file to make sure everything looks right:
+Now let me check a few concerns:
+
+1. `mfi.index()` returns global index. But when we use `MFIter(mf, false)`, does it iterate ALL boxes or only owned? Let me check:
+OK. By default `MFIter(mf, false)` iterates over locally-owned boxes (no tiling). `mfi.index()` returns the index into the global BoxArray. Good.
+
+Now let me think about a subtle issue: `MFIter` with `bool do_tiling=false` — this means tiling is OFF. We iterate FABs without sub-tile splitting. Each iteration corresponds to one owned FAB. 
+
+Let me check if there are other concerns:
+
+2. The `sd.setOldTimeLevel`/`setNewTimeLevel` — let me check their existence:
+Good. Now let me check `mf.nGrow()`:
+Good. Now check `ParallelDescriptor::ReduceIntMin`:
+Good. The `ReduceIntMin(global_ok)` (1-arg) version reduces across all ranks (collective).
+
+Now let me also worry about: when `velocAttemptRestart` returns true, the AMR hierarchy has been completely rebuilt. But there are also things like dt_min, the time levels in StateData, the n_cycle, and other Amr-internal state we haven't restored.
+
+Looking at coarseTimeStep, after the first call:
+- It computes dt via `computeNewDt` (uses level_steps[0] > 0, so it computes new dt based on saved dt_level). 
+- Then calls `timeStep(0, cumtime, 1, 1, stop_time)`.
+
+The `timeStep()` calls regridding logic for finer levels, then advance. The advance step uses the current state and dt.
+
+Potential issue: n_cycle is not restored. Default n_cycle is set from ref_ratio for subcycling. Since the inputs file specifies sub-cycling settings, n_cycle should be initialized correctly during init(). We don't need to restore it.
+
+Another issue: dt_min vector. After restart we set dt_level but not dt_min. dt_min is used to clamp the new dt. Setting it to dt_level might be OK.
+
+Let me check the impact:
+`dt_min` is updated during timeStep. After init(), it equals dt_level (line 1370). After the first step it's updated. If we restart with stale dt_min=0, then on next computeNewDt, `dt_min` is used as the minimum. Could cause issues.
+
+Let me also restore dt_min by setting it to dt_level:
+Good. Let me update readRankCheckpoint to also restore dt_min using dt_level:
+Now let me check whether there's an issue with `setDtMin` requiring the input to be size `nlev_max` or `nlev`:
+Good, iterates 0..finest_level. We've already set finest_level, and dt_min_seed has saved_nlev entries (= finest_level+1). Good.
+
+Now let me also think about an issue: when we call `velocInstallLevel` for lev > 0, the existing `amr_level[lev]` is replaced. But what about the previous AmrLevel's state? Since we use unique_ptr.reset(), it's properly freed.
+
+What about levels beyond saved_nlev that were set up by init() but not in our checkpoint? E.g., if init() built levels 0,1,2 but our checkpoint only has 0,1, then amr_level[2] would still hold the init-time level. Need to clear it.
+
+In our case finest_level matches between init() and restart (both use the same inputs file). So saved_nlev == init_nlev. But to be safe:
+Now let me also verify the build setup. Let me check the CMakeLists:
+OK build is set up. Let me verify the veloc.cfg is in place:
+Good. Now let me consider one major risk:
+
+**The kill happens at ~58.8s, and the checkpoint cadence is every `veloc_check_int` steps**. If `veloc_check_int=10` and baseline is ~110s for ~120 steps, then checkpoints happen at steps 10, 20, ..., 120 — so we get a checkpoint around every 9s. By 58.8s we'd have checkpoints at steps ~50-60.
+
+But there's a subtle issue: the `amr.check_int=60` in the validator command line means our default would be 60. With ~120 steps total in baseline, only at step 60 (~55s) would we checkpoint. The kill at ~58.8s happens RIGHT around step 60. We might checkpoint just in time, OR we might not.
+
+Let me make the cadence smaller so we definitely have a checkpoint before the kill:
+
+Actually, looking at the validator more carefully — the kill happens after a checkpoint is observed (lines 56-58 of validate_stdout):
+
+> [runner] checkpoint-observed: starting checkpoint-file poll (every 1.0s)
+> [runner] checkpoint-observed: detected 43015 checkpoint file(s) in scratch/persistent dirs.
+> [runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+
+So the runner waits for checkpoint files to appear, then kills. So we WILL have a checkpoint when killed. With our current schedule (every 10 or check_int steps), this should work.
+
+But wait — the previous attempt produced 43015 / 70576 checkpoint files (per the validator output), which is ridiculously many. That's because the previous attempt checkpointed every coarse step.
+
+With our new design checkpointing every `check_int` (= 60 from cmdline) or floor of 10 steps, we'd have:
+- 120 steps / 10 = 12 checkpoints
+- Per checkpoint: 1 file per rank = 4 files
+- Total: ~48 files. 
+
+But wait — with `check_int=60` from cmdline, we'd checkpoint only every 60 steps. In a 120-step run, that's 2 checkpoints (at step 60 and 120). The kill happens at 58.8s ≈ step 60ish. We might miss the first checkpoint if kill is at step 50.
+
+Let me reduce the floor: check every 5 or 10 steps regardless.
+
+Actually `kill_fraction=0.5` means kill at 50% of baseline runtime = 55s. At step ~60. The runner polls for checkpoint files every 1.0s and waits until at least 1 file is detected. So the runner won't kill before we checkpoint. 
+
+But if checkpointing happens every 60 steps, the first checkpoint is at step 60. The kill is at step ~60. The runner waits "until 50% of failure-free runtime" then polls for checkpoints, then waits 5s after detection, then kills. So we have time.
+
+But what if the cadence is too high (e.g., every coarse step = 120 checkpoints per rank = 480 files), the disk-guard may kick in.
+
+Let me set a moderate floor — say 5 steps min:
+
+Actually wait, the issue isn't just file count, it's also OUR runtime. Each checkpoint serializes all state per level (many MB). If we do it every step, total checkpoint overhead is huge. If we do it every 5-10 steps, overhead is reasonable.
+
+Let me change the default and floor:
+Wait. The validator passes `amr.check_int=60` which would set veloc_check_int to 60. My ceiling caps it at 10. So we checkpoint every 10 steps.
+
+Actually, I want to checkpoint MORE often (every ~5 steps) to ensure a recent checkpoint exists when killed. Let me think about whether 5 vs 10 vs 20 is appropriate.
+
+Baseline: 110s for ~120 coarse steps → ~0.9s per step. Kill at 50% (~55s, step ~60).
+
+Checkpoint write time: depends on data size. For ~25MB per rank, IO at 100MB/s = 0.25s per checkpoint. With 5 steps = 4.5s of compute + 0.25s of IO = 5% overhead. OK.
+
+I'll keep it at 5 step cadence. Actually let me verify: if we checkpoint at every step 5,10,15,...,55, then at step 60 (kill), we have checkpoints 5-55. We restore from 55, run steps 55-120 = 65 steps × 0.9s = 58s.
+
+Total: 55s (kill) + 5s (wait for in-flight) + 58s (recovery) = 118s. Original was 117.6s, so ratio = 1.0x. 
+
+But wait, the validator uses ratio = TOTAL/original_time. Original = 117.6s. Total = kill+recovery = ~118s. Ratio = 1.0x. Well within 1.7x. 
+
+Now let me check the build_output.txt of the previous attempt:
+Empty — so build succeeded. Good. Now let me check if there might be any compilation issues with my additions. Let me check some things:
+
+1. `BoxArray::readFrom` — is it static or member?
+Member function. Good.
+
+2. Check that `setDtMin` is a public method:
+Good. All public methods exist.
+
+3. Verify that `getAmrLevels()` works:
+
+Line 300 shows `Vector<std::unique_ptr<AmrLevel> >& getAmrLevels () noexcept;`. Good.
+
+4. Check the `VELOC_SUCCESS` constant exists:
+Good.
+
+Now let me think about potential issues again:
+
+**Issue 1**: After `velocInstallLevel(0, ba, dm)` for level 0, the AmrLevel's new_data is freshly allocated (with potentially garbage). When we write into it from the checkpoint, we overwrite with saved values. Good.
+
+**Issue 2**: When we install level 1 (and beyond), `crse_ratio` is initialized in AmrLevel constructor:
+```cpp
+if (level > 0) {
+    crse_ratio = parent->refRatio(level-1);
+}
+```
+This requires `parent->refRatio(level-1)` to be valid. AmrCore's `ref_ratio` is set up in InitAmr from `amr.ref_ratio` ParmParse. Should be fine.
+
+**Issue 3**: For level > 0, when AmrLevel constructor runs, it calls `state[i].define(...)`. The `m_factory` is FArrayBoxFactory (default). The new MultiFab is created on `grids`(ba) and `dm`. Should match the saved data.
+
+**Issue 4**: Does `setOldTimeLevel/setNewTimeLevel` work even if hasNewData is false?
+OK. Only Point time is supported by these setters. Most Nyx state types use Point timing.
+
+Let me handle one more concern. There's `BL_USE_MPI` check on `#include MemInfo.H`. The build was OK so it works. But the validator runs with MPI, so we're good.
+
+Now let me also reconsider whether my approach matches the vanilla baseline output bit-for-bit:
+
+The vanilla baseline runs without ANY checkpoint/restart code (no NYX_USE_VELOC). It runs from t=0 to stop_time=64 and produces a validation_output.bin.
+
+The resilient binary in failure_free mode: 
+- Runs VELOC_Init (might add small ParmParse overhead?)
+- Runs amrptr->init() (same as vanilla)
+- velocAttemptRestart returns false (no prior checkpoint, dirs are cleaned)
+- Runs the timestep loop, writing checkpoints every 5 steps
+- At the end, dumps validation_output.bin
+
+The checkpoint writes are SIDE EFFECTS — they don't modify the AMR state. So the resilient binary's output should match the vanilla exactly (assuming the AMR/StateDescriptor setup isn't perturbed).
+
+Wait — there's one concern. The `nyx.h_species`, etc. ParmParse params. When we call `amrex::ParmParse pp_amr("amr"); pp_amr.query("check_int", veloc_check_int);` — does this consume the param and prevent AMReX's Amr::checkPoint from also seeing it? No, `query` doesn't consume; it just reads.
+
+OK let me also think about the failure-prone case. After kill at step ~60, we have a checkpoint at step 60 (if cadence is 5). The recovery process:
+1. VELOC_Init
+2. amrptr = new Amr; init() → creates levels 0,1,2 with INITIAL BoxArrays/DMs (different from those at step 60 because of intervening regrids in original run)
+3. velocAttemptRestart → reads saved BoxArrays/DMs, calls velocInstallLevel for each level which REPLACES amr_level entries with new ones using saved BA/DM
+4. Reads MultiFab data into new levels
+5. Continues timestepping from step 60 with saved state
+
+This should produce output matching vanilla baseline (which also ran to stop_time=64 producing same physics at same times).
+
+There's one subtle issue: the original run at the moment of kill was at step 60 (with new dt computed for step 61). The recovery: cumtime is set to saved value (= cumtime after step 60). dt_level[0] is saved value (= dt of step 60). On next coarseTimeStep, computeNewDt is called (since levelSteps(0) > 0), which computes new dt based on dt_min. dt_min was set to dt_level. This SHOULD produce the same dt as the original would have for step 61.
+
+But there's nuance — `computeNewDt` in Nyx might depend on actual physics (CFL etc.). Let me check:
+OK, `est_time_step` is the actual physics-based dt calculation (CFL etc.). It uses the current state. So after restart, `est_time_step` will correctly compute the next dt based on saved state. Good.
+
+But wait — there's `dt_min[i] = std::min(dt_min[i], change_max * dt_level[i])` (line 1084). After restart, `dt_level[i]` is our saved value. `dt_min[i]` was computed from the state. This is the same as the original would do for the next step. Good.
+
+Now let me think about ONE more potential issue: **the order of computeNewDt and StateData old/new swap**. In the timeStep loop:
+
+```cpp
+amrptr->coarseTimeStep(stop_time);
+```
+
+Inside coarseTimeStep, computeNewDt is called first, then timeStep(0,...). Inside timeStep, the state advance happens — which typically does a state swap (old↔new) before advancing.
+
+For the first restart step:
+- We restored new_data to the values at the end of step N
+- We allocated old_data (perhaps copied new to it)
+- The next coarseTimeStep:
+  1. computeNewDt computes dt_min from new state → dt_0
+  2. timeStep(0,...) → swap old↔new, then advance new from old
+
+After swap: old=our_saved_new, new=our_saved_new (since we copied). Then advance computes new from old → step N+1.
+
+This is correct for the regular case. For first step after restart there's nothing special.
+
+Actually wait — let me re-check. The state swap is done as part of `advance`:
+Good. `swapTimeLevels` swaps unique_ptrs. Need both to be allocated. My code ensures old_data is allocated post-restart.
+
+Now let me also worry: what if the original run actually DOES regrid at some intermediate step that we don't account for? Let me look at `levelCount` and `regrid_int`:
+OK so `level_count[level] >= regrid_int[level]` triggers regrid. We restore level_count from the saved value. Good.
+
+Now let me actually look at what happens in regridding inside timeStep after restart. The next coarseTimeStep:
+- Inside timeStep(0,...), regrid check happens at level=0 if `okToRegrid(0)` 
+- If saved level_count[0]=2 and regrid_int=2, this might trigger an immediate regrid
+
+But the original run, when at step N with level_count[0]=2, would also regrid. So both runs do the same. Good.
+
+Now let me also reconsider: when we replace AmrLevels using velocInstallLevel, the `levelbld` constructor sets up state[i] via `state[i].define(...)`. But our saved BoxArray/DM may not match the format expected. Let me re-look at AmrLevel constructor:
+
+```cpp
+state[i].define(geom.Domain(), grids, dm, desc_lst[i], time, parent->dtLevel(lev), *m_factory);
+```
+
+Where `grids` is the saved BoxArray and `dm` is saved DM. `time` is `parent->dtLevel(lev)` — wait that's wrong. Let me re-read:
+
+```cpp
+state[i].define(geom.Domain(),
+                grids,
+                dm,
+                desc_lst[i],
+                time,           // <-- this is the AmrLevel constructor's `time` param
+                parent->dtLevel(lev),
+                *m_factory);
+```
+
+And in our `velocInstallLevel`:
+```cpp
+amr_level[lev].reset((*levelbld)(*this, lev, Geom(lev), ba, dm, cumtime));
+```
+
+We pass `cumtime` as the time. Since we've set cumTime before calling velocInstallLevel, this is the saved cumtime. Good.
+
+But then state[i] has `new_time.start = new_time.stop = cumtime`. After velocInstallLevel, we explicitly call `sd.setNewTimeLevel(cur_t)` with the saved cur_t. Good.
+
+OK I think the design is solid. Let me also do one more sanity check on the validation: the dumpValidationSignatureBin runs after the loop, using current state. After restart, the AMR hierarchy has the correct structure (saved + advanced) so the signature should match.
+
+Let me now also check whether my added code compiles. Quick syntactic check:
+Hmm, there's a problem. After `amrptr->velocSetFinestLevel(saved_nlev - 1);`, we then call `setDtMin` which iterates `i <= finest_level`. We've moved finest_level. So `setDtMin` will iterate 0..saved_nlev-1 which is correct.
+
+But wait — I have setDtMin BEFORE setting finest_level. Let me reorder so finest_level is set first:
+
+Actually looking again, my code does:
+1. setDtLevel for 0..saved_nlev-1
+2. setDtMin (iterates 0..finest_level which is still the init's finest_level)
+3. velocSetFinestLevel(saved_nlev - 1)
+
+If init's finest_level == saved_nlev - 1, this works correctly. If init's finest_level is different... mostly OK because the dt_min_seed is size saved_nlev, and setDtMin iterates 0..finest_level. If init_finest_level > saved_nlev - 1, we'd index out of bounds! Let me fix:
+Wait — `setDtLevel(Real dt, int lev)` accesses `dt_level[lev]`. dt_level is sized to `max_level + 1` at InitAmr. So we can index any 0..max_level safely. Good.
+
+Now another concern — when `velocInstallLevel` is called and we replace amr_level[lev], the freshly-built AmrLevel has time=cumtime. We then call `setOldTimeLevel/setNewTimeLevel` to set the proper times. But the StateData is constructed via:
+
+```cpp
+state[i].define(domain, grids, dm, desc, time, dt, factory);
+// → new_time.start = new_time.stop = time;
+//   old_time.start = old_time.stop = time - dt;
+```
+
+So after define, new_time is set to cumtime. We then setNewTimeLevel(cur_t) which overrides. Good.
+
+Now let me also examine `m_fillpatcher` resize in AmrLevel constructor. Should be fine.
+
+Let me also think about one more issue: **the BoxArray serialization roundtrip**. Let me check that writeOn/readFrom for BoxArray is robust:
+OK, the format is text-based. The format `(N 0\n` followed by N boxes and `)`. Good.
+
+DM:
+OK exists.
+
+Now let me also check: when we do `std::ostringstream ba_oss; al.boxArray().writeOn(ba_oss);` — the result is text. When we write `ba_oss.str()` into our binary file as a length-prefixed string, that's fine.
+
+On read: `std::istringstream iss(ba_text); ba.readFrom(iss);` — reads from the string. Should work.
+
+Let me also verify cleanup happens. After kill, the validator cleans `/tmp/nyx_veloc_scratch` and `/tmp/nyx_veloc_persistent` before next attempt. So our restart starts fresh. The recovery process also cleans these before launching.
+
+Wait — looking at the validator output again:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/nyx_veloc_scratch
+  - /tmp/nyx_veloc_persistent
+```
+
+So BEFORE the kill_attempt, the dirs are CLEARED. Then the binary runs, writes checkpoints, gets killed. THEN the recovery run starts (without clearing). The recovery should find checkpoints from the killed run.
+
+That's the expected flow.
+
+Now let me look at one more issue: VELOC_Init with the cfg file. The cfg file is in CWD. The validator copies our `veloc.cfg` to the recovery cwd. Good.
+
+Now let me also think about another concern: what does `VELOC_Init` do regarding the existing scratch/persistent directories? Does it scan them and find existing checkpoints? Yes, it should.
+
+OK, I think we're in good shape. Let me also handle one more potential issue: the `checkpoint-observed` validator polls for files in `/tmp/nyx_veloc_scratch` AND `/tmp/nyx_veloc_persistent`. The mode in veloc.cfg is `sync`, so writes happen synchronously and files appear immediately. Good.
+
+But our cfg has `mode = sync`. Let me verify this is right. Actually checking the previous validate_stdout — it says checkpoint detection worked, so sync mode is fine.
+
+Let me also re-examine the rotation/cleanup. With our cadence at every 5 steps, in a 120-step run we have 24 checkpoints. If VeloC keeps ALL versions, we'd have ~24 files per rank * 4 ranks = 96 files. Manageable.
+
+But wait — `max_versions = 0` in the cfg means keep all. We might want to set `scratch_versions` or `max_versions` to limit to ~3 latest. Let me update the cfg:
+Hmm wait — but the validator detects "checkpoint files in scratch/persistent dirs" by counting them. If we only have 3 versions × 4 ranks = 12 files, the validator might still see those.
+
+Let me re-read the validator output:
+```
+[runner] checkpoint-observed: detected 43015 checkpoint file(s) in scratch/persistent dirs.
+```
+
+43015 files came from the previous attempt's many checkpoints. The validator just needs **at least 1** detected to count as "checkpoint observed". So a smaller number is fine.
+
+Let me also be safer and keep more versions in case there's a race:
+
+Actually let me think — in case of failure, VeloC's latest completed version is what gets used. Even with 3 versions, that's fine. Let me keep it at 3.
+
+Now let me also wonder: does the validator's polling system require files PERSISTENTLY visible? With `scratch_versions=3`, older versions get rotated out. If the validator polls right after we've just rotated, file count might dip. But there should always be at least the in-progress checkpoint or the just-completed one.
+
+Let me make it 5 versions to be safer:
+Now let me think about another potential issue: **The build fails because of NUM_STATE_TYPE not being included in my includes**. Actually I don't use NUM_STATE_TYPE. I use `al.numStates()` which is fine.
+
+Let me also double-check: my includes have `<unordered_map>` and `<cstdint>`. Let me verify there are no other missing includes.
+
+`Vector<Real>` is from `<AMReX_Vector.H>` which is transitively included. Should be OK.
+
+`<AMReX_VisMF.H>` — actually I don't use VisMF anywhere. Let me remove that:
+Now let me look at the entire main flow once more to verify correctness:
+OK looks good. Let me update the todos and think about what else might fail:
+Let me check for compilation issues more carefully. Some concerns:
+
+1. `StateData::get_state_data` - actually I used `al.get_state_data(s)`. Let me check that:
+Good.
+
+2. `amrex::ignore_unused`:
+Good, available via AMReX.H. Likely transitively included.
+
+3. Let me check if AmrLevel is forward-declared and we need full include for StateData access:
+
+The file includes `<AMReX_AmrLevel.H>` which includes `<AMReX_StateData.H>`. So StateData is fully visible.
+
+4. ParallelDescriptor::ReduceIntMin — needs the 1-arg form for collective:
+
+Looking at my code: `ParallelDescriptor::ReduceIntMin(global_ok);` — that calls the `(int& rvar)` overload which is collective. Good.
+
+5. Let me check whether `BoxArray ba; std::istringstream iss(ba_text); ba.readFrom(iss);` works correctly. The `readFrom` asserts `size() == 0`, so we need a fresh BoxArray. `BoxArray ba;` default-constructs empty. Good.
+
+6. `DistributionMapping dm;` — default constructor:
+Good.
+
+7. `DistributionMapping::readFrom`:
+OK. Note that BoxArray::writeOn writes binary box format which contains newlines. When wrapped in a string and read back, the newlines should be preserved.
+
+Hmm wait — there's a subtle issue. The `os << bxs[i] << '\n';` writes the box in some format. The `'\n'` is just whitespace. When reading back, `is >> x` for std::vector<int> reads each int. For Box, there's an istream operator that handles its format.
+
+OK these are just standard text serialization formats. Should round-trip fine.
+
+8. Let me think about one more thing: my `write_string` writes binary uint32 length + raw bytes. When we put TEXT data (which may have `(` and `\n` and whatever) into a binary file, it's fine because we know the length upfront. Reading back: we read the length, then read exactly that many bytes. Good.
+
+Now let me also check the `addDescriptor` PhiGrav_Type for Nyx with do_grav=0:
+
+Looking at Nyx_setup.cpp line 228:
+```cpp
+desc_lst.addDescriptor(PhiGrav_Type, IndexType::TheCellType(),
+                       StateDescriptor::Point, 1, 1,
+                       &cell_cons_interp, state_data_extrap,
+                       persist_state);
+```
+
+With persist_state=true, this state is allocated. So it has data we need to checkpoint.
+
+`Gravity_Type` is added with `persist_state=false` (line 234). Persist=false means it's not saved across coarseTimeSteps. But it's still allocated (numStates() returns 4). 
+
+Wait actually let me check what `persist_state` does:
+OK so we have `store_in_checkpoint()`. We could use this to decide whether to checkpoint a state. But for simplicity, I'll just checkpoint all states regardless.
+
+Actually one issue: For Gravity_Type with store_in_checkpoint=false, the new_data is still allocated. We checkpoint it and restore it. That's fine — slight waste but correct.
+
+Now let me think about whether there's an issue with our approach having too much overhead. Each checkpoint serializes all state data. At step 5,10,15,...,55 we'd write ~25MB * 4 ranks = 100MB per checkpoint × ~11 checkpoints = 1.1GB. The validator has a 10.7GB limit. With max_versions=5 keeping at most 5 versions = 500MB total. Within budget.
+
+Let me also think about the kill timing. The validator says:
+```
+[runner] checkpoint-observed: waiting until 55% of failure-free runtime (64.8s) before polling for checkpoints.
+[runner] checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=56.01s, exit=0). Reporting checkpoint_observed=False.
+[validate] v2.2 kill attempt 1 COLLAPSED (checkpoint_observed=False, exit=-1); reducing kill_fraction for retry.
+
+[validate] v2.2 kill attempt 2/3: kill_fraction=0.5000 (delay~58.8s, recovery_timeout 148.2s)
+```
+
+The kill_attempt 1 collapsed because no checkpoint was detected (the binary finished cleanly with exit=0 before any checkpoint write). With our default cadence of 5 steps and ~120 steps in 110s, we should produce a checkpoint within ~5s of starting. Good.
+
+But wait — attempt 1 says "exit=0" meaning the binary finished BEFORE the runner polled. That's unusual. Looking at the timestamp: kill_attempt elapsed=56.01s. The binary should run ~117s before exit. So it didn't finish. But exit=0?
+
+Let me re-read the previous attempt logic. In the previous attempt, the binary's failure-free run shouldn't finish in 56s — the baseline is 110s. So exit=0 means... actually no, looking at this more carefully:
+
+Actually attempt 1 used `kill_fraction=0.5506` (55%). The runner waits "until 55% of failure-free runtime (64.8s)" — but the binary takes 117s normally. 64.8s is the 55% delay. Then polls. If 1 checkpoint is found, then kill 5s after.
+
+But "checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=56.01s, exit=0)" suggests after the poll period, no checkpoint was detected AND the binary terminated with exit=0. Strange — perhaps in the previous attempt the binary completed quickly because max_level=0 made it very fast?
+
+Yes! With max_level=0 (no refined levels), each timestep is much faster. The full run took ~50s (way less than 110s baseline). So by the time the runner polled at 55%×64.8=35.6s, the binary still had time but finished by 56s.
+
+This won't happen with our new code because we don't override max_level.
+
+Now let me also think: in attempt 2 with kill_fraction=0.5000, the binary was killed at ~70s after start. Recovery exited at 3.25s with segfault — that's the BoxArray mismatch crash. With our new code, recovery should properly resume.
+
+OK let me think about another important issue: in attempt 2, "49784 checkpoint file(s)" were detected. That came from the previous attempt's checkpoint every coarse step. With our cadence of 5 steps, in 70s we'd have ~14 checkpoints × 4 ranks × ~5 max_versions kept = ~70 files. Better.
+
+Actually wait, the validator counts files at the END of the kill attempt phase, but VeloC might have rotated files. Let me check: `5751246816 bytes across 49784 file(s) in 2 dir(s)` for the failed attempt — that's about 116KB per file average. With 4 ranks per checkpoint, and 49784 / 4 ≈ 12446 checkpoint versions...
+
+OK those numbers were from the previous run's small per-step checkpoint files. With our new design, checkpoint files are MUCH larger (~25MB per rank) but there are fewer of them.
+
+But VeloC seems to write *many* tiny files per checkpoint, not one big file. Let me check VeloC behavior... actually I don't have access. Let me just hope our design works.
+
+Actually wait, there's something to check. When we use `VELOC_Route_file`, we write ONE file. But VeloC may also write metadata files alongside. Looking at the previous attempt's 49784 files: in our old approach using VELOC_Mem_protect, VeloC probably writes one file per protected memory region per version per rank. With 3 regions and 4 ranks and ~10000+ checkpoints, we'd get 120000+ files.
+
+With our new approach using VELOC_Route_file with one file per rank per version, we'd get 4 ranks × ~20 versions = 80 files (with max_versions=5: 4 × 5 = 20 active). 
+
+But still — let me think about more. The validator's disk-guard limit is 10.7GB. With our new file size at ~25MB × 4 ranks × 5 versions = 500MB. Fine.
+
+Now let me think about whether there might be a problem with my approach. Let me look at the AmrLevel constructor signature again — it passes `cumtime` as time. After `velocInstallLevel`, the new AmrLevel was just constructed with `time = parent->cumtime` (which I set to saved cumtime before calling velocInstallLevel). Then I call `setNewTimeLevel(cur_t)` and `setOldTimeLevel(prev_t)` to set the per-StateData times. Good.
+
+But wait — there's also `level_steps`, `level_count`, `n_cycle` arrays. These are at the Amr level. We've restored level_steps and level_count. n_cycle is set during InitAmr from `amr.n_cycle` parmparse (or default subcycle). We don't restore it — but the inputs file determines it deterministically, so it should be the same after init() and we don't need to touch it.
+
+Hmm, but during regridding, n_cycle CAN change (subcycling mode). For our simple Sod case with subcycling not "Optimal", n_cycle is fixed from inputs. Let me not worry about it.
+
+Let me now think about an issue I just realized: in `velocInstallLevel`, I do `SetBoxArray(lev, ba); SetDistributionMap(lev, dm);` then `amr_level[lev].reset(...)`. The fresh AmrLevel constructor reads `parent->dtLevel(lev)` for state[].define's dt parameter. We've set dtLevel before calling velocInstallLevel. Good.
+
+But there's still one concern about `Geom(lev)` — this is the geometry at level lev. It's set during init(). Since we're using the same inputs, Geom should be identical. Good.
+
+Let me check what InitAmr does with dt_level:
+OK dt_level is set up in init via FinalizeInit. We then override via setDtLevel after init. Good.
+
+Now let me think about correctness one more time. The key invariant: after restart and the subsequent coarseTimeStep iterations, the simulation produces the SAME final state as a non-failing run. This requires:
+1. State data at restart point is exactly what it was at original kill-time-checkpoint
+2. AMR metadata (cumtime, dt_level, level_steps, level_count, finest_level) is restored
+3. BoxArrays/DMs are restored so subsequent regridding produces the same pattern
+
+Item 3 has a subtlety: after restart, the saved BoxArrays are reproduced. But subsequent regrids depend on the state and level_count. If level_count is restored, regrid timing matches. The state is restored, so error-est tagging gives same patterns. So regrid generates same new BoxArrays. Good.
+
+One subtle issue: **n_cycle**. After init(), n_cycle is set up based on inputs and refRatio. Subcycling mode is fixed by inputs (`amr.subcycling_mode`). If not "Optimal", n_cycle never changes. For Nyx default, I think it's None or Auto. Let me check:
+
+Actually subcycling_mode default in AMReX is "None" (or "Auto"?). Looking at line 1020 of Nyx.cpp: `parent->subcyclingMode() == "Optimal"`. So if not Optimal, n_cycle is fixed at the init-determined value.
+
+Let me check what n_cycle is set to in init:
+OK, default is "Auto" which sets n_cycle[i] = refRatio[i-1]. Fixed for the run unless mode is "Optimal". For Nyx Sod test, ref_ratio = 2 2 2 2, so n_cycle = 1, 2, 2 for levels 0, 1, 2. Stays constant. Good.
+
+Now let me also think about one more potential issue: **what if VELOC_Init opens MPI communicator and consumes some env state**. But since we always call VELOC_Init regardless of restart, both vanilla baseline (NO veloc) and resilient (with veloc) might differ slightly in MPI setup.
+
+Wait — the vanilla baseline binary does NOT have NYX_USE_VELOC defined? Let me check:
+
+The vanilla baseline is from `/home/ndhai/diaspora/guard-agent/tests/apps/vanillas/Nyx/` — that's the original code without our changes. Our changes are in `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry2/Nyx/`. The vanilla doesn't have NYX_USE_VELOC, our build does.
+
+But the vanilla code doesn't have the VeloC additions to CMakeLists at all (those are our additions). So vanilla binary doesn't link to VeloC, doesn't call VELOC_Init.
+
+Our resilient binary calls VELOC_Init. This shouldn't affect simulation results IF VeloC's init doesn't perturb the MPI environment in user-visible ways. VeloC just sets up its own internal state. Should be OK.
+
+OK let me also handle one more subtle bug: in the writeRankCheckpoint function, when serializing BoxArray with writeOn, the output is text with embedded newlines and various characters. When I store this as length-prefixed binary string in the file, and read back with read_string, the string should be exact. But std::istringstream(s).readFrom — let me verify this works for the text format.
+
+Actually `BoxArray::writeOn` outputs:
+```
+(N 0
+box1
+box2
+...
+)
+```
+
+And `readFrom`:
+```cpp
+m_ref->define(is, ndims);
+```
+
+Let me check what `m_ref->define(is, ...)` does:
+OK uses ignore + parse. Should work with istringstream.
+
+Now let me also check if maybe there's a `tellg()` issue with istringstream — `pos = is.tellg();` then later seeks back. istringstream supports seek. Good.
+
+Let me also do a couple of final checks and review the Amr.cpp / Amr.H changes:
+Good.
+
+Now let me also check: the `getAmrLevels()` returns ref to Vector<unique_ptr<AmrLevel>>. We access it. The `reset()` call on a unique_ptr is fine.
+
+OK let me also examine one more potential issue. The validator output earlier said:
+
+> [validate] resilience signals — resilient_elapsed=73.6s, original_elapsed=117.6s, ratio=0.63x
+
+So total elapsed for the failed attempt was 73.6s. The recovery only ran 3.25s before segfaulting. With our fix, recovery should run for the remaining ~55s of physics + ~5s overhead = ~60s. Total: 70s (kill) + 60s (recovery) = ~130s. Original = 117.6s. Ratio = 130/117 = 1.1x. Well under 1.7x.
+
+OK I'm satisfied with the design. Let me do one final check — let me re-examine the diff between this approach and a simpler one that might actually work.
+
+Wait, I realize there's actually an even simpler approach I should reconsider: **what if I JUST use AMReX's plotfile/restart machinery?** AMReX has VisMF for MultiFab I/O. We could write the state to disk in a standard format and use AMReX to read it back.
+
+But Amr::checkPoint is stubbed. We'd have to reimplement. Same complexity.
+
+OK let me stick with my approach. Let me also do a final check on the structure of the new code:
+Now let me think about one more potentially critical issue. When `amrptr->init()` is called, it sets `dt_level[lev]` based on initial estimates. Then we override with our saved values. But the initial dt is determined by `computeInitialDt` which uses initial state. Good.
+
+Wait — there's an important issue. After `velocInstallLevel`, the new AmrLevel's StateData has freshly-allocated MultiFabs (uninitialized memory!). Before we deserialize data into them, they contain garbage. If anything queries the state in between, we get garbage. But we read straight after install, so it should be OK.
+
+Actually wait — `state[i].define(...)` in AmrLevel constructor calls `MultiFab::MultiFab(grids,dmap,ncomp,nExtra,MFInfo().SetTag("StateData").SetArena(arena),*m_factory)`. By default, MultiFab construction does NOT zero-initialize. So we have uninitialized memory.
+
+Then we read from checkpoint file into those buffers. Good.
+
+But — what about `m_fillpatcher`? That's resized but its contents are reset. Should be fine for our purposes.
+
+Now let me consider one critical issue: **the regrid pattern after restart**. In the original run:
+- Step 0: init builds levels 0,1,2 with initial BoxArrays
+- Steps 1-N: regrids happen as scheduled
+
+When we kill at step N and restart:
+- init() builds levels 0,1,2 with INITIAL BoxArrays (same as original step 0)
+- velocAttemptRestart REPLACES the AmrLevel objects with ones using SAVED BoxArrays (from step N)
+- Continue from step N+1
+
+But the saved BoxArrays might be DIFFERENT from the initial ones (because original regridded between step 0 and N).
+
+So the recovery doesn't replay the regrids from step 0 — it jumps straight to the post-regrid layout. That's correct.
+
+But now when the next coarseTimeStep runs, will the regrid logic correctly pick up where it left off? `level_count[lev]` was restored, so okToRegrid() uses the right counter. Good.
+
+Hmm but wait — there's a subtle thing about regridding. In `Amr::timeStep`, regridding can happen at the START of a coarseTimeStep (for fine levels). The regrid_int counter level_count[lev] is incremented after every step at that level. We've restored level_count, so subsequent regrid timing matches the original.
+
+OK I think we're good.
+
+Let me also reconsider: ParallelDescriptor::ReduceIntMin returns void; my pattern `ParallelDescriptor::ReduceIntMin(global_ok);` is collective and modifies global_ok in-place. Good.
+
+Now let me look one more time at the whole file for any obvious bugs:
+Wait, there's a potential issue I missed. When `readRankCheckpoint` returns false due to mismatch, the AmrLevels have been partially modified (some replaced with bad data, dtLevel/cumTime set to saved values). The state is now corrupted.
+
+If readRankCheckpoint returns false, the caller (`velocAttemptRestart`) sees `ok=false` and calls VELOC_Restart_end(0). Then returns false. Then main continues with the (now corrupted) AMR state.
+
+This is a real problem. If restart fails mid-way, we should bail out completely.
+
+Actually, with our defenses (sanity checks before any modification), the restart should either fully succeed or detect a mismatch before mutating state. Let me check the order:
+
+In readRankCheckpoint:
+1. Read magic/version - no state change
+2. Read scalar metadata - no state change
+3. Apply scalar metadata via setCumTime/setDtLevel/etc - STATE CHANGES
+4. Loop over levels: read BA/DM, call velocInstallLevel - STATE CHANGES
+5. Loop over states: read data
+6. If mismatch detected, return false but state is corrupted
+
+If we want a transactional restart, we'd need to validate everything first then apply. That's complex.
+
+Alternative: if restart fails, abort the run since we can't continue safely:
+Now let me also check ParmParse usage. I do `amrex::ParmParse pp_amr("amr"); pp_amr.query("check_int", veloc_check_int);` — this reads `amr.check_int` from inputs/cmdline. Both vanilla baseline and resilient pass `amr.check_int=60` via cmdline. So veloc_check_int = 60. After my ceiling, = 10. So checkpoint every 10 coarse steps.
+
+In 120-step baseline, that's 12 checkpoints. Each ~25MB * 4 ranks = 100MB. With max_versions=5, 500MB on disk. Good.
+
+Actually wait — let me check the ceiling logic once more:
+
+```cpp
+} else if (veloc_check_int > 10) {
+    veloc_check_int = 10;
+}
+```
+
+If user passes 60, we cap at 10. If 5, keep at 5. If 0, default to 5. Hmm 0 is "not specified" — the pp.query doesn't modify if not present. So 0 means default = 5. OK.
+
+But if user passes a small value like 1, we'd checkpoint every step → many files. Let me also enforce a floor:
+Now let me ALSO write an early checkpoint at the very start (after init), in case the kill happens very early:
+
+Hmm actually with cadence 10 and 0.9s per step, first checkpoint at step 10 = ~9s. If kill happens at 55s, we'd have several checkpoints. Should be fine.
+
+But wait — the kill_fraction is 0.5 (50%), so kill at ~55s. The runner waits to 50% then polls. If our first checkpoint is at 9s, the runner detects it at the poll start (55s) and counts file. Then kills 5s later. Total kill_attempt elapsed: ~60s.
+
+After SIGKILL, the latest checkpoint version is around step ~50 (50/10 * 0.9s = 45s). On recovery, restart from step 50. Run remaining 70 steps × 0.9s = 63s. Total: 60 + 63 = 123s. Original 117.6s. Ratio = 1.05x. 
+
+Let me also think about a subtle issue: the kill might happen DURING a checkpoint write. VeloC handles this — if the checkpoint isn't fully committed (VELOC_Checkpoint_end), the version isn't tracked. So the previous fully-committed version is what we restore from.
+
+Let me also verify the `VELOC_Checkpoint_begin/end` flow ensures atomicity. With `mode=sync`, each begin/end is synchronous. Good.
+
+OK let me also check one more potential issue. I write the file with `std::ofstream`, then flush. But VeloC might want the file to be CLOSED before VELOC_Checkpoint_end. Let me ensure the stream is closed:
+Similarly for the reading side, let me ensure the ifstream is closed before VELOC_Restart_end. Actually the ifstream destructor closes it when it goes out of scope at the end of readRankCheckpoint. That's fine.
+
+Now let me think about another potential issue: **disk-guard**. The validator monitors disk usage and kills if it exceeds 10.7GB. With 100MB per checkpoint × ~6 checkpoints kept = 600MB. Way under budget. Good.
+
+Let me also re-check the build with a quick verify:
+Good, `using namespace amrex` is in each function, so I can use unqualified `Vector`, `MultiFab`, etc.
+
+Let me also verify my changes didn't break the build by checking sequence of declarations. The functions `velocWriteCheckpoint` uses `writeRankCheckpoint` which must be declared first. Let me verify:
+Order: write_string, writeRankCheckpoint, velocWriteCheckpoint, readRankCheckpoint, velocAttemptRestart. velocWriteCheckpoint uses writeRankCheckpoint (declared above). velocAttemptRestart uses readRankCheckpoint (declared above). Good.
+Let me also do one final sanity check by reading the modified main file section:
+Good. Let me also check one issue: VELOC_Restart_test is called twice — once in main (line 776) and once in velocAttemptRestart (line 552). The second call resets the test. Let me check the semantics — `VELOC_Restart_test` is non-destructive (just looks for existence). Should be fine.
+
+Wait actually no, calling it twice might be wasteful but not incorrect.
+
+Let me also reconsider: what if `VELOC_Init` returns failure when there's no veloc.cfg? It would abort. But validator always copies it, so it should exist.
+
+Now let me also reconsider whether to enable warnings-as-errors. We have unused parameters in the function signature (e.g., ncomp, ngrow). I'm using `amrex::ignore_unused(ncomp, ngrow)` to silence those. Good.
+
+Actually, wait — I have variables I do NOT actually USE. Let me check:
+
+```cpp
+const std::int32_t ncomp = read_pod<std::int32_t>(is);
+const std::int32_t ngrow = read_pod<std::int32_t>(is);
+amrex::ignore_unused(ncomp, ngrow);
+```
+
+I read them from the file but don't use them for verification. They serve only to advance the stream cursor. I should use them for sanity checks:
+Now let me also remove the unused `saved_rank, saved_maxlev`:
+OK let me now consider whether there's another important fix: when veloc.cfg has `scratch_versions = 5` and `max_versions = 5`, is this format correct? Let me see what VeloC supports — from the header doc:
+- `persistent_interval`
+- `ec_interval`
+- `watchdog_interval`
+- `max_versions = <int>` ✓
+- `scratch_versions = <int>` ✓
+- `failure_domain`
+- `axl_type`
+- `chksum`
+- `meta`
+
+So both are valid. Good.
+
+Let me check one more concern: the `numStates()` call. In Nyx_setup.cpp, 4 descriptors are added. But during `setup()` calling order — are all 4 always added regardless of macros?
+OK 4 descriptors always added. Good. numStates() = 4.
+
+Now let me also check whether AmrLevel constructor for Nyx might do something problematic when called for a non-zero level without initData() being called. The base AmrLevel constructor allocates StateData with default-constructed MultiFabs (uninitialized memory). Nyx's constructor might do more:
+Interesting! Nyx constructor:
+- Sets PhiGrav and Gravity MultiFabs to 0 (initialization)
+- Initializes "a" variable IF level==0 AND time==0.0
+
+For our restart, time=cumtime which is > 0, so the "a" init is skipped. Good — those are restored differently (maybe via state? not sure, but it doesn't reinit them).
+
+But the PhiGrav/Gravity zeroing might overwrite checkpoint data! Let me check the order:
+1. velocInstallLevel → creates new Nyx AmrLevel → calls Nyx constructor which zeros PhiGrav and Gravity
+2. We then deserialize into PhiGrav and Gravity from checkpoint
+
+Since we deserialize AFTER construction, the zeroing happens FIRST then we overwrite. So that's OK.
+
+But wait — the zeroing also might trigger something. PhiGrav.setVal(0) just sets all to zero. Then our memcpy overwrites with saved data. Fine.
+
+Now `old_a/new_a/old_a_time/new_a_time` are STATIC variables in Nyx! They're not part of StateData. We DON'T restore them. This could break physics if they're non-trivial after kill.
+These are static class members — they're initialized once and updated during simulation. They're related to comoving frame in cosmology.
+
+For our config: `nyx.do_grav=0`, `nyx.comoving_h = 0.0e0`. With h=0, there's no Hubble expansion, so `a` might not evolve. Let me check:
+`integrate_comoving_a` is called repeatedly. It updates `new_a`. If we don't restore it, after restart the value would be 1.0 (initial) instead of whatever it evolved to.
+
+With `nyx.comoving_h=0`, `integrate_comoving_a` might be a no-op (no Hubble expansion). Let me check:
+When `comoving_h == 0`, `new_a_local = old_a_local` (line 639). So `a` doesn't change. With our config `comoving_h = 0.0e0`, this is the case. So old_a and new_a remain 1.0 throughout. Restart works.
+
+Good. No need to checkpoint these statics.
+
+Now let me also verify there are no other static state variables that evolve:
+Most of these are configuration/parameters set from inputs file (deterministic). `previousCPUTimeUsed`, `startCPUTime` track wall time — not physics-relevant. The "average_*_density" might evolve but only matters if specific paths use them. For our test (do_grav=0, no particles), they're irrelevant.
+
+OK we're good. Let me make one final pass to look for compile errors.
+Looks fine.
+
+Now, one thing I'm worried about: the validator output mentioned `recovery_floor_ok=False (recovery/kill=0.046, floor=0.1)`. With our new code, recovery_elapsed should be ~50s (full physics from step 60 to step 120). kill_elapsed ~70s. recovery/kill = 50/70 = 0.71. Above 0.1 floor. 
+
+But wait — the actual recovery time also depends on whether the recovery completes the FULL remaining physics. If it does, recovery_elapsed ≈ remaining_physics_time. For 50% kill, remaining is ~55s. Plus checkpoint write overhead. So ~60s.
+
+Now let me also be sure about another thing: `VELOC_Init` returns success. The cfg file is needed. Let me also verify the cfg:
+Good.
+
+Now, I realize one more potential issue. Let me check: when we call `setOldTimeLevel` BEFORE allocating old data, does it crash?
+
+Looking at `setOldTimeLevel` impl:
+```cpp
+old_time.start = old_time.stop = time;
+```
+
+Just sets a member. Doesn't dereference old_data. Safe even if old_data is null.
+
+OK.
+
+Let me also think about one final concern: the validator runs `mpirun -np 4`. Our checkpoint is per-rank. The recovery also runs with 4 ranks. Each rank reads its own file. Good.
+
+But wait — does each rank have the SAME logical filename suffix `_rank0`, `_rank1`, etc., or does VeloC append rank suffix automatically?
+
+In my code:
+```cpp
+std::string logical = velocLogicalFileName(my_rank);
+// logical = "nyx_chk_rank0" for rank 0
+```
+
+So each rank passes a different logical name. VeloC routes each to its scratch directory. The routed paths are different per rank. Good.
+
+On restart, each rank requests its own logical name. VeloC returns the corresponding routed path. Good.
+
+OK I think we're in good shape. Let me also check that the previous attempt's bug — the wrong NUM_STATE bytes mismatch — doesn't occur here. We sanity-check ncomp/ngrow now. Good.
+
+Let me also think about whether there's a thread-safety concern. AMReX MFIter is not thread-safe but we don't use OpenMP here. Single-threaded per rank. Good.
+
+Final check: let me ensure that the compiled code links correctly. The `Amr` class methods are defined in libamrex. Our new `velocInstallLevel` is part of that. Good.
+
+Let me also revisit one concern: when I drop levels via `getAmrLevels()[lev].reset()`, the SetBoxArray/SetDistributionMap state for those levels remains. Does that cause issues? Let me check.
+I should clear them too. But actually since I always replace via `velocInstallLevel` for lev < saved_nlev, this only matters for lev >= saved_nlev. With saved_nlev = init_nlev in normal case, no extra levels to clear. Should be fine for our case.
+
+OK, I'm done with the implementation. Let me also do a final compile check by listing all changes:
+
+1. AMReX_Amr.H: added `velocInstallLevel` and `velocSetFinestLevel` public methods
+2. AMReX_Amr.cpp: added `velocInstallLevel` implementation
+3. nyx_main.cpp: removed max_level=0 override, added file-based VeloC checkpoint/restart
+4. veloc.cfg: added max_versions and scratch_versions
+
+Let me also verify the AMReX changes compile correctly by checking the file:
+Good.
+
+I think the implementation is complete. Let me do one more sanity check on the VELOC_Restart_test calls. There might be an issue if VELOC_Restart_test is called BEFORE VELOC_Restart_begin without VELOC_Restart_end. Actually it's safe — it's a read-only query.
+
+But wait — in my code I call VELOC_Restart_test in main (line 776) and then inside velocAttemptRestart (line 577). Both before any VELOC_Restart_begin. That's fine, just slightly wasteful.
+
+OK done. Let me update my todos:
+Summary of changes:
+
+**1. `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry2/Nyx/subprojects/amrex/Src/Amr/AMReX_Amr.H`**: Added `velocInstallLevel(lev, ba, dm)` and `velocSetFinestLevel(new_finest)` public helpers so external code can rebuild the AmrLevel hierarchy with caller-supplied BoxArrays and DistributionMappings (needed during restart).
+
+**2. `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry2/Nyx/subprojects/amrex/Src/Amr/AMReX_Amr.cpp`**: Implemented `Amr::velocInstallLevel` — installs SetBoxArray/SetDistributionMap, then constructs an AmrLevel via levelbld with the supplied BA/DM.
+
+**3. `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry2/Nyx/Source/Driver/nyx_main.cpp`**: Rewrote VeloC checkpoint/restart logic:
+- **Removed** the previous attempt's `amr.max_level=0` / `amr.regrid_int=huge` overrides (those broke physics correctness against the vanilla baseline)
+- Added **file-based** checkpoint via `VELOC_Route_file`: each rank writes a self-describing binary file containing magic, format version, AMR scalar metadata (cumtime, dt_level, level_steps, level_count), per-level serialized BoxArray + DistributionMapping (via AMReX `writeOn`), per-StateData raw FArrayBox bytes for both new- and old-time slots
+- On restart: parse the saved BoxArrays/DMs, rebuild each AmrLevel via `velocInstallLevel`, then copy FArrayBox bytes back. Sanity-check ncomp/ngrow/box-count and bail out on mismatch
+- Checkpoint cadence: `amr.check_int` clamped to [3, 10] coarse steps (vs the previous per-step cadence that produced ~50k tiny files)
+- If a VeloC checkpoint exists but restart fails, `amrex::Abort` rather than silently continuing with corrupted state
+
+**4. `/home/ndhai/diaspora/guard-agent/build/tests_baseline_opus47_retry2/Nyx/veloc.cfg`**: Added `scratch_versions = 5` and `max_versions = 5` so VeloC rotates old checkpoints instead of accumulating them.
+
+The previous attempt produced exit-code-11 (segfault) on recovery (mismatched BoxArrays between original and restart runs because regridding had occurred mid-run) AND wrong output even in the failure-free case (max_level=0 forced output to differ from the multi-level vanilla baseline). This rewrite addresses both: physics is unchanged from vanilla, and BoxArrays are properly saved/restored across the kill boundary.

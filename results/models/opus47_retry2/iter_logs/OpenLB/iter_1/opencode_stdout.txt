@@ -1,0 +1,242 @@
+I'll start by reading the previous iteration logs to understand what went wrong, then plan my approach.
+Let me check what's available in the iterative_logs directory using glob:
+No previous logs exist - this is iteration 1. Let me explore the codebase structure.
+Let me use glob to explore the OpenLB directory structure:
+The application is `examples/laminar/bstep2d/bstep2d.cpp`. Let me read it and the Makefile.
+Now let me check the VeloC headers and library:
+Now I understand. Let me explore the OpenLB API to understand how to access lattice population data for checkpointing:
+OpenLB provides Serializable save/load functions. Let me investigate the SuperLattice serializer specifically:
+Good - so `SuperLattice` (a Serializable) provides `save(filename)` and `load(filename)`. This is perfect for VeloC's "manual file" approach using `VELOC_Route_file`. Let me check OpenLB SuperLattice save:
+SuperLattice IS Serializable. So I can simply call `sLattice.save("file")` and `sLattice.load("file")`. Let me verify and examine the `setProcessingContext` interaction since this could matter for GPU contexts:
+Now let me check the save/load actual file format and any examples that do save/load. Maybe there's an example that already saves lattice state for reference:
+Let me look at how save/load works with file system. There's `save(std::string fileName)` which uses MPI rank to make distinct files. Let me look at that implementation:
+Interesting - the file-based `save`/`load` are stubbed out. But the buffer-based ones work via `getSerializableSize()` + `save(buffer)` / `load(buffer)`. Excellent - this gives us complete control. I can:
+1. Allocate a buffer of `getSerializableSize()` bytes
+2. Call `sLattice.save(buffer)` to dump state
+3. Write that buffer to the file path returned by `VELOC_Route_file`
+4. On restart, read it back and call `sLattice.load(buffer)`
+
+Now let me make a plan and check for one detail - the converter state and statistics:
+First, create veloc.cfg in the source tree root.
+Now check libveloc's location and proper linker setup:
+Let me check the share/doc/veloc directory which is allowed:
+Hmm, glob isn't returning results in /home/ndhai. Let me try a different way:
+The VeloC library is `libveloc-client.so`. Let me confirm:
+Good. Now let me design the integration. The approach:
+
+1. **Initialize VeloC** after MPI init.
+2. **Register memory regions** for state that must survive crash:
+   - Current iteration `iT` (just an int)
+   - Lattice state via buffer-based serializer
+3. **On restart**: detect via `VELOC_Restart_test()`, restore `iT` and lattice buffer, then call `sLattice.load(buffer)`.
+4. **During the loop**: at intervals, do `VELOC_Checkpoint()`.
+
+But there's a complication: the lattice serialized buffer has a `getSerializableSize()` that's only known *after* the lattice is set up. So memory registration must happen after `prepareGeometry()`/`prepareLattice()`. That's fine.
+
+Let me also consider: `setProcessingContext(ProcessingContext::Evaluation)` may need to be called before save (to sync GPU→CPU). For CPU_SISD platform (which is configured), this likely doesn't matter, but to be safe let me bracket with set Evaluation before save, set Simulation after load. Looking at the existing code, it does `setProcessingContext(ProcessingContext::Evaluation)` after the simulation loop.
+
+Let me check the validation signature: it uses `stats.getTime()` which means the lattice tracks iteration internally too. Let me check what getTime returns:
+The LatticeStatistics is a member. Let me check if it's part of the serializable interface for SuperLattice. Let me look at the `getBlock` body more carefully - it's only iterating over `_block` (BlockLattice instances), not statistics. So statistics might not be persisted. Let me check if BlockLattice statistics matter:
+Good. So `getStatistics().incrementTime()` is called every collideAndStream. After restart, statistics time will not match — but `collectStatistics()` is called inside collideAndStream, so after the final iteration completes, statistics will be re-collected based on the current physical state. The signature uses `stats.getTime()` which counts collideAndStream calls.
+
+So if we restart at iteration X and continue to N, `getTime()` will be (N-X), not N. This is critical for the validation check (which compares against vanilla run).
+
+Therefore I MUST also persist `_statistics._time` (the lattice's internal step count) — or just re-run the entire simulation by restoring `iT` properly such that `getTime()` equals N.
+
+Actually wait, looking again: when we restart, the lattice statistics' `_time` resets to 0 (since the lattice is rebuilt). Then if we run from iT=X up to N, we'll do N-X collideAndStreams, so getTime()=N-X.
+
+I need to also persist the LatticeStatistics state. Let me look at it:
+`resetTime(size_t value=0)` is available. So after restart I can:
+1. Restore `iT` (loop counter)
+2. Restore lattice population data
+3. Set `sLattice.getStatistics().resetTime(iT)` to set the lattice's internal time so signature[0] matches
+
+Wait — but also the block-level statistics: each block's `getStatistics().incrementTime()` is called. So I'd also need to reset each block too. Actually, the validation signature uses the super-level `stats.getTime()`, not block-level. So just resetting super-level is enough.
+
+But there is yet another wrinkle: the validation `stats.getAverageRho`, `getAverageEnergy`, `getMaxU` — these are recomputed in `collectStatistics()` which runs every step (it does `stats.reset()` first). So those are *always* current. Only `getTime()` accumulates.
+
+Plan:
+- Persist `iT` (the iteration counter) 
+- Persist the entire lattice serialization buffer 
+- On restart: load both, call `sLattice.load(buffer)` which calls `postLoad()` which presumably restores GPU contexts; then `resetTime(iT)` on statistics
+
+Now let me check `postLoad` and `BlockLattice::postLoad` to ensure it does the right thing:
+Good. Now let me write the modified bstep2d.cpp.
+
+Strategy considerations:
+- I should keep the original validation signature emission code intact
+- I'll add VeloC init right after `initialize()`
+- I'll modify `simulate()` to:
+  - Get state buffer size after lattice ready, register memory
+  - On entry: check `VELOC_Restart_test()` and recover
+  - In loop: checkpoint every N iterations
+  - On exit: VELOC_Finalize
+
+Let me also confirm `setProcessingContext` is needed. For pure CPU, the population data lives in CPU memory, so save/load should work directly. Looking at the example, after the simulation it calls `setProcessingContext(ProcessingContext::Evaluation)`. To be safe before checkpoint and after restart I'll set Evaluation/Simulation.
+
+Actually, let me just look at how iT is computed. Since `iT` is the loop counter and `stats.getTime()` is the lattice's internal counter, they should remain in sync. But if I restart at iT=X with statistics.resetTime(X), then run N-X more iterations, stats time becomes N. Good.
+
+Let me also note: when collectStatistics gets called in collideAndStream during iT=X (the first step after restart), it does `getStatistics().reset()` first - which clears averageVect/maxVect/numCells but NOT latticeTime. So after the first step post-restart, `getTime()` = X+1. 
+
+Now write the code. I'll keep changes minimal and self-contained.
+Now modify the `simulate` function and `main` to integrate VeloC. Let me restructure simulate() to take more responsibility:
+Now modify `main` to init/finalize VeloC:
+Now add VELOC_Finalize before return:
+Now update the Makefile to link libveloc. The example Makefile is minimal — I need to add the appropriate flags. The cleanest way is to modify the example's Makefile directly:
+Wait — looking at default.single.mk, the link line is `$(CXX) $(OBJ_FILES) -o $@$(EXTENSION) -lolbcore $(LDFLAGS)`. So `-lveloc-client` in LDFLAGS will be passed correctly. Good.
+
+Now let me try to build:
+I don't have a Bash tool, so I cannot run `make` directly. The validator will build. Let me carefully review the code I wrote to maximize the chance of a clean build.
+
+Let me re-read the modified bstep2d.cpp to verify correctness:
+Now an important question: does `sLattice.save(buffer)` and `sLattice.load(buffer)` work? Looking back at serializer.hh:
+
+- `bool Serializable::save(std::uint8_t* buffer)` (line 133): creates a `Serializer` and calls `tmpSerializer.save(buffer)` which calls `serializer2buffer(*this, buffer)`. ✓
+- `bool Serializable::load(const std::uint8_t* buffer)` (line 139): same but loading + postLoad(). ✓
+
+Note that `load` takes `const std::uint8_t*`. My code passes `latticeBuf.data()` which is `std::uint8_t*` — that converts fine.
+
+Now I'm worried about VeloC's collective semantics. `VELOC_Init(MPI_COMM_WORLD, ...)` activates collective checkpointing mode. `VELOC_Checkpoint` will be a collective call on all ranks. My code does it for all ranks unconditionally - good.
+
+The Restart side - `VELOC_Restart_test` returns the maximum version available. All ranks need to agree. In collective mode it should be consistent across ranks.
+
+However, there's an issue: the lattice serialized buffer size may differ per rank (different blocks owned). VeloC tracks per-rank memory regions, so each rank's checkpoint is its own size. This should work fine since collective mode just synchronizes the operations.
+
+One more concern: a vanilla run that never crashed will have no checkpoint file. On the first run (no checkpoint exists), `VELOC_Restart_test` returns < 0 / failure. The condition `restartVersion > 0` handles that.
+
+Let me verify VELOC_SUCCESS / VELOC_FAILURE values:
+Good. `VELOC_Restart_test` returns the version int (positive) on success or `VELOC_FAILURE = -1` on failure. My `restartVersion > 0` check handles both cases properly.
+
+Let me also confirm one more thing - the include order issue. olb.h includes mpi.h transitively via mpiManager. But veloc.h also includes mpi.h. Both should be safe to include together. Let me double-check by including veloc.h after olb.h, which I did.
+
+Wait - there could be a subtle issue with `OstreamManager`. Looking at `setProcessingContext` — let me make sure the type is correct:
+Good, `ProcessingContext::Simulation` is well-defined.
+
+Let me also re-examine the modification to confirm one detail — `setProcessingContext(ProcessingContext::Simulation)` is what I want after restart and after a checkpoint. The original code only does `setProcessingContext(ProcessingContext::Evaluation)` at the very end. So in the original main loop it never calls setProcessingContext explicitly during iteration. But in `getResults` at line 265 (original) we see:
+```
+sLattice.setProcessingContext(ProcessingContext::Evaluation);
+```
+This is called every 0.1 lattice time units for stats printing. So state already gets toggled between Evaluation and Simulation. This is fine.
+
+Actually wait — for CPU_SISD mode, `setProcessingContext` is largely a no-op (no GPU device sync). For our config (CPU_SISD only) this is safe.
+
+Let me also worry about the includes — I included `<mpi.h>` but `olb.h` probably brings it in. Let me check more carefully:
+Good. Let me also check that olb.h includes mpiManager:
+OK so `olb.h` is treated as system include. Where does it live? Let me search via the install path:
+So `-I$(OLB_ROOT)/src`. Let me find olb.h:
+Hmm let me list src/:
+Good - `olb.h` is there. Glob just didn't find it for some reason. Let me check:
+Good. mpiManager is included via olbInit.h which is included via core/initialize.h which is included via olb.h. So `mpi.h` is available. My explicit `#include <mpi.h>` is just safety.
+
+Let me look at the modified main once more to ensure correctness:
+Hmm — I notice a subtle issue: `VELOC_Finalize(1)` with cleanup=1 will delete checkpoints AT THE END OF A SUCCESSFUL RUN. But if the validator runs the program once, it gets killed mid-flight, then re-runs the program — that's exactly the scenario I want to support. So cleanup=1 at end of *successful* runs is fine: only at the very last clean run, we clean up. Mid-run crashes don't reach VELOC_Finalize.
+
+But wait — actually, if the resilient program is killed mid-run, restarts from checkpoint, and completes successfully, it'll call `VELOC_Finalize(1)` which removes all checkpoints — that's correct, we're done. 
+
+However, there's another consideration: the validator might run vanilla once (records expected signature), then run resilient once-success, then run resilient again with mid-run kill+restart to validate recovery. In that 3rd run, after recovery, it runs to completion → VELOC_Finalize(1) cleans up → next validator run starts fresh. Good.
+
+But actually — what if the validator runs the SAME resilient binary multiple times back-to-back where each ought to be independent? Let me think — actually no: if the binary always completes successfully and calls Finalize(1), checkpoints are removed at end of run. Good. Fresh run finds no checkpoint, starts from scratch. Good.
+
+Now there's potential for one more issue: the validator's kill-and-restart procedure. The validator likely launches the binary, kills it mid-flight (SIGKILL/SIGTERM), then re-launches it. Between those two launches there's no `VELOC_Finalize`, so the persistent checkpoints from the first launch should still be there for the second launch to pick up. Good.
+
+Let me also verify the lattice's `setProcessingContext` happens with proper context — actually for our CPU_SISD configuration, setProcessingContext is mostly trivial. Let me check:
+Confirmed - setProcessingContext is no-op on CPU. Good.
+
+Now let me think about checkpoint placement more carefully. The validator's kill point matters. Typical validator approach: launch, sleep N seconds, kill, relaunch, expect signature to match. We need at least one checkpoint to have completed before the kill happens for any progress to be preserved.
+
+CKPT_INTERVAL=50 in a simulation of ~thousands of steps should give many checkpoints. Let me check maxIter: `maxPhysT=2.0`, `RESOLUTION=20`, characteristic length=~0.0104, velocity=1.0, so lattice timestep is ~delta x / velocity ~5e-4, and 2.0/5e-4 = ~4000 iterations. So 50-step interval gives 80 checkpoints. 
+
+But we also want checkpoints to happen frequently enough that the validator kill doesn't wait too long. 50 iterations should take well under a second on CPU.
+
+Actually let me check the bstep2d converter output to estimate. `delta_x = char_length / resolution = 0.0102/20 = 5.1e-4 m`. The lattice time step depends on relaxation time choice. Looking at typical OpenLB, `delta_t / delta_x = u_lat / u_phys` where `u_lat ≈ 0.05` typically. So delta_t ≈ 2.5e-5 s. maxPhysT=2.0 → 80000 lattice steps. That's a lot. Each step is fast though.
+
+Let me lower checkpoint interval to be more conservative — maybe every 100 steps. Actually 50 is fine.
+
+Now one concern: I should ensure that even if the validator kills right after the first iteration, we have a checkpoint. Right now first ckpt happens at iteration 50 (after iT=49 completes, nextIter=50, 50%50==0). Should be quick — <1 sec.
+
+Let me also verify the `setProcessingContext` after `sLattice.load(buffer)`:
+
+Wait actually there's another subtle issue. When I call `sLattice.load(buffer)`, this calls `Serializer.load` which calls `buffer2serializer` then `postLoad()`. postLoad iterates blocks and calls `postLoad()` on each. For CPU, this iterates over populations and calls `postLoad()` on each column. Let me check if that's important:
+Good. Refresh is called automatically. So `sLattice.load(buffer)` should correctly restore state.
+
+Now let me run a final sanity check on the overall file:
+Looks good. Let me also re-read the simulate function to ensure everything is right:
+Wait, I just realized something concerning: `getResults()` calls `vtmWriter.createMasterFile()` at iT==0. If we restart and skip iT=0 (start at iT>0), this won't be called. Let me check:
+
+Looking at original code (line 264-267):
+```cpp
+if (iT == 0) {
+  // Writes geometry, cuboid no. and rank no. to file system
+  ...
+  vtmWriter.createMasterFile();
+}
+```
+
+This is benign — it's just VTK output infrastructure. Skipping it won't affect the validation signature. The validation signature relies only on stats values, not VTK output.
+
+However, there's also the `getResults` block at `iT % converter.getLatticeTime(0.2) == 0` that does `sLattice.setProcessingContext(ProcessingContext::Evaluation);` and other things. That's all about output. Won't affect signature.
+
+Also `if (iT % converter.getLatticeTime(0.1) == 0)` — that does `sLattice.setProcessingContext(ProcessingContext::Evaluation);` and `velocityFlux.print()`. These are for stats display but they call `setProcessingContext(Evaluation)` WITHOUT resetting to Simulation. Is that an issue? 
+
+Looking at the original code: it doesn't switch back to Simulation between getResults and the next collideAndStream. So either (a) collideAndStream auto-handles it, or (b) for CPU it doesn't matter. For CPU_SISD it's all no-ops anyway.
+
+Now I should think about one final issue: in collective mode, **all ranks must call VELOC operations in the same sequence**. My code does, since they all enter `simulate()`, all execute the same loop, all hit the same iteration counts → all call VELOC_Checkpoint at the same time. Good.
+
+But wait — `restartVersion` could in principle differ across ranks if some ranks have checkpoints and others don't. In collective mode, VELOC should keep these in sync internally though. Let me look at the VeloC docs once more:
+
+The docs say: "init/finalize the VELOC library, IN comm - MPI communicator (activates the collective checkpointing mode)". With collective mode, all ranks must call checkpoint/restart together. `VELOC_Restart_test` is collective in this mode.
+
+Let me think about edge cases. What if 2 ranks each ran 50 iterations before crash, but only rank 0 finished checkpointing while rank 1 was killed mid-checkpoint? VeloC handles this internally via its atomic completion semantics; restarts should resume from a consistent global version.
+
+OK I'm satisfied with the design. Let me also verify the Makefile modification:
+Wait — there's a subtle Makefile concern: `default.mk` includes `config.mk`, which then sets `CXXFLAGS := -O3 ...` (overwrite, not append). That would wipe out my `+= -I/home/ndhai/usr/include`!
+
+Let me check the order:
+- example Makefile sets `EXAMPLE`, `OLB_ROOT`
+- example Makefile does `CXXFLAGS += -I/home/ndhai/usr/include` ← appends, but to empty value? Yes, CXXFLAGS is empty at this point.
+- example Makefile does `LDFLAGS += -L... -lveloc-client` ← appends to empty
+- example Makefile includes `default.mk`
+- `default.mk` first does `-include $(OLB_ROOT)/config.mk`
+- `config.mk` does `CXXFLAGS := -O3 -Wall ...` ← **WIPES** my -I flag!
+- `config.mk` does `LDFLAGS := ` ← **WIPES** my -lveloc-client!
+
+This is bad. I need to set my flags AFTER config.mk is included. Let me restructure:
+Wait, but the issue with putting it after the include is that `default.mk` includes `rules.mk` which defines the recipe rules. The `default.single.mk` line `all: dependencies core $(EXAMPLE)` is the FIRST target — defined inside default.mk. If I add stuff after include, `all` remains the default target.
+
+Also, `default.single.mk` has line 11: `LDFLAGS := -L$(OLB_ROOT)/external/lib $(LDFLAGS)` which prepends to LDFLAGS using `:=` — that's not a recursive assignment. At the time this line runs, LDFLAGS = (whatever config.mk set). After this line: `LDFLAGS := -L$(OLB_ROOT)/external/lib (config_value)`.
+
+Then if I do `LDFLAGS += ...` AFTER the include, the value becomes:
+`-L$(OLB_ROOT)/external/lib (config_value) (my_value)`. 
+
+For CXXFLAGS, after my append:
+`(config_value) -I/home/ndhai/usr/include`. 
+
+But wait — there's a problem. The `%.o: %.cpp` rule uses CXXFLAGS. By the time make processes the recipe (during execution), CXXFLAGS includes my addition because make uses deferred expansion. 
+
+However, the dependency generation rule `%.d: $(CPP_FILES)` also uses CXXFLAGS. That should work too.
+
+Let me verify by looking at default.single.mk once more:
+Good. The recipes use `$(CXXFLAGS)` and `$(LDFLAGS)`, both will be evaluated at recipe-execution time.
+
+Final sanity check on the final Makefile:
+Good. Let me also verify veloc.cfg one more time:
+Both paths absolute, in /tmp, different from each other. 
+
+Let me also think about an important edge case: what happens if the lattice's serialized buffer size differs between fresh init and post-restart? It shouldn't (the lattice is constructed the same way both times — same geometry, same cuboid decomposition, same MPI rank count). So buffer sizes match.
+Implementation summary:
+
+**Files created/modified:**
+
+1. **`veloc.cfg`** (new, source tree root): Static cfg with absolute /tmp scratch+persistent paths and sync mode — required infrastructure consumed by the validator before mpirun.
+
+2. **`examples/laminar/bstep2d/bstep2d.cpp`**: Real checkpoint/restart integration with VeloC.
+   - `VELOC_Init(MPI_COMM_WORLD, "veloc.cfg")` immediately after `olb::initialize()` (after MPI_Init).
+   - In `simulate()`:
+     - Register two memory regions with `VELOC_Mem_protect`: the iteration counter `iter_state` (region 0) and a raw byte buffer sized by `sLattice.getSerializableSize()` holding the full lattice state (region 1).
+     - Call `VELOC_Restart_test`; if a checkpoint exists, `VELOC_Restart` loads both regions, then `sLattice.load(buffer)` deserialises the actual lattice populations (this calls `postLoad()` which refreshes each column). The lattice's internal step counter is set via `getStatistics().resetTime(iter_state)` so `stats.getTime()` continues to match what an uninterrupted run would produce — critical for the validation-signature slot [0].
+     - Inside the time-march loop, every `CKPT_INTERVAL=50` steps: `sLattice.setProcessingContext(Evaluation)` → `sLattice.save(buffer)` (serialise populations into the registered buffer) → record `iter_state = iT+1` → `VELOC_Checkpoint(name, version)`.
+   - `VELOC_Finalize(1)` at the end of `main`, after the signature is written.
+
+3. **`examples/laminar/bstep2d/Makefile`**: Append `-I/home/ndhai/usr/include` to `CXXFLAGS` and `-L/home/ndhai/usr/lib -Wl,-rpath,/home/ndhai/usr/lib -lveloc-client` to `LDFLAGS` *after* `default.mk` (which is what brings in config.mk's `CXXFLAGS := ...` overwriting assignment), so the additions survive recipe expansion.
+
+The captured state on each checkpoint is the entire D2Q9 population field for every block this rank owns (`SuperLattice::getSerializableSize()` / `save(buffer)`), which is the only information needed to deterministically resume `collideAndStream` and produce the same `avg_rho`, `avg_energy`, `max_uSqr` values at iteration `maxIter` as a non-failure run. The iteration counter is captured separately and used to (a) skip already-completed loop iterations and (b) restore the lattice statistics' internal step count.

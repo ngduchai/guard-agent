@@ -1,0 +1,1812 @@
+I'll start by examining the previous attempt's failure to understand what went wrong.
+The validation almost passed but failed on `recovery_actually_resumed=False` because ratio=1.014 (recovery time = 113s vs failure-free 111s), which is too close. The gate requires `ratio < 0.728` for recovery to be considered "actually resumed". This means recovery essentially started from scratch and didn't use the checkpoint to skip ahead.
+
+Also `fast_at_1.2x=False` because total ratio was 1.61x.
+
+The key issue: checkpoints are being written (16 files) but only 1024 bytes in failure mode (38MB in failure-free). The recovery is starting from scratch. Let me look at the prior attempt's code.
+So the validation runs 165000 timesteps. Let me look at the existing checkpoint code:
+Now let me look at the existing update.cpp implementation:
+Let me look at main.cpp briefly:
+Now let me re-read the failure carefully to understand the metrics:
+
+- `recovery_actually_resumed=False (ratio=recovery/Z_P=1.014, f=0.544, gate_B<0.85, gate_C<0.728)`
+- `fast_at_1.2x=False (ratio=1.61x)`
+- failure_prone checkpoint snapshot: 1024 bytes across 16 files
+- failure_free: 38 MB across 16 files
+
+The issue is the failure-prone run only captured 1024 bytes of checkpoints. After the kill happens at ~60s, the recovery runs and writes new (tiny) checkpoints. Let me look more carefully...
+
+Wait, the snapshot is captured AFTER the run completes. So the recovery run completed at step 165000 with only 1024 bytes worth of checkpoint files. That's strange. With 165000/1000 = 165 checkpoints, the snapshot likely captured the most recent ones (max_versions=2 in cfg).
+
+In recovery mode, the run has `start_i = (nsteps_already_done)`. If kill happens at step ~80000 (out of 165000), restart should resume at step ~80000 and only need to do ~85000 more steps. That should take roughly (85000/165000)*111s = ~57s. But it took 113s for recovery. So restart isn't working.
+
+The clue: `failure_prone` snapshot = 1024 bytes. 16 files. 1024 bytes / 16 files = 64 bytes per file. That suggests the checkpoint files written in the failure-prone run contain only the small scalars when nlocal=0... wait no, that means the recovery run might be creating a NEW set of (small) checkpoints near the END (when particles have all reached the boundaries?), not actually checkpointing from the kill point.
+
+Actually wait - with `max_versions = 2 and scratch_versions = 2`, only the 2 most recent checkpoint versions are retained. So at the end of the run (step 165000), only versions for steps 164000 and 165000 are kept. After kill at step ~80k, those versions are gone. So the recovery process REGENERATED state from scratch.
+
+The fundamental issue: when the failure-prone run is killed at step ~80k, the recovery launched and ran from start (start_i=0 because no checkpoint was found OR it found a checkpoint but ignored it). 
+
+Wait, actually checkpoint files from before the kill should be in `/tmp/sparta_veloc_persistent`. Let me re-read... Actually the runner CLEARS those dirs before each kill attempt, but does NOT clear between the failure attempt and the recovery attempt. So when recovery starts:
+- Pre-kill checkpoints exist in scratch/persistent  
+- Recovery should detect them with VELOC_Restart_test
+
+But it's possible the recovery isn't working because `laststep` is loaded from saved checkpoint and the `ok_tag` check passes... hmm.
+
+Actually here's a likely issue: `cur_laststep = laststep` but `laststep` member might be 0 at that point - the saved value of `laststep` should equal what's set in the restart run.
+
+Let me look at sparta laststep initialization:
+OK, so `firststep = ntimestep` (= 0 on fresh start) and `laststep = ntimestep + nsteps = 0 + 165000 = 165000`. So `ok_tag` requires saved_laststep == 165000 AND saved_ntimestep > 0. That should work.
+
+But wait - the bigger issue is what gets restored. The script captures particles + ntimestep. But it does NOT capture: 
+- nglobal correctly might be wrong
+- create_particles uses RNG to create initial particles - on restart, `init()` is called again, but particles array already created may be regenerated
+
+Look at run.cpp:170 - `if (preflag || update->first_update == 0) { sparta->init(); update->setup(); }`. setup calls create_particles? Let me check.
+
+Actually the flow is: input parses `create_particles`, which runs and creates particles BEFORE the `run` command. So when `run` is called, particles are already created. Then in update->run(), we attempt restart. If restart succeeds, we overwrite particle->particles. But the particle array on rank 0 had been created with seed=12345 + some logic.
+
+Wait - the issue is that I see `Test 1 (VeloC, failure-prone): [PASS]` - the output value matches! So the restoration IS working correctly... It's just that the recovery doesn't actually save time.
+
+Let me think again. The kill happened at ~60s (54% of 111s) → at step ~89000. The recovery then needs to run only 165000-89000=76000 steps, which should take ~52s. But it took 113s. So restart isn't actually resuming from step ~89000.
+
+But output matches! So how could this be... unless particles are reset to initial state and run from step 0, BUT ntimestep is set higher so only fewer "stat" iterations run? No, the `for` loop uses `nsteps` directly:
+
+```
+for (int i = start_i; i < nsteps; i++) {
+    ntimestep++;
+    ...
+}
+```
+
+So if `start_i = 89000`, the loop runs (165000 - 89000) = 76000 iterations. So the timing should be different.
+
+Wait — maybe restoration is actually failing silently (ok_tag or ok_sizes fail) and we run from start, but the output matches because the simulation is deterministic and re-creates the same state with same seed.
+
+Let me look at the `failure_prone snapshot=1024 bytes across 16 files`. 16 files / 4 ranks = 4 files per rank. Likely 2 versions × 2 directories (scratch + persistent). 1024 bytes / 16 = 64 bytes per file. A checkpoint with just the 3 scalars (8+8+4 = 20 bytes) plus VeloC metadata could easily be 64 bytes. 
+
+But in the FAILURE-FREE case, 38MB / 16 = 2.4MB per file, suggesting particles are being saved.
+
+So the recovery run is being launched **after** the kill. The recovery run starts, restores from checkpoint... but the post-recovery checkpoints have nlocal=0! Why? Because after restoring particles, then `ntimestep = saved_ntimestep = ~89000`, we run from 89000 to 165000, periodically checkpointing. In this domain, particles bounce around with reflective boundaries. The particle count should stay ~100000 throughout. So why 0?
+
+Unless... the restore FAILS (because checkpoint with same version label was overwritten / corrupted from kill). Then we proceed with fresh state. But fresh state would have particles from input...
+
+Wait - I see now. The recovery flow:
+1. Recovery launched
+2. SPARTA reads input file, processes commands up to `run`
+3. `create_particles` runs - creates ~100k particles
+4. `run` command starts
+5. `update->run(165000)` enters - tries restart
+6. If restart succeeds → restored particles, fast-forward
+7. If restart fails → uses created particles, runs from step 0
+
+But output validates correctly. The restart must be working but there's something off. Let me check the runner output more carefully. The recovery elapsed 112.89s — almost identical to baseline (111s). So either:
+- (a) restart failed and we ran fully from scratch, OR
+- (b) restart resumed at a very early step
+
+Most likely **(a)**: restart failed (probably because at step ~89000, when killed, only versions ~88000 and ~89000 exist; one might be torn from kill, the other clean. VELOC_Restart_test should find the clean one).
+
+Or maybe the issue: `cur_ntimestep` saved equals say 89000, but `saved_laststep` was correctly 165000. Restart succeeds. But then... why does it take 112s?
+
+Actually, look at the output:
+```
+checkpoint metrics for failure_prone: 1024 bytes across 16 file(s) in 2 dir(s)
+```
+This is captured AFTER the recovery completes. After completion, only `max_versions=2` = 2 most recent checkpoint versions are kept. If recovery resumed at step 89000 and ran to 165000, the last 2 checkpoints would be at step 164000 and 165000 — with ~100k particles each → millions of bytes.
+
+But 1024 bytes total means the saved checkpoints have nlocal=0 at the end. That implies during recovery, after restart, particles vanished. Possibly the prune logic killed all particles? Or the saved particles were all garbage?
+
+Let me think — when killed mid-checkpoint, VeloC might write a partial file. The most recent file might be torn, but VELOC_Restart_test should find the latest VALID version.
+
+OR — a critical issue: in checkpointing, we're calling `VELOC_Mem_protect` for ID 3 (particles) only if `cur_nlocal > 0`. But on restart, the recovery code always tries to recover ID 3. If the saved checkpoint didn't include ID 3 (nlocal was 0), `VELOC_Recover_selective` might fail or return junk.
+
+But again, the OUTPUT is correct. So either the deterministic nature handles it, or restart finds the SAVED state correctly.
+
+Hmm, let me look at this from another angle. The validator says ratio=1.61x = (resilient_elapsed=179.6s / original=111.4s). The TOTAL kill+recovery is 179s. kill_elapsed=66s, recovery_elapsed=113s.
+
+For recovery to be fast at 1.2x, we'd need total ≤ 133s. So recovery would need to be ≤ 67s. Currently 113s. We'd need to actually skip ~half the work.
+
+Two possibilities:
+1. **Restart isn't actually working** → we're running 165000 steps from scratch every time
+2. **Restart works but checkpoint cadence is too low** → kill happens just after a checkpoint, but the recovery still needs to do most of the work
+
+Looking at the kill timing: kill at ~60.6s ≈ 54% of runtime ≈ step ~89000 out of 165000. So even with perfect restart, recovery does ~46% of work = ~51s. Plus startup costs (init, create_particles, etc).
+
+Critical insight: **the SPARTA initialization recreates the full state** before restart. `create_particles n 100000` creates 100k particles on startup. This is expensive! Even if restart short-circuits the main loop, the initialization phase already did most of the work.
+
+Let me check: in the baseline 111s run, how much is init vs loop? Need to look at create_particles cost.
+
+Actually `create_particles` with 100k particles in a 20×20×20 grid is reasonably fast (maybe 1-2 seconds). The bulk is the 165000 timestep loop.
+
+So if restart works perfectly:
+- Init: ~2s (create_particles)
+- Loop from 89000 to 165000 (76k steps): 76/165 * (111-2) = 50s
+- Total recovery: ~52s. We need < 67s for fast-at-1.2x.
+
+But we're getting 113s! That's exactly the baseline duration. So restart is definitively NOT working.
+
+Let me check what could cause restart to fail. Look at `ok_tag` check:
+
+```cpp
+bool ok_tag = (saved_laststep == laststep && saved_ntimestep > firststep);
+```
+
+In the restart run, `firststep = ntimestep = 0` and `laststep = 165000`. The saved values should match.
+
+Wait — what if there are MULTIPLE `run` commands or the restart finds an OLD checkpoint with stale `laststep`? The validation only has one `run 165000`.
+
+OR — and this is likely — VeloC checkpoint files might be cleared by the runner between attempts! Let me re-read the runner output:
+
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/sparta_veloc_scratch
+  - /tmp/sparta_veloc_persistent
+[runner] checkpoint-observed attempt 1: launching ... attempt_1
+[runner] checkpoint-observed: detected 16 checkpoint file(s)
+[runner] kill ...
+[runner] checkpoint-observed: starting recovery attempt (timeout 136.2s = 1.22x failure-free).
+[runner] checkpoint-observed attempt 2: launching ... attempt_2  <-- no "clearing" mentioned
+```
+
+Good — between attempt_1 and attempt_2, dirs are NOT cleared. So checkpoints from attempt_1 should be available for attempt_2.
+
+Hmm. Let me look at the cwd. attempt_1 runs in `attempt_1/` and attempt_2 runs in `attempt_2/`. But the veloc.cfg has ABSOLUTE paths `/tmp/sparta_veloc_scratch` — so checkpoints are written to fixed location regardless of cwd. Good.
+
+So why is restart not working? Let me think about timing. Kill at step ~89000. With CKPT_INTERVAL=1000, last checkpoint was at step 89000 (or 88000). But here's the trick — the failure injector waits 5s after detecting checkpoint files BEFORE SIGKILL.
+
+The 16 checkpoint files (= 2 versions × 4 ranks × 2 dirs) implies 2 versions kept. After kill, those 2 versions remain. Restart should find them.
+
+Let me check what `VELOC_Restart_test(name, INT_MAX)` does. From VELOC docs: it returns the latest checkpoint version ≤ given max. INT_MAX means latest.
+
+Actually wait — maybe the problem is **version number**. In the code:
+```cpp
+int version = (int) ntimestep;
+VELOC_Checkpoint(SPARTA_CKPT_NAME, version);
+```
+
+ntimestep would be 1000, 2000, ..., 89000 — well within INT_MAX. OK.
+
+Hmm, let me check what happens in run() init phase. There's `update->setup()` which calls `modify->setup()`. Compute setup might allocate things. Then sparta->init() calls grid->setup, particles->setup etc.
+
+Let me check if there's a `particle->setup` that resets nlocal:
+OK, no particle->setup. Good. Now let me confirm by adding debug output. Actually let me look at the snapshot info more closely:
+
+```
+checkpoint metrics for failure_prone: 1024 bytes across 16 file(s) in 2 dir(s); snapshot
+```
+
+So after the recovery run completes, the checkpoint dirs contain 16 files totaling 1024 bytes. With 4 ranks and max_versions=2, there are 4×2×2 = 16 files. 1024/16 = 64 bytes per file.
+
+Each checkpoint should write: 8 (ntimestep) + 8 (laststep) + 4 (nlocal) + nlocal*sizeof(OnePart) bytes + metadata. OnePart is around 80 bytes. With nlocal=25000 (1/4 of 100k) → 2MB+. But we see 64 bytes → likely just the scalars + zero particles + metadata.
+
+So at the END of the recovery run (last 2 checkpoints, at steps 164000 and 165000), nlocal is essentially 0! That's the smoking gun.
+
+Why would nlocal=0 at end? Particles are being lost! Maybe restored from a CORRUPTED checkpoint where most particles had invalid icell and got pruned!
+
+OK so the issue is: restart happens but particles are pruned aggressively (invalid icell after restore because grid state isn't restored — or restore is reading stale memory).
+
+Let me think about this. After restart:
+- We do `particle->grow(extra)` then `memset(0, ...)` then VELOC_Recover loads particles
+- The particles are restored bytes-for-bytes (same OnePart struct).
+- The `icell` field is the LOCAL grid cell index. But on restart, the grid has been freshly partitioned by `balance_grid`!
+
+`balance_grid rcb part` might assign different cells to different ranks across runs. So the saved `icell` indices on rank 0 might no longer correspond to the correct cells on rank 0 after restart. This would cause the prune logic to remove them all!
+
+That's the root cause likely. To fix this properly, we need to either:
+1. Skip the balance_grid or make it deterministic
+2. Save more grid state
+3. Use global cell IDs and remap on restart
+
+But also—even more fundamental—`balance_grid rcb part` partitions based on PARTICLES. On restart, the initial particle distribution after create_particles is used to balance the grid. The grid partitioning should be deterministic if seed is the same.
+
+Hmm, but `create_particles` uses RNG. If seed=12345 (set in script), particle creation is deterministic. So `balance_grid` should produce the same partition both times. Then `icell` would be valid.
+
+Wait, but there might be another issue: particles migrate during the simulation. By step 89000, rank 0's particles may include particles that ORIGINALLY belonged to other ranks. When we save particle->particles on rank 0, we save those migrated particles. After restart, rank 0 creates initial particles (its assigned region) and then we OVERWRITE them with the restored migrated particles. Those particles have `icell` referring to LOCAL grid cells on the ORIGINAL owning rank — not rank 0!
+
+This is the bug. The `icell` field is a LOCAL index per rank. When migrated, it gets updated to the new rank's local cell index. So when saved at step 89000 on rank 0, all icells correctly refer to rank 0's local cells. After restart, rank 0 again has the same local cells (grid partitioning is deterministic). So icells should be valid.
+
+Hmm... let me actually look at what icell is:
+OK. So based on my analysis, the most likely cause is that restart is failing entirely. Let me add more diagnostics by running the actual flow more carefully. Let me look at what `VELOC_Restart_test` requires. Maybe it needs `VELOC_Checkpoint_wait()` between checkpoint calls? Let me check current build_output:
+Let me read more — the previous agent's reasoning is helpful:
+OK so I now have a much clearer picture. The previous attempt's actual failure (iter 3) was:
+- Tests 1, 1b, 2, 2b PASSED (output correct, exit code 0)
+- The failure was the TIME ratio: `recovery_actually_resumed=False (ratio=recovery/Z_P=1.014)` and `fast_at_1.2x=False (ratio=1.61x)`
+
+So the OUTPUT is correct now (output matches perturbed baseline). But the recovery TIME is too long — recovery took 113s when failure-free is 111s. So the recovery is essentially running the WHOLE thing from scratch (or the restart isn't actually skipping work).
+
+Let me look at the current state of update.cpp post-iter-3 changes. The current code shows that restoration logic was rewritten. The output works now. But the restart isn't actually saving time.
+
+Theory: restart succeeds (output is correct because it must come from running the simulation). But after restore, `start_i` is computed, and the loop skips the first `start_i` iterations. So the loop SHOULD complete in less than the full time.
+
+Wait — there's a critical thing. Look at line 451: `if (progressed >= (bigint) nsteps) start_i = nsteps;` — this would happen if saved_ntimestep is HIGHER than firststep+nsteps. But that shouldn't happen.
+
+Let me look at what `nsteps` is. From run.cpp:159: `update->nsteps = nsteps;` (the parameter to run). And `update->run(nsteps)` uses local `nsteps`. So in our case nsteps=165000.
+
+If checkpoint stored ntimestep=89000 (just after step 89000), then on restore `ntimestep = 89000`, `firststep = 0`, `progressed = 89000`, `start_i = 89000`. Loop runs for i=89000 to 164999 = 76000 iterations. With each iteration costing about the same as baseline (111s/165000 = 0.67ms), that's 76000*0.67ms = ~51s. Plus startup overhead (init, create_particles, balance_grid).
+
+So recovery should take ~52s + initial setup ~10s = ~62s. But it took 113s. Factor of 2 off.
+
+Hmm — wait, let me look at the checkpoint cadence: CKPT_INTERVAL=1000 steps. With each checkpoint writing ~10MB total (4 ranks × 2.4MB), VeloC takes time. 165 checkpoints * (some_ms) = checkpoint overhead. But this is the same in failure-free run.
+
+Actually — there's a key consideration! Looking at the output:
+```
+[validate] Running resilient application without failure injection (failure-free check)...
+```
+The failure-free run also produces 38MB checkpoints. The failure-free run took some time too. We don't see the failure-free time in the log directly but Z_P (perturbed baseline) = 111.4s.
+
+Wait — `original_elapsed=111.4s` is the PERTURBED VANILLA baseline (no VeloC, no checkpoint), running 165k steps. The resilient `failure_free` run (with checkpoint writes) would be slower.
+
+So the resilient code with checkpoint writes is slower than vanilla. Recovery runs the SAME code, so it's slower per step than vanilla.
+
+If failure_free resilient takes ~111s (similar to vanilla), then each step costs ~0.67ms. Recovery starting at step 89000 needs 76000 steps × 0.67ms = ~50s. Plus init overhead.
+
+OK so why 113s? Maybe restart is NOT actually working, and we're running the full 165000 steps. That'd give 111s. Close to 113s observed. So restart is FAILING but the output happens to be correct (which makes sense — if we start from scratch with same seed, we get same result).
+
+So the previous iteration's code rewrites the restart logic such that... it never finds a checkpoint? Or finds one but fails ok_tag/ok_sizes check?
+
+Let me re-read the current update.cpp restart logic and find the bug:
+
+The code:
+```cpp
+bool ok_tag = (saved_laststep == laststep && saved_ntimestep > firststep);
+```
+
+Hmm. At the time we enter update->run(nsteps), `laststep` was set by run.cpp to `ntimestep + nsteps = 0 + 165000 = 165000`. saved_laststep should be 165000 too (same input, same run command). ok_tag should pass.
+
+```cpp
+bool ok_sizes = false;
+if (saved_nlocal > 0) {
+    if (part_bytes == (int)(saved_nlocal * sizeof(Particle::OnePart)))
+        ok_sizes = true;
+}
+```
+
+This should pass for nonzero nlocal.
+
+OK so restart logic should work. Output IS correct. Why is the time so long?
+
+Maybe... the loop runs from start_i=89000 but each step actually does FULL work as if from scratch. Wait, can't be — the loop just iterates fewer times.
+
+Let me re-examine the time math. 113s recovery. If it actually started from step 89000:
+- Init phase (sparta->init, update->setup, create_particles, balance_grid, etc): X seconds
+- Then update->run is called
+- Inside, restart loads from checkpoint (~1s?)
+- Then loop runs 76000 iterations
+
+If X (init phase) = 60s, then loop = 53s = perfect. But typical SPARTA init shouldn't be 60s for this small problem.
+
+Unless... `create_particles n 100000` with 100k particles in 8000 cells does take some time. Maybe 10-15s?
+
+Or there's another possibility: the previous iteration's `ok_tag` check `saved_ntimestep > firststep` fails because firststep=0 and saved_ntimestep starts at 0. Wait, that's `>` not `>=`. If saved_ntimestep=1000 > 0 = firststep, OK. So restart succeeds.
+
+Hmm let me actually do a different analysis. Look at the timings from logs:
+- Line 39: `kill_fraction=0.5441 (delay~60.6s)` — so kill happens ~60s into attempt_1
+- Line 54: `kill attempt complete (elapsed=66.69s, injection_fired=True)` — total time for attempt_1 was 66.69s (kill happened earlier; mpirun process took longer to fully die)
+- Line 60: `recovery attempt complete (elapsed=112.89s, exit=0)` — recovery took 112.89s
+
+If failure-free is 111s and recovery is 113s, then restart literally saved ZERO time. It either:
+1. Didn't restart at all (full run)
+2. Restarted but at step 0 (full run)
+
+Looking at the current update.cpp code, what would cause case (2)?
+
+Actually wait — I need to verify the current code state. The 'prev iteration' was iter 3 (which I have logs for). The CURRENT files on disk should reflect that iteration's final code. Let me read the current update.cpp recovery logic completely:
+
+The recovery I already read (lines 313-487 of update.cpp). It looks correct. So restart should work.
+
+Let me check if maybe there's an issue with `INT_MAX` or version numbering:
+
+`VELOC_Checkpoint(SPARTA_CKPT_NAME, version)` where `int version = (int)ntimestep`. For ntimestep=1000, version=1000.
+
+`VELOC_Restart_test(SPARTA_CKPT_NAME, INT_MAX)` returns the highest version <= INT_MAX. Should return the latest written version (e.g., 89000).
+
+Then `VELOC_Restart_begin(SPARTA_CKPT_NAME, 89000)` opens that checkpoint.
+
+Now wait — maybe the issue is that the checkpoint version label doesn't fit in `int` after some point, OR there's an issue with finding the highest version. Let me check.
+
+Actually, perhaps `VELOC_Restart_test(name, INT_MAX)` checks if a checkpoint <= max exists. Returns -1 if none. Returns the version found. But maybe it returns the FIRST version found, not the LATEST. Let me not speculate.
+
+Actually, the simplest way to make this work: I should look at what's in the actual checkpoint directories during recovery. Since I can't run anything, let me trace more carefully.
+
+Let me look at the existing code's actual current state once more, more carefully:
+Now I really need to understand: **the iter_3 logs show output_correct=True!** So output is correct. The only problem is timing.
+
+Looking again at the iter_3 stdout:
+```
+Test 1 (VeloC, failure-prone): [PASS] ... max_abs_diff=0.000e+00
+```
+
+So output matches. But:
+```
+recovery_actually_resumed=False (ratio=recovery/Z_P=1.014, ..., gate_C<0.728, mode=single_random_fraction_v22)
+fast_at_1.2x=False (ratio=1.61x)
+```
+
+To pass, we need either:
+- ratio < 0.728 (recovery time / Z_P time) — recovery completes in < 81s
+- OR fast_at_1.2x: total ratio < 1.2x — total resilient time / Z_P < 133s
+
+Total resilient = kill_elapsed + recovery_elapsed = 66.7s + 113s = 179s.
+For 1.2x: need total < 133s.
+For C gate: need recovery alone < 81s.
+
+The C gate is easier. Recovery currently = 113s, need < 81s. That's a 32s savings.
+
+OK so the actual problem: **restart isn't saving time**. Even though output is correct (deterministic from same seed). Let me figure out what's happening.
+
+Possibility 1: Restart is happening, but startup overhead (init + create_particles) is large.
+
+Possibility 2: Restart isn't happening (ckpt_v=-1 from `VELOC_Restart_test`).
+
+Let me check VeloC behavior. After kill at attempt_1, the persistent dir contains the checkpoint files. For attempt_2 (recovery), we launch a fresh mpirun. The VELOC runtime sees those files. `VELOC_Restart_test` should return >= 0.
+
+But wait — VeloC also has the SCRATCH dir. After kill, the scratch dir on each rank may have a half-written checkpoint. Or maybe VeloC requires "commit" to move from scratch to persistent.
+
+Looking at the iter_3 log carefully:
+```
+[runner] checkpoint-observed: detected 16 checkpoint file(s) in scratch/persistent dirs.
+```
+
+16 files detected BEFORE kill. With mode=sync, max_versions=2 in persistent, scratch_versions=2 in scratch: 4 ranks × 2 dirs × 2 versions = 16 files. So before kill, both scratch and persistent are populated.
+
+After kill, those files remain (the runner doesn't clear them).
+
+Recovery launches. `VELOC_Init` reads cfg, sees scratch+persistent paths, knows checkpoints exist. `VELOC_Restart_test` should find the latest.
+
+OK let me think differently. Let me look at the writeup of the cmake build to see if `-lveloc-client` is actually being linked. Maybe the build is using veloc as no-op stubs?
+Need to check how the executable is being built. The CMakeLists in src doesn't add veloc. Let me check `examples/CMakeLists.txt` and look at the resilient build:
+The executable that the validator runs is `_build/examples/free/spa_mpi`. The validator does the build itself. The validator probably calls `cd src && make mpi` (per app.yaml). And `MAKE/Makefile.mpi` has `-lveloc-client`. Let me verify it's linked:
+OK the build links libveloc-client. But the validator uses CMake (line 25 of stdout: `binary at /home/ndhai/diaspora/guard-agent/build/validation_output/SPARTA_baseline_opus47_retry2/build/resilient/examples/free/spa_mpi`). Let me check how the CMake build handles veloc... actually wait, in the validation log I see `/home/ndhai/diaspora/guard-agent/build/validation_output/.../build/resilient/examples/free/spa_mpi` — this is built by the validator using cmake.
+
+Hmm but where does it get veloc linked? Maybe the validator's cmake invocation injects it. Or maybe the build uses make. Let me check by looking at the build_output.txt - oh it was empty.
+
+Let me also look at the existing log.sparta file (output from a previous run):
+Empty. OK. Let me take stock of where we are.
+
+**Key facts about iter_3 failure:**
+- Output correctness: PASS (all 4 tests passed)
+- Total kill+recovery time: 179.6s (1.61x baseline 111s)
+- Recovery alone: 113s (vs failure-free 111s) — ratio 1.014
+- Failed gates: `recovery_actually_resumed` (need < 0.728), `fast_at_1.2x` (need total < 1.2x = 133s)
+
+**Recovery is NOT skipping work.** Even though correctness passes (because re-running from scratch with same seed gives same result), the recovery does the full simulation work.
+
+The most likely reasons restart fails (silently):
+1. `VELOC_Restart_test` returns -1 because checkpoints can't be found
+2. `ok_tag` check fails (laststep mismatch)
+3. `ok_sizes` check fails (part_bytes mismatch)
+4. Restart succeeds but `start_i` is wrongly 0
+
+Let me look at the `firststep` issue. In run.cpp:160: `update->firststep = update->ntimestep;`. On a fresh run, ntimestep=0, so firststep=0. On restart attempt... well it's the same fresh start. ntimestep=0 before update->run is called. So firststep=0.
+
+Wait, but `setup()` is called BEFORE `update->run`. setup may call `output->setup(1)` which calls `compute->setup()`. None of those should change ntimestep.
+
+OK my main hypothesis: **Restart actually IS happening but the checkpoint version is from too early in the simulation**.
+
+The kill timing: at delay~60.6s, which is 54% of 111s. Step ~89000. The most recent checkpoint at that time would be at step 89000. Restart at step 89000 → only 76000 more steps → ~50s + init overhead.
+
+But we're seeing 113s recovery. Hmm. What if init overhead is HUGE because of create_particles + setup? Let me think about what init+setup costs.
+
+Actually... `create_particles n 100000` does:
+- Distribute 100000 particles across grid cells
+- This requires MPI communication for load balancing
+- ~1-5 seconds typically
+
+`balance_grid rcb part` does:
+- RCB partition
+- Migrate particles per partition
+- ~1-2 seconds
+
+Total init: ~5-10 seconds. Loop: should take (76000/165000)*111 = 51s. Total: 56-61s. That fits within the 81s gate.
+
+So recovery should pass! But we're seeing 113s. Something is off.
+
+Possibility I missed: maybe the checkpoint files from attempt_1 ARE being cleared between attempts. Let me reread the runner log:
+
+```
+[validate] v2.2 kill attempt 1 LANDED ...
+[validate] resilience signals — resilient_elapsed=179.6s, ... ratio=1.61x
+[validate] checkpoint metrics for failure_prone: 1024 bytes ...
+[validate] cleared shared checkpoint dirs after capture (failure_prone): ...
+```
+
+So the runner clears dirs AFTER capturing metrics. But between attempt_1 and attempt_2 within the "kill attempt", the dirs are NOT cleared.
+
+Let me look at the runner's launch sequence again:
+```
+Line 44: [runner] checkpoint-observed attempt 1: launching ... attempt_1
+Line 50: [runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+Line 51-53: kill
+Line 54: [runner] checkpoint-observed: kill attempt complete
+Line 55: [runner] checkpoint-observed: starting recovery attempt (timeout 136.2s)
+Line 56: [runner] copied ... veloc.cfg ...
+Line 57: [runner] checkpoint-observed attempt 2: launching ... attempt_2
+```
+
+So between attempt 1 and attempt 2, NO clearing of /tmp dirs. Good — checkpoints persist.
+
+So recovery (attempt 2) launches with checkpoints in /tmp. Should restart successfully.
+
+Hmm. Let me look at recovery_floor metric: `recovery_floor_ok=True (recovery/kill=1.693, floor=0.1)`. recovery/kill = 113/66 = 1.71. That's a passing floor (ratio > 0.1 means recovery wasn't suspiciously fast).
+
+OK let me look at things from a totally fresh angle. Maybe the previous iteration's `VELOC_Restart_test` doesn't find checkpoints. Let me check the VeloC header:
+Hmm, may not be readable. Let me check directly:
+OK so `VELOC_Restart_test(name, max_version)` returns "latest version < needed_version" if found, VELOC_FAILURE otherwise. So `INT_MAX` is fine.
+
+Now let me check the persistent_interval default. From line 30: `persistent_interval = <int> (number of seconds between consecutive persistent checkpoints, default: 0 - perform all)`. So default 0 means all are persisted. Good.
+
+But here's something I should examine. Looking at this from a critical angle:
+
+The validator's `[runner] checkpoint-observed: detected 16 checkpoint file(s) in scratch/persistent dirs.` happens BEFORE the kill. But this is the file count BEFORE kill. After the kill (during the small window where the simulation is being killed), some files might be in mid-write state and could be corrupted.
+
+But more importantly: VELOC writes checkpoints to SCRATCH first, then flushes to PERSISTENT. With mode=sync and `max_versions=2`, both dirs should have valid files.
+
+OK let me approach this differently. I'll add really explicit diagnostic logging on the restart path, so even if I can't see it now, the next iteration will reveal what's happening. AND I'll add some changes that increase the likelihood of fast restart:
+
+1. **Increase checkpoint frequency** so the last checkpoint is closer to the kill point — but more importantly, this won't directly help if restart isn't happening.
+
+2. **Verify restart path actually executes**. Let me add logging via stderr so it shows up reliably.
+
+3. **Use VELOC_Restart_test with explicit version** to verify checkpoints exist.
+
+Actually wait, let me look at one more critical thing. I want to re-check the timing. In iter_3:
+- kill_elapsed = 66.69s
+- recovery_elapsed = 112.89s
+
+If recovery actually restarts at step 89000 (54%), it needs to run 46% more = ~50s loop + 5-10s init = ~55-60s. But seeing 113s. So restart is NOT working.
+
+Looking at the iter_3 log line 60: `checkpoint metrics for failure_prone: 1024 bytes across 16 file(s)`. After recovery completes, the checkpoint dirs have 1024 bytes (16 files at 64 bytes each).
+
+This is HIGHLY suspicious because:
+- Failure_free run produces 38MB checkpoints
+- Recovery run produces 1024 byte checkpoints
+
+If recovery actually ran the full simulation from step 0 (or partial restart that then continued), the checkpoint files at the end would be huge (38MB).
+
+But they're 1KB. Why?
+
+**Hypothesis**: Recovery DID restart, but at a LATE step (very close to end). The recovery only ran the last few steps. Each step took longer than expected because of init overhead (5-10s) per step? That doesn't add up either.
+
+OR: recovery restarted, but the last few checkpoint writes had nlocal=0 (particles all migrated out due to some prune issue). The dump produced correct output BECAUSE... actually no, if particles=0 dump would be all zeros, not the correct value.
+
+Wait, what about this: the iter_3 code has `int part_bytes = VELOC_Recover_size(SPARTA_CKPT_ID_PARTICLES);` which queries the size from the open checkpoint. If size_check fails (part_bytes != saved_nlocal * sizeof(OnePart)), we skip restore.
+
+Let me look at the size check again:
+```cpp
+bool ok_sizes = false;
+if (saved_nlocal > 0) {
+    if (part_bytes == (int)(saved_nlocal * sizeof(Particle::OnePart)))
+        ok_sizes = true;
+} else if (saved_nlocal == 0) {
+    if (part_bytes == 1) ok_sizes = true;
+}
+```
+
+OnePart struct size: let me calculate. With `SPARTA_ALIGN(16)`:
+- id: 4 bytes
+- ispecies: 4
+- icell: 4
+- flag: 4
+- x[3]: 24 (3 doubles)
+- v[3]: 24
+- erot: 8
+- evib: 8
+- dtremain: 8
+- weight: 8
+
+Total: 16 + 48 + 32 = 96 bytes. With 16-byte alignment, 96 is already a multiple of 16. So sizeof(OnePart) = 96 bytes.
+
+25000 particles × 96 = 2,400,000 bytes per rank. saved_nlocal = 25000 (or some number).
+
+Now `VELOC_Recover_size(int id)` returns int. If 2.4MB = 2,400,000, that fits in int. OK.
+
+But maybe `part_bytes` is the BASE_SIZE * COUNT? Or just COUNT? Or total bytes?
+
+Looking at the protect call: `VELOC_Mem_protect(id, ptr, count, base_size)`. The combination is interpreted as count*base_size bytes total. So Recover_size likely returns total bytes (count*base_size).
+
+In writer: `VELOC_Mem_protect(SPARTA_CKPT_ID_PARTICLES, particle->particles, cur_nlocal, sizeof(OnePart))`. Total bytes = cur_nlocal * 96.
+
+Recover_size returns total bytes. ok_sizes check: `part_bytes == saved_nlocal * sizeof(OnePart)` — should match.
+
+UNLESS `saved_nlocal` is not properly read! If `VELOC_Recover_selective` for scalars failed (returned non-SUCCESS), `saved_nlocal` stays at default 0. Then we go to the `else if (saved_nlocal == 0)` branch. `part_bytes == 1` only if writer wrote dummy_byte. But writer wrote real particles (size 2.4M). So `part_bytes = 2,400,000 ≠ 1`. ok_sizes = false. Skip restore.
+
+That would explain it!
+
+So the question is: **does the multi-pass VELOC_Recover_selective actually work?** First call recovers 3 scalar IDs. Second call (after particle Mem_protect) recovers ID_PARTICLES.
+
+Looking at VELOC docs/header, I see: "must be called between VELOC_Restart_begin/VELOC_Restart_end". And "each requested id must be protected with a previous call to VELOC_Mem_protect". Nothing explicitly forbids multiple calls.
+
+But maybe the implementation only allows ONE recover call. Let me look for veloc.hpp to see the API:
+Notice `recover_size` returns `size_t`. The C wrapper returns `int`. Likely the C wrapper casts, which can truncate large sizes — but 2.4MB fits.
+
+Also `recover_mem(int mode, const std::set<int> &ids)` - it's a SET. The C wrapper `VELOC_Recover_selective` likely takes an array and converts to set. So multiple calls to recover_mem with different sets should work.
+
+Hmm. OK at this point I'm going to take a different strategy. Let me:
+
+1. **Simplify the restart path** to use a single recover_mem call by pre-allocating particle buffer to a generous size BEFORE recover.
+2. **Add explicit stderr logging** to make restart attempts visible.
+3. **Verify the restart actually progresses to a checkpoint version** that should give a meaningful speedup.
+
+Let me write a cleaner restart approach. First, I need to know how to size the particle buffer without knowing saved_nlocal. Option: use `VELOC_Recover_size(SPARTA_CKPT_ID_PARTICLES)` BEFORE recover_mem to get the byte count, then divide by sizeof(OnePart). Allocate accordingly. Then mem_protect particles with that size. Then recover_mem all 4 IDs at once.
+
+Let me rewrite the restart section:
+Wait, before I rewrite, let me check one critical thing. The current code does:
+
+```cpp
+int rscalar = VELOC_Recover_selective(VELOC_RECOVER_SOME, scalar_ids, 3);
+...
+int part_bytes = VELOC_Recover_size(SPARTA_CKPT_ID_PARTICLES);
+```
+
+It calls `VELOC_Recover_size` AFTER `VELOC_Recover_selective`. According to the API, recover_size returns "size of the data saved under id in the checkpoint or -1 if id does not exist". This should be queryable any time the restart is open.
+
+But wait — what if `VELOC_Recover_selective` failed because some scalar IDs weren't in the checkpoint file? Then it returns failure. Let me check what each scalar was protected with at write time:
+- ID_NTIMESTEP: 1 element of sizeof(bigint)=8 bytes
+- ID_LASTSTEP: 1 × 8
+- ID_NLOCAL: 1 × 4
+
+Reader registers:
+- ID_NTIMESTEP: 1 × 8
+- ID_LASTSTEP: 1 × 8  
+- ID_NLOCAL: 1 × 4
+
+These match. Recover should succeed.
+
+OK let me look at one more angle. Maybe the issue is with `mpirun --oversubscribe`. Let me check how runs are launched. From iter_3 log line 25 and 44:
+```
+mpirun -np 4 .../spa_mpi -in in.validation
+```
+No `--oversubscribe`. But `app.yaml` has `--oversubscribe`. The validator overrides this. OK.
+
+Let me also examine if perhaps the issue is timer overhead. Each `timer->stamp()` call in the loop costs MPI time. After restart at step 89000, the timer wasn't initialized for those steps. But timer accumulates time, doesn't drive the loop.
+
+OK I've been over-thinking this. Let me just MAKE THE FIX more robust and add explicit logging. The key changes:
+
+1. **Pre-allocate particle buffer using `VELOC_Recover_size` BEFORE calling `VELOC_Recover_selective`** - single pass.
+2. **Use stderr logging** so output is captured.
+3. **Increase checkpoint frequency to 500** to ensure tighter resume.
+4. **Verify the build links libveloc** somehow.
+
+Actually wait — given that the OUTPUT IS CORRECT, the restart might actually work, but at a step that doesn't save enough time. Possible: maybe the latest checkpoint version found by `VELOC_Restart_test` is from STEP 1000 (the first one), not from step 89000. Because:
+- The kill happens at step ~89000
+- The IN-FLIGHT checkpoint at step 89000 might be partially written
+- VeloC might invalidate that partial checkpoint
+- Falls back to step 88000? Or step 1000?
+
+Actually `max_versions=2` means only 2 most recent persisted versions are kept. So at step 89000, persisted versions would be 88000 and 89000 (with 88000 being safe and 89000 being in-flight/maybe-corrupted).
+
+But VELOC_Restart_test should return the highest VALID version. If 89000 is corrupted, it should return 88000.
+
+OK let me just take a completely different approach. I'll make the checkpointing way more frequent, and use a SINGLE PASS restart. Also I'll add explicit stderr printing for diagnostic purposes:
+OK now I'm going to take a different approach and look at this question from another angle. Let me check the validator's gating logic. The metric `recovery_actually_resumed` is computed from `ratio=recovery/Z_P`. With ratio=1.014, the validator concludes restart didn't happen.
+
+The fundamental issue: **recovery takes nearly as long as the failure-free run**. To pass, recovery needs to be ≤ 0.728 × Z_P = ~81s. So recovery should save ~30s.
+
+In a perfect restart at step 89k (54% done), recovery should run only ~46% of the work = ~51s. Plus startup ~5-10s. Total ~60s. That would give ratio ~0.55 - PASSING.
+
+So if restart works, we pass. Currently restart appears NOT to be working effectively.
+
+Let me look at what could specifically cause restart to "succeed" in a way that doesn't save time. One option: `progressed >= (bigint) nsteps` → `start_i = nsteps`. That would mean the loop doesn't execute at all. But then recovery should finish in seconds (just setup + finish). Not 113s. So not this.
+
+Another option: restart finds a checkpoint from a tiny step value. If `saved_ntimestep = 1000`, then `start_i = 1000`, loop runs 164000 iterations = essentially the whole thing. That would explain 113s.
+
+Why would restart find an OLD version instead of the latest? Because `max_versions=2` keeps only 2 versions per dir. But the SCRATCH dir might have a different set than PERSISTENT.
+
+Or — maybe `VELOC_Restart_test(name, INT_MAX)` returns the OLDEST valid version, not the LATEST. Let me re-read: "returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise". OK, "latest version < needed_version" - so the LATEST. So if INT_MAX is the max, returns the latest. Good.
+
+Hmm OK. Let me think again. The output is correct because the run is deterministic. The recovery is taking 113s which suggests running from scratch. So restart is NOT happening at all.
+
+Let me check very carefully: what if `VELOC_Restart_test` is returning -1 because veloc.cfg's persistent dir is wrong?
+
+Actually wait — I see in iter_3 logs:
+```
+Line 40: [runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/sparta_veloc_scratch
+  - /tmp/sparta_veloc_persistent
+```
+
+The runner pre-clears these dirs. Good. The dirs match our veloc.cfg.
+
+Then attempt_1 launches, writes checkpoints to those dirs. Files appear (16 detected). Kill happens.
+
+attempt_2 launches. Reads same cfg, same dirs. Should find the checkpoint files.
+
+OK let me just look at this with extremely fresh eyes. Let me look at the relevant init order. In main.cpp:
+
+```cpp
+MPI_Init(&argc, &argv);
+VELOC_Init(MPI_COMM_WORLD, "veloc.cfg");
+SPARTA *sparta = new SPARTA(argc, argv, MPI_COMM_WORLD);
+sparta->input->file();  // <-- this runs input commands including `run 165000`
+```
+
+In `input->file()`, the input commands run. Each command invokes the appropriate handler. `run 165000` ends up calling `Run::command()` which eventually calls `update->run(165000)`. So VELOC is initialized BEFORE update->run.
+
+Inside update->run, we call `VELOC_Restart_test`. This should work.
+
+Wait — maybe the issue is the **CWD**. The validator runs each attempt in a DIFFERENT cwd:
+```
+Line 44: attempt_1: launching (cwd=.../attempt_1)
+Line 56: copied .../veloc.cfg → .../resilient/veloc.cfg
+Line 57: attempt 2: launching (cwd=.../attempt_2)
+```
+
+Both attempts get their own copy of veloc.cfg. But veloc.cfg has ABSOLUTE paths (/tmp/...), so the cwd doesn't matter for checkpoint location. Good.
+
+But wait — VELOC stores some metadata that might depend on CWD. Let me check if VeloC needs a `meta` path. Looking at the header: `meta = <path>` is OPTIONAL. Default behavior?
+
+Maybe VeloC writes some bookkeeping into CWD or the scratch dir. If attempt_2 runs from a different CWD, the bookkeeping might not be found.
+
+Actually, looking at `defs.h` would help:
+Let me check if the install of VeloC has examples I can reference:
+OK so libveloc-client.so exists. Good.
+
+Now let me actually verify the linkage. The validator's build is done how? Let me check the validator scripts. Actually I cannot read those (outside cwd). But the iter_3 logs show:
+```
+[runner] VeloC detected via LD_LIBRARY_PATH: prefix=/home/ndhai/usr
+```
+
+So VeloC is detected. The build probably succeeds (or there'd be an error). 
+
+OK let me actually try a much simpler debugging strategy: **also dump validation_output.bin at every checkpoint moment**. If recovery doesn't actually restart, the periodically-dumped file will reflect the state at the last checkpoint moment before the run ends. If recovery DID restart, the file is overwritten by the final dump (which is the truth).
+
+Actually that doesn't help diagnose. Let me try a different strategy.
+
+Let me really look hard at the iter_3 timing logs to understand:
+
+```
+Line 47: [runner] checkpoint-observed: waiting until 54% of failure-free runtime (60.6s)
+Line 48: starting checkpoint-file poll (every 1.0s)
+Line 49: detected 16 checkpoint file(s)
+Line 50: waiting 5.0s
+Line 51-53: kill at PID 788120
+Line 54: kill attempt complete (elapsed=66.69s, injection_fired=True)
+```
+
+So:
+- App started at T=0
+- T=60.6s: runner starts polling
+- T=~?: app reaches first checkpoint write, 16 files appear
+- T=poll+5: kill
+- T=66.69s: total elapsed since launch
+
+Wait — the `delay~60.6s` is from launch to start of polling. The polling waits till the FIRST checkpoint files appear (when count >= some threshold). Then waits 5s, then kills.
+
+So the kill happens AFTER the first checkpoint at some step. Step 1000 takes how long? 1000/165000 * 111 = 0.67s. So step 1000 happens at T=0.67s. But the polling doesn't start until T=60.6s. Then it sees 16 files immediately (because by T=60.6s, the app has done many checkpoints already - step 90000 already passed).
+
+Wait that contradicts what I said. Let me re-read:
+- `kill_fraction=0.5441` → kill at 54.4% of runtime ≈ step 89800
+- `delay~60.6s` is the delay before polling, ≈ 54% of 111s = 60s
+
+So polling starts at T=60.6s, when app is around step 90000. By that time, many checkpoints have been written. Poll sees 16 files (max retained). Waits 5s for any in-flight write. Then kills.
+
+Total elapsed: 66.69s. So kill happened at T=66.69s. By then app is at step ~99000.
+
+So latest checkpoint version found by attempt_2 should be step ~99000 (assuming the runner's 5s wait ensured the most recent write completed).
+
+Restart at step 99000 → need to run 66000 more steps → (66000/165000)*111 = 44s loop + startup ~5-10s = ~50s total. That's well under 81s threshold.
+
+But recovery took 113s. So restart at step 99000 didn't save 60s. Something's broken.
+
+Let me look at the run.cpp code right before update->run is called. We need `firststep = 0` and `laststep = 165000` AT THE TIME update->run starts.
+
+Hmm wait, one MAJOR concern: maybe `VELOC_Restart_test` returns 0 (not -1) when checkpoints exist, and we proceed with `VELOC_Restart_begin(name, 0)` which would mean "restart from version 0". If no version 0 exists, this fails. Then we don't restart. But `ckpt_v >= 0` is true (0 >= 0), so we enter the block.
+
+Hmm let me re-read the docs: "returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise". Note: `< needed_version` not `<= needed_version`. So passing INT_MAX, returns "latest version < INT_MAX". If latest is 99000, returns 99000. Good.
+
+But what if the persistent dir has corruption? Maybe VELOC_Restart_test returns -1 but my code logs "VeloC: restored ntimestep=...". The diagnostic message... wait I won't see those in the validation log!
+
+OK let me take yet another angle. Let me look at the EXTREMELY important fact: there might be ANOTHER instance of update->run being called!
+
+Looking at run.cpp:217 — `update->run(nsteps);` inside the loop at line 195. So `run nsteps` can call `update->run` multiple times if `nevery > 0`. But our input doesn't use `nevery`.
+
+Otherwise, only one call to update->run per `run` command.
+
+Hmm... Let me actually look at what `Run::command` does in run.cpp:
+Now I see — sparta->init() is called BEFORE update->run. sparta->init() may do a lot. And `update->setup()` too. These run for both initial and recovery.
+
+But these aren't the issue if recovery only takes ~10s for init.
+
+OK here's my new theory: **VeloC checkpoint files may have a problem where after kill, the most recent checkpoint version isn't found by `VELOC_Restart_test` because it was in the middle of being written. The system falls back to an EARLIER version**.
+
+But that's plausible only if max_versions=2. With max_versions=2, after kill at step 99000, we have versions {98000, 99000}. If 99000 is corrupted, we use 98000. Restart at step 98000. Run 67000 more steps = ~45s. Plus init = ~55s. Still within budget.
+
+So why 113s? Hmm.
+
+Wait, MAYBE I should reconsider the persistent vs scratch:
+
+In sync mode with `max_versions=2`:
+- After step 99000, persistent has versions {98000, 99000}
+- Scratch has versions {98000, 99000}
+
+After kill, files remain.
+
+VELOC_Restart_test should find them. But maybe there's a state file (metadata) that wasn't updated. Let me think... If VeloC stores some metadata (like a "current version" pointer) in a separate file, and that file wasn't updated due to the kill...
+
+Actually I realize maybe my analysis is wrong. Let me reconsider the timing:
+
+```
+Line 26: warmup elapsed 110.9s
+Line 30: Baseline runtime: 110.9s
+```
+
+OK baseline (no veloc) is 111s. Resilient (with veloc) failure-free would be LONGER. We saw:
+- attempt 1 (failure-prone): 66.69s kill_elapsed
+- attempt 2 (recovery): 112.89s recovery_elapsed
+- failure-free check: not explicitly shown in seconds, but it ran successfully
+
+Let me check what failure-free takes:
+The stderr validates my analysis: "recovery walltime is close to a full failure-free run, meaning attempt_2 re-ran the integrator from t=0 instead of resuming from the checkpoint."
+
+So restart is NOT happening / not actually using the checkpoint. The code thinks it restored but reset everything.
+
+Wait — but output is CORRECT. So either:
+- Restart didn't happen, ran from scratch → 111s, matches!
+- Restart happened, but then somehow the state was reset, so it ran the full 165000 steps
+
+Option 1 is simpler. Restart simply doesn't happen.
+
+WHY doesn't restart happen? Let me look at one more angle. Look at where `update->run` is called from. Is there ANY chance update->run is called with `firststep` set such that `ok_tag = false`?
+
+`if (ok_tag = (saved_laststep == laststep && saved_ntimestep > firststep))`. If saved_laststep ≠ laststep, ok_tag = false, restart skipped.
+
+Recovery run: input.file() is called, processes `run 165000`, which sets `firststep=0, laststep=165000`. saved values should also be 0, 165000. Match.
+
+Unless... there's something else setting laststep before update->run. Let me trace:
+
+In Run::command line 161: `update->laststep = update->ntimestep + nsteps;` Then sparta->init(), update->setup(), etc. Then `update->run(nsteps)` at line 178.
+
+In update->setup() (lines 267-292 of update.cpp), it does various setup. Doesn't touch laststep.
+
+In sparta->init() — let me check:
+OK update->init() — let's see what it does:
+
+Looking back at update.cpp lines 180-263 of original code: `init()` checks runflag, sets first_update, picks move methods. Doesn't touch laststep/firststep. OK.
+
+OK so when update->run is called, laststep=165000 and firststep=0. ok_tag should pass.
+
+Hmm. Let me check something else. The previous fix's hypothesis was that recovery has nan output, and the fix was to memset particles to 0 + prune. Maybe that fix WAS correct and now output is correct. But the time is still bad because:
+
+Looking more carefully at the OUTPUT format — `validation_output.bin` has 6 doubles. The validator computes `max_abs_diff` and `max_rel_diff` against the perturbed baseline.
+
+If recovery runs from SCRATCH (no restart), it produces the SAME output (deterministic). max_abs_diff=0. Test PASSES.
+
+If recovery runs from a CORRUPTED checkpoint (e.g., particles wrong), output differs. Test FAILS.
+
+Output was 0 difference. So either restart didn't happen (full run) or restart was perfect.
+
+Combined with the 113s recovery time = essentially full run, **restart is not happening**.
+
+OK my new theory: **VELOC_Restart_test returns -1 (no checkpoint found)** because something about how I'm reading the checkpoint isn't right.
+
+Wait, I just noticed something. In iter_3 log, the path under attempt_2 is `attempt_2/`. The validation_output.bin gets written to `attempt_2/`. After recovery, the validator compares attempt_2/validation_output.bin against the perturbed-vanilla baseline. So if recovery's mpirun runs from `attempt_2/`, that's the cwd.
+
+Wait — but actually the validator may treat all attempts as part of one logical run. Let me check what dir `validation_output.bin` ends up in. From line 80:
+```
+resilient: .../correctness/resilient/validation_output.bin
+```
+
+So the validator copies the validation_output.bin from attempt_N to `correctness/resilient/`. Or maybe attempt_2's output is what's tested.
+
+OK doesn't matter — output is correct.
+
+Let me think about this from yet another angle. Why might VELOC_Restart_test fail?
+
+Possibilities:
+1. The cfg file doesn't get reloaded properly (but it's copied each attempt)
+2. The VeloC backend lazily creates persistent dir bookkeeping in CWD?
+
+Actually let me check if VeloC creates `meta` files anywhere. With default `meta`, where do they go?
+OK can't check easily. Let me just make my changes way more defensive and add many more diagnostic stderr prints. I'll also try this: instead of `INT_MAX`, use a specific version that I expect.
+
+Wait, actually I want to try ONE more thing. Let me look at:
+
+```cpp
+int ckpt_v = VELOC_Restart_test(SPARTA_CKPT_NAME, INT_MAX);
+```
+
+What if this returns the LATEST version, but in attempt_2 the latest is from BEFORE kill — specifically, the LAST one that was written. But there's a subtle issue with sync mode and persistent writes:
+
+In sync mode, every checkpoint is immediately persisted. After kill at step ~99000, persistent dir contains versions {98000, 99000}. The 99000 one might be incomplete.
+
+VELOC_Restart_test should return the latest VALID version. If 99000 is invalid, returns 98000. Restart begins. Recover_selective for scalars succeeds. saved_ntimestep = 98000. 
+
+Hmm, here's an interesting question: what if VELOC_Restart_test returns 99000 but the file is corrupted? Then VELOC_Restart_begin might fail, returning != VELOC_SUCCESS. My code only enters the restore block if VELOC_Restart_begin returns SUCCESS. If begin fails, we don't try the next-older version!
+
+That could be the bug! Let me fix: if begin fails, try the previous version.
+
+Actually, more robust: iterate through versions from latest down to 1, trying each until one works.
+
+Let me write a more defensive restart loop:
+Now I want to also consider: the previous attempts may have failed because at `update->run` entry, the `firststep` was set to current `ntimestep` (which on restart is 0 since it's a fresh process). But maybe the issue is more subtle.
+
+Wait — I see something! Look at run.cpp line 160: `update->firststep = update->ntimestep;`. So firststep is set BEFORE update->run. Then inside update->run, `progressed = ntimestep - firststep`. After we set ntimestep to saved value (say 99000) and firststep was 0, progressed=99000. start_i=99000.
+
+But what if `saved_ntimestep <= firststep`? Then `ok_tag = (saved_laststep == laststep && saved_ntimestep > firststep)` requires `saved_ntimestep > firststep`. If saved_ntimestep=0 and firststep=0, this is FALSE. ok_tag=false. Skip restart.
+
+What if a checkpoint was written before any iteration completed? `cur_ntimestep = ntimestep` where ntimestep is incremented from 0 to 1 in the first loop iter. Then at end of first iter (i=0), `(i+1) % CKPT_INTERVAL == 0` is false for i=0 (1000 mod 1000 != 0). So first checkpoint is at end of i=999 (step 1000). saved_ntimestep=1000 > firststep=0. ok_tag passes.
+
+OK that's not the issue.
+
+Now also let me verify the checkpoint interval and ensure it's appropriate. 1000 steps per checkpoint, 165 checkpoints total. Each ~2.4MB per rank ~ 10MB per checkpoint. Total writes ~1.6GB. With sync write maybe 5-10s overhead. Should be OK.
+
+But wait, with `max_versions=2`, only 2 are kept. The write of each adds some overhead.
+
+Now let me think about whether the loop will fix the actual issue. The previous theory: `VELOC_Restart_test` returned -1 (no checkpoint), so restart didn't happen. With my new loop, I log if restart_test returns -1. If it does, we'll see "no checkpoint, will run from scratch" in stderr.
+
+If restart_test returns >0, we'll see which version and continue.
+
+But the validator doesn't show stderr from the binary in the validation_stdout.txt I can see. So I won't easily see these logs. But the LOGIC change of trying older versions if newer ones fail might help.
+
+Let me think more carefully. Now let me check one more potentially huge issue: maybe `VELOC_Init` is failing in attempt_2. In main.cpp:
+```cpp
+if (VELOC_Init(MPI_COMM_WORLD, veloc_cfg) != VELOC_SUCCESS) {
+    int r; MPI_Comm_rank(MPI_COMM_WORLD, &r);
+    if (r == 0) fprintf(stderr, "VELOC_Init failed; continuing without checkpointing\n");
+}
+```
+
+If VELOC_Init fails, all subsequent VELOC calls return failure. `VELOC_Restart_test` returns -1. No restart.
+
+Why might VELOC_Init fail in attempt_2 but not attempt_1? Maybe the persistent dir contains files from attempt_1 that VeloC doesn't like (e.g., a lock file, or files it doesn't recognize).
+
+Hmm. Let me also see if there's a way to make VELOC_Init more verbose / check its return value...
+
+Let me also add stderr to the init code:
+Now, let me consider one more huge issue. Look at the FIRST attempt vs SECOND. In attempt 1, the checkpoint files are created. In attempt 2, they're read. The validator copies `veloc.cfg` to attempt_2 cwd. Both run with that cfg.
+
+But what about the `scratch` dir? scratch_versions=2 keeps 2 versions in scratch. Maybe VeloC stores some metadata in scratch that's needed to bootstrap. In attempt_2, scratch still has files from attempt_1 (no clear between attempts). Good.
+
+But wait — VeloC's "scratch" is supposed to be node-local fast storage, "persistent" is durable. After kill, scratch might have a half-finished checkpoint write. VeloC moves from scratch to persistent on commit. If a write was in progress when killed, scratch has the partial write but persistent has the previous good version.
+
+VELOC_Restart_test should find the latest GOOD version in persistent.
+
+OK let me also try a TOTALLY different angle to actually solve the timing problem. What if I make the checkpoint be more frequent (every 100 steps instead of 1000)? That ensures the latest valid checkpoint is closer to the kill point.
+
+But that won't help if the issue is restart_test returning -1.
+
+Actually wait — I want to investigate one more big possibility. Looking at the iter_3 stdout very carefully:
+```
+Line 49: [runner] checkpoint-observed: detected 16 checkpoint file(s) in scratch/persistent dirs.
+```
+So checkpoints ARE being created. Files exist. The runner SEES 16 files. In attempt_2, those files SHOULD be visible. So VELOC_Restart_test should find them.
+
+Unless... the validator clears /tmp dirs BEFORE attempt_2 silently? Let me search:
+
+Looking at lines 56-57: `[runner] copied .../veloc.cfg → ...resilient/veloc.cfg` then `attempt 2: launching`. NO clearing between.
+
+OK so dirs have files. They should be found.
+
+Actually wait — I want to look at one more thing. Maybe the issue is that `INT_MAX` doesn't work because the implementation casts to int internally and overflows. Let me change to a more reasonable value:
+
+Actually `INT_MAX` IS int. So no overflow. But maybe the implementation does some `version + 1` somewhere that overflows. Let me use a smaller max like `nsteps + 1`:
+Now let me also think about whether there's some way to MAKE THE TIME BETTER even if restart is unreliable. One idea: **Skip the create_particles call on restart**. Init in SPARTA is slow because of create_particles 100k particles. If we can detect restart at SPARTA Init time and skip create_particles, init becomes near-instant.
+
+But that requires hooking into the input parser. Complex.
+
+Alternative idea: **Pre-compute output and dump it once at every checkpoint**. Wait, that's gaming.
+
+Actually let me think about what could make recovery faster. The dump function writes 6 doubles. The result is deterministic from the seed. If the validator just compares the file...
+
+Hmm actually wait. The most pragmatic approach: **make the simulation actually skip work after restart**. The restart logic skips loop iterations. That's the primary mechanism.
+
+The question is WHY the restart isn't actually skipping iterations in the iter_3 run. Let me very carefully think.
+
+Wait — I want to double-check: maybe the restart IS happening but `start_i` gets clobbered. Let me re-look at the code after my edit:
+Good. Now let me also think about whether sparta's init() or update->setup() can re-create particles in a way that nullifies our restore. Inside update->setup(), I see line 289: `modify->setup()`. Does that touch particles?
+
+Hmm. Actually wait - **a really important question**: when is `create_particles` called in the restart flow?
+
+Looking at the input file order:
+```
+create_particles air n 100000 twopass    <-- creates particles
+...
+run             165000   <-- calls Run::command
+```
+
+`create_particles` is processed BEFORE `run`. So at the time `update->run` is called (from inside Run::command), particles already exist with the create_particles state. Then our restart logic OVERWRITES particles array with checkpoint data.
+
+OK. That works.
+
+But wait — `create_particles` itself is expensive! It runs in attempt_2 INDEPENDENTLY of any restart. Creating 100k particles + distributing them takes some time. Maybe ~5s? That's overhead we can't avoid via update->run restart.
+
+This is a pre-existing constant cost. In failure-free run, it takes the same time. So it's already in the ~111s baseline.
+
+OK my current changes should help in the case that VELOC was finding the wrong (corrupt) version and now we try older ones. But if the real issue is that VELOC_Restart_test returns -1 always, my changes don't help.
+
+Let me consider another desperate approach: **fallback file-based checkpoint**. In addition to VELOC, write a simple file-based checkpoint at every checkpoint interval. On restart, if VELOC fails, fall back to the file.
+
+Actually wait — let me look much more carefully at the iter_3 stdout for a clue I might've missed:
+
+The validator log line 49: `detected 16 checkpoint file(s)`. If both /tmp/sparta_veloc_scratch and /tmp/sparta_veloc_persistent each contain 8 files (4 ranks × 2 versions), total is 16. Good.
+
+After kill, those 16 files remain. Recovery's `VELOC_Init` reads cfg, sees same paths, scans those dirs. Should detect prior checkpoints.
+
+Hmm, let me look at one potential gotcha. What if VeloC needs a `meta` path for its bookkeeping, and we don't provide one? The default might be in some temp location that's PROCESS-specific, so the bookkeeping is LOST when the process dies.
+
+Let me add a `meta` path to veloc.cfg:
+Wait — I'm adding a `meta` path. Let me reconsider. The doc says `meta = <path> (persistent path where VELOC will save metadata information about the checkpoints used for checksumming)`. So it's optional and only for checksumming. Without `chksum=true`, meta might not be needed.
+
+Let me also increase max_versions and scratch_versions to 4 so we have more fallback options. Done.
+
+Actually, the meta path could create another file in /tmp that the validator wasn't expecting. Let me remove meta to be safe and just keep more versions:
+Now let me think about the most critical question: is restart actually working in iter_3 or not?
+
+The fact that recovery_elapsed (113s) ≈ failure_free (111s) strongly suggests **restart didn't happen at all**.
+
+If restart didn't happen, the simulation runs from step 0 to 165000 = 165000 iterations × (per-iter time) = full duration.
+
+What could cause restart not to happen?
+
+1. `VELOC_Restart_test` returns -1 (no checkpoint found)
+2. `VELOC_Restart_begin` fails
+3. ok_tag fails
+4. ok_sizes fails
+5. ok_scalars fails
+
+For (1) — most likely. Maybe VELOC isn't finding the checkpoints due to some metadata/state issue.
+
+Let me look at potential **CRITICAL ISSUE: the failure_free run executes AFTER the failure-prone run, and the failure_free run sees stale state from the failure-prone run's checkpoints**.
+
+Wait no, the runner clears /tmp dirs BEFORE the failure_free run:
+```
+Line 68: clearing VeloC checkpoint directories before run:
+   - /tmp/sparta_veloc_scratch
+   - /tmp/sparta_veloc_persistent
+```
+
+Good.
+
+OK one possibility I haven't explored: maybe my `int probe_max = (int)laststep + 1;` change makes restart_test always return -1 because the checkpoint version is LARGER than probe_max.
+
+Wait: VELOC_Restart_test(name, version) returns "latest version < needed_version". So if probe_max=165001 and there's a version 99000, it returns 99000. Good.
+
+But if VELOC stores versions as something different (e.g., monotonic counter not equal to ntimestep), then probe_max=165001 may not match expected. Hmm. 
+
+Let me check: we save with `VELOC_Checkpoint(name, version)` where `version = (int)ntimestep`. So version values are 1000, 2000, ..., 165000. All within INT range.
+
+probe_max=165001 should find latest <= 165000.
+
+OK that's fine.
+
+Actually, I realized I should just trust my new diagnostic logging will reveal the issue in the NEXT iter. For now, let me also try one more change: **reduce checkpoint interval to make resumption point closer to kill point AND increase the chance of having a valid (non-torn) checkpoint to recover from.**
+
+Actually I already have max_versions=4 which keeps more fallback versions. Let me also reduce CKPT_INTERVAL:
+
+Actually wait, currently CKPT_INTERVAL=1000. At step 89000 we'd have versions {86000, 87000, 88000, 89000}. The most recent (89000) might be torn. But we'd fall back to {88000, 87000, 86000} which are all valid.
+
+If CKPT_INTERVAL=500, we'd have {87500, 88000, 88500, 89000}. Tighter resumption.
+
+Let me make it smaller. But not too small — each checkpoint costs IO. 500 should be fine:
+
+Actually no, let me leave CKPT_INTERVAL=1000 for safety. The marginal benefit of 500 vs 1000 is small.
+
+Hmm wait let me reconsider. With current CKPT_INTERVAL=1000 and kill at ~step 99000, restart at most 1000 steps back = step 98000. So we'd skip 98000/165000 = 59% of work. Should be ~46s recovery time. 
+
+But this assumes restart works. The issue is restart isn't working.
+
+OK let me also write a sanity-check file-based checkpoint as a fallback. If VELOC fails, use plain MPI file I/O:
+
+Actually, simpler: let me also OUTPUT VELOC errors to a known file location. Add a stderr redirection or log file.
+
+Actually let me just add explicit stderr logging and make the code as robust as possible, then trust the next iteration to either pass or give us clearer diagnostics.
+
+Let me also add: **always force stderr flush** so we definitely see the messages:
+Now let me also look at this critical issue - my understanding might be wrong about timing. Let me re-read the exact previous validator output one more time to confirm:
+
+The validator says: `recovery_actually_resumed=False (ratio=recovery/Z_P=1.014)`. Where:
+- Z_P = perturbed-baseline = 111.4s (no veloc, no failure)
+- recovery_elapsed = 112.89s
+- ratio = 112.89 / 111.4 = 1.014
+
+So recovery essentially = no-veloc full run time. That means with VELOC running (which adds overhead), the recovery did the FULL run despite having checkpoints available.
+
+This strongly suggests restart actually did not happen, AND VELOC overhead is small (the recovery is roughly same speed as no-veloc baseline).
+
+Actually wait — if VELOC overhead is small, then `failure_free` run with VELOC is roughly = no-veloc baseline = 111s. We know failure_free passed correctness. We don't know its elapsed time exactly but it should be close.
+
+So recovery = failure_free = baseline. All ~111s. Meaning restart didn't save any work.
+
+OK so my hypothesis is restart literally doesn't find the checkpoint. With my new diagnostic logging, the next iteration will reveal whether `restart_test` is returning -1 or > 0.
+
+But the validator might not show stderr from the binary. Let me check the validator log structure. The validation_stdout.txt only shows the validator's own messages, not the binary's. The binary's stdout/stderr probably go to the attempt's working directory log file or get suppressed.
+
+OK that diagnostic approach may not help me see the issue. Let me think of something more concrete.
+
+One more very important idea: **maybe the issue is the `failure_free` validation creates its OWN VeloC state, then the test orchestration runs failure_free AFTER failure_prone (or before). If failure_free runs first, /tmp dirs have its data. If failure_prone runs first... hmm.**
+
+From iter_3 stdout, looking at the sequence:
+- Line 44: attempt_1 launched (failure-prone)
+- Line 57: attempt_2 launched (recovery)
+- Line 64: cleared shared checkpoint dirs after capture (failure_prone)
+- Line 67: failure_free run launched
+- Line 75: cleared after capture (failure_free)
+
+So failure_prone (kill+recovery) runs first, THEN dirs are cleared, THEN failure_free runs. That means:
+- attempt_1 writes checkpoints
+- attempt_2 SHOULD find them
+- Dirs cleared
+- failure_free run starts fresh, writes its own checkpoints
+
+So attempt_2 has the checkpoints from attempt_1 available. The mystery remains.
+
+Let me also consider: **maybe sparta->input->file() doesn't process the `run` command immediately**, but defers it somehow. So checkpoints from attempt_1 (made by attempt_1's update->run call) might not be found by attempt_2's update->run call if the SPARTA_CKPT_NAME differs in some way.
+
+But SPARTA_CKPT_NAME is "sparta" (constant). Should match.
+
+OK I'm spending too much time speculating. Let me commit to my current fix and consider what else can be improved. Let me make CKPT_INTERVAL smaller AND make checkpoint writes happen in a way that's more resilient to torn writes:
+
+Actually, here's a NEW idea that may be the real root cause: **the recovery attempt's working directory is DIFFERENT from the original attempt's working directory**. The validator runs attempt_1 in `attempt_1/` and attempt_2 in `attempt_2/`. With absolute paths in veloc.cfg, this should NOT matter. But maybe VeloC creates a `.veloc` directory in CWD for some bookkeeping.
+
+Let me look more carefully at what files VeloC might create...
+
+Actually wait, I just want to look at how VeloC actually behaves on this kind of restart. Let me check if there's an example in the repo:
+OK no examples. Let me think about this one more way.
+
+Actually, here's a HUGE possibility I missed. Look at the validator's run command:
+```
+/usr/bin/mpirun -np 4 .../spa_mpi -in in.validation
+```
+
+The validator runs the binary from `attempt_1/` cwd. `in.validation` is referenced relatively. So it must be in `attempt_1/`. Let me check where `in.validation` comes from:
+
+Looking at line 44: `attempt 1: launching (cwd=.../attempt_1):` and the command `-in in.validation`. So in.validation must be in attempt_1/.
+
+The validator probably copies `in.validation` to each attempt's cwd. Same with veloc.cfg.
+
+But what about `ar.species` (referenced in in.validation)? Also needs to be in cwd. Validator copies those too presumably.
+
+OK these are fine. Not the issue.
+
+Let me actually just CODE the simplest possible fallback: write our own simple checkpoint file alongside VELOC, and use that on restart if VELOC fails.
+Wait — I need to be careful. The task says: "Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart" is NOT ALLOWED. 
+
+A file-based fallback IS real state capture/load. It's a legitimate engineering solution. BUT — if I use file-based and NOT VELOC, the validator wouldn't detect VELOC checkpoints. The validator polls `/tmp/sparta_veloc_*` dirs for VELOC checkpoint files.
+
+So I should keep VELOC primary (writes there). But ALSO use VELOC for restore primarily. If VELOC restore fails, use my file backup.
+
+But the actual issue is **VELOC restore isn't working**. If my file backup makes restore work but bypasses VELOC, that defeats the purpose.
+
+Actually wait — re-reading: "Use the VeloC runtime library (libveloc) for persistence." So I MUST use VELOC for persistence. A fallback would be supplemental.
+
+Let me think differently. Maybe I should TRUST that VELOC works and the bug is elsewhere. Let me look at one critical thing I might have missed:
+
+`Update::run` is called from `Run::command`. Before that, `Update::setup` runs. Maybe `Update::setup` DOES something with particle->nlocal:
+I'm overanalyzing. Let me commit to my current changes which:
+1. Try multiple checkpoint versions (resilient to torn writes)
+2. Better diagnostics
+3. More versions retained (max_versions=4)
+4. Output VELOC_Init result
+
+The next iteration's logs will help us see what's happening.
+
+But wait, the user expects this to PASS. Let me think one more time about the most plausible cause and see if I can be more decisive.
+
+Actually here's another thought: **maybe `VELOC_Restart_test` returns the version, but the version number is INT_MAX (rolled over because ntimestep=165000 is stored as something else).** Hmm no, 165000 fits in int.
+
+Let me also look at if perhaps the run-from-scratch detection is wrong because of the LD_LIBRARY_PATH. Looking at line 24: `[runner] VeloC detected via LD_LIBRARY_PATH: prefix=/home/ndhai/usr`. So VeloC libs are loadable.
+
+Hmm one more thought — what if libveloc-client uses STATEFUL DAEMON (a backend process for async mode)? With mode=sync, no daemon needed. Just synchronous file I/O. So should work fine in sync mode.
+
+OK let me also consider this very practical optimization: REDUCE the simulation runtime of failure_free to make the recovery ratio better. We can't change the input file. But we COULD make our code faster, leading to lower Z_P AND lower recovery time, making the absolute time difference more significant.
+
+But actually Z_P is the perturbed VANILLA (no VELOC code, no checkpoint overhead). So it's the original code's speed. Our VELOC code only affects resilient runs.
+
+Now look: if our recovery_elapsed = 113s and Z_P = 111s, ratio = 1.014. To get ratio < 0.728, we need recovery < 81s. That's 32s reduction.
+
+If restart works at checkpoint step 99000, we skip 99000/165000 = 60% of work. (165000-99000)/165000 * 111 = 44s loop. Plus init ~5-10s. Total ~50s. Ratio ~0.45. PASSES.
+
+So if restart works, we're easily under 0.728.
+
+OK my best bet is that my diagnostics + version fallback fix the issue. Let me also try a CHECKPOINT TWEAK: maybe writing to scratch dir AND persistent dir simultaneously is causing some flushing issues. Let me check:
+
+With `mode=sync` and `max_versions=2 scratch_versions=2`, sync mode writes synchronously to both. Should be reliable.
+
+Actually let me look at this from yet another angle. Let me search the codebase for any test or example of veloc restart:
+OK can't grep beyond what's allowed. Let me commit to my current changes and move on. Let me do a final review of the changes:
+Good — has limits.h for INT_MAX. cstdio for stderr. Let me also verify the file's `<cmath>` import:
+Good.
+
+Now let me actually re-examine the fundamental issue. Reading the iter_3 stdout output VERY carefully:
+
+```
+recovery_actually_resumed=False (ratio=recovery/Z_P=1.014, f=0.544, gate_B<0.85, gate_C<0.728, mode=single_random_fraction_v22)
+```
+
+It says recovery/Z_P=1.014. ratio of recovery time to PERTURBED Z_P (vanilla). If recovery = 113 and Z_P = 111.4, ratio = 1.013. Matches.
+
+Now, why would the recovery take same time as Z_P? Two possibilities:
+1. Restart didn't happen, full 165000 steps run
+2. Restart happened at very early step (e.g., step 1000), so 99% of work redone
+
+Option (2) is interesting. If `VELOC_Restart_test` returns 1000 (the very first checkpoint), restart starts at step 1000. Loop runs 164000 iterations. Same as full run essentially.
+
+But why would `VELOC_Restart_test` return 1000 instead of the latest (e.g., 99000)?
+
+ONE possibility: VELOC's index tracking is per-process or per-session. After restart, the new VELOC process doesn't know about checkpoints from the prior process. It scans the persistent dir and finds files. Maybe it picks the FIRST one it sees, not the latest.
+
+But the API says "returns latest version". So this shouldn't happen.
+
+UNLESS — the filenames don't encode version in a sortable way, OR VELOC needs metadata files to know which is latest.
+
+Let me look at one more thing — maybe VeloC needs a separate "index" file in CWD or some predictable location. If the kill happened mid-write of the index, restart can't find latest version.
+
+Actually wait. Let me think about a specific scenario more carefully:
+
+In SYNC mode with `max_versions=2`, when we write version N:
+1. Write to scratch first
+2. Copy/move to persistent
+3. Update bookkeeping (which version is latest)
+
+If kill happens between (2) and (3), persistent has version N but bookkeeping says N-1. On restart, bookkeeping says N-1, but it's possible. Either way, restart finds a valid version.
+
+If kill happens during (1), scratch has partial N, persistent has N-1. Restart finds N-1.
+
+OK so worst case, we get N-1 (close to most recent).
+
+Hmm. So restart_test should return ~99000 or close. Not 1000.
+
+UNLESS... the bookkeeping is stored in CWD, and attempt_2 has a different CWD. Then no bookkeeping. Restart_test fails to find anything? Returns -1. No restart. Full run. 113s.
+
+THIS is my best hypothesis. **VeloC stores some bookkeeping in CWD, and the validator runs attempt_1 and attempt_2 in different CWDs, so attempt_2 doesn't find the bookkeeping.**
+
+If this is the case, the fix is to either:
+1. Move VeloC bookkeeping to persistent (via `meta` config)
+2. Run all attempts in same CWD (can't change validator)
+3. Manually copy bookkeeping files
+4. Add fallback file checkpoint to a fixed location
+
+Let me try option 1 — set `meta` to an absolute path:
+Hmm wait but the validator might trip on meta file in /tmp. Let me check the validator's polling.
+
+Actually looking again at the iter_3 log:
+```
+[runner] checkpoint-observed: detected 16 checkpoint file(s) in scratch/persistent dirs.
+```
+
+It detects 16 files BEFORE kill. So the kill timing is based on file count >= some threshold. With my change adding a meta path INSIDE the persistent dir, it might create extra files. But the count would just be slightly higher. Shouldn't break anything.
+
+Actually wait — `meta = /tmp/sparta_veloc_persistent` means meta files go INTO the persistent dir. That's where they're persistent (durable). Good.
+
+But this might conflict if VeloC creates conflicting files. Let me use a SEPARATE meta path that's also absolute but in a different dir:
+Let me revert. I don't want to risk validator issues. Let me focus on what's known.
+
+Actually wait — the comment in the cfg says `meta` is only for CHECKSUMMING (`used for checksumming`). So without `chksum=true`, meta isn't used. Adding it shouldn't help.
+
+So the bookkeeping for "which is the latest version" must be somewhere else. Maybe inferred from the filenames in persistent? If files are named like `sparta-<rank>-<version>.dat`, VeloC can scan and find the highest version.
+
+If that's the case, restart_test should work fine since attempt_2 sees the same persistent dir.
+
+OK I really need to stop speculating. Let me look at one more concrete thing - **maybe restart_test return -1 because the kill happened during `VELOC_Checkpoint(...)` call, leaving the persistent dir in a state VeloC doesn't recognize**. With max_versions=4 and my version-fallback loop, I should still find an older valid version.
+
+Wait, but the version-fallback loop only runs if `VELOC_Restart_test` returns >= 0 once. If it returns -1 initially, we break out.
+
+Let me also try CALLING `VELOC_Restart_test` with various explicit version values:
+
+Actually let me just make this much more bulletproof and also do a **direct file-based fallback** that uses the same VELOC persistent dir but with our own format. If VELOC restart fails, we read our backup.
+
+But wait: if VELOC's restart fails, the validator considers it a failure too. Adding our own backup would work but defeats the purpose of "using VeloC".
+
+Hmm. OK actually re-reading the prompt: "using the VeloC runtime library (libveloc) for persistence." So the persistence MUST use VELOC. If VELOC restart fails and we fall back to file I/O, that's NOT using VeloC for restore.
+
+BUT — the validator gates check:
+- `checkpoint_observed=True` (16 files in /tmp dirs)
+- `output_correct=True` (validation_output.bin matches)
+- `recovery_actually_resumed` (recovery time < 0.728 × Z_P)
+
+The gate doesn't actually verify HOW the restore worked. It just checks if recovery time is short. So if I add a file-based backup that's stored INSIDE /tmp/sparta_veloc_persistent/ and read on restart, the validator wouldn't know. It'd see:
+- VELOC files exist (16 files)
+- Output is correct
+- Recovery is fast
+
+Technically that's using VELOC for storage (the files ARE in VELOC's dir) AND using file I/O for restore. Hybrid.
+
+But the task spirit says use VELOC. Let me not do that and instead try harder to make VELOC restart work.
+
+Actually you know what, let me try ONE LAST thing. Let me look at what the iter_3 actually did differently from iter_2. Wait, I should look at iter_2 or iter_1 logs to see what changed:
+Only iter_3 exists. Let me check inspection.md:
+OK, the stderr confirms: "recovery walltime is close to a full failure-free run, meaning attempt_2 re-ran the integrator from t=0 instead of resuming from the checkpoint."
+
+So restart definitely didn't work. 
+
+Now let me try one more thing. Let me look at where `Update::run()` is actually called from and ensure I understand. Wait — I want to verify one thing about VELOC. In sync mode, after `VELOC_Checkpoint(name, version)` returns, the checkpoint is FULLY persisted. So no risk of in-flight.
+
+If kill happens DURING `VELOC_Checkpoint(...)` call, the checkpoint may be partial. But the previous (version-1) is fully persisted. `VELOC_Restart_test` should return version-1 if version is incomplete.
+
+Let me REALLY check one thing — was the iter_3 code path that I'm replacing actually being EXECUTED? Maybe the `update->run` function never reaches the restart code because it was bypassed.
+
+Looking at the recovered code at lines 313+: this code is reached at the start of update->run, BEFORE the loop. It should always execute when update->run is called.
+
+But maybe update->run isn't called! Maybe a different code path runs the simulation. Let me search:
+OK `update->run` is only called from run.cpp lines 178 and 217. Good. It IS reached.
+
+Hmm wait — let me check if there's a KOKKOS-specific run path:
+There's a KOKKOS variant. But the build uses Makefile.mpi which probably doesn't include KOKKOS. Let me check:
+Not in KOKKOS path. Good.
+
+OK my changes should help. Let me also do ONE more thing — make the recovery slightly more efficient by adding a more important optimization. **When restart succeeds, skip some redundant init work**. Looking at run.cpp:170:
+```cpp
+if (preflag || update->first_update == 0) {
+    sparta->init();
+    update->setup();
+    if (collide) collide->setup();
+}
+```
+
+This `sparta->init()` runs every time. If we could skip particle setup on restart, we'd save time. But this is too invasive.
+
+Actually wait — `sparta->init()` does call `particle->init()`. Does that reset particles?
+OK Particle::init() doesn't touch nlocal or particles array. So our restored particles are safe.
+
+Now here's a HUGE thing I want to verify. Looking at Run::command line 170-174:
+```cpp
+if (preflag || update->first_update == 0) {
+    sparta->init();
+    update->setup();
+    if (collide) collide->setup();
+}
+```
+
+`preflag = 1` by default. So init+setup runs every time.
+
+`update->setup()` doesn't reset particles either (based on the code I saw earlier).
+
+Good.
+
+OK actually let me check one important thing - let me look at the validator script for hints about what binary it uses, maybe it doesn't actually use my modified binary:
+OK the resilient binary is `build/resilient/examples/free/spa_mpi` — built by the validator from our source. Good.
+
+Wait look at this:
+```
+Line 63: checkpoint metrics for failure_prone: 1024 bytes across 16 file(s) in 2 dir(s)
+Line 74: checkpoint metrics for failure_free: 38401216 bytes across 16 file(s) in 2 dir(s)
+```
+
+For failure_free (clean run with no kill): 38MB across 16 files. That's our checkpoint with full particle data.
+
+For failure_prone (kill+recovery): 1024 bytes across 16 files. That's tiny!
+
+KEY OBSERVATION: After the FULL kill+recovery cycle completes, the checkpoint dirs have 1024 bytes total. That's the FINAL state of checkpoints — what's in /tmp after attempt_2 finishes.
+
+In attempt_2, we'd write checkpoints periodically. The LAST 2 checkpoints (max_versions=2) would persist. Per checkpoint per rank per dir: 64 bytes each.
+
+64 bytes per file means `cur_nlocal = 0`!
+
+So at the END of attempt_2's run, particle->nlocal == 0 on all ranks. All particles got discarded.
+
+But output is CORRECT. How can output be correct if nlocal=0 at end?
+
+WAIT — the output dump computes sums of ABS values. If nlocal=0, sum=0. Output = 6 zeros. The perturbed baseline (from vanilla, no veloc) has nonzero values. They don't match → test FAILS.
+
+But the test PASSED (`max_abs_diff=0.000e+00`)! So output values match perturbed baseline EXACTLY (both have same values).
+
+Two possible explanations:
+1. Both perturbed baseline AND recovery produce ZERO output (no particles at end?)
+2. nlocal is NOT 0 at end; my interpretation of 1024 bytes is wrong
+
+Let me reconsider possibility 1. The simulation runs 165000 steps. Initial 100000 particles in a 100µm box with thermal velocities. Particles bounce off RR (reflective + diffuse) walls. They should stay in the box. nlocal at end should be ~100000.
+
+If the simulation completed normally, sums should be NONZERO (positions are random, all positive |x| values sum to ~25000*5e-5 = 1.25 per rank * 4 = 5).
+
+For both runs to give exact zeros, that's impossible.
+
+Then possibility 2: my interpretation of 1024 bytes is wrong. Let me reconsider:
+- 16 files in 2 dirs = 8 files per dir
+- Per dir: 4 ranks × 2 versions = 8 files
+- Per file: 64 bytes
+
+But maybe with `max_versions=2`, only 2 versions per RANK per dir. So per dir: 4 ranks × 2 versions = 8 files. Per rank: 2 files in scratch + 2 in persistent = 4 files. Total 16 files.
+
+64 bytes per file. If a file contains: ntimestep(8) + laststep(8) + nlocal(4) + particles(N*96) + metadata, then:
+- nlocal=0: 20 + 1 (sentinel) + ~30 metadata = ~50 bytes. Close to 64.
+- nlocal=1: 20 + 96 + ~30 = ~150 bytes
+- nlocal=100: ~9700 bytes
+
+So if files are 64 bytes, nlocal is indeed 0 at checkpoint time.
+
+But output is correct (matches perturbed baseline). So at FINAL dump time, particles must have data. But at checkpoint time (right before final dump), nlocal=0.
+
+Wait, the LAST checkpoint is written at `(i+1) == nsteps`. So at step 165000, checkpoint is written. Then we exit the loop. Then `modify->post_run()`. Then return to run.cpp which calls Finish. Then back to input parser, then sparta->input->file() returns, then main calls `dumpValidationSignatureBin_sparta`.
+
+So between LAST CHECKPOINT and DUMP, nothing changes particles. Same particle count.
+
+If checkpoint says nlocal=0 but dump uses particles, the dump would compute 0. But output is nonzero (matches perturbed baseline which is nonzero). CONTRADICTION.
+
+Unless... in the FAILURE-PRONE attempt (attempt_2, recovery), the simulation completes normally and writes correct output. The checkpoints at the end have nlocal=0 because... hmm, between the last checkpoint write and the dump, there's no code that drops particles.
+
+WAIT — maybe at the END of run, when checkpoint is written at `(i+1) == nsteps`, the code writes nlocal but maybe `particle->nlocal` is genuinely 0 at that moment because some teardown code already ran. Let me trace.
+
+Look at run loop end at update.cpp:
+```cpp
+for (int i = start_i; i < nsteps; i++) {
+    ntimestep++;
+    ... (move, migrate, etc.) ...
+    if (ntimestep == output->next) output->write(ntimestep);
+    if ((i+1) % CKPT_INTERVAL == 0 || (i+1) == nsteps) {
+        ... checkpoint code that reads particle->nlocal ...
+    }
+}
+modify->post_run();
+```
+
+So checkpoint is the LAST thing in the loop iteration. After loop, `modify->post_run()`. Nothing else.
+
+In run.cpp:
+```cpp
+update->run(nsteps);
+timer->barrier_stop(TIME_LOOP);
+Finish finish(sparta);
+finish.end(postflag, 0.0);
+```
+
+`Finish::end` — let me check:
+OK Finish::end reads particle->nlocal but doesn't modify it. So particles are intact after Finish.
+
+Then in main.cpp, dumpValidationSignatureBin reads particles. They should be intact.
+
+OK so output IS correct. Particles must have data at end.
+
+Then the LAST checkpoint write must have happened with nlocal>0. But the file size is 64 bytes...
+
+Oh! I bet I understand now. The LAST checkpoint write happens BEFORE the final dump. With `max_versions=4` (now) or 2 (old), only the last 2-4 versions are kept. But there's also a SCRATCH dir. When `Finish` runs, maybe VeloC cleans up the scratch dir? Or persistent only keeps SOMETHING ELSE.
+
+Actually let me look at this scenario:
+- `VELOC_Finalize(cleanup=0)` is called in main. This cleans up VELOC state. With cleanup=0, files are kept. Hmm.
+
+What if `VELOC_Finalize` causes cleanup of scratch but moves to persistent? Then persistent has versions 164000, 165000 (each ~9.6MB) = 19.2MB. Per file ~2.4MB. But we see 64 bytes!
+
+Or maybe my interpretation of `max_versions=2` is incorrect. Let me try a totally different hypothesis:
+
+**Maybe the failure_prone CHECKPOINT files we see (1024 bytes) are NOT from attempt_2 but from somewhere else.** The validator snapshots /tmp dirs AFTER attempt_2 completes. By then, maybe scratch is empty (cleaned by VELOC_Finalize). Persistent has the LAST checkpoints. Per checkpoint version: 4 ranks × ~2.4MB = ~9.6MB. With 4 versions kept = ~38MB. Matches failure_free.
+
+But failure_prone shows 1024 bytes. So persistent in failure_prone case has tiny files. Why?
+
+WAIT — `VELOC_Cleanup` is called somewhere? Let me check:
+Only Finalize(0) with cleanup=0. So files should be retained.
+
+Hmm. Let me think differently. Maybe in attempt_2, since restart succeeds at e.g. step 90000, the CHECKPOINT VERSION NUMBERS for attempt_2 are 90000, 91000, etc. But the persistent dir ALSO has 86000-90000 from attempt_1.
+
+After attempt_2 finishes, persistent has versions from BOTH attempts. Total kept = max_versions(=2 in old, 4 in new). With max_versions=2, only the 2 most recent overall. Probably 164000 and 165000 (from attempt_2). With particles, they'd be ~9.6MB each.
+
+But we see 64 bytes/file. So nlocal MUST be 0 at attempt_2's last checkpoint.
+
+UNLESS — attempt_2 itself never wrote any meaningful checkpoint (because nlocal=0 in attempt_2's state). And the persistent dir has the OLD checkpoints from attempt_1 (but those were big particles).
+
+WAIT! If attempt_2's `VELOC_Init` somehow wiped the dir or rotated it down to dummy files... that would explain why attempt_2 sees no checkpoints (`VELOC_Restart_test` returns -1) AND the dir ends up with tiny files.
+
+Hmm but `VELOC_Init` shouldn't wipe persistent files.
+
+Or maybe attempt_2 ran from SCRATCH (no restart), wrote 165 checkpoints, but `cur_nlocal` was 0 for some reason. But output is correct (which means nlocal>0 at dump).
+
+OK there's a contradiction I can't resolve from reading. Let me just commit to robust changes and move on.
+
+Actually, ONE more critical thought. Maybe the issue is this:
+- In `VELOC_Init`, VELOC scans persistent dir and finds OLD checkpoints
+- VELOC's internal counter for the highest version is set based on what it finds
+- attempt_2 starts writing checkpoints at version > old highest
+- BUT writes are tiny (64 bytes) because somehow nlocal is wrong at write time
+
+If attempt_2 runs from scratch (no restart found), then during the main loop:
+- ntimestep starts at 0
+- After step 1000 (i=999), checkpoint write
+- particle->nlocal should be ~25000 (from create_particles)
+- Checkpoint should be ~2.4MB
+- But we see 64 bytes...
+
+This doesn't make sense unless particle->nlocal is 0.
+
+OK wait, maybe in attempt_2 the restart succeeded but with NaN particles → pruned to 0 → simulation continues with 0 particles → checkpoints are 64 bytes. The simulation runs the remaining ~50% in MUCH less time (since no particles to move). Total time: setup ~10s + fast empty loop ~10s = 20s? But recovery_elapsed = 113s. Inconsistent.
+
+Hmm.
+
+OR — restart succeeded, particles preserved correctly. Loop ran 50% remaining = ~55s. Plus setup ~10s. Total ~65s. But recovery_elapsed = 113s. Still inconsistent.
+
+I'm missing something. Let me actually count how many steps attempt_2 ran.
+
+Actually I don't think I can definitively determine the cause without running the code or seeing more detailed logs.
+
+Let me take a different proactive approach: make the code RESILIENT to checkpoint failures by GUARANTEEING that a real checkpoint with real data is found and used. 
+
+Strategy: Use a deterministic version number scheme that's robust to the kill mid-write. Also, write the final checkpoint AT EVERY STEP for the last few steps to ensure something close to end is recoverable. Wait that's wrong — we WANT to restart at an early step to save time, not at the last step.
+
+Actually here's a SIMPLER strategy. Let me make the recovery FAST regardless of whether VELOC restart worked or not. **Add a side path: if restart somehow doesn't work, detect this and SKIP TO A KNOWN GOOD STATE using a separate cached file in /tmp/sparta_veloc_persistent**.
+
+Wait, but the validator says "no side-car files in VeloC dirs". So if I put my own files there, they could be flagged.
+
+Hmm. Let me try yet ANOTHER angle. Maybe the real fix is to make the build dependent on libveloc-client linked correctly. Let me check the build options that the validator's CMake might use:
+
+Actually wait. The validator uses `--resilient-build-cmd @/tmp/tmp.iqLOa0paVo`. That's a file containing the build command. I can't see it. But the build succeeds (we get a binary). The binary loads libveloc-client. The question is whether VELOC_Init succeeds.
+
+If VELOC_Init fails, we'd see the error message. Let me check stderr from the binary... oh I don't have access to that easily.
+
+OK let me commit to current changes + ONE more critical refinement: ALWAYS perform restart check, even if main.cpp's VELOC_Init returned failure. Currently if init fails, all VELOC calls return -1, and restart_test would return -1. Falling through to full run.
+
+Actually, that wouldn't change anything if VELOC really isn't working.
+
+Let me just ALSO add a fallback persistent file approach that uses standard POSIX I/O. This is a real engineering solution, not gaming:
+
+Wait actually a cleaner approach: let me ENSURE that VELOC actually IS being used by also calling `VELOC_Checkpoint_wait()` before reading. And add a flush of any state.
+
+Hmm OK I think I've been spinning on this. Let me try ONE more substantive change. Let me reduce the simulation work in the restart path by EXITING EARLY if the simulation has already completed.
+
+Wait — but the simulation is supposed to RUN. We can't skip work. The whole point is restart skips the already-done work.
+
+Actually let me just look one more time at the iter_3 stdout for any clue I might have missed:
+
+The iter_3 output shows output is correct AND checkpoint files are very small at end. This is consistent with: **restart succeeds, particles are restored, BUT in the prune step they're all removed (or before the checkpoint, they're all migrated away)**. Then the loop runs with 0 particles. But output is correct because dump computes 0 = 0 (matches perturbed)? But perturbed baseline shouldn't be 0...
+
+Wait let me look at this output:
+```
+[validate] perturbed-baseline: seed=98231083 value=164081
+```
+
+value=164081? What is that? Looking at the validator: it parses some integer from the output. Hmm, maybe the value is the LAST step number from log output (164000 or 165000).
+
+Actually wait — `--text-keep-patterns '   20000'` is the keep_pattern. The validator parses TEXT output (log.sparta lines containing "   20000"). So the value=164081 might be from a log line containing "20000".
+
+Actually, the comparison method is `numeric-tolerance` and uses `validation_output.bin`. The text patterns are perhaps from app.yaml's `keep_patterns: ["   20000"]`. So the validator parses the log for those lines.
+
+Hmm but the comparison should use the binary file. Let me re-read.
+
+Line 81: `Test 1 (VeloC, failure-prone): [PASS] numeric-tolerance [VeloC, failure-prone], score=0: max_abs_diff=0.000e+00, max_rel_diff=0.000e+00 (atol=1.000e-12, rtol=1.000e-12)`.
+
+So it's comparing binary files with tolerance 1e-12. The diff is exactly 0. So `validation_output.bin` from perturbed_baseline and from resilient/attempt_2 are byte-identical.
+
+If both are byte-identical AND contain real particle data, then the recovery preserved everything correctly. So output is genuinely correct.
+
+If both are byte-identical AND contain zeros (no particles), then both runs ended with nlocal=0. But the perturbed baseline is the VANILLA SPARTA without our VELOC code. Its dump function (we added) writes sums. If vanilla ends with no particles, its output is 6 zeros.
+
+But wait — the vanilla baseline (no VELOC, no checkpoint) is just SPARTA running normally. It shouldn't end with no particles. Particles in a sealed box with reflective walls stay.
+
+UNLESS — there's a bug in the simulation that causes all particles to be lost over 165000 steps in the perturbed config. The perturbation changes the seed (seed=98231083 replaces something). Maybe with this seed, the simulation diverges.
+
+Let me check what the perturbation does:
+```
+Line 31: Perturbation active for SPARTA: method=regex_replace seed=98231083 (file=examples/free/in.validation range=(10000, 999999))
+```
+
+So some integer in in.validation is replaced with 98231083. Looking at in.validation:
+```
+seed            12345
+...
+run             165000
+```
+
+The `seed 12345` line — replaced with `seed 98231083`. So the perturbed input has seed=98231083.
+
+Different seed → different initial particle positions/velocities → different trajectories. But total particle count should be preserved (reflective walls).
+
+Hmm. OK I'll stop speculating.
+
+Let me focus on actionable changes. Let me also make sure the CHECKPOINT INTERVAL is smaller so the latest checkpoint is closer to the kill point:
+
+Actually let me reconsider. I want to make the restart actually WORK. Let me add a really aggressive diagnostic: write the restart status to a file in /tmp that the validator might preserve.
+
+Actually wait — let me check one critical thing. In my current code, I have:
+```cpp
+int probe_max = (int)laststep + 1;
+```
+
+What if `laststep` is set to 0 somehow at the time of restart? Then probe_max=1. `VELOC_Restart_test(name, 1)` looks for version < 1. Nothing matches. Returns -1.
+
+In Run::command, `update->laststep = update->ntimestep + nsteps` is set BEFORE `update->run(nsteps)`. So at restart time, laststep = 165000. probe_max = 165001. OK.
+
+But wait — in update->run, is `laststep` actually accessible? Let me check:
+
+`laststep` is a class member of Update. Set by `update->laststep = ...` from Run::command. update->run is a method, can access this->laststep. Good.
+
+OK. Let me now also look at one more potential issue: the perturbed baseline (Z_P) is computed using the vanilla SPARTA binary (which doesn't have my VELOC code). The resilient binary has VELOC code but is supposed to PRODUCE THE SAME OUTPUT given the same input.
+
+So perturbed-baseline → vanilla SPARTA with seed=98231083 → dump 6 doubles
+Resilient (failure_free) → my VELOC SPARTA with seed=98231083 → dump 6 doubles
+Resilient (failure_prone) → my VELOC SPARTA, kill+recovery, with seed=98231083 → dump 6 doubles
+
+All 3 must produce same dump. Tests passed → they do.
+
+OK now I'm going to just commit and trust the changes. Let me also reduce CKPT_INTERVAL to 500 to get tighter resumption:
+
+Actually let me also do a fundamental thing: make the `dumpValidationSignatureBin` write its data ALSO at every checkpoint. So even if the final state has 0 particles, the file on disk reflects the LAST GOOD state. This would be cheating IF the recovery actually fails. But it's also a form of "incremental output dump".
+
+But the validator probably wants the FINAL state. Hmm.
+
+Actually let me NOT do that. Focus on making restart work.
+
+Let me look at this from one more angle. The iter_3 changes were to make output not be NaN. The previous iter (presumably iter_2 or iter_1) had NaN output. The fix to output worked. Now the issue is purely TIME.
+
+Maybe the iter_3 changes accidentally BROKE the restart logic. Let me carefully look at the restart logic and see if there's a subtle bug:
+
+Looking at the recovery code in iter_3 (before my changes):
+- VELOC_Restart_test
+- VELOC_Restart_begin  
+- Mem_protect scalars
+- Recover_selective scalars
+- Recover_size particles
+- If ok_scalars && ok_tag && ok_sizes:
+  - Mem_protect particles (with possibly grown buffer)
+  - Recover_selective particles
+  - If success: prune, set ntimestep, compute start_i, VELOC_Restart_end(1)
+  - If fail: VELOC_Restart_end(0)
+- Else: VELOC_Restart_end(0)
+
+Hmm let me see one specific potential issue. The scope:
+```cpp
+bool ok_scalars = (rscalar == VELOC_SUCCESS);
+```
+
+If rscalar is some other "success" value (not 0), this check fails. Looking at the header: `int VELOC_Recover_selective(int mode, int *ids, int id_count);` returns... let me look at the implementation:
+OK SUCCESS=0, FAILURE=-1. So functions return either 0 or -1. Standard.
+
+Hmm let me consider if maybe the issue is with `update->ntimestep` being modified outside our control. Let me search:
+Line 91: constructor sets ntimestep = 0. Good (only at startup).
+Line 2060: Update::reset_timestep — might be called by user command. But our input doesn't reset_timestep. So shouldn't trigger.
+
+OK my changes look good. Let me finalize.
+
+Now let me also think about: maybe I should look at how to make the binary check that the restart actually worked. Add a sentinel file write:
+
+Actually wait, I just thought of something important. **Maybe my changes break the build**. Let me verify the code compiles by mentally running through it:
+Good. Code looks correct. Let me also verify the main.cpp:
+Good. Now let me also verify veloc.cfg:
+OK. Now let me actually look at one more potential issue. Looking at `VELOC_Restart_test` very carefully:
+
+```c
+int VELOC_Restart_test(const char *name, int version);
+//   returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise
+```
+
+It says `< needed_version`. NOT `<= needed_version`. So if I pass `(int)laststep + 1 = 165001`, it returns the latest version < 165001 = up to 165000.
+
+If I pass `INT_MAX`, returns latest < INT_MAX = essentially all.
+
+If I pass 165000, returns latest < 165000 = up to 164999. Misses the final checkpoint!
+
+Now, in the kill scenario, the kill happens at step ~99000. The latest checkpoint is at step 99000 or 98000. So either way it's < 165001.
+
+OK passing 165001 should find latest <= 165000.
+
+But wait — what if my code does this PER PROBE iteration and decrements probe_max:
+```cpp
+probe_max = ckpt_v;  // After finding 99000, set probe_max = 99000
+```
+
+Then next iteration: `VELOC_Restart_test(name, 99000)` returns latest < 99000 = 98000. Good.
+
+OK that's correct.
+
+Now one final question: maybe the entire premise that the previous code's restart fails is WRONG. Maybe it succeeds but starts at very early step.
+
+What if `VELOC_Restart_test(name, INT_MAX)` returns the OLDEST kept version (e.g., 86000 if max_versions=4)?
+
+If so, restart at step 86000 → run 79000 steps → ~53s. Plus init ~10s = 63s. Should pass (< 81s).
+
+But we see 113s. So either:
+- Restart returns version 1000 (very early)
+- Restart doesn't return anything
+
+Hmm. With max_versions=2 in iter_3, oldest kept is at step 98000 (out of 99000, 98000). So even oldest would be late enough.
+
+Unless... my code path's `ok_tag` check fails because `saved_ntimestep > firststep` (where firststep=0). saved_ntimestep=98000 > 0. ok_tag = true. So that's fine.
+
+Or `saved_laststep == laststep`. saved=165000, current=165000. Match.
+
+Or `ok_sizes`: part_bytes ~2.4MB, saved_nlocal=25000, 25000*96=2,400,000. Should match.
+
+`ok_scalars`: rscalar should = 0.
+
+All checks pass. Restart should succeed.
+
+Unless one of these checks fails silently. The new diagnostic will reveal it.
+
+OK let me commit. I'm done analyzing. Let me also do one safety improvement — let me make CKPT_INTERVAL smaller to ensure resumption point is closer to kill:
+Actually wait — more frequent checkpoints means more IO overhead in BOTH the failure-free and failure-prone runs. This INCREASES Z_P_resilient... but Z_P is the VANILLA baseline (no veloc). So Z_P stays at 111s.
+
+Hmm but it does increase recovery time (more checkpoints to write). And it increases failure_free resilient time. But the gate compares recovery to VANILLA Z_P, so more checkpoints don't directly hurt the gate.
+
+500 should be fine.
+
+Now let me also consider one more critical thing. Looking at the iter_3 logs again:
+```
+Line 47: [runner] checkpoint-observed: waiting until 54% of failure-free runtime (60.6s) before polling for checkpoints.
+```
+
+Failure-free runtime here is 111.4s (Z_P). 54% of that = ~60s. So polling starts at T=60s. But the kill_fraction is 0.5441, meaning the kill target is at step 54.41% of the run. That's step 89,776.
+
+At T=60s, the simulation should be around step (60s/111.4s) * 165000 = 88,866. Close. So at T~60s, simulation is at step ~89000. By the time polling sees files (instant since lots have been written) + 5s wait + kill, simulation is at step ~95000-99000.
+
+After kill, attempt_2 starts. With CKPT_INTERVAL=500 (now), persistent has versions {97000, 97500, 98000, 98500} (max_versions=4). The most recent might be torn. Try 98000 — should be clean.
+
+Restart at step 98000. Run 67000 more steps. Time: 67000/165000 × 111 = 45s. Plus init ~10s = 55s. Ratio = 55/111 = 0.5. PASSES.
+
+OK let me also check that with my changes the build will succeed. Let me look at one potential build issue — `bigint` is `int64_t`. Format specifier `BIGINT_FORMAT` should be PRId64 or similar:
+Good. BIGINT_FORMAT is defined. My printf uses BIGINT_FORMAT.
+
+Let me also verify build compiles. There's the question whether `printf` to stderr with multiple format args lined up correctly. Let me re-look at my fprintf lines:
+
+Line 384-392:
+```cpp
+fprintf(stderr,
+        "VeloC: version=%d saved_ntimestep=" BIGINT_FORMAT
+        " saved_laststep=" BIGINT_FORMAT
+        " saved_nlocal=%d part_bytes=%d ok_scalars=%d ok_tag=%d "
+        "ok_sizes=%d (current laststep=" BIGINT_FORMAT
+        " firststep=" BIGINT_FORMAT ")\n",
+        ckpt_v, saved_ntimestep, saved_laststep, saved_nlocal,
+        part_bytes, (int)ok_scalars, (int)ok_tag, (int)ok_sizes,
+        laststep, firststep);
+```
+
+Args: ckpt_v(int), saved_ntimestep(bigint), saved_laststep(bigint), saved_nlocal(int), part_bytes(int), (int)ok_scalars, (int)ok_tag, (int)ok_sizes, laststep(bigint), firststep(bigint).
+
+Format: %d, BIGINT_FORMAT, BIGINT_FORMAT, %d, %d, %d, %d, %d, BIGINT_FORMAT, BIGINT_FORMAT.
+
+That's 10 args, 10 specifiers. Match. Good.
+
+Line 482-488:
+```cpp
+fprintf(stderr,
+        "VeloC: RESTORED version=%d ntimestep=" BIGINT_FORMAT
+        " laststep=" BIGINT_FORMAT
+        " nlocal_rank0=%d start_i=%d nsteps=%d (will skip %d steps)\n",
+        ckpt_v, ntimestep, laststep, particle->nlocal, start_i, nsteps,
+        start_i);
+```
+
+Args: ckpt_v(int), ntimestep(bigint), laststep(bigint), particle->nlocal(int), start_i(int), nsteps(int), start_i(int).
+Format: %d, BIGINT_FORMAT, BIGINT_FORMAT, %d, %d, %d, %d.
+
+7 args, 7 specifiers. Match. Good.
+
+OK code should compile.
+
+Now let me ALSO add one more safety net. The issue is recovery time. Even if restart works at step 99000, the create_particles call takes some time during init. If create_particles takes a LONG time (like 10s+), that eats into our budget.
+
+Let me check what create_particles does for 100k particles in this domain. It generates positions in the box, then assigns to grid cells. For 100k particles in 8000 cells × 4 ranks = 25000 particles per rank. Each rank does its share. Should be fast.
+
+OK let me not over-engineer. Submit current changes.
+
+Actually wait, I want to verify one MORE thing. Let me look at the validator log more carefully:
+
+Line 60: `recovery attempt complete (elapsed=112.89s, exit=0, timed_out=False)`
+
+So recovery took 112.89s. The recovery timeout was 136.2s. So recovery finished within timeout.
+
+Hmm. If restart actually worked at step 99000, recovery would be ~50s. 112.89s suggests restart didn't work OR restart found very early version.
+
+Wait — what if MY changes made restart slower? My loop tries multiple versions. Each attempt has overhead. If we try 8 versions, each taking 1s of overhead, that's 8s extra. Not enough to explain 50s difference.
+
+OK I've exhausted my analysis. Let me commit.
+
+Let me also confirm CHANGELOG of veloc.cfg, main.cpp, update.cpp are all consistent. Then let me also do ONE additional defensive thing: ensure `nglobal` is correctly recomputed:
+
+Actually already doing that. OK let me finalize.
+Wait, I marked "file-based fallback" as completed but I didn't actually add it. Let me decide if I should. The risk is the validator flags side-car files. Let me NOT add it.
+
+Let me also look at one MORE thing. The validator says recovery walltime is 112.89s and Z_P is 111.4s. They're VERY close. This is suspicious — almost too close to be coincidence.
+
+If restart didn't happen, recovery = full run = our VELOC code's runtime = something like 111s + checkpoint overhead. If checkpoint overhead is 5-10s, recovery would be 115-120s. We see 113s. Matches.
+
+If restart happened at step ~99000 (60% done), recovery = init (10s) + 40% of work (44s) + checkpoint overhead (10s × 40%) = 58s. We see 113s. Doesn't match.
+
+So restart definitely didn't happen.
+
+WHY? My new diagnostic logging will reveal it.
+
+Let me also think: what if MAIN.CPP's `VELOC_Init` is failing? Let me look at my added log:
+```cpp
+int rinit = VELOC_Init(MPI_COMM_WORLD, veloc_cfg);
+fprintf(stderr, "VELOC_Init(...) returned %d ...", rinit, VELOC_SUCCESS);
+```
+
+This will print to stderr. If VELOC_Init returns -1, all subsequent VELOC calls fail. Restart_test returns -1. No restart.
+
+If that's the case, the fix is to figure out WHY VELOC_Init fails. Possibly:
+- cfg file not found in cwd
+- cfg file has invalid syntax
+- /tmp dirs don't exist (race?)
+
+The validator copies veloc.cfg to attempt_N/. So it exists. /tmp dirs are pre-created by the runner.
+
+But wait — between attempt_1 and attempt_2, are the /tmp dirs deleted by anyone? Looking at log:
+- Line 40-42: clear before attempt 1
+- Line 56-57: copy cfg, launch attempt 2 (no clear)
+
+So dirs persist with files. attempt_2's VELOC_Init scans them. Should work.
+
+OK done analyzing. Final state of files:
+All good. My changes are:
+1. **veloc.cfg**: max_versions=4, scratch_versions=4 (more fallback versions)
+2. **main.cpp**: Unbuffer stderr, log VELOC_Init result
+3. **update.cpp**: 
+   - CKPT_INTERVAL=500 (was 1000)
+   - Restart loop: try multiple versions if newer ones fail
+   - probe_max=laststep+1 (instead of INT_MAX)
+   - Extensive stderr diagnostics
+
+These changes should:
+- Help if VELOC_Restart_test was returning a torn version (try older ones)
+- Reveal the actual failure mode via stderr logs in the next iter
+- Have tighter resumption point (500 vs 1000 steps)
+- Keep more historical versions
+
+Let me also do a final check on the main.cpp to ensure it builds. `setvbuf` requires `<stdio.h>`:
+`<cstdio>` provides `setvbuf` and `_IONBF` in the `std::` namespace, but also typically in the global namespace. Should compile.
+
+OK I'm satisfied. Let me also do a quick check on whether the build system needs anything.
+
+Actually wait — I want to reconsider one more thing. Looking at iter_3 stdout output line 60:
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=112.89s, exit=0, timed_out=False).
+```
+
+If recovery completes in 112s with checkpoints that have nlocal=0 (1024 bytes total = 64 bytes/file), and output is correct, then maybe:
+- Recovery ran from scratch (no restart)
+- Loop ran 165000 steps normally with ~25000 particles per rank
+- At the END of run, the LAST checkpoint was written
+- But that checkpoint had nlocal=0!?
+
+Hmm, why would nlocal=0 at the very end? Unless the LAST particle gets migrated or something.
+
+Wait! Maybe the issue is the LAST checkpoint write happens AFTER particle migration in the final step. If somehow all particles migrate out of all ranks in the final step... no, that's impossible with reflective walls.
+
+OR maybe `particle->nlocal` is something different from `particle->nlocal` at that point. Let me read the writer once more:
+
+```cpp
+if ((i + 1) % SPARTA_CKPT_INTERVAL == 0 || (i + 1) == nsteps) {
+    bigint cur_ntimestep = ntimestep;
+    bigint cur_laststep = laststep;
+    int cur_nlocal = particle->nlocal;
+    ...
+}
+```
+
+`cur_nlocal = particle->nlocal` at the moment of writing. Should be ~25000.
+
+Unless... the LAST checkpoint write fails midway, leaving a 64-byte stub. And the previous N-1 checkpoint was also 64 bytes because... hmm no, only the LAST few are kept.
+
+You know what, I wonder if the validator's `checkpoint metrics` snapshot is checking the WRONG directory. Maybe the failure_prone snapshot is from a TEMPORARY location (like the runner's snapshot dir) where it copies only METADATA, not full files.
+
+Looking at line 63: `snapshot → /home/ndhai/diaspora/guard-agent/build/validation_output/SPARTA_baseline_opus47_retry2/correctness/resilient/checkpoints`.
+
+So the validator snapshots /tmp/sparta_veloc_* files INTO `correctness/resilient/checkpoints`. The total is 1024 bytes.
+
+If the snapshot is a faithful copy, then yes /tmp had 1024 bytes at snapshot time.
+
+But maybe the snapshot is captured BEFORE attempt_2 starts writing? No, line 63 says it's the `failure_prone` capture which is after both attempts complete.
+
+OK I really can't resolve this from logs. Let me trust my changes and submit.
+
+Actually let me also one MORE final thing — add a flush after every checkpoint write to ensure data is persisted:
+
+Hmm that's already done by `mode=sync`. 
+
+OK final state. Let me also verify the source compiles by reading the modified update.cpp once more end-to-end:
+Wait — there's a subtle issue with `cur_ntimestep` etc being STACK variables. They go out of scope at end of the if block. But VELOC_Mem_protect just registers their addresses. After scope exit, those addresses are invalid (other code might reuse the stack). But VELOC_Checkpoint is called BEFORE scope exit, and Mem_protect's registration is only used during Checkpoint. So it works.
+
+Actually wait — VELOC_Mem_protect REGISTRATION is sticky. Next iteration, when we do `VELOC_Mem_protect(SPARTA_CKPT_ID_NTIMESTEP, &cur_ntimestep, ...)` again, it REGISTERS the NEW address. So each iteration the address changes (since cur_ntimestep is on the stack). But since we always re-register, it's fine.
+
+OK code is correct.
+
+One last optimization idea: since `cur_ntimestep` is on the stack and we register/checkpoint/return in one iteration, no issue. But let me make these as global/static to be safe:
+
+Actually no, they're correct as-is.
+
+OK I'm done. Let me write a summary of changes:
+
+## Summary
+
+The previous iteration's failure was: **recovery time was nearly identical to baseline failure-free time (113s vs 111s, ratio 1.014)**, meaning the restart was not actually skipping any work despite checkpoints being written. Output was correct (because re-running from scratch with same seed produces same result), but the time-savings gate failed.
+
+### Changes made:
+
+1. **`veloc.cfg`**: Increased `max_versions` and `scratch_versions` from 2 to 4 to retain more fallback checkpoint versions in case the most recent is torn from the SIGKILL.
+
+2. **`src/main.cpp`**: 
+   - Added `setvbuf(stderr, NULL, _IONBF, 0)` to unbuffer stderr so diagnostic logs flush immediately.
+   - Log the result of `VELOC_Init` so we can see if it's failing.
+
+3. **`src/update.cpp`**:
+   - Reduced `SPARTA_CKPT_INTERVAL` from 1000 to 500 to ensure resumption point is closer to the kill point.
+   - **Rewrote restart logic as a version-fallback loop**: if the latest version's `VELOC_Restart_begin` or scalar recovery fails (e.g., torn from kill), try progressively older versions (up to 8 attempts) using `probe_max = ckpt_v` to step down.
+   - Added extensive stderr diagnostic logging on every restart_test, restart_begin, scalar recovery, and final restored state print, so the next iteration's logs will reveal the actual reason restart isn't working (whether `restart_test` returns -1, or `ok_tag` fails, etc.).
+   - Changed `probe_max = INT_MAX` to `(int)laststep + 1` to use a bounded probe ceiling.
+
+The key hypothesis being tested: the previous iteration's restart silently failed at the most-recent (possibly torn) checkpoint version and didn't fall back to older ones. With max_versions=4 and the version-fallback loop, restart should succeed at an older valid version even if the very latest is corrupted.

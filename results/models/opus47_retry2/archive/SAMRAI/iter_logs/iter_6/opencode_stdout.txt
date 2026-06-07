@@ -1,0 +1,179 @@
+I'll start by examining the previous attempt's validation output to understand what failed.
+Key findings:
+- Tests pass (correctness OK), checkpoints are written (225 files, 260MB)
+- BUT recovery ratio = 1.85x (above 1.7x gate B), and `recovery_actually_resumed=False` (ratio=1.013, gate_B<0.85 needs ratio<0.85)
+- This means recovery took ~83s (same as full run from scratch), implying the restart did NOT actually load the checkpoint and resume - it started over
+
+The problem: checkpoints are being written, but on restart the application is starting from scratch instead of resuming from the checkpoint.
+
+Let me look at the codebase.
+Let me find the linadv main file:
+Now I understand the structure. The previous attempt's logic is sound but the failure-prone run took 152s vs baseline 82s (1.85x). The key insight from validate_stdout.txt:
+
+- **recovery_actually_resumed=False (ratio=recovery/Z_P=1.013, gate_B<0.85)** — recovery_elapsed=83.52s, while Z_P_walltime=82.4s — i.e. the recovery run took as long as a full fresh run, meaning we did NOT actually skip work.
+- We need recovery to take < 0.85 * 82.4s = 70s to pass gate B (so the resume must actually save work).
+- We need wall ratio < 1.488x = 122.5s total kill+recovery to pass the per-app cap. 
+
+Looking at the values: the kill happened at 68.7s (76% of failure-free runtime), and the recovery starts (presumably from a checkpoint near t=0.76*final_time), but the recovery took 83.52s. Looking back at the file output - `start_time` is being overridden. The issue may be that the checkpoint isn't actually being loaded.
+
+Wait — the previous attempt's code looks reasonable. Let me look at what might be wrong:
+
+1. The previous attempt stores 89 checkpoint files written before kill. So checkpoint files do exist.
+2. The restart calls VELOC_Restart and reads state files.
+3. But the recovery elapsed = 83.52s ≈ baseline 82s. Hmm.
+
+This could mean: the start_time override actually causes the time integrator to NOT skip earlier steps, OR initializeHierarchy doesn't honor start_time correctly. Let me look at how SAMRAI's `TimeRefinementIntegrator` uses `start_time`.
+So `start_time` is being read at construction time (line 1597). When the override happens before constructing TimeRefinementIntegrator, it should take effect. Good.
+
+But wait — there's a subtle issue. The override sets start_time, then `initializeHierarchy()` calls `makeCoarsestLevel(d_start_time)`. This uses `d_start_time` (which is the override). Then `initializeRefinedTimesteppingLevelData(0)` sets `d_level_sim_time[0] = d_start_time` and calls `getLevelDt(..., initial_time=true)`.
+
+The integration loop should then start from `d_integrator_time = d_start_time = ckpt_loop_time`. But the test says recovery took 83.5s — essentially the same as failure-free 82.4s.
+
+Hmm, this means: **the start_time override is not being applied successfully**, OR there is something else making it run the full simulation.
+
+Wait — looking at line 1597 again, this is in `getFromInput()`. Let me check if `keyExists("start_time")` — if not, it errors:
+OK, so the override DOES take effect. Let me find the actual input file to know the simulation parameters:
+Total simulation goes t=0 to t=10. Baseline is 82.4s. The kill happened at delay 62.7s in the failure-prone run, then recovery took 83.5s.
+
+The previous attempt set `CHECKPOINT_EVERY_N_STEPS = 30`. With ~750 total timesteps total → ~25 checkpoints. The last checkpoint version before kill at 62.7s would correspond to roughly the simulation time at that point, maybe ~7.7 (since 62.7/82.4 * 10 ≈ 7.6).
+
+If the restart loaded a checkpoint at t≈7.6 and ran to t=10, that's only 2.4/10 = 24% of work, should take ~20s. But recovery took 83.5s — same as full run from scratch.
+
+This strongly suggests **the restart is NOT actually loading from a late checkpoint**. Why? Two possibilities:
+
+1. The checkpoint isn't being found by VELOC_Restart_test on restart
+2. The start_time override doesn't actually skip the work
+
+Let me check if there's some issue with `getDouble` vs `getDoubleWithDefault` semantics or how `putDouble` interacts with input_db. Also there's the issue of how the time_integrator reports recovered state.
+
+Wait — look at the restart logic more carefully. The check is `if (have_restart && ckpt_loop_time > 0.0)`. The override is applied. Then `time_integrator->initializeHierarchy()` is called. But note that `d_start_time` is read from input_db only when `is_from_restart == false`, and SAMRAI's own `is_from_restart` flag is from SAMRAI's restart manager — which is NOT being initialized here. So `is_from_restart=false`, and start_time IS read from input_db. So override should work.
+
+Let me look at the resilient log to see what actually printed. Looking for `resilient/attempt_2` log file:
+No source edits in iter_5! That means it was a re-validation of the previous attempt's code. Let me check earlier iters:
+Let me look at the build_output and prompt:
+Wait — iter_5's inspection says 0 modifications. But the opencode_stdout reveals what the previous attempt (iter_4) did. Let me read more:
+Now I understand much better. The current code is from iter_4 (which did the every-30-steps approach), but iter_5 was idle. The actual current state appears to be the iter_4 version. The recovery still takes 83.52s vs Z_P 82.44s → ratio 1.013. We need < 0.85 (gate B) or < 0.62 (gate C).
+
+The problem persists: even with N=30, recovery takes essentially the same as a full fresh run. Why?
+
+Looking at the failure-prone run carefully: kill at 68.74s. The simulation runs from t=0 to t=10 in 82s. Kill at 68.74s means simulation reached ~t=8.3 (rough proportional). But checkpoints every 30 steps... we may have ~25 checkpoints total → checkpoint cadence is ~3.3s per checkpoint window.
+
+Wait — the kill is at delay 62.7s, which is 76% of failure-free 82.4s. The killed run was running for 68.74s before getting killed. Most recent checkpoint should be very close to the kill time (within 30 steps of work = ~3s).
+
+After restart, with checkpoint at maybe iteration 720, only ~30 more iterations remain... should be FAST.
+
+Unless... something is wrong with the restart picking up the checkpoint. Maybe the issue is **VELOC_Restart_test returns 0 because VeloC needs the application to call VELOC_Checkpoint at least once to track state, and our killed process didn't get to fully sync**? Or **the checkpoint files are being written but not seen by VeloC's metadata?**
+
+Let me look at VELOC behavior. Actually, the issue might be `VELOC_Mem_protect` in `mode = sync`. With sync mode, `VELOC_Checkpoint` returns after persistence. So the checkpoint IS complete on disk. But maybe `VELOC_Restart_test` returns the latest fully-flushed version, which might lag if a checkpoint was in flight.
+
+Actually, looking more carefully: the previous log says `checkpoint files = 225` for failure_prone and `129` for failure_free. With 4 ranks and ~25 checkpoints total: 25 * 4 ranks * 2 dirs (scratch+persistent) = 200 files. Plus per-rank state files: 25 * 4 ranks * 2 dirs = 200 more files. Hmm wait, that's only including 225 total in resilient_clean. The numbers do roughly match ~25-30 checkpoints with extras.
+
+So the checkpoints ARE happening. So either:
+1. Recovery doesn't actually pick up the latest checkpoint (start_time stays at 0)
+2. OR start_time override works but the run still takes a long time due to some setup
+
+Let me look at potential issue: **the override may not work because input_db has key "start_time" of type Double but `putDouble` may add it but `getDouble` returns... let me think. Actually `putDouble` should replace the existing value. So that should work.
+
+Wait — let me re-read line 1597. `d_start_time = input_db->getDouble("start_time");` — this reads from the input database directly. If we do `tri_db->putDouble("start_time", ckpt_loop_time)` and tri_db is the same Database object obtained via `getDatabase("TimeRefinementIntegrator")`, then yes, the override would apply.
+
+Hmm, let me check another angle. The state save happens AFTER `advanceHierarchy`. So checkpoint at step S has the state AT time = sim_time after step S, with `ckpt_loop_time = loop_time` (post-advance) and `ckpt_dt_now = dt_new`. Looks correct.
+
+After restart: override start_time to ckpt_loop_time, build hierarchy at that time, override u-field, then run from ckpt_loop_time to end_time. This SHOULD work.
+
+Wait — let me look at one critical thing: `time_integrator->getIntegratorTime()` returns `d_integrator_time`. After `initializeHierarchy()`, in not-restart case, that's `d_start_time` from line 173. So `loop_time = d_start_time = ckpt_loop_time`. Good.
+
+So why does it take 83.52s? Let me look for SAMRAI's restart manager interactions and see if there's some other issue.
+
+Actually, wait. Let me re-look at the validator output. **"checkpoint files = 225"** is for failure-prone, recovered. So 225 files for the failure-prone resilient run, INCLUDING the killed phase AND the recovery phase. Recovery itself wrote ~96 more files (225 - 129 = 96). At N=30 with ~750 steps, that's about 25 cps per full run. Recovery wrote 96 files = roughly 12 checkpoints in 30-step intervals. 12 checkpoints * 30 = 360 iterations during recovery. That's about 47% of work! Hmm, that doesn't match "skip 76% of work".
+
+Wait, the failure-free run has 129 files, but the failure_free total is from one full run. The failure-prone resilient SHOULD have FEWER checkpoint files if it skipped work properly. But it has 225 = 129 (failure-free) + 96 (recovery only) MORE than a full run. So recovery wrote a substantial number of checkpoints. Specifically, if recovery wrote 96 files, that means recovery itself ran ~12 checkpoint cycles = ~360 steps = ~half the full simulation.
+
+But maybe the failure-prone PRE-KILL run also wrote 129+ files before getting killed. So 225 total = 129 (pre-kill) + 96 (post-restart). Hmm, that suggests post-restart did ~12 checkpoints, ~360 steps = ~half the work.
+
+**The issue**: The start_time override IS working partially — recovery skipped some work but not enough. Let me think about why.
+
+Actually wait — looking carefully at validate_stdout line 58: `checkpoint files = 225`. And line 70 shows failure_free had 129 files. The 225 includes BOTH attempts in the failure-prone scenario (the killed attempt's files PLUS the recovery attempt's files, since they share the same checkpoint dirs).
+
+Yes! So 225 total in failure-prone scenario. If failure-free is 129, and the killed attempt wrote at most 129 files (it covered 76% of work, so maybe wrote ~100 files), the recovery wrote remaining ~125 files. Or maybe the killed attempt wrote 96 files and recovery wrote 129 — basically the same as a full run from scratch.
+
+Let me re-read more carefully. In iter_4's logic, looking at the validator's runner: "checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt". So before kill attempt, dirs are CLEARED. Then 225 files accumulate during the kill+recovery. If 129 happens for a full failure-free run, then 225 = ~96 from killed phase + 129 from recovery = recovery ran a FULL fresh simulation.
+
+So the recovery is NOT actually picking up the checkpoint. It's running from scratch. **Why?**
+
+Possibilities:
+1. `VELOC_Restart_test` returns 0 on the new run because VeloC needs `client.cfg` with `mode=sync` to fully persist, but maybe `persistent` directory isn't being checked.
+2. Maybe the killed process's checkpoints don't transition properly.
+3. Maybe there's an MPI/rank issue with how checkpoint files are loaded.
+
+Wait, let me look at validator log: "starting checkpoint-file poll" - "detected 89 checkpoint file(s)". So 89 files before kill. Then kill at 5s later. So ~90 files at kill time. Then recovery starts: total grows to 225. So recovery wrote 225 - 90 = 135 files — that's MORE than a fresh run (129)! That means recovery wrote ALL fresh checkpoints PLUS a few extras. This strongly indicates recovery does NOT load the existing checkpoint and starts from scratch.
+
+**Root cause: VELOC_Restart_test isn't finding the prior checkpoint**, OR an MPI issue where the rank we polled and the rank that has checkpoints differ.
+
+Let me check the VeloC docs/source.
+OK so `VELOC_Restart_test(name, 0)` — with version=0 — should return latest available version, or VELOC_FAILURE if none.
+
+Wait — the doc says `IN needed_version - maximum version to look for; returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise`. So with version=0, it would look for `version < 0`, i.e., nothing. That's the bug! We need to pass a large number, or 0 is special-cased differently in the implementation.
+
+Let me check:
+Let me look at how VeloC is typically used — possibly with a large version like INT_MAX:
+The VeloC source convention I recall is that `VELOC_Restart_test(name, 0)` returns the latest version available. The version arg is "needed_version" and 0 might mean "any". But the docs do say "version < needed_version". Let me check via the implementation:
+Let me look at /home/ndhai/usr structure:
+Hmm, the glob isn't finding files. Let me try direct read:
+Let me check VELOC source — it should be in /home/ndhai/usr/share or similar:
+OK. The doc comment says: `returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise`. With version=0, no version < 0 exists (since versions start at 1). So `VELOC_Restart_test(name, 0)` returns FAILURE.
+
+That **is** the bug. The fix is to pass a large number like INT_MAX so that any version qualifies as "< needed_version".
+
+Wait, but the previous validate stdout shows recovery did execute `VELOC_Restart` somewhere — let me check. Actually no, the log doesn't show stdout from the binary. Let me check if there's a log file somewhere. The `tbox::PIO::logOnlyNodeZero` outputs to a `.log` file (`linadv_val.log`).
+
+The validate stdout doesn't show the application's stdout, so we don't directly see if "VeloC: no prior checkpoint found" was printed. But given the recovery time is essentially the same as fresh, this is highly likely.
+
+Actually, looking at the validator logic, with the convention I recall from VELOC, `VELOC_Restart_test(name, 0)` does indeed return failure (or 0) when no checkpoint up to version 0 (exclusive) exists. To get the latest, you should pass `INT_MAX` or similar.
+
+Let me fix this and other potential issues.
+Add the `#include <climits>` header:
+Now let me also do a sanity check on the rest of the restart path. The critical things are:
+
+1. Make sure all ranks agree on the latest_version (different ranks may see different highest version, but the all-reduce on `have_restart` handles that).
+
+But wait — different ranks may return different `latest_version` values. Then each rank reads its own state file with its own version number. That's actually a problem: if rank 0 succeeded in version 5 but rank 1 only got version 4, they'll try to read different state files and won't see consistent simulation time.
+
+Actually, the existing code uses MPI_MIN on `ckpt_loop_time`, so they align on the minimum time. But each rank still reads a different state file for that time. Hmm — but the time in the bookkeeping IS what matters; the per-patch state is per-rank anyway.
+
+Wait, this is actually a real issue: if rank 0 loads checkpoint v5 (t=8.0) and rank 1 loads checkpoint v4 (t=7.5), their u-fields are at different simulation times. Then they all start from t=min=7.5, but rank 0's u-field is at t=8.0. That's inconsistent.
+
+Better approach: agree on a common version first via MPI_Allreduce MIN, then all ranks load that version.
+
+Let me fix this:
+Let me improve this to first agree on a common version across all ranks:
+Now let me also think about the time spent. The previous attempt also had `removePatchLevel` calls and the level stripping logic. That's expensive but probably necessary. Let me also consider whether we should reduce the time-consuming `removePatchLevel` calls and let SAMRAI re-regrid normally.
+
+Actually, the key issue we identified (VELOC_Restart_test passing 0) prevents the restart from ever happening in iter_5. With that fix, the whole restart logic should kick in and reduce recovery time substantially.
+
+Let me also verify the file compiles correctly by re-reading the modified area:
+Good. Now let me also check: was the build actually built successfully? Let me check build_output:
+Empty build output (which probably means already built and cached). Validator was able to run the binary so it compiled in iter_4.
+
+Now let me verify my edit looks syntactically correct:
+Looks good. The fix is minimal and targeted at the root cause.
+
+Now let me also check: does the build system know to rebuild the file? The build_output was empty in iter_5, suggesting the build system likely caches successful builds. As long as we've modified the source file, a rebuild should occur.
+## Summary of fix
+
+**Root cause identified from iter_4/iter_5 validate_stdout.txt:**
+
+The validator reported `recovery_actually_resumed=False (ratio=recovery/Z_P=1.013)` — the recovery took 83.5s, essentially identical to a fresh full run (82.4s). The restart was *not* loading the saved checkpoint and was running the full simulation from `t=0` again. The checkpoint files were being written correctly (225 files visible to the validator), but recovery ignored them.
+
+**Why:** The code called `VELOC_Restart_test(ckpt_name, 0)`. Per the VeloC API contract (see `/home/ndhai/usr/include/veloc.h:121-125`):
+
+> `IN needed_version - maximum version to look for`  
+> `returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise`
+
+With `needed_version = 0`, no version is strictly less than 0, so the call always returns `VELOC_FAILURE`. The `latest_version > 0` check then falls through into the "no prior checkpoint found" branch and the run starts from scratch.
+
+**Fix in `source/test/applications/LinAdv/main.cpp`:**
+
+1. Pass `INT_MAX` instead of `0` to `VELOC_Restart_test` so it returns the latest version actually present on disk. Added `#include <climits>`.
+2. Added a collective `MPI_Allreduce(MIN)` over each rank's `local_latest_version` so all ranks restart from the same version (avoids inconsistent per-rank physics state if one rank's persistent write was still in flight when the crash hit).
+
+With the fix, restart will actually load the latest checkpoint, override `TimeRefinementIntegrator::start_time` to the checkpointed `loop_time`, overwrite the u-field on every patch, and resume the time loop from there — skipping the ~76% of work already completed before the kill. That should bring recovery well under the 0.85×Z_P gate-B threshold and the total kill+recovery well under the 1.488×Z_P per-app cap.

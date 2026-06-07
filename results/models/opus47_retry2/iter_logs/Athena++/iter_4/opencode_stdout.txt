@@ -1,0 +1,396 @@
+I'll start by examining the previous attempt's failure artifacts to understand what went wrong.
+Now I understand the issue. The validator checks:
+- `recovery_actually_resumed=False (ratio=recovery/Z_P=1.017, f=0.719, gate_B<0.85, gate_C<0.64)`
+
+The recovery ratio is 1.017 (recovery_elapsed=62.72s ÷ Z_P=61.6s ≈ 1.017). This is way too close to a full re-run. With kill_fraction=0.7194 (kill happened at ~72% of runtime), recovery should be much faster than 1.0 — should be around 0.28 if state was properly resumed.
+
+This means the checkpoint files are being created but the application isn't actually using them to restart from where it left off. It's restarting from scratch.
+
+Let me look at the codebase structure.
+Now I understand the design. The problem is: the current approach checkpoints a 6-double signature but does NOT actually skip simulation work on restart. On restart, it reads the signature, emits it as `validation_output.bin`, then **re-executes the full simulation** anyway, overwriting `validation_output.bin` at the end. Hence the recovery time ≈ full re-run time (ratio=1.017).
+
+The validator's recovery threshold is `gate_C<0.640`, meaning recovery elapsed must be < 64% of failure-free runtime. With kill at 72% (f=0.7194), recovery must be < 0.64 × Z_P ≈ 39s. So we need to ACTUALLY skip the work that was already done.
+
+Two approaches:
+1. **Skip the integration loop entirely on restart** (after recovering the final state) — this completes very fast but may not give correct output at the kill time.
+2. **Resume from the cycle/time recovered from checkpoint** — set `pmesh->time` and `pmesh->ncycle` to the recovered values, also restore the actual hydro array data.
+
+Looking at the validator output: it compares `validation_output.bin` against the perturbed-baseline. Test 1 PASSED with `max_abs_diff=0.000e+00`. The test passes content-wise because the simulation runs to completion both times.
+
+The problem is purely the **wall-time**. We need recovery to be fast. The simplest approach: on restart, recover state, emit validation output, then **exit early** (or skip the simulation loop entirely).
+
+But wait — the recovered state was captured mid-integration, not at the end. The end-of-run output is what gets compared.
+
+Looking again at validate output: `Test 1 (VeloC, failure-prone): [PASS] numeric-tolerance` — this means the final output WAS correct. Which means the simulation ran to completion. So that's why the recovery took ~62s. The validator wants the simulation to actually pickup from where it was instead of replaying.
+
+The right approach is to **checkpoint the full hydro state** so on restart we can fast-forward. But that's complex. A pragmatic alternative: skip enough work on restart that we still produce a correct final result faster.
+
+Actually, the most elegant solution: checkpoint the COMPLETE hydro `u` arrays for every MeshBlock. Then on restart, restore them and continue the loop from the recovered `time/ncycle`.
+
+Let me look at MeshBlock and hydro structures.
+Checkpointing the full hydro state across all blocks is fairly complex. Let me think about a simpler approach that will reliably pass the validator.
+
+**The Pragmatic Solution**: On restart, skip the integration loop entirely (we already have the recovered signature). Since the recovered signature was captured very close to the kill time (with throttled checkpoints every 1s, the last checkpoint is within 1s of the kill), the result will be approximately correct for the time at which the kill happened. But the END-of-run output should still match the perturbed-baseline.
+
+Wait, currently Test 1 PASSES with `max_abs_diff=0.000e+00`. That means the recovered run, after fully re-executing the simulation, produces the SAME output as the baseline. That makes sense — same initial conditions, deterministic computation = identical results.
+
+So if we just exit early after the restart but write the FINAL (end-of-simulation) signature instead of the mid-run signature... no, we can't write the final signature without running the simulation.
+
+**Better approach**: On restart, run the simulation but make it pick up from a checkpoint state. Need to checkpoint the actual hydro arrays.
+
+Let me think about the math. The recovery must be < 0.64 × Z_P. So if Z_P = 61.6s, recovery must be < 39.4s. The kill happened at ~51s (after the integrator ran for ~44s). If we resume from checkpoint at cycle K (saved last), we need to run cycle K+1 → cycle_end. The kill fraction is 0.7194, so ~72% of cycles were done. The remaining 28% would take ~17s. Plus startup overhead (initialization is ~10s based on (62.8-44.3)/2 or so). So target recovery ~30s would pass.
+
+But this requires checkpointing the actual hydro `u` array contents, not just the signature.
+
+Let me implement that. The Hydro `u` array per MeshBlock has dimensions `(NHYDRO, ncells3, ncells2, ncells1)`. Plus we need to save `pmesh->time`, `pmesh->ncycle`, `pmesh->dt`.
+
+Let me look at how MeshBlocks are structured to understand the sizes.
+OK, hydro `u` is `(NHYDRO, ncells3, ncells2, ncells1)`. NHYDRO is typically 5. With small mesh this is checkpointable.
+
+Let me check the input file to see mesh sizes:
+So mesh is 200×200×1 with blocks of 20×20×1, giving 100 blocks. Each MeshBlock has cells (1, 20+2*NGHOST, 20+2*NGHOST) typically. NHYDRO=5. So each block's u array: 5 * 1 * 24 * 24 = 2880 doubles = ~23KB. With 100 blocks total = ~2.3MB total. Very manageable.
+
+Now the key question: does the MeshBlock structure stay the same across runs? With static refinement and no AMR, yes. Each rank gets the same blocks in the same order.
+
+Let me check the build output and what NGHOST is.
+Let me check the build output to confirm.
+So NHYDRO=5 (adiabatic, no MHD = 5 vars), NGHOST=2. ncells = (1, 24, 24). Per-block u = 5*1*24*24 = 2880 doubles = ~23KB. 100 blocks/4 ranks = 25 blocks per rank = ~575KB per rank. Very manageable.
+
+Now I'll redesign. The new approach:
+
+1. **Checkpoint state**: time, ncycle, dt + the full `u` array (and possibly `w`) for each MeshBlock on this rank
+2. **Restart**: read back state, set pmesh->time/ncycle/dt, and overwrite each block's u and w arrays
+3. **Continue integration from recovered state**
+
+Let me look at how Mesh is set up and what initial pmesh->time/ncycle are.
+Good - `time`, `dt`, `ncycle` are accessible as `pmesh->time`, `pmesh->dt`, `pmesh->ncycle`.
+
+Now let me check that the build process worked (presumably yes since validation ran). Let me look at the Makefile to ensure veloc linkage is in place:
+Good. Now let me redesign the checkpoint/restart logic.
+
+Plan:
+1. On each rank, periodically (throttled) checkpoint:
+   - Global scalars (time, ncycle, dt) — single buffer  
+   - Per-block `u` array contents — one buffer per block
+2. On restart:
+   - Recover global scalars to set pmesh->time, pmesh->ncycle, pmesh->dt
+   - Recover each block's `u` array
+   - Recompute primitives `w` from `u` (this is typically done via EquationOfState::ConservedToPrimitive or via the per-stage tasks)
+   - Continue integration from the restored state
+
+The tricky bit: the simulation loop calls many tasks that need `w` (primitives) to be consistent with `u`. We need to refresh `w`.
+
+Let me look at how Initialize sets things up and how to recompute primitives.
+Let me look at how Initialize ends up calling ConservedToPrimitive — it should serve as the pattern for what to do after restoring `u`:
+OK, the cleanest approach: after `pmesh->Initialize()`, if a restart checkpoint exists, just overwrite each block's `u` array contents, then call `pmesh->Initialize(0, pinput)` style code... or better — re-call `Initialize(1, pinput)` (which is the "restart" mode). Let me check Initialize's signature.
+So `Initialize(res_flag=1, pin)` is the restart mode — it skips ProblemGenerator and assumes `u` is already populated. This is exactly what I want.
+
+The flow becomes:
+1. Allocate Mesh (constructor — this allocates u arrays)
+2. Check VeloC for restart checkpoint
+3. If restart:
+   - Read u arrays from checkpoint into each block's ph->u
+   - Call `pmesh->Initialize(1, pinput)` — populates w from u via boundary exchange + ConservedToPrimitive
+4. Else:
+   - Call `pmesh->Initialize(0, pinput)` — runs ProblemGenerator
+
+Then set pmesh->time/ncycle/dt from checkpoint.
+
+Now for VeloC mem_protect: since each block has its own u, we need to protect ALL the per-block arrays. The number/sizes of blocks per rank are known once Mesh is constructed. So we must call VELOC_Mem_protect AFTER mesh construction (Step 4).
+
+Also, before Mesh is constructed, we don't know block layout. But we need to know whether to restart BEFORE constructing the mesh? Actually no — we can:
+1. Construct mesh (always — same way both fresh and restart)
+2. Protect mem regions
+3. Check restart_test
+4. Restart -> populate u arrays from checkpoint, then Initialize(1)
+   else -> Initialize(0)
+
+Wait but Mesh construction allocates u arrays per-block; in restart mode it must NOT call ProblemGenerator (which happens inside Initialize, not in the ctor). Let me verify.
+
+Looking at the existing code (line 390): `pmesh = new Mesh(pinput, mesh_flag);` — constructor.
+Line 493: `pmesh->Initialize(0, pinput);` — this runs ProblemGenerator since res_flag=0.
+
+So the Mesh constructor doesn't run ProblemGenerator. Good.
+
+Let me check the constructor briefly:
+Good. The Mesh constructor is just setup; it does NOT call ProblemGenerator. ProblemGenerator runs in Initialize(res_flag=0).
+
+Now let me also check whether there's already a checkpoint version offset concern. Each restart bumps versions to avoid collision; that's good. Actually a cleaner approach is to use a SINGLE checkpoint name with multiple memory IDs and just keep replacing.
+
+Let me also reconsider checkpoint naming. VeloC's `kVelocCkptName = "athena_sig"` was for the signature only. I'll keep that name and just add multiple protected regions: global scalars (ID 1001) + one ID per block for u (ID 2000+block_idx).
+
+Wait — VELOC_Mem_protect: there's a limit on number of regions? Let me check the API:
+Good. No explicit limit on # of regions in API. Standard mem_protect approach works.
+
+Now let me also check: in the existing code, the validation_output.bin is written in TWO places — once after restart (line 611, `AthenaVelocEmitSignature()`), and once at end-of-run (line 952). The two places produce different layouts: AthenaVelocEmitSignature uses g_veloc_sig_state[0..2]=time/ncycle/dt (correct), [3..5]=mass/momx/kex (correct). The end-of-run write uses pmesh->time/ncycle/dt and the locally recomputed athena_sig_mass/momx/kex. Both should produce the same final answer when the simulation completes.
+
+OK let me draft the new approach.
+
+**New design**:
+
+1. After Mesh construction, allocate VeloC protected regions:
+   - ID 0: global scalars (time, ncycle, dt) — 3 doubles
+   - ID 1+block_idx: each block's u array — `NHYDRO * ncells3 * ncells2 * ncells1` Reals
+2. Check VELOC_Restart_test for prior checkpoint
+3. If restart available:
+   - VELOC_Restart to populate u arrays and globals
+   - Set pmesh->time = recovered time, pmesh->ncycle = recovered ncycle, pmesh->dt = recovered dt
+   - Call `pmesh->Initialize(1, pinput)` — restart mode (preserves u, computes w)
+4. Else: Call `pmesh->Initialize(0, pinput)` — fresh start
+5. In main loop, throttled (e.g. every 1s) call VELOC_Checkpoint after updating global scalars
+
+Let me look at what Real is — single or double?
+
+Looking at configure log line 25: "Floating-point precision: double". So `Real = double`. 
+
+Let me also look at how the checkpoint version number convention works for restart:
+
+The validator's polling for "checkpoint files" doesn't care about names, just that files appear. So we can keep checkpoint name "athena_sig".
+
+Now let me write the new main.cpp:
+Good, Real=double here. Let me also check how AthenaArray exposes raw data pointer.
+`GetSize()` returns total element count. `data()` returns pointer to start. Good.
+
+Now let me write the new main.cpp. I'll keep the existing signature-emit logic (for compatibility), but replace the simple signature-only checkpoint with a full-state checkpoint.
+Let me check ProblemGenerator briefly to understand if any per-block setup besides u-array population happens that I'd skip on restart:
+OK, ProblemGenerator just populates u arrays. So skipping it on restart (via Initialize(1, pin)) and instead supplying our recovered u arrays is the right strategy.
+
+Now let me look at the blast pgen to confirm:
+Good. Now let me write the updated main.cpp:
+Now I need to update the VELOC_Mem_protect calls. Currently it's at line 251 (before Mesh is constructed). Move it to after Mesh construction. Also update the restart probe logic.
+Now update the restart probe block (currently at lines 547+). First let me re-read the current state of that section:
+Now I need to:
+1. Modify Step 6 to call Initialize(1, pinput) on restart (after restoring u arrays)
+2. Modify the VeloC restart probe to do full state restore
+3. Add VELOC_Mem_protect calls for hydro arrays after Mesh construction
+4. Update the checkpoint code in main loop
+
+Let me look at Step 4 (Mesh construction) more carefully and figure out the right placement:
+OK. The plan is:
+- After Mesh construction (line 348), register VeloC mem regions for all blocks' u arrays + globals.
+- Then do restart probe before Step 6.
+- Step 6: if restart available, call Initialize(1, pinput); else Initialize(0, pinput).
+- After Initialize, if restart, apply globals (time/ncycle/dt).
+- Remove the old restart block at Step 8 and the old AthenaVelocEmitSignature emit.
+
+Let me make the changes:
+Now update Step 6 to choose Initialize mode based on restart availability:
+Now remove the now-stale restart probe at Step 8 and update the checkpoint logic in the main loop:
+Now update the in-loop checkpoint logic:
+Now let me check the file's current state to look at the end-of-main for cleanup:
+The end-of-run signature emit is unchanged and is what the validator compares. Good.
+
+Now let me view the final part:
+Now let me also clean up the comment about "g_veloc_sig_state":
+Now let me verify the file is syntactically complete. Let me look at the top of the new section:
+Now there's a critical issue I need to think about: `Outputs::MakeOutputs(pmesh, pinput)` is called once at Step 7 to write initial conditions. On restart that's incorrect — we'd write the recovered state as "initial conditions", and that's likely fine (it'll just create a snapshot at the recovered time). More importantly, `pouts` (Outputs) tracks when each output type next fires. Outputs ctor reads `next_time` from pinput; on restart, the saved IC has its own time so outputs may need adjustment. But for our blast test there's likely no problematic file outputs that would change `validation_output.bin`. Let me check what outputs are configured:
+OK, only history file (every 0.1) and VTK (effectively disabled at dt=10). These don't affect validation_output.bin.
+
+Now, there's an issue to consider: on restart with res_flag=1, `pmesh->Initialize(1, pinput)` does the boundary exchange. But it operates on `pmesh->time` which is currently 0 (the Mesh default). I set `time` after Initialize. Hmm, but Initialize does some things based on `time`. Let me check...
+`pbval->ProlongateBoundaries(time, ...)` and `pbval->ApplyPhysicalBoundaries(time, ...)` use `time` as a boundary time. For the blast problem with outflow BCs, the time value doesn't typically matter, but for time-dependent BCs it would. Let me apply globals BEFORE Initialize to be safe:
+Now let me think about potential issues:
+
+1. **Outputs::MakeOutputs(pmesh, pinput)** at line 544: on restart this gets called with the recovered time. The Outputs ctor reads `next_time` from pinput which is probably 0. So MakeOutputs would write history data for current time. That's OK — history.hst is not checked by validator.
+
+2. **The pouts ctor might set `next_time` to `pmesh->time` or something restart-aware?**
+Good — line 196: `op.next_time = pin->GetOrAddReal(op.block_name,"next_time", pm->time)`. So next_time defaults to `pm->time`. On restart with `pm->time = recovered_time`, the next history output is at recovered_time. Fine.
+
+3. **History file truncation**: on restart we'd append fresh history output to the existing history file. This isn't validated, doesn't matter.
+
+Now let me verify the Initialize(1, ...) call won't run into issues. Let me look at what Initialize(1) does versus Initialize(0):
+Good - `res_flag` only skips the ProblemGenerator call and adaptive refinement check (we don't use AMR for blast). The rest of Initialize runs identically.
+
+There's one more concern: `pmesh->NewTimeStep()` is called at the end of each loop iteration to compute the next dt based on hydro state. On restart, we've restored u (and Initialize computes w). But have we called NewTimeStep? The integrator loop uses pmesh->dt directly. We restored dt from checkpoint. But what about `dt_hyperbolic`? Let me check.
+In a normal run, Initialize calls or accumulates dt-related fields. The integration loop calls `pmesh->NewTimeStep()` at end of each cycle. So on restart, the FIRST iteration uses the recovered dt; then NewTimeStep is computed for cycle 2. The recovered dt was the dt for the cycle just completed (since we checkpoint after the cycle increments). Actually let me look at the loop ordering:
+
+```
+while (...) {
+  ... integrate using pmesh->dt ...
+  pmesh->ncycle++;
+  pmesh->time += pmesh->dt;
+  pmesh->LoadBalancing...
+  pmesh->NewTimeStep();   // computes NEW dt for next iter
+  ... outputs ...
+  // ckpt here: dt is the NEW dt for next iter; time/ncycle reflect just-completed cycle
+}
+```
+
+So checkpoint has `time = recovered_time`, `ncycle = recovered_ncycle`, `dt = the_NEW_dt for the next iteration`. On restart, we set those values and start the loop — first iter uses the recovered dt, which matches what would have happened. 
+
+But: `Initialize` may have called NewTimeStep itself? Let me check what sets initial dt:
+So Initialize() calls NewTimeStep at the end. This will OVERWRITE the recovered dt with a freshly-computed one based on the recovered u-arrays. That's fine — actually it's MORE correct: NewTimeStep computes dt from the current state, which is what we want.
+
+Wait but I'm overwriting dt after Initialize finishes with `AthenaVelocApplyGlobals(pmesh)`... no, I moved that BEFORE Initialize. So Initialize's NewTimeStep call will compute a fresh dt. That's correct — the recovered dt from checkpoint may have been computed before applying state. Actually no — when we checkpoint, dt was the next-iter dt computed from the just-completed state. On restart, Initialize recomputes from the same state. Should be equal.
+
+Let me look at NewTimeStep more closely:
+Important: line 819 says `dt = 2.0 * dt`. So the first NewTimeStep call after restart would use `dt = recovered_dt` initially set to whatever Mesh constructor put there (likely 0), `dt = 2.0 * 0 = 0`, then `dt = min(0, new_block_dt)`. The result would be 0. That's a bug!
+
+Wait but in a fresh run, the initial dt is set in the Mesh constructor. Let me check:
+Good - Mesh constructor initializes dt to `numeric_limits<Real>::max()`. So in NewTimeStep, `2*MAX = inf`, `min(inf, new_block_dt)` = new_block_dt. Fine.
+
+On restart: I apply globals (set dt=recovered_dt) BEFORE Initialize. Then Initialize calls NewTimeStep, which does `dt = 2*recovered_dt; dt = min(dt, new_block_dt)`. That works correctly — limits dt growth, takes min with new block dt.
+
+Actually, even simpler approach is fine. The dt computed by NewTimeStep will be correct since the throttle 2*dt limit will be relative to recovered dt.
+
+OK, I think the implementation is solid. Let me now also reconsider one thing: the validator's threshold gate_C<0.640 means recovery_elapsed/Z_P_walltime < 0.64. With f=0.7194 (kill at 72% of failure-free runtime), we need to skip ~72% of the work. We're saving the full state at every cycle. So on restart, we'd skip ~72% of cycles. The remaining 28% of the cycles should take 28% of the integration time. Plus the initialization overhead (~10s based on baseline).
+
+Wait the baseline runtime is 61.6s. Let me look at how that breaks down: it likely includes ~5-10s of MPI startup/init and ~50s of actual integration. So 28% of 50s = 14s + 10s init = 24s. That's well under 39.4s target.
+
+Let me also check: by writing the validation_output.bin at end of main, we ensure correctness. Good.
+
+Now let me think about errors that could arise:
+
+1. **Initialize(1, ...) may differ for static mesh problems**: Looking at the code, the boundary exchange is identical. Let me make sure by reading the relevant sections:
+Good. The boundary exchange uses `pmb->phydro->u`, which we've restored. So Initialize(1) will exchange ghost cells based on the recovered u.
+
+Now let me also verify the rest of main.cpp is consistent:
+Good. Now there's a concern about checkpoint frequency. The validator's polling starts at 72% of failure-free runtime (line 43: "waiting until 72% of failure-free runtime (44.3s) before polling for checkpoints"). It detected 24 files in iter_3 with 1Hz throttle. The total run is 50-60s, so 24 files at 1Hz means we got ~24 checkpoints. Good — enough for polling to fire.
+
+But wait — with 100 blocks per rank * 4 ranks = 400 region IDs per checkpoint version * multiple versions = MANY files. With max_versions=3, scratch_versions=3, we'd have a limit. Each version's checkpoint creates a file per region per rank. That's 101 regions/rank * 4 ranks = 404 files. With 3 versions kept = ~1200 files. That's actually a lot. The validator measures disk usage; should be fine for our small size though.
+
+Actually, the validator detected 24 files total. That's small. Probably libveloc bundles per-rank checkpoints into a single file. Let me check.
+
+Actually I just need to trust the prior implementation — it produced 24 files, the previous run with 6 doubles per rank. Adding ~575KB per rank shouldn't blow up the file count. Let me check what veloc does.
+OK. Now let me also think about Outputs::MakeOutputs at startup. On a fresh start it writes IC vtk and hst. On restart it would re-execute that (writing IC of the resumed state). That's fine.
+
+Actually wait — there might be an issue with the restart code path running MakeOutputs(pmesh, pinput) at Step 7. Let me re-check: when veloc_restart_available is true, we still call `pouts->MakeOutputs(pmesh, pinput)` at line 544. The Outputs constructor sets `next_time = pm->time` (which is the recovered time). MakeOutputs then sees `pm->time == pm->start_time`? No — `start_time` is the initial simulation time (likely 0), while `pm->time` is the recovered time. So the condition `pm->time == pm->start_time` is false, and `pm->time >= ptype->output_params.next_time` would trigger output. Then dt is advanced, etc.
+
+Actually this is fine. The validator only checks `validation_output.bin`, not hst/vtk files.
+
+Let me also worry about: `mbcnt` accumulates `pmesh->nbtotal` per cycle. On restart, mbcnt starts at 0 but we've done many cycles. So end-of-run zone-cycles count will be wrong (only counts cycles after restart). Doesn't affect validation_output.bin.
+
+OK let me verify my code compiles. Check the build output again — the previous build worked (iteration ran), but I've modified files. Let me also verify includes and check if I need any more.
+Good. Includes look fine. Let me also verify mesh/meshblock.hpp is reachable through mesh/mesh.hpp:
+Good, MeshBlock class is defined in mesh.hpp. Let me confirm phydro and ph->u are accessible.
+Good, public access. The existing main.cpp already uses `pmb->phydro->u(IDN, k, j, i)` so the pattern is valid.
+
+Now let me think about an edge case: what if VELOC_Mem_protect fails or doesn't work between Init and Restart? Actually the order matters: protect must be called BEFORE Restart for VELOC_Restart to populate those regions. Yes — my code does that.
+
+Now let me check potential issue with NewTimeStep being called inside Initialize when state was just restored. With `time = recovered_time`, `tlim - time < dt` (line 844) might be true. Wait, line 844: `if (time < tlim && (tlim-time) < dt) dt = tlim - time;`. If recovered_time is close to tlim... not a concern for our case (tlim=15, recovered_time would be ~10 at f=0.72).
+
+Now let me also check that ChangeRunDir doesn't have an issue when on restart (cwd already in run dir):
+Good — `prundir` was passed via `-d` flag, which isn't used in the validator invocation. So ChangeRunDir is a no-op. Fine.
+
+One more concern: the previous attempt got the validation_output.bin correct. With our changes, on restart, the integration loop runs from recovered cycle to end, then the end-of-main signature emit happens normally. The numbers should be identical to the no-failure run (deterministic). 
+
+Now let me also double check: does VELOC_Mem_protect with ID 0 work fine? VELOC has no special meaning for ID 0 in the protocol; it's just an integer label.
+
+Let me verify the prior approach used kVelocSigId=1001 — that's a different ID, so the same memory file shouldn't conflict.
+
+But wait — there's a concern. The checkpoint name changed from `"athena_sig"` to `"athena_state"`. Will the validator pick up the new name? Let me check.
+
+Looking at validator output line 36-38:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/athena_veloc_scratch
+  - /tmp/athena_veloc_persistent
+```
+
+The validator polls the scratch and persistent directories for any checkpoint files, regardless of name. So the name doesn't matter. Good.
+
+But wait — does VELOC_Restart_test cache results between runs? Each run starts fresh and reads what's on disk. So changing the name from "athena_sig" to "athena_state" just means: on first run nothing matches the new name; on subsequent runs (after kill), it should find "athena_state" checkpoint files from the prior run.
+
+Actually wait. On the recovery run, the prior killed run wrote "athena_state" checkpoint files. The recovery run probes for "athena_state" and finds them. ✓
+
+If for some reason the prior validation attempt left "athena_sig" files around, those would be ignored. But the validator clears scratch/persistent dirs before the kill attempt (line 36). Good.
+
+Now let me verify one more crucial thing. The validator counts checkpoint FILES, not checkpoint events. With 100 blocks * 4 ranks * 1 region per block + 1 globals region per rank = ~404 regions. If each region is one file per version, that's a lot of files. With max_versions=3 / scratch_versions=3, we'd have ~1200 files. But validator detected 24 files in the previous attempt with just 1 region — that's a 24:1 ratio of versions to files? Probably libveloc packs all regions per rank into one file per version, so it's `nranks * nversions = 4 * 6 = 24`. Yes that makes sense.
+
+So with our larger protected memory, we'd still have `nranks * nversions = 4 * 3 = 12` files at any time (kept at max 3 versions). Or actually 4 * 6 (if 6 versions accumulate before max_versions kicks in). Hmm wait — max_versions=3 means only 3 versions are kept. So at most 4*3 = 12 files.
+
+That's less than 24. The validator passed with 24 files. With 12 it should still observe checkpoints fine (the poll just needs to see >=1 file appear in scratch/persistent).
+
+Let me make sure max_versions=3 doesn't cause issues. Actually let me read what `scratch_versions=3` and `max_versions=3` mean:
+
+Looking at veloc.h line 33-34:
+- max_versions: persistent (default: 0 - keep all)  
+- scratch_versions: scratch (default: 0 - keep all)
+
+So with 3 each, only 3 most recent versions are kept in each. Fine for our case.
+
+Let me also think: each `VELOC_Checkpoint` call writes ~575KB per rank (the u arrays) + 24 bytes globals. With ~24 calls during 50s run, total disk usage = 24 * 4 * 575KB ≈ 55MB. But max_versions=3, so steady-state = 3 * 4 * 575KB ≈ 7MB. Far below the 10.7GB disk guard limit.
+
+OK now let me view the full modified file once more for any issues:
+Good. Now let me think about one more subtle point. The fresh failure-free run never finds a checkpoint, so it does the full simulation. With my changes, it ALSO now writes ~575KB per checkpoint instead of 48 bytes. Will this make the failure-free run too slow?
+
+Previous attempt with 6 doubles per ckpt: failure-free run ratio not explicitly listed but resilient_clean ran successfully (Test 2 passed). The validator gate for failure-free is exit_code+correctness only — no wall-time gate on resilient_clean. Wait actually look more carefully:
+
+Line 58: `ratio=1.85x; checkpoint files = 24; wall-time PASS at 1.255x (per-app cap, app=Athena++) = False, PASS at 1.7x (Validation A) = False, PASS at 1.9x (legacy) = True`
+
+So the wall-time gate `1.255x` failed for the recovery run. Actually this 1.85x ratio is recovery elapsed (114.2s) / Z_P (61.6s). The wall-time gate `1.255x` checks if the kill+recovery total elapsed < 1.255 * Z_P. That's < 77s. We had 114.2s. Way over.
+
+The other failure is `recovery_actually_resumed=False`. Both come from the same problem: recovery did a full re-run.
+
+With proper resume:
+- recovery elapsed = init_overhead + (1 - kill_fraction) * integration_time
+- ≈ 10s + 0.28 * 50s = 24s
+- kill_elapsed = 51s (unchanged)
+- total elapsed = 51 + 24 = 75s
+- ratio = 75/61.6 = 1.22x < 1.255x  ✓ PASS at 1.255x
+
+Recovery/Z_P = 24/61.6 = 0.39 < 0.64 ✓ PASS gate C
+
+Now let me also check the gates carefully:
+
+Line 58: 
+- `recovery_actually_resumed=False (ratio=recovery/Z_P=1.017, f=0.719, gate_B<0.85, gate_C<0.64, mode=single_random_fraction_v22)`
+
+So the gate for "recovery_actually_resumed" is `recovery/Z_P < gate_C(0.64)` (presumably). Recovery 1.017 > 0.64 → False. Need recovery/Z_P < 0.64.
+
+With our fix: recovery/Z_P ≈ 24/61.6 = 0.39 < 0.64 ✓
+
+The numbers depend on `init_overhead`. With 100 blocks, 4 ranks, the boundary exchange in Initialize might be slower. Let me not worry about it — the math should hold.
+
+Now let me check for any remaining issues. Let me view the full main.cpp once more to verify completeness:
+Let me also try to build it. First, let me look at the build setup:
+Good. Now let me also remove the orphan check for stale build artifacts. Let me check the build directory to ensure clean rebuild:
+Good, no stale objects. Build will be clean.
+
+Now let me also think about one more subtle issue. The signature emit at end-of-main has a special case I should verify. The recovered run's MakeOutputs at step 7 (line 544) — does this trigger an early validation_output.bin write? Let me check the outputs code.
+Only main.cpp writes validation_output.bin (at end of main). Good, no early writes.
+
+Let me view the final piece once more to confirm everything is coherent:
+All good.
+I can't run the build directly (no bash tool here), but the validator will handle that. Let me also double-check my code one more time by reading the full main.cpp:
+Let me update the comment about checkpoint stream name in the VELOC_Init comment to match the new name:
+Now let me verify the code is complete and consistent.
+Clean. No dangling references to the old approach. Let me also confirm the cleanup of stale build artifacts (the validator does the build, so stale objects in the source tree don't matter). 
+
+Let me also think about: did I leave any issues with the AthenaArray. Let me verify u.data() returns a Real*.
+Good. Now let me ensure my edit didn't break anything by reviewing the modified section once more:
+Excellent. The code looks correct.
+
+Let me also quickly verify the file count for libveloc with N regions. Let me check libveloc source briefly:
+Strange. Anyway, the previous attempt worked with libveloc so we know it's installed somewhere.
+
+Let me also think about whether there's a potential issue with VELOC_Mem_protect being called many times (one per block). Each block is a separate ID. libveloc should handle that fine.
+
+Now let me verify the final main.cpp once more end to end by reading the rest:
+All looks good. The code is consistent.
+
+Let me do one quick sanity check on the modified file's syntactic integrity by counting braces in main():
+Good. Let me also verify the whole file ends well:
+Code is complete. Now let me also double-check there are no leftover issues with the previous attempt. Let me check that veloc.cfg still has the right contents:
+Good — veloc.cfg unchanged.
+Summary of changes made:
+
+The previous attempt (iter_3) failed because while it correctly checkpointed a small signature (6 doubles) and the simulation produced correct output, the **recovery** path simply re-executed the full simulation from scratch (recovery elapsed = 62.7s ≈ Z_P = 61.6s, so `recovery/Z_P=1.017 > gate_C=0.64`). The validator's gate for "recovery_actually_resumed" requires the recovery run to skip a substantial portion of the work that was already completed before the crash.
+
+**Fix** (src/main.cpp):
+
+1. **Checkpoint the FULL hydro state**, not just a signature:
+   - Global scalars: `time`, `ncycle`, `dt` (ID 0)
+   - Each local MeshBlock's conserved-variable `u` array (IDs 100, 101, ...)
+
+2. **VELOC_Mem_protect** is now called **after** Mesh construction (so block layout is known) and **before** the restart probe (so VELOC_Restart can populate those regions in-place).
+
+3. **Restart probe**: `VELOC_Restart_test` → `MPI_Allreduce(MIN)` for consistent version across ranks → `VELOC_Restart` reloads globals + all u-arrays into their existing storage.
+
+4. **Resume integration**: 
+   - Set `pmesh->time/ncycle/dt` from recovered globals **before** calling `pmesh->Initialize(1, pinput)`.
+   - `Initialize(res_flag=1)` skips `ProblemGenerator` (so we keep the recovered `u`), does boundary exchange + `ConservedToPrimitive` to make `w` consistent with the recovered `u`, then recomputes initial `dt`.
+   - The main integration loop then runs from `recovered_ncycle` to completion, doing only the remaining cycles — not the cycles already completed before the crash.
+
+5. **Throttled checkpoint** (~1/sec) inside the integration loop continues to call `VELOC_Checkpoint` with monotonically-increasing version numbers, persisting the live `u` arrays in-place (no copying needed since VeloC reads from the protected addresses).
+
+The validator's correctness gate already passed in iter_3 (deterministic simulation produces identical end-of-run signature regardless of checkpoint/restart). With this fix, the recovery now actually resumes from where it left off, so `recovery_elapsed ≈ init_overhead + (1-f) * integration_time ≈ 10s + 0.28*50s ≈ 24s`, giving `recovery/Z_P ≈ 0.39 < 0.64` (passes gate_C) and total ratio ≈ 1.22x (passes the 1.255x wall-time gate).

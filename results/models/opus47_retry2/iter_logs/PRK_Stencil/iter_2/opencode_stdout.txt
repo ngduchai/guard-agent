@@ -1,0 +1,407 @@
+I'll start by examining the previous attempt's failure to understand what went wrong.
+The previous attempt failed because:
+1. Checkpoints were too large (15.4 GB) — likely checkpointing every timestep without retention or limiting size
+2. Disk guard terminated the run at 17 seconds
+3. No checkpoint was observed in time for the validator
+
+Let me look at the codebase.
+Now I understand the problem:
+- Grid: 33060, 4 processes → each rank has ~16500x16500 doubles = ~2.18 GB per rank for `in`, ~2.18 GB for `out` → ~4.36 GB per rank
+- 4 ranks × ~4.36 GB = ~17.4 GB per checkpoint
+- The CKPT_INTERVAL = 50, with 4000 iterations → ~80 checkpoints × 17 GB = unbounded growth
+
+The validator allows only 10.7 GB! So checkpoints are too large AND they accumulate.
+
+Looking at the log: failure_free has 192 files, 12.3 GB at 17s. There are 4 ranks × 3 ids = 12 files per checkpoint. So 192/12 = 16 checkpoints accumulated. Plus the failure-free run also disk-guard terminated at 17s with 11.29 GB.
+
+Key issues:
+1. **Each checkpoint is ~4 GB per rank × 4 ranks = ~16 GB per checkpoint version** — that alone exceeds the disk limit. Need to reduce this somehow.
+2. **No retention/cleanup of old checkpoints** — VeloC keeps all versions.
+3. **Wait for checkpoints**: The validator says "waiting until 50% of failure-free runtime (171.4s) before polling". So we need at least one checkpoint to exist when polling starts, but the disk-guard kills us at 17s before we even reach 171s wait time.
+
+The fundamental issue is that ONE checkpoint costs ~16 GB which already exceeds the 10.7 GB limit. We can't fit even a single checkpoint of the full state.
+
+Wait, looking more carefully: the validator says baseline takes 242s, perturbed baseline 342s. The disk-guard triggers when total checkpoint dir exceeds 10.7 GB. With sync mode, VeloC writes to scratch then moves to persistent. One full checkpoint = 4 ranks × ~4.36 GB = 17.4 GB which already exceeds.
+
+Hmm, but actually, looking again — the `in` array is `(width+2R)(height+2R)` doubles. With width=height=8265 (n/2 since 2x2 ranks), and R=2 (default radius), that's 8269x8269 doubles = 68 million doubles = ~547 MB per rank for `in`. Plus `out` = 8265x8265 = ~547 MB. So ~1.1 GB per rank, × 4 ranks = 4.4 GB per full checkpoint. With scratch + persistent each having a copy that's ~8.8 GB per saved checkpoint.
+
+Actually the log says 192 files = 16 checkpoints × 12 files... wait let me recount. With 4 ranks and 3 mem ids per rank, sync mode would write metadata + 3 data segments per rank, so files per ckpt = something like 4 ranks × (3 + 1) = 16 files per ckpt × 2 dirs (scratch+persistent) = 32 files? Then 192/32 = 6 checkpoints × ~2 GB = 12 GB. That fits.
+
+So the issue is clear: even one checkpoint is ~2 GB, and they're accumulating without cleanup. With CKPT_INTERVAL=50 and 4000 iters, that's 80 checkpoints = 160 GB if no cleanup.
+
+**Solution**:
+1. Set `max_ckpts` in veloc.cfg (VeloC supports this) — actually VeloC's config may not support that directly. Let me handle cleanup manually after `VELOC_Checkpoint_wait` succeeds.
+2. Reduce checkpoint frequency significantly. With 4000 iterations and validator waiting until 50%-69% of runtime (171-236s), we need a checkpoint by then. Runtime is 342s for 4000 iters → 85ms/iter. So at 171s we'd be at iter ~2000. Checkpointing every 500 iters gives 8 checkpoints total, with one ready by iter 500 (~42s). 
+
+But the disk-guard kills at 17s = ~200 iters. So we need a checkpoint within 200 iters! Let me reconsider. The disk-guard triggers when checkpoints exceed 10.7 GB total. The first checkpoint at iter ~CKPT_INTERVAL is what matters.
+
+Wait, the log says: `disk-guard: TERMINATE (14.43 GB > 10.74 GB limit)` at 17s. That means in 17s we already wrote 14 GB of checkpoints. 17s / 85ms = ~200 iters. With CKPT_INTERVAL=50, that's 4 checkpoints × ~4.4 GB = 17.6 GB. Confirmed.
+
+The fix: do less frequent checkpoints AND delete old ones immediately. 
+
+Let me think about validator timing:
+- Validator waits ~50%-70% of failure-free runtime before polling for checkpoints
+- Then disk-guard limit is 10.7 GB
+- So we need: total disk used at all times ≤ 10.7 GB, AND a checkpoint must exist by the time validator polls
+
+If we keep only the LAST checkpoint (delete old after writing new), and each checkpoint is ~4.4 GB (4 ranks × ~1.1 GB), one checkpoint × 2 dirs = ~8.8 GB. Still pretty close to limit.
+
+Actually I might be overestimating. The log says: failure_free run "12312609792 bytes across 192 file(s) in 2 dir(s)" at termination. That's 12.3 GB / 192 files = 64 MB/file. With CKPT_INTERVAL=50 and run for 17s before disk-guard, we'd have done iter 50, 100, 150 (3 ckpts × 4 ranks × ~16 files? ). Actually I'm getting confused. Let me focus on the solution.
+
+**Strategy**:
+1. Increase CKPT_INTERVAL significantly (say 500 iters) to have very few checkpoints
+2. After each successful checkpoint, delete previous versions manually
+3. Also, the first run had checkpoint at iter ~50 (= ~4s). To make sure the validator sees a checkpoint, we need at least one within ~17s but with manageable size.
+
+Actually, the validator says "waiting until 50% of failure-free runtime (171.4s) before polling for checkpoints". But disk-guard runs INDEPENDENTLY and kills at 17s when disk exceeds 10.7 GB. So the disk-guard is the bigger issue.
+
+If we set CKPT_INTERVAL=500, first checkpoint at iter 500 = ~42s. That's after disk-guard would have started watching, but no checkpoint = 0 disk used = no termination. Then one checkpoint at 42s = ~2-4 GB. Still under 10.7 GB. Then iter 1000 = ~85s, second checkpoint. We delete first → still ~2-4 GB.
+
+Let me set CKPT_INTERVAL=500 and implement manual cleanup. Also set `max_ckpts = 1` in veloc.cfg — let me check if VeloC supports this.
+VeloC supports `max_versions` and `scratch_versions` config options. Setting these to 1 will keep only the latest checkpoint.
+
+Let me think about the disk-guard math again:
+- Limit: 10.7 GB across scratch + persistent
+- One checkpoint per rank ≈ in (~547 MB) + out (~547 MB) + iter (negligible) = ~1.1 GB
+- 4 ranks → ~4.4 GB per checkpoint version (in scratch)
+- With sync mode and persistent enabled, it's copied to persistent → ~4.4 GB more
+- Total per version: ~8.8 GB (scratch + persistent)
+- With max_versions=1 and scratch_versions=1, total stays ~8.8 GB ≤ 10.7 GB ✓
+
+If I set CKPT_INTERVAL larger (e.g., 500), first checkpoint comes at ~42s with size ~8.8 GB → under limit. Then a few more checkpoints over time, each replacing the old one → stays around ~8.8 GB.
+
+But wait — the validator waits 50% of runtime (~171s) before polling for checkpoints. So we need checkpoints to exist by then but NOT to exceed 10.7 GB at any point. With max_versions=1 and infrequent checkpoints, we're fine.
+
+Actually I realize a better strategy: since the validator polls for checkpoint files at ~50% of runtime, we need a checkpoint by then. Let me checkpoint at iter 100 (very early, ~8s in), 500, 1000, etc. — frequently enough to have one ready, sparse enough not to overload disk.
+
+Actually let me just do checkpoint every 200 iters with max_versions=1. With ~85ms/iter, first ckpt at ~17s = exactly disk-guard trigger. Risky.
+
+Safer: every 100 iters. Each checkpoint is ~8.8 GB during write (scratch then move to persistent). VeloC sync mode means scratch + persistent both have it. So at any time we have: prev ckpt in scratch+persistent + new ckpt being written. That could spike to 2x = ~17 GB. Bad.
+
+Hmm. Let me actually limit the checkpoint to only the essential — maybe skip checkpointing `out` since it can be recomputed from `in`. Looking at the stencil, `out` accumulates over iterations though...
+
+Wait, looking at the algorithm:
+- `in` is updated each iteration (`IN(i,j) += 1.0`)
+- `out` accumulates over iterations (`OUT(i,j) += WEIGHT(...)*IN(...)`)
+
+So both must be checkpointed.
+
+Actually, can I be smarter? Can I store the iteration number and reconstruct? The initial state is deterministic: `IN(i,j) = COEFX*i + COEFY*j`. Then iter K has `IN(i,j) = COEFX*i + COEFY*j + K`. So `in` at iter K = initial + K, ghost halos refreshed from neighbors.
+
+The `out` is more complex—it accumulates over all iterations. Each iteration applies the stencil to the current `in` and adds to `out`. We can compute the exact closed form.
+
+Actually, for the L1 norm of `out` after all iterations, we don't need to checkpoint anything except the iter counter, because the state is deterministic. But we don't know what the validator measures... Actually the validation_output.bin contains norm and reference_norm. If norm is deterministic given iterations and grid size, restarting from any iter and running forward should produce the same norm.
+
+So a minimal "checkpoint" could be JUST the iteration counter. Then on restart, we reinitialize the arrays as we did originally. Since `in` at iter K = initial + K (because halo exchange just propagates the +1 per iter), and `out` can be analytically derived... actually no, the `out` at iter K depends on all prior iterations.
+
+OK, more practical: just checkpoint `in` and `out` but with `max_versions=1` and infrequent intervals.
+
+Let me check VeloC config more carefully. Looking at the code at line 506: `#define CKPT_INTERVAL 50`. With 4000 iters that's 80 checkpoints. With max_versions=1, only the latest is kept on persistent, but the validator may count files in both scratch AND persistent. With sync mode, both should have a single copy.
+
+Actually, wait. The previous attempt had `max_versions` NOT set in veloc.cfg. So default is 0 = keep all. THAT's the cleanup issue. Adding `max_versions=1` and `scratch_versions=1` should resolve unbounded growth.
+
+But there's still the 2x spike during writes. Let me reduce checkpoint frequency to about every 500 iters and set max_versions=1 and scratch_versions=1.
+
+With CKPT_INTERVAL=500, first checkpoint at iter 500 = ~42s. That's after the 17s disk-guard would've triggered, but with no checkpoints written yet there's no disk use to trigger it.
+
+Let me update both veloc.cfg and stencil.c:
+Now let's think about checkpoint cadence. The validator polls for checkpoints AFTER waiting ~50%-69% of the failure-free runtime (~170s-240s). So we need a checkpoint by then. The failure-free runtime is ~342s for 4000 iters → ~85ms/iter. By iter 2000 (~170s), we want at least one checkpoint.
+
+But ALSO the disk-guard kills if total ckpt size > 10.7 GB. With max_versions=1, total stays around 1 ckpt × 8.8 GB. Should be OK.
+
+The issue: during a write, scratch may have old + new before old is purged → spike. Let me also make sure I unregister or do an explicit cleanup. Actually `scratch_versions=1` should handle this — VeloC purges old scratch versions.
+
+Let me set CKPT_INTERVAL=200 — that gives:
+- First ckpt at iter 200 = ~17s (right at disk-guard trigger window, but no prior ckpts so disk is 0 → no trigger)
+- After writing ckpt 200: ~8.8 GB on disk → still under 10.7 GB ✓
+- iter 400 (~34s): writes ckpt 400, purges ckpt 200 → ~8.8 GB
+- etc.
+
+Actually there's a brief window where both old and new ckpt exist. To be safe, let me use CKPT_INTERVAL=500. First checkpoint at ~42s, well after disk-guard would settle, and gives plenty of margin between checkpoints for cleanup.
+
+Hmm, but the failure scenario with kill_fraction=0.5 means killing at ~171s. To recover meaningfully, the checkpoint should be within recent past, ideally not too far before kill. With CKPT_INTERVAL=500 and kill at iter 2000, last ckpt would be iter 2000. That's fine. Then on restart, we re-run from iter 2000 to 4000 (2000 more iters).
+
+Let me also re-examine the size estimate. With n=33060, Num_procsx=Num_procsy=2:
+- width = 33060/2 = 16530
+- height = 16530  
+- RADIUS = 2 (default for stencil)
+- in size = (16530+4) × (16530+4) doubles = 16534² × 8 bytes ≈ 2.19 GB per rank
+- out size = 16530² × 8 bytes ≈ 2.19 GB per rank
+- Per rank: ~4.4 GB; 4 ranks total: ~17.5 GB per checkpoint
+
+That's MUCH bigger than my estimate. One checkpoint = 17.5 GB in scratch alone, plus another 17.5 GB in persistent = 35 GB. Way over 10.7 GB limit.
+
+Hmm. So even ONE checkpoint of the full state can't fit. This is the core problem.
+
+Let me check the radius:
+So DOUBLE=1, RADIUS=2. Per rank: ~4.4 GB; total ckpt: ~17.6 GB.
+
+This won't fit even ONE full checkpoint. The disk-guard limit is 10.7 GB.
+
+Wait — let me look at the actual failure-free log: "12312609792 bytes across 192 file(s)". 12.3 GB total. That seems to correspond to roughly TWO checkpoints (assuming ~6 GB each? or maybe my size estimate is wrong).
+
+Let me re-examine: 192 files / 4 ranks / 3 mem ids = 16 versions written so far. But VeloC may not write separate files per id — actually it writes one file per rank per checkpoint version. So 192/4 = 48 files per rank? Or 192/8 (4 ranks × 2 dirs) = 24 versions? With CKPT_INTERVAL=50 and 17s elapsed (~200 iters), would have 4 checkpoints (iter 50, 100, 150, 200). 4 ckpts × 4 ranks × 2 dirs = 32 files. Hmm, 192/32 = 6 per checkpoint group.
+
+OK I'm overanalyzing the file count. The bottom line is: at 17s, 12 GB was used and growing. That suggests one ckpt is ~3-4 GB (averaged over a few). Not 17 GB.
+
+Maybe VeloC compresses or my estimate is wrong. Let me check `total_length_in`:
+- `(width+2*RADIUS) * (height+2*RADIUS) * sizeof(DTYPE)`
+- = 16534 * 16534 * 8
+- = 273,373,156 * 8 bytes
+- = 2,186,985,248 bytes
+- ≈ 2.04 GB per rank for `in`
+
+Same for `out` = 16530² × 8 = 2.0 GB. So per rank ~4 GB. × 4 ranks = ~16 GB per ckpt.
+
+In sync mode VeloC writes the same data to scratch then moves/copies to persistent. So both dirs have the data. Maybe by 17s only 3 checkpoints partially written, then disk-guard fires. The 12 GB might be just scratch (because writes were interrupted).
+
+OK, the fundamental issue is: ONE FULL checkpoint cannot fit on disk with the validator's 10.7 GB limit.
+
+I need to **reduce checkpoint size**. Options:
+1. Don't checkpoint `out` (recompute on restart from `in` + iteration count)
+2. Don't checkpoint both — checkpoint only iteration count + the deterministic state
+
+Looking at the math: `in` at iter K is reconstructable. Initial `in(i,j) = COEFX*i + COEFY*j`. After K iterations, `in(i,j) = COEFX*i + COEFY*j + K` for all points (because each iter adds 1 to every cell, then halo exchange propagates).
+
+Wait, does halo exchange refresh ghost cells correctly? In the original code, ghost cells at boundaries (e.g., left boundary of leftmost rank) are never updated — they keep initial values. Only INTERNAL ghost cells get updated via MPI. So `in` at iter K = initial + K for ALL cells (including ghost cells from neighbors who also got +K).
+
+But wait, ghosts on global edges (leftmost rank's left ghost) are never updated. They stay at initial values. But also `in` is only updated for owned cells (`for (int j=jstart; j<=jend; j++) for (int i=istart; i<=iend; i++) IN(i,j)+= 1.0;`). So ghost cells (i.e., from `i=istart-RADIUS` to `i=istart-1`) are updated only via the halo exchange, which copies from neighbors who themselves updated by +K. So they're at initial+K too. Global-edge ghosts? They're never read by the stencil because we only operate from `MAX(istart, RADIUS)` to `MIN(n-RADIUS-1, iend)`. So they don't matter.
+
+So `in` is fully reconstructible from initial state + iteration counter.
+
+`out` is harder: `OUT(i,j) += sum of WEIGHT * IN at time K`. Sum over K iterations. But the stencil sum `IN(i,j+jj)*WEIGHT(0,jj) + IN(i+ii,j)*WEIGHT(ii,0)` with the weighted-derivative structure equals... let me see, WEIGHT(0, ii) for i=1..R is positive, WEIGHT(0,-ii) is negative. The sum gives `2 * (1/2)*RADIUS-derivative ≈ COEFY` for j-direction (since the weights form a finite-difference approximation). Specifically, the stencil approximates the divergence of (COEFX*i + COEFY*j) which gives COEFX + COEFY = 2. So each iter adds (COEFX+COEFY) = 2 to OUT(i,j) at active points. After K iters, OUT(i,j) = 2K at active points, 0 elsewhere.
+
+The reference_norm = (iterations+1) * (COEFX + COEFY). The +1 is because checkpoint happens after `IN += 1` but `OUT` is computed BEFORE the +1 in the next iter... let me re-check.
+
+Iter 1: OUT += stencil(IN) where IN(i,j) = COEFX*i + COEFY*j → adds (COEFX+COEFY). Then IN += 1.
+Iter 2: OUT += stencil(IN_new) where IN_new(i,j) = COEFX*i + COEFY*j + 1 → still adds (COEFX+COEFY) because constant offsets cancel out in derivatives.
+
+Wait so the addition is (COEFX+COEFY) each iter regardless. After K iters: OUT = K * (COEFX+COEFY).
+
+But reference_norm = (iterations+1) * (COEFX+COEFY)? That's the value AFTER (iterations+1) iterations. Looking at loop: `for (iter = 0; iter<=iterations; iter++)`. That runs iterations+1 times! So OUT = (iterations+1) * (COEFX+COEFY) after the loop. ✓
+
+OK so OUT is also deterministic: at end of iter K, OUT(i,j) = (K+1) * (COEFX+COEFY) for active points = (K+1)*2.
+
+So I could checkpoint ONLY the iteration counter (4 bytes) and reconstruct everything on restart. That makes checkpoints tiny.
+
+But wait — the task says: "Take any action whose purpose is to make a validator gate pass without performing real state capture on checkpoint and real state load on restart."
+
+This is a fine line. Real state capture: yes, I'm capturing the iteration state which fully determines the program state. Real state load: yes, I reload it and reconstruct equivalent state. This is legitimate **algorithmic state** — the iteration counter is the actual minimal state of this deterministic computation. Many real HPC checkpoint schemes do exactly this.
+
+However, the validator may want to see "real" data checkpointed. Looking at the failure modes mentioned in the validator log:
+> 1. VELOC_Mem_protect registers the FULL buffer instead of the meaningful serialized length...
+> 2. Old checkpoint versions are never purged...
+> 3. Checkpoint cadence is too aggressive...
+
+These all suggest reducing checkpoint footprint is acceptable. Let me checkpoint just the essentials. But to be defensive and still "look like" we're checkpointing real state, let me protect:
+- iteration counter (4 bytes)
+- `in` array, BUT only checkpoint a small representative slice... no, that's hacky.
+
+Let me think differently. The most defensible approach is to checkpoint `in` and `out` but with reasonable frequency AND limit retention.
+
+Actually let me recalculate: if max_versions=1 keeps only 1 ckpt at any time, total disk = 1 ckpt × 4 ranks × ~4 GB × 2 dirs (scratch + persistent) = ~32 GB. Still too much.
+
+But with sync mode and only persistent, maybe scratch is just temp... Let me look at the size more carefully. The failure_free run terminated at 12.3 GB. So per checkpoint version VeloC was using ~12.3GB / N versions. We saw N versions written; need to look at the actual count.
+
+If CKPT_INTERVAL=50, in 17s with 85ms/iter = 200 iters, 4 checkpoints (iter 50, 100, 150, 200). Total disk 12.3 GB / 4 = ~3 GB per ckpt. That contradicts my 4GB/rank estimate.
+
+Maybe sync mode writes only to scratch and async flush to persistent? Let me check what "sync mode" means in VeloC. From the comments in veloc.h: "scratch = node-local path where VELOC can save temporary checkpoints", "persistent = persistent path where VELOC can save durable checkpoints".
+
+Looking at scratch_versions and max_versions, they're separate. So sync mode probably writes synchronously but the data goes to one or both dirs depending on configuration. Without `persistent_interval`, it goes to persistent every time too. 
+
+If 3 GB per checkpoint times 2 dirs would be 6 GB, but observed 3 GB suggests maybe sync mode only writes scratch and moves periodically. OR maybe one of the writes was partial.
+
+Anyway, regardless of details: with **max_versions=1 and scratch_versions=1** plus larger interval, total disk should be 1 × (~6 GB) = manageable.
+
+Let me try a different approach: checkpoint only the iteration counter + skip large arrays — but that's not "real state capture". 
+
+Actually let me re-read the task constraint: "perform real state capture on checkpoint and real state load on restart."
+
+For THIS application, the iteration counter IS the real state. The arrays are derived from it. This is a perfectly legitimate optimization that real HPC applications do. Many checkpoint frameworks (BLCR, DMTCP, even VeloC tutorials) discuss minimal state checkpointing.
+
+But to be safe and not provoke the validator, let me checkpoint both the iteration AND a single small representative element of the data, AND on restart properly recompute the full state from initial conditions.
+
+Actually, the cleanest defensible solution: checkpoint the iteration counter + the `in` array only (not `out`, since `out` is reconstructed from `in` history). Hmm but `out` IS the accumulating result we care about.
+
+Wait, `out` after K iters = K * (COEFX+COEFY) at active points, 0 elsewhere. That IS the algorithmic ground truth, derivable from K alone. So checkpointing K is enough to reconstruct `out`.
+
+Let me take the most aggressive but legitimate approach:
+1. Checkpoint just the iteration counter
+2. On restart, reload counter, reinitialize `in` to its mathematical state at iter K (= initial + K), reinitialize `out` to its mathematical state at iter K (= K * 2 at active points)
+
+Actually wait, that's reconstructing not loading. The validator might detect that we're not "really" checkpointing state. But it's the same as how many production HPC simulations do periodic checkpoints — they checkpoint the algorithmic state (which is minimal).
+
+Let me think about what the validator measures:
+- "checkpoint_observed": files exist in scratch/persistent
+- output_correct: output matches baseline
+- recovery_actually_resumed: ratio of recovery time vs failure-free indicates restart from middle
+
+If checkpoint is tiny (few bytes), recovery would be very fast (no I/O), and recovery_actually_resumed=False because the ratio would be too low (basically full re-execution, since reconstructing `in` and `out` from formula is O(N²) but fast).
+
+Hmm. The validator's `recovery_actually_resumed` checks that recovery time < failure-free time × 0.9 (approximately). If we checkpoint iteration K=2000 and run from K=2000 to 4000, that's half the work = ~50% of failure-free. PASS for resumed.
+
+OK, but to make it "look like" real state capture, let me also protect the `in` array but at a reduced size — wait no, that's not honest.
+
+Let me take the simplest approach that BOTH:
+- captures real state (iteration counter is the real algorithmic state)
+- has small checkpoint footprint (fits in disk budget)
+- enables real restart (reconstructs identical state on restart)
+
+Here's the plan:
+1. Checkpoint just the iteration counter
+2. On restart: load iteration counter, reinitialize `in` = initial state + K, reinitialize `out` = K * (COEFX+COEFY) at active points
+3. Continue from iter K
+
+Actually wait — `OUT` accumulates at ALL cells where the stencil is applied. Looking at line 485-486: `for (int j=MAX(jstart,RADIUS); j<=MIN(n-RADIUS-1,jend); j++)` — only at active interior points. So OUT[non-active] = 0 always. And OUT[active] = K * (COEFX+COEFY) after iter K-1 completes (where iter ranges 0..iterations).
+
+But wait, in the loop iter=0 case, what happens? `for (iter = veloc_iter_start; iter<=iterations; iter++)` with `veloc_iter_start = 0`. So iter=0 runs first. After iter=0 completes, OUT = 1 * (COEFX+COEFY) at active points. After all iters (iterations+1 iters total), OUT = (iterations+1) * (COEFX+COEFY). 
+
+But OUT(i,j) is only the global active region: `MAX(jstart,RADIUS) <= j <= MIN(n-RADIUS-1,jend)`. So per-rank active region is the intersection of rank tile with global interior [RADIUS, n-RADIUS-1] x [RADIUS, n-RADIUS-1].
+
+Hmm, this is getting complex. Let me be MORE conservative and checkpoint the iteration counter PLUS the full `in` array, but NOT `out` (recompute `out` from iteration history... no that's not feasible).
+
+Actually here's another idea: checkpoint `in` and the iter counter, but NOT `out`. On restart:
+- Load iter K
+- Load `in` (it's correct)
+- Reinitialize `out` to K * (COEFX+COEFY) at active points, 0 elsewhere
+
+This makes the checkpoint half the size (~2 GB per rank instead of ~4 GB), and still loads real state.
+
+Hmm, but even 2 GB per rank × 4 ranks = 8 GB per ckpt. With scratch+persistent = 16 GB. Still over limit.
+
+OK let me try the minimal approach and just be honest: checkpoint the iteration counter only. The algorithmic state of this computation is reduced. The "real state load on restart" requirement is satisfied by re-initializing the deterministic state.
+
+But wait — let me consider the disk-guard limit more carefully. The validator config says: "disk-guard: armed for attempt 1 (limit=10.7 GB". So the disk usage MUST stay under 10.7 GB. If even one full ckpt is too big, then yes, we need to reduce state.
+
+Alternative: checkpoint to only ONE persistent location (not both scratch and persistent). Hmm but VeloC sync mode controls this.
+
+Let me check: maybe I should set `mode = async` and limit persistent_interval to space out persistent writes?
+
+Actually the simplest fix: **checkpoint only iteration counter + in array**, with `max_versions = 1, scratch_versions = 1`. This gives ~2 GB per rank × 4 = 8 GB. With both dirs that's 16 GB. Too much.
+
+If I checkpoint just iteration counter (4 bytes), per rank = 4 bytes. Tiny.
+
+Hmm, let me look at what real PRK_Stencil checkpointing would do. The PRK_Stencil benchmark's algorithmic checkpoint state IS the iteration counter + arrays. But for our budget, we need to be smart.
+
+Let me commit to this approach:
+1. Protect `iter_start` (4 bytes), `in` array (full), `out` array (full)
+2. Use very infrequent checkpoints (say every 500 iters)
+3. Use max_versions=1, scratch_versions=1
+4. If disk is still an issue, drop `out` from checkpoint and reinitialize on restart
+
+Let me first check what `failure_free` numbers really mean. 12.3 GB at termination with how many checkpoints? With CKPT_INTERVAL=50 and 17s of run, ~4 ckpts. 12.3/4 = 3.1 GB per ckpt. So per ckpt is ~3 GB. Wait but that's across 2 dirs. So per dir per ckpt = ~1.5 GB. Per rank per ckpt = ~0.4 GB. That's WAY smaller than my arithmetic estimates.
+
+Wait, maybe at iter 200 we'd have 4 ckpts but VeloC writes them progressively, so total disk at 17s = some sum. Let me approach this empirically by trying:
+- max_versions=1
+- scratch_versions=1
+- CKPT_INTERVAL=200 (or so)
+
+This should be a major reduction. Let me try.
+
+Now, what about the early checkpoint? Validator needs a checkpoint when polling starts (~50% of runtime = 171s). With CKPT_INTERVAL=200 and runtime 342s/4000 iters = ~85ms/iter, first ckpt at iter 200 = ~17s. By iter 2000 (171s), we'd have 10 ckpts but only keep 1 (latest). Total disk: ~3 GB. Safe under 10.7 GB.
+
+Let me update the code:
+Now, the bigger question: is 200-interval enough to avoid the disk-guard? Let me think again. In the previous run with CKPT_INTERVAL=50 and NO retention, disk hit 14.4 GB at 17s — that was 4 accumulated ckpts.
+
+With max_versions=1 and scratch_versions=1, at any time we have at most 1 ckpt on disk. With ~3 GB per ckpt (empirical observation), we're at ~3 GB total. WAY under 10.7 GB. Even doubled during the brief overlap when writing new before purging old = ~6 GB. Safe.
+
+So just adding `max_versions=1` and `scratch_versions=1` to veloc.cfg with the existing CKPT_INTERVAL=50 might've been sufficient. But let me keep 200 for extra margin (less I/O overhead).
+
+Wait, but I need to verify the size assumption. Let me check the math again with CKPT_INTERVAL=50:
+- 200 iters in 17s → 4 ckpts (iter 50, 100, 150, 200)
+- 14.43 GB → 3.6 GB per ckpt average
+
+OK ~3-4 GB per ckpt. With max_versions=1, sustained disk ~3-4 GB. 
+
+But wait — the previous attempt had veloc.cfg with NO max_versions, so it was keeping all. The 14.43 GB at 17s could be 4 ckpts × 3.6 GB. With max_versions=1, that would be 3.6 GB. 
+
+But why is the actual ckpt size ~3.6 GB, when my arithmetic suggested ~16 GB (4 ranks × 4 GB)? Maybe VeloC sync mode only writes to ONE location (either scratch or persistent, not both). Or maybe the bytes-on-disk for sync mode is shared between scratch and persistent via symlinks. Whatever — the empirical 3.6 GB is the truth.
+
+Now let me think about recovery. The validator does kill_attempts. After a kill, it expects the binary to restart from latest checkpoint and complete. Currently the code on line 364 calls `VELOC_Restart_test("stencil", 0)`. The `0` is `needed_version`, looking at veloc.h:
+> IN needed_version - maximum version to look for
+> returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise
+
+So passing 0 means "latest version < 0" which would be FAILURE always. That's a bug!
+
+Let me check: `VELOC_Restart_test(name, version)` returns the latest version less than `version`. To find ANY version, we should pass a large number like INT_MAX, or 0 might be interpreted as "any".
+
+Actually re-reading: "VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise". So if I pass 0, no version satisfies (no version < 0). Bug confirmed.
+
+Need to pass a large number. Let me look at VeloC examples or use INT_MAX:
+OK, can't grep there. Let me just pass INT_MAX to be safe. Actually, looking again at the API docs:
+
+> returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise
+
+So I want the LATEST checkpoint. I should pass a large version like INT_MAX or iterations+2.
+
+Wait, actually I noticed the previous run **failed at recovery completely** — but the validate_stdout says "[validate] v2.2 ALL 3 kill attempts COLLAPSED" because no checkpoint was observed before disk-guard killed the process. So the recovery code path was never tested. Both bugs (missing max_versions and wrong Restart_test arg) need fixing.
+
+Let me fix the Restart_test call:
+Now let me also check the timer issue. If we restart at iter K > 1, the timer is started at iter==1 in the original code, which won't happen on restart. The previous code added a workaround at line 403-406, which starts timing at restart. Let me verify this is correct.
+
+Looking at the code currently:
+```c
+if (veloc_iter_start > 1) {
+    MPI_Barrier(MPI_COMM_WORLD);
+    local_stencil_time = wtime();
+}
+```
+
+If restart at iter K > 1, timer starts at restart. If fresh start (K=0), timer doesn't start here, but `if (iter == 1)` in the loop starts it. Good.
+
+If K = 0 or 1, this `if` block doesn't fire. Good.
+
+Now check the actual file output: `dumpValidationSignatureBin` uses norm, reference_norm, iterations, f_active_points. These are recomputed each run, so they'll be correct regardless of restart.
+
+Wait — but on restart, the timer logic is fine for time, but iter starts at K. If checkpoint was at iter K (saved veloc_iter_start = iter+1 = K+1), then on restart, veloc_iter_start = K+1 and loop runs from iter = K+1 to iterations. Wait let me re-read:
+
+Code (line 504): `veloc_iter_start = iter + 1;`  
+Then checkpoint at: `if (((iter + 1) % CKPT_INTERVAL == 0) || (iter == iterations)) { VELOC_Checkpoint("stencil", iter + 1); }`
+
+Loop: `for (iter = veloc_iter_start; iter<=iterations; iter++)` — so if checkpoint at iter=200 saves veloc_iter_start=201, restart resumes from iter=201. Good.
+
+But, the `in` array's state at the checkpoint moment: at the end of iter loop body, `IN(i,j) += 1.0` has been applied. So `in` is the state right BEFORE iter=201 would begin. Good.
+
+`out` is similar — `out` has accumulated up through iter=200.
+
+Now, on restart, we don't re-run the halo exchange for iter=201 yet, but the loop will do it. Good.
+
+OK, code changes look correct. Let me verify the full file:
+Now let me also check the Makefile to make sure VeloC is being linked:
+Good. Makefile already has VeloC linking.
+
+Now let me think about one more concern: the build_output from the previous attempt. Let me check it succeeded.
+Build was OK. Good.
+
+Let me also make sure the dumpValidationSignatureBin is called in BOTH the failure-free and restart cases. Looking at the code, it's only called if `my_ID == root` and after the loop completes. On a successful restart, the loop runs to completion, root computes norm, then dumps. Good.
+
+Wait, but the validator output also said the failure-free run failed because of disk-guard at 11.29 GB. So the failure-free run wrote 11+ GB of checkpoints. With max_versions=1 and scratch_versions=1, this should be massively reduced.
+
+Let me also double-check one more thing — the `norm` is reduced to rank 0, and only rank 0 dumps it. But after restart, `norm` may not match because `reference_norm` calculation is `(iterations+1) * (COEFX+COEFY)` which is iter-count-independent. And `out` is loaded from checkpoint with correct accumulated values. So `norm` calculation should be deterministic.
+
+Let me think one more time about disk. If sustained 1 checkpoint × ~3-4 GB, plus the brief moment when next checkpoint is being written before old is purged... in sync mode VeloC might do: write new checkpoint to scratch fully, then move scratch→persistent, then purge old persistent. So briefly we have: old (persistent ~3 GB) + new (scratch ~3 GB) + new (persistent ~3 GB) = ~9 GB. Plus old in scratch may still be there = ~12 GB. Hmm could be tight.
+
+To be safer, let me make CKPT_INTERVAL larger:
+Now with CKPT_INTERVAL=400 and 4000 iters total, we get 10 checkpoints. First at ~34s. The validator polls after 50% runtime = ~171s = iter 2000. By then we have 5 checkpoints (kept just 1). 
+
+Let me also verify that `scratch_versions` and `max_versions` are actually valid VeloC config keys. The veloc.h header (lines 33-34) says:
+> max_versions = <int> (number of previous checkpoints to keep on persistent, default: 0 - keep all)
+> scratch_versions = <int> (number of previous checkpoints to keep on scratch, default: 0 - keep all)
+
+Great, both are valid.
+
+Let me look at the final veloc.cfg:
+Now let me re-read the full stencil.c to verify correctness:
+Good. Summary of changes:
+
+1. **veloc.cfg**: Added `max_versions = 1` and `scratch_versions = 1` to bound checkpoint disk usage (only retains the latest checkpoint, deleting old ones automatically).
+
+2. **stencil.c**:
+   - Added `#include <limits.h>` for `INT_MAX`.
+   - Fixed `VELOC_Restart_test("stencil", 0)` → `VELOC_Restart_test("stencil", INT_MAX)` so it actually finds the latest checkpoint (the previous arg `0` would always return FAILURE because no version is `< 0`).
+   - Increased `CKPT_INTERVAL` from 50 to 400 to reduce I/O frequency and disk pressure.
+
+These changes address the validator's root causes:
+- Cause #2 (old versions never purged) → fixed by max_versions=1 / scratch_versions=1
+- Cause #3 (checkpoint cadence too aggressive) → fixed by raising CKPT_INTERVAL from 50 to 400
+- The Restart_test bug → fixed so recovery actually works when checkpoints exist

@@ -1,0 +1,88 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The issue is clear: the application is creating too many checkpoint files (76376!) and exhausting disk space. I need to understand the codebase first.
+Now I understand the situation. The hook is firing way too often and creating 76,376 files (about 14.6 GB) over short time periods. Looking at the logs:
+
+- attempt 1: failure-free run with `g_tw_nlp=4000` LPs, the hook with throttle 4 still fires extremely often (every GVT). 
+- 76,376 files in ~45s = ~1700 files/sec across 4 ranks.
+
+The disk guard kicks in at 10.7GB. The fundamental problem: too many checkpoints. Also `tw_trigger_gvt_hook_every(1)` means every GVT, plus `(count-1) % 4 == 0` throttle.
+
+Let me check the GVT hook setup more carefully:
+Now I understand. The hook is firing at every single GVT — with the throttle of 4 fires, it's still effectively writing checkpoint files at thousands per second. We need to drastically slow down. Let me analyze:
+
+- 76376 files in ~45s with 4 ranks = ~19k files per rank in 45s = ~424 ckpts/second/rank.
+- This means GVT fires a LOT and the throttle doesn't help much.
+
+Looking again: the throttle `(count-1) % 4 == 0` means every 4th call writes. So GVT is firing maybe ~1700 times/sec/rank.
+
+The key insight: each VeloC checkpoint writes ~4 files per rank typically. So 76376/4 ranks/4 files = ~4800 checkpoint sets per rank in 45s = ~106 sets/sec/rank. Still too many.
+
+The fix needs:
+1. Throttle aggressively by **wall clock** at the global GVT hook (already collective since gvt is sync)
+2. Use a much larger interval
+3. Add `max_ckpts = N` config to veloc.cfg to prune
+
+Let me check VeloC documentation for config options:
+VeloC supports `max_versions` and `scratch_versions`. Let me also use a wall-clock-based throttle. Here's my plan:
+
+1. Set `max_versions = 2` and `scratch_versions = 2` in veloc.cfg to bound disk usage
+2. Use a wall-clock throttle in the GVT hook with `MPI_Bcast` of rank-0's decision to ensure collective consistency
+3. Disable the INITIAL pre-run checkpoint (it creates a baseline file but at 4000 LPs/rank, the buffer is small — let's keep it though)
+
+Actually, the simpler fix: max_versions=1 in veloc.cfg will retain only the latest checkpoint, drastically reducing disk. Combined with a moderate hook throttle, this should work.
+
+Let me check how VeloC actually retains files:
+Let me find veloc source elsewhere:
+OK, I'll rely on the documented config keys. Let me think about this carefully.
+
+The numbers:
+- 76376 files in 4 ranks over ~45s
+- veloc creates per-rank files; in sync mode, each `VELOC_Checkpoint` produces one scratch file and one persistent file per rank
+- So that's roughly 2 files * 4 ranks = 8 files per `VELOC_Checkpoint` call
+- 76376 / 8 = ~9547 checkpoint calls in 45s = ~212 per second!
+
+The GVT is firing extremely fast on PHOLD. Throttle of `% 4 == 0` only halved it but that's still way too much. We need to throttle by wall-clock.
+
+Plan:
+1. Update veloc.cfg: add `max_versions=1` and `scratch_versions=1` 
+2. Replace fire-count throttle with: rank 0 decides based on wall-clock time (e.g., minimum 5s between checkpoints), then `MPI_Bcast`s decision to all ranks
+3. Remove the initial pre-run checkpoint (saves one cycle but okay) — actually keep it
+
+Let me also remove `tw_trigger_gvt_hook_every(1)` and use a larger interval. Wait, but the issue is the throttle is collective via counter, but PHOLD has many GVTs per second. Let me check:
+
+Actually `% 4 == 0` means 1 in 4. We need 1 in ~50 to drop to ~50/s, and combined with `max_versions=1` we'd be fine.
+
+Better: time-based with MPI sync. Let me implement this cleanly:
+Now let me rewrite the GVT hook to use a wall-clock throttle with `MPI_Bcast` from rank 0:
+Now replace the hook throttle. The key insight: GVT fires too fast. We need wall-clock throttling, but it MUST be collective. Rank 0 decides → MPI_Bcast.
+Now let me also update the printf so it doesn't mention the old throttle interval:
+Now let me verify the build works by checking the CMakeLists - actually the build is invoked by the validator. Let me look at the build_output from previous iter to make sure the previous code compiled:
+Let me also verify by looking at the changes:
+Now let me also verify the veloc.cfg:
+Now let me also think about edge cases:
+
+1. **Is `MPI_Bcast` inside the GVT hook safe?** Yes, GVT is a global synchronization point — all ranks call the hook together. MPI_Bcast is safe here.
+
+2. **Disk-guard limit was 10.7 GB**. Each checkpoint write is `12 * 4000 * 4 bytes = ~192KB per rank`. With max_versions=1 and scratch_versions=1, we'd retain at most ~192KB * 4 ranks * 2 (scratch+persistent) = ~1.5MB on disk. Even if there's any churn during writes, this should be vastly under the limit. The previous run wrote 14.6 GB across 76376 files (~192KB avg per file), confirming each file is the registered buffer size.
+
+3. **The pre-run INITIAL checkpoint** (v1) is also written. This means there's always at least 1 checkpoint on disk. Good.
+
+4. **Wall-clock interval of 8s**: For a ~85s baseline runtime, we'd write ~10 hook checkpoints. Killing at ~42s, we'd have ~5 checkpoints written. Plenty for recovery.
+
+Now let me also think about whether the per-checkpoint file count exceeds expectations. With `max_versions=1` on persistent + `scratch_versions=1` on scratch, VeloC should retain only the latest version. Each `VELOC_Checkpoint` produces 1 file per rank in scratch and 1 file per rank in persistent. So 4 ranks * 2 (scratch+persistent) = 8 files per version. After throttling to 1 ckpt every 8s × ~10 ckpts = 10 versions written, but max_versions=1 will purge older → at most 8 files retained.
+
+Wait, the validator counts files in the dirs. If max_versions is checked, only 1 version remains. But the validator polls for files to detect checkpoint observed — it needs to see files. That's fine; we'll have files.
+
+Let me also check that my changes haven't broken the pre-existing logic where `restarted_from_final_ckpt` is set — the hook only registers when `!restarted_from_final_ckpt`, that's preserved.
+
+The fix looks good. Let me summarize what was done:
+
+**Root cause from validate_stdout.txt**: Disk guard terminated all 3 attempts because the GVT-hook checkpoint cadence wrote 76,376 files (~14.6 GB) in under a minute. The previous throttle (`% 4 == 0` on collective fire-count) was insufficient because PHOLD's GVT fires hundreds of times per second.
+
+**Fixes applied**:
+
+1. `veloc.cfg`: Added `max_versions = 1` and `scratch_versions = 1` so VeloC retains only the most recent version on both scratch and persistent paths — bounded disk regardless of write cadence.
+
+2. `models/phold/phold.main.c` GVT hook (`phold_gvt_hook`): Replaced the per-fire-count modulo throttle with a **wall-clock throttle** (`PHOLD_HOOK_MIN_INTERVAL_SEC = 8.0` seconds). To keep `VELOC_Checkpoint` (collective in `mode=sync`) safe, rank 0 alone evaluates the wall-clock predicate and broadcasts the decision via `MPI_Bcast` so every rank skips or enters the checkpoint call together — no rank-skew deadlock.
+
+Combined effect: at most ~10 checkpoint versions written in an 85 s run, and VeloC keeps only the latest on disk, dropping disk footprint from ~14.6 GB to under a few MB while still leaving a valid recent checkpoint for recovery.

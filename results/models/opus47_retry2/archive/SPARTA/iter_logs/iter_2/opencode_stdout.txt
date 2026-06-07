@@ -1,0 +1,95 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The validator hit the disk-guard limit due to checkpoint footprint exceeding 10.7 GB. The checkpoint cadence is too aggressive or buffer sizes are too large. Let me look at the codebase.
+Now I understand the disk problem. With `SPARTA_CKPT_INTERVAL = 5`, the program checkpoints every 5 steps with all particles serialized. Run is 165000 steps. The validator runs ~112s and the disk-guard limit (10.7 GB) gets exceeded around 7 seconds in. We need:
+
+1. Much larger checkpoint interval (so we don't checkpoint too often)
+2. Purge old checkpoint versions after writing new ones (so disk doesn't grow unbounded)
+
+Let me look at main.cpp and check the run.cpp `laststep` logic:
+Let me calculate disk usage. With 100k particles, each `OnePart` is some size. Looking at the validator log:
+- failure_free: 17184544160 bytes (~16 GB) across 7160 files
+- failure_prone (collapsed at 7s): 13 GB across 5712 files
+
+That's roughly 2.4 MB per file × ~7000 files. With 4 ranks and checkpoint every 5 steps, in 165000 steps we'd get 33000 checkpoint events × 4 ranks = lots of files.
+
+Looking at fail at 7s: that's already 5712 files. Each rank wrote ~1400 versions. That's 1400/7s ≈ 200 versions/sec → checkpointing each step almost.
+
+Wait, the validator output says checkpoint interval is 5 steps, but in 7s, if computation is fast, we have many steps. The particle data is ~100000/4 ≈ 25000 particles/rank × sizeof(OnePart). Let me check OnePart size:
+OnePart is 16 bytes (4 ints) + 9 doubles = 16 + 72 = 88 bytes, aligned to 16 = 96 bytes. 25000 × 96 ≈ 2.4 MB per checkpoint per rank. Matches the observed ~2.4 MB/file.
+
+To fit in 10.7 GB total at most ~4 ranks × ~30 checkpoints retained = 120 files would be ~290 MB. Far less than 10.7 GB. Actually a much smaller number of checkpoints is needed.
+
+The fix is:
+1. Keep only N most recent checkpoint versions (purge older). 
+2. Reduce checkpoint cadence significantly.
+
+The validator needs `checkpoint_observed=True`. The polling starts at ~56s (50% of failure-free runtime ~112s). So we need checkpoints to exist by then. Let me checkpoint maybe every 1000 steps. With ~165000 steps in 112s, that's ~1475 steps/sec → checkpoint every ~0.68s. After 56s, ~80 checkpoints would exist.
+
+Better: checkpoint by wall-clock interval (time-based) or every N steps where N is moderately large. Let's use every 500 or 1000 steps and explicitly delete old versions.
+
+Let me check VeloC API for deletion:
+Good — there's `max_versions` and `scratch_versions` config knobs. Let me set both to a small value (like 2) and increase checkpoint interval. Also let me manually delete old version files for extra safety.
+
+Let me also check VELOC_Route_file usage - we could use it to know paths. But for simplicity, since we know `scratch` and `persistent` paths, we can just glob the old version files using `unlink` after each new checkpoint. But better to rely on `max_versions`/`scratch_versions` config.
+
+Plan:
+1. Update `veloc.cfg` to set `max_versions = 2` and `scratch_versions = 2`.
+2. Change `SPARTA_CKPT_INTERVAL` from 5 to a much larger value, say 1000.
+3. Also manually unlink prior checkpoint files (defense-in-depth).
+
+Let me check the validator timing: validator polls at 56s for failure-free runtime ~112s. So checkpoints must exist by ~56s. If 165000 steps in 112s, that's 1473 steps/s. With interval=1000, we'd checkpoint every ~0.68s, so by 56s we'd have ~82 checkpoints. With `scratch_versions = 2` only 2 versions retained per checkpoint = ~2 × 2.4 MB × 4 ranks = ~20 MB. Way under limit.
+
+Actually wait — re-reading: the polling delay is 56.1s for the **kill** attempt. But the failure-free run also has disk-guard armed and ran for the full duration. At 17 GB after the full failure-free run, the limit was exceeded. So definitely need version retention.
+
+Also, the failure-prone runs are terminated by disk guard at ~7 seconds with 13 GB. That means in 7 seconds, the app already wrote 13 GB. 13 GB / 7 = ~1.86 GB/s of checkpoint writing. With checkpoint every 5 steps and ~1473 steps/s, that's ~295 checkpoints/s × 4 ranks × 2.4 MB = ~2.8 GB/s. Matches roughly.
+
+But the validator log says 5712 files in 7s. 5712 / 4 ranks = 1428 checkpoint events per rank in 7s = ~204/s = checkpoint every ~5 steps as expected.
+
+Let me also verify the wall-clock check. The current "wall-time PASS at 1.2x" was True because failure-prone run only took 7s (killed). But we need checkpoint_observed=True and output_correct=True. So fix:
+
+1. `max_versions = 2`, `scratch_versions = 2` in veloc.cfg
+2. Increase checkpoint interval to 1000 steps
+3. Maybe also reduce checkpoint payload (but already only particles + 3 scalars, no other choice).
+
+Wait — particle data is the bulk. Let me check ckpt size differently: max retained = 4 ranks × (scratch + persistent) × 2 versions × 2.4 MB = 38 MB. Safe.
+
+But with `sync` mode, scratch contents get pushed to persistent. So files exist in both. With max_versions=2 and scratch_versions=2 → ~40 MB total. 
+
+Let me also be more conservative on interval. The recovery checkpoint must be recent enough so that after restart, the work-to-replay is small. Let me use 500 steps.
+
+Let me also confirm the time-based persistent_interval - I can set `persistent_interval = 5` (only push every 5 seconds) to throttle persistent writes.
+
+Let me apply the changes:
+Now update the checkpoint interval in update.cpp:
+Now let me also add defense-in-depth: after each successful checkpoint, manually delete any prior version files for this ckpt. But `max_versions` should do this. Let me verify behavior — looking at the issue, with `max_versions = 2`, VeloC should retain only 2 most recent persistent checkpoint versions. Similarly for scratch. So at any time, max files = (ranks × 2 versions × 2 dirs) = 4×2×2 = 16 files = ~38 MB. 
+
+But wait — the validator log says checkpoint_files=5712 after 7s of failure-prone run. That's a lot of files even with max_versions. Let me check whether VeloC actually purges in sync mode...
+
+Looking at the previous run more carefully: with `mode = sync`, every checkpoint is immediately written to persistent. With no `max_versions`, all are kept. Setting `max_versions = 2` should fix this.
+
+Let me also add manual cleanup as belt-and-suspenders. I'll add code after `VELOC_Checkpoint` to delete older versions:
+
+Actually, looking at the VeloC source behavior — `max_versions` and `scratch_versions` should work. Let me trust them but also add an explicit manual unlink as a safety net, since the failure mode is severe.
+Let me add manual cleanup logic. I'll need cstdio, unistd.h for unlink, and store the previous version per rank to delete it. Let me modify the checkpoint block:
+Now add a helper function and modify the checkpoint block to manually delete previous-version files. Since we don't know exactly the file naming, let me reverse engineer by examining a real VeloC scratch dir... actually, the standard VeloC file naming convention is `<name>-<rank>-<version>.dat` or similar. Let me check the VeloC docs:
+Let me just rely on `max_versions` config knob and trust it. The `max_versions` parameter is explicitly documented as keeping only N previous checkpoints. That should suffice.
+
+Actually, I should also make sure the failure-free run completes successfully. Let me re-examine - in the failure-free leg, the run was killed at disk-guard exceed. With my fix, total disk should stay ~40 MB. Should be fine.
+
+But wait — I notice another subtle issue. When max_versions=2, VeloC keeps versions N-1 and N (the latest 2). When VELOC_Restart_test is called with INT_MAX, it returns the latest. Good.
+
+Let me also verify the build approach. Let me check if there's an existing Makefile:
+Let me check build_output from previous attempt to see if build succeeded:
+Empty, but the binary was built and ran during validation (we saw it execute). So build worked. Let me confirm the changes are correct and complete.
+
+Let me double-check that I'm not missing other aggressive checkpointing or sources of disk pressure:
+Single checkpoint site, every 1000 steps now. Good.
+
+Let me verify my changes:
+The fixes:
+
+1. **`veloc.cfg`** — added `max_versions = 2` and `scratch_versions = 2` so VeloC retains only the 2 most recent checkpoint versions in each of the persistent and scratch directories. This caps total checkpoint footprint at roughly `4 ranks × 2 versions × 2 dirs × 2.4 MB ≈ 38 MB`, far below the 10.7 GB disk-guard limit.
+
+2. **`src/update.cpp`** — bumped `SPARTA_CKPT_INTERVAL` from `5` to `1000`. With ~1473 steps/sec, this still yields ~80 checkpoints by the validator's 56 s polling window, so `checkpoint_observed` will be `True`, while removing the ~2.8 GB/s write rate that was killing the disk-guard within 7 s.
+
+These changes preserve the real state capture (ntimestep, laststep, nlocal, full per-rank particle array) and the real restart logic — they only bound disk usage and reduce frequency to a sustainable rate.
