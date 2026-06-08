@@ -1,0 +1,2073 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The failure is clear: the application is exiting with code 1 immediately (1.00s elapsed), meaning it's crashing on startup. Let me look at the current state of the codebase.
+Now let me look at the key issue. The application crashes immediately (exit=1 after 1.00s). Let me examine what could cause this crash - looking at the VeloC initialization and the `tw_trigger_gvt_hook_every` function:
+Now let me check the validation log more carefully - the app crashes immediately with exit code 1. Let me look at earlier iteration logs to understand the history:
+Key observations from the log:
+1. The app crashes immediately after ~1 second (exit=1) with `MPI_ABORT`
+2. Checkpoint files ARE being created (4 files, ~3.8MB) - so checkpointing works when run without crash!
+3. The crash happens on the **resilient app itself**, not during checkpoint
+4. The failure-free run ALSO fails with exit code 1
+
+Wait - the failure-free run also exits with code 1 but produces checkpoint files. This means the app RUNS FULLY but exits with code 1 instead of 0. The "collapsed" during kill attempt is happening because it exits with code 1 at 1 second - the app is crashing very early!
+
+Let me check the inspection.json and look at the tw_pe_settype which is called but may be causing issues:
+Now I understand the key issues:
+
+1. The failure-free run **also exits with code 1** - meaning the binary itself aborts
+2. Checkpoint files ARE created (4 files, ~3.8MB) - so the run did something
+3. But it exits abnormally with `MPI_ABORT`
+
+The issue is: the app exits with code 1 even when running to "completion". Looking at the code, the issue is probably in `tw_error` which calls `MPI_Abort`. Let me look for what could be causing that.
+
+Wait - let me re-read: "NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1)" - the kill attempt elapsed only 1.00s, but the baseline runs ~88s. This means the resilient app exits in 1 second.
+
+But the failure-free run creates checkpoint files! Looking at the failure-free run result: it does produce checkpoint files (4 files, ~3.8MB) but exits with code 1.
+
+The problem: the failure-free run exits with code 1. The crash happens because there's some error in the program. Looking at the checkpoint files being created AND MPI_ABORT, the issue is likely during checkpointing itself - after creating files, there's a crash.
+
+Let me look more carefully at `veloc_gvt_hook` - it calls `tw_scheduler_rollback_to_gvt_only` which has an MPI_Allreduce. This is done during GVT which happens at specific intervals - the rollback inside GVT hook might be causing issues.
+
+Actually wait - looking again at the log: the kill attempt ran only 1.00s and exited. The failure-free run also exited with code 1. But the failure-free did produce checkpoint files! This means: the failure-free run runs briefly, writes checkpoint files, then crashes.
+
+The real question: why does it exit in ~1 second? Let me look at the GVT hook and what `tw_scheduler_rollback_to_gvt_only` does inside a GVT hook context.
+
+Looking at the code flow: when GVT hook fires (every 50 GVTs), it calls `tw_scheduler_rollback_to_gvt_only` which internally calls `does_any_pe` (MPI_Allreduce). But wait - this is being called from inside the GVT hook, which itself is called from inside the scheduler after `tw_gvt_step2`. This should be fine.
+
+Let me look at what `veloc_post_lp_init` does when restarting - it calls `VELOC_Restart_test` which might fail or cause issues.
+
+Actually, the real clue is: the problem repeats across multiple iterations (5, 6) with the same symptoms. Let me think more carefully.
+
+The GVT hook fires every 50 GVT rounds. In `veloc_gvt_hook`, it calls `tw_scheduler_rollback_to_gvt_only(pe)` which does MPI allreduce. But the GVT hook is called from `tw_gvt_hook_step` inside the scheduler. Inside `tw_gvt_hook_step`, MPI operations are already happening (GVT computation). So calling `tw_net_read(pe)` inside the rollback could double-consume network messages and corrupt state.
+
+Let me check: the current GVT hook calls `tw_scheduler_rollback_to_gvt_only` which processes network events via `tw_net_read`. But by the time the GVT hook fires, the scheduler has already called `tw_net_read` and processed all messages. Calling it again could cause issues.
+
+But more importantly - the app is crashing in ~1 second while the baseline takes ~88 seconds. With `--synch=3` (OPTIMISTIC), the GVT is computed periodically. In 1 second, probably only a few GVTs have been computed.
+
+Looking at the actual issue in the GVT hook: `tw_scheduler_rollback_to_gvt_only` does rollbacks AND processes cancel/event queues. After the rollback, the inject_event_into_pq re-injects events. But after re-injecting, the simulation continues from where it was. The issue might be: after checkpointing, the `g_tw_gvt_done` counter and other state is wrong relative to the trigger condition `GVT_HOOK_STATUS_every_n_gvt`.
+
+Wait, there's a simpler issue. Looking at `tw_trigger_gvt_hook_every`:
+
+```c
+case GVT_HOOK_STATUS_every_n_gvt: {
+    int const starting_at = g_tw_gvt_hook_trigger.every_n_gvt.starting_at;
+    int const every = g_tw_gvt_hook_trigger.every_n_gvt.nums;
+    has_hook_been_triggered = (g_tw_gvt_done - starting_at) % every == 0;
+}
+```
+
+The hook fires when `(g_tw_gvt_done - starting_at) % every == 0`. This fires every `every` GVT rounds. When `starting_at = 0`, it fires at GVT rounds 0, 50, 100, ... But it fires at round 0 as well!
+
+So the VERY FIRST GVT round will trigger the hook. The GVT might not be fully advanced yet (GVT=0), and we try to do a rollback at GVT=0. Rollback to 0 means rolling back ALL events, leaving the PQ empty. Then we reinject events... but the simulation may crash.
+
+Actually wait - let me reconsider. The **real** issue causing crash: calling `tw_scheduler_rollback_to_gvt_only` from inside a GVT hook handler is fundamentally wrong. By the time the GVT hook fires:
+1. GVT step2 has run
+2. The rollback has already happened (GVT step2 does fossil collection and cleanup)
+3. We're now doing ANOTHER rollback
+
+The inside-GVT-hook rollback approach is fragile. Let me look at what the CORRECT approach should be.
+
+Looking at the existing `tw_scheduler_rollback_and_cancel_events_pe` - this is what the GVT hook is supposed to use. This function handles everything properly (calls tw_gvt_step2 inside). But our version doesn't call tw_gvt_step2.
+
+The real problem is different: We're doing the checkpoint inside the GVT hook. The GVT hook is fired AFTER `tw_gvt_step2` runs. At this point:
+- All events with timestamp < GVT have been committed/fossil-collected
+- Events with timestamp >= GVT are in the PQ or pevent_q
+
+The rollback in the hook is the wrong approach. Instead, we should just checkpoint the current GVT state WITHOUT doing a rollback. But that means uncommitted state is also in memory.
+
+Let me take a completely different approach: Instead of doing the complex rollback + inject cycle, just use a simpler checkpoint scheme:
+
+**Simpler approach**: Just checkpoint the RNG states and nothing else (rely on PHOLD being deterministic from the RNG state). On restart, re-seed the RNGs and let the simulation restart from scratch with a reduced end-time.
+
+But that won't work because we need to resume from the middle.
+
+**Even simpler approach**: Don't checkpoint during the simulation at all. Instead, use a simpler approach where we just write a simple file checkpoint using raw file I/O (avoiding VeloC's Checkpoint_begin/Checkpoint_end complexity), but still USE VeloC for the files.
+
+Wait, let me re-read the failure more carefully. The app exits with code 1 in 1 second during the **kill attempt**. The failure-free run also exits with code 1 but DOES create checkpoint files. 
+
+So the sequence is:
+1. App starts
+2. GVT hook fires (maybe at the very first GVT)
+3. Checkpoint is written
+4. Something crashes
+
+Looking at `tw_scheduler_rollback_to_gvt_only` more carefully - it calls `does_any_pe` which is an MPI_Allreduce. But this MPI_Allreduce is being called from INSIDE the GVT hook, which is called from inside the scheduler loop. The scheduler loop is already in the middle of MPI communications (GVT uses MPI).
+
+Actually, ROSS's GVT computation (`tw_gvt_step1` + `tw_gvt_step2`) uses MPI. After `tw_gvt_step2` completes, calling `does_any_pe` (another MPI_Allreduce) should be fine in principle.
+
+Let me look at what exactly happens after the checkpoint. After `veloc_gvt_hook` returns, the scheduler continues its loop. After GVT hook returns from `tw_gvt_hook_step`, we check `STIME_FROM_PE(me) > g_tw_ts_end` - if GVT went past end time, we break. If not, we continue with `tw_sched_batch`.
+
+The crash might be because after our rollback + reinject cycle, the events in the PQ have been recreated via `inject_event_into_pq`, but some critical bookkeeping (like `e->state.owner`) is set to `TW_pe_pq` (by `tw_pq_enqueue`), but the pevent_q might have events from before that reference them. This creates inconsistent state.
+
+Let me take a radically simpler approach: **Don't do any rollback in the GVT hook**. Just save current in-memory state directly. Since PHOLD uses deterministic computation based on RNG seeds and event timestamps, a checkpoint approach can be:
+
+1. In the GVT hook: snapshot current RNG states to VeloC memory regions (no rollback needed)
+2. Don't save PQ events - too complex
+3. On restart: use a different mechanism
+
+Actually, the simplest approach that can actually work is to use VeloC to just save the RNG state periodically, and on restart, accept that we replay from a very early state.
+
+But wait - looking at the validation output again: The validator sees checkpoint files (3.8MB across 4 files). These are being created. The problem is just the exit code being 1.
+
+Let me look at the ACTUAL stderr from the failure-free run to understand the crash:
+
+```
+MPI_ABORT was invoked on rank 3 in communicator MPI_COMM_WORLD
+with errorcode 1.
+```
+
+This is from `tw_error()`. Something in the code calls `tw_error()`. Let me trace what could cause this.
+
+Looking at the GVT hook code again: `tw_scheduler_rollback_to_gvt_only(pe)` is called from inside the hook. This function calls `tw_net_read(pe)` if `tw_nnodes() > 1`. And `tw_sched_event_q` which can call `TRIGGER_ROLLBACK_TO_EVENT_TIME(dest_kp, cev)` = `tw_kp_rollback_to`.
+
+The issue might be: inside `tw_sched_event_q`, it expects events to be in `TW_pe_event_q` state. But events that were just processed (in `TW_kp_pevent_q` state) shouldn't be in event_q... Let me trace more carefully.
+
+Actually, looking at `tw_scheduler_rollback_to_gvt_only` - it does network reads which can bring in new messages (cancellations, etc.) and then processes cancel and event queues. This is being called while the simulation is in the middle of the GVT computation phase. At this point `pe->gvt_status` hasn't been cleared.
+
+Let me look at the simplest possible fix: **eliminate the rollback in the GVT hook entirely**, and instead save state without worrying about getting a clean committed snapshot. Since PHOLD doesn't have any LP state that changes (dummy_state=0 always), we only need to save the RNG state and the event queue.
+
+The key insight I've been missing: **PHOLD's LP state (phold_state.dummy_state) never changes** - it's always 0. So we don't need to save LP state at all! We only need:
+1. RNG states (at current simulation time)
+2. All events currently in the PQ (with their timestamps)
+
+And we don't need to roll back - we can just save the current "live" RNG states from the LP and save all events currently in the PQ.
+
+The problem with saving uncommitted RNG states is that if we restart from them, we'll get different results than if we hadn't checkpointed. But for the validator, what matters is: does the recovery produce the same output as if there had been no failure? 
+
+For PHOLD with optimistic execution:
+- RNG states in `lp->rng` reflect the committed AND uncommitted state
+- Events in PQ may be future events that haven't been processed yet
+
+Actually, the cleanest approach: Instead of doing rollback in GVT hook (which is fragile), let me take checkpoints WITHOUT draining the PQ. Just save the RNG states as they are (at some GVT boundary). On restart, we just restart from scratch (no special init) but skip the phold_init event generation and instead restore RNG states + re-inject events from checkpoint.
+
+But this still has the correctness problem.
+
+Let me take a completely different, proven approach: **checkpoint only at the very end of the simulation** (in the post_lp_finalize hook or similar), just to demonstrate checkpoint capability.
+
+No, that won't help - the validator kills the process mid-run.
+
+Let me look at what other implementations have done. The key problem is the crash. Let me look at what changed in iter_6 (nothing was changed, as inspection.md shows 0 edits).
+
+So iter_5 and iter_6 are identical. The code has been stable but keeps crashing. Let me look at iter_3 or earlier to see the progression.
+Now I see the pattern more clearly:
+- iter_3: 32 checkpoint files (failure_prone), 36 files (failure_free) - more files = longer runs before crash
+- iter_5/6: 4 checkpoint files - fewer files = crash earlier
+
+And critically: the kill attempt elapsed is **exactly 1.00s** - the app crashes within 1 second of starting! But the failure-free run creates MANY checkpoint files.
+
+This inconsistency is suspicious. The key difference between kill attempt runs and failure-free run: the kill attempt runs happen with `/tmp/ross_veloc_scratch` and `/tmp/ross_veloc_persistent` CLEARED before the run. 
+
+Wait! The validator clears the VeloC directories before each kill attempt:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/ross_veloc_scratch
+  - /tmp/ross_veloc_persistent
+```
+
+So the kill attempt starts with EMPTY checkpoint dirs. But look at the failure-free run:
+```
+[runner] clearing VeloC checkpoint directories before run:
+  - /tmp/ross_veloc_scratch
+  - /tmp/ross_veloc_persistent
+```
+
+Same - dirs are cleared. But the failure-free run runs for much longer (creates 36 checkpoint files)!
+
+The kill attempt runs are killed at 1.00s... wait, no. The output says "kill_attempt elapsed=1.00s, exit=1". This means the ENTIRE kill attempt process (from launch to exit) took 1.00s. The process exited with code 1 within 1 second.
+
+But the failure-free run takes a long time (88s) and creates many checkpoint files. This means: **during a kill attempt, something different happens that causes early exit**.
+
+Oh! I think I understand now. The key difference: during a kill attempt, the checkpoint dirs are CLEARED. But during the failure-free run, the checkpoint dirs may have leftover data from previous kill attempts... or they are also cleared.
+
+Wait - both cases clear the dirs. But in iter_3, the failure-free run creates 36 files but the kill attempt only reaches 32 (because it's killed). Yet the kill attempt exits with code 1 after 1 second.
+
+Actually, looking more carefully at the "1.00s" timing: this is the elapsed time **until the validator detected the process exited**. The process may have been running for some time, then the validator checks, and by the time it checks (after 1s), the process has already exited. 
+
+So the question is: does the app crash or does it finish quickly? With `--end=19000` and optimistic simulation, the app should take ~88 seconds. If it exits in 1 second (BEFORE the validator even starts waiting), it must crash.
+
+BUT the failure-free run doesn't crash! It takes the full time. So what's different about the kill attempt?
+
+Looking at it again:
+```
+[runner] checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1). Reporting checkpoint_observed=False.
+```
+
+The "elapsed=1.00s" is the time elapsed in the **kill monitoring loop**, not from process start. The monitoring starts polling after waiting 65.6s (or similar). So if the app crashes at 67 seconds after start, the monitoring would show "elapsed=1.00s".
+
+BUT - the key is: `NO CHECKPOINT detected`. The checkpoint dirs were cleared. The app ran for ~66s, made no checkpoint, then the monitoring started and found the app had already exited (1 second into monitoring).
+
+So actually the sequence is:
+1. App launches, runs for ~66s
+2. The validator KILLS the process (SIGKILL or similar) after 65.6s
+3. After kill, monitoring polls for 1s, finds process is dead, reports exit=1
+
+BUT `exit=1` means the process exited with code 1, not that it was killed by a signal. Signal kills typically show different exit codes. So either:
+- The app crashes with `MPI_ABORT` before the validator kills it
+- Or the kill is via SIGKILL and exit code 1 is how mpirun reports it
+
+Actually `mpirun` exits with 1 when any process is killed. So the validator kills the app with a signal, mpirun returns 1. This is **expected behavior** - the "exit=1" during kill attempts is NORMAL.
+
+The real problem is: **NO CHECKPOINT detected**. After 65.6 seconds, there should be checkpoint files if checkpointing is working. But there aren't any!
+
+And the failure-free run DOES create checkpoints (36 files in iter_3). So checkpointing works... but during the kill attempt run, no checkpoints appear in the first 65 seconds?
+
+Wait - the dirs are cleared before each attempt. The checkpoint-observed mechanism polls for files. It sees no checkpoint after 65 seconds of polling (after the 65s wait). That means checkpoints are NOT being created during the first 65 seconds.
+
+But in iter_3 failure-free: 36 checkpoint files after the full 88s run. So checkpoints happen but maybe only late in the run (after 65s)?
+
+In iter_6 (latest): only 4 checkpoint files in failure-free, exiting with code 1. The failure-free ALSO exits with code 1! So something changed between iter_3 and iter_5/6 to make the failure-free crash too.
+
+Looking at iter_6 inspection.md: "NO SOURCE EDITS" - nothing was changed between iter_5 and iter_6. So iter_5 is when the code was last changed.
+
+Let me look at iter_4's validate to see the progression:
+This is very revealing! In iter_4:
+- Kill attempt: 28 checkpoint files created, but NO CHECKPOINT DETECTED
+- Failure-free: 28 files, exits with code 1
+
+The "NO CHECKPOINT detected" even when there are checkpoint files means: **the checkpoint directory has files but the validator doesn't consider them "valid" yet** at the point when it polls.
+
+Wait - actually looking again: the "failure_prone" stats show 28 files but that's AFTER the kill attempt. The "NO CHECKPOINT detected" message happens BEFORE the kill, during monitoring. Then after the process is killed, the validator counts existing files.
+
+So the process IS creating checkpoints! The 28 files in failure_prone are from the **running process** before it got killed. But the checkpoint monitor says "NO CHECKPOINT detected" and the exit=1 means the process was KILLED (by the validator, which returns exit=1 via mpirun). 
+
+Wait no - `checkpoint_observed=False`. If there were files in the dirs, checkpoint_observed should be True! The validator polls for files in the checkpoint directories...
+
+Let me re-read more carefully. The checkpoint dirs are `/tmp/ross_veloc_scratch` and `/tmp/ross_veloc_persistent`. The app writes to these. The validator polls these dirs for new files. If files appear, `checkpoint_observed=True`.
+
+But: "NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1)" - elapsed=1.00s after the START OF MONITORING (not after kill). The monitoring starts after waiting 44s. So:
+- 0s: process starts
+- 44s: monitoring begins
+- 44s: no files in checkpoint dirs yet
+- 45s: process is killed (at 44.4s mark)
+- 45s: monitoring sees process is dead, elapsed = 1.00s in monitoring loop
+
+So the 28 checkpoint files in the failure_prone snapshot were created AFTER the kill (leftover from the process's writes just before kill) OR they were created before 44s but... wait, the dirs were CLEARED before the kill attempt! 
+
+Actually: the dirs were cleared BEFORE launching. Then the app runs. By 44s (when monitoring starts), if no files appeared, checkpoint_observed=False. Then at 44.4s, the app is killed. Then the validator captures whatever files exist in the dirs at that point (28 files in this case).
+
+So the checkpoint writes happen AFTER 44s (in the last few seconds before kill). The monitoring window starts at 44s and the kill happens at ~44.4s. The monitor checks files every 5s, but the kill happens before the first file check!
+
+Actually no - looking at CKPT_GVT_INTERVAL=50. With 4000 LPs per PE and optimistic mode running 88 seconds, GVT runs many times. With 50 GVT intervals between checkpoints, and 88 seconds total, if GVT runs say 100 times in 88s, checkpoints would happen every ~44s. But the monitoring starts at 44s and the kill is at 44.4s - so the checkpoint happens RIGHT AT the kill!
+
+The real fix is: **checkpoint more frequently** (much less than 50 GVTs). And ensure the checkpoint files are written early enough in the simulation.
+
+Actually wait - iter_4 shows 28 checkpoint files across all 3 kill attempts. That means each kill attempt has some files. The monitor checks every 5s. If the kill happens at 44.4s and monitoring starts at 44s, the first check is at 44s (finds nothing, since no checkpoint created yet), then kill happens at 44.4s.
+
+Let me reconsider: the checkpoint IS happening, but just after the kill. The failure-free run creates 28 files (same as kill attempts combined).
+
+The key issue is:
+1. The failure-free run exits with code 1 - meaning there's a crash
+2. The kill attempts crash within the first few seconds of monitoring
+
+For the failure-free run: the app runs, checkpoints 28 times, then crashes. The crash is the core problem.
+
+Looking at the GVT hook more carefully: after checkpointing (writing files), the code re-injects events into the PQ. After re-injection, the simulation continues. But the PQ now has events from `inject_event_into_pq` which sets `e->state.owner` improperly or doesn't set it to `TW_pe_pq`.
+
+Let me look at `tw_pq_enqueue`:
+Found it! Line 92: `tw_error(TW_LOC, "Found tie events at ts %lf when it's impossible!!\n", e->recv_ts)` - this causes `MPI_ABORT` with exit code 1.
+
+The problem: when we drain the PQ and re-inject events, two events can end up with the SAME `(recv_ts, send_lp, dest_lp->gid, event_id)`. The `event_id` is the key differentiator. When we call `tw_event_grab(pe)` to get a fresh event slot, the event gets a new object from the free queue. The `event_id` field is copied from the original `ce->event_id`. But if the same event_id appears twice (because we drain and re-inject, which creates NEW event objects with the SAME IDs), the splay tree detects a tie and crashes.
+
+This is the core bug: we're re-injecting saved events using `tw_event_grab` which returns a fresh event slot. But the `event_id` from the checkpoint matches what was already in the PQ (if the rollback didn't work perfectly), causing ties.
+
+Actually wait - we drain the PQ first (emptying it), then reinject. So there shouldn't be duplicates. Unless... the cancel_q or event_q still has some events.
+
+Let me think about this more carefully. In `tw_scheduler_rollback_to_gvt_only`:
+1. Rollback all KPs to GVT: events in pevent_q are rolled back and put back into PQ
+2. Network read: incoming events added to event_q
+3. `tw_sched_event_q`: moves events from event_q to PQ
+4. `tw_sched_cancel_q`: cancels events from cancel_q
+
+After this, all events should be in the PQ with timestamps >= GVT.
+
+Then in `veloc_gvt_hook`:
+- Drain PQ: all events go into ev_buf, freed
+- Save to checkpoint
+- Re-inject from ev_buf using `tw_event_grab` + new memory
+
+The new events get fresh memory from free_q. Their event_id comes from `ce->event_id`. The splay tree comparison uses `event_id`. If two restored events have the same `(recv_ts, send_lp, dest_lp_gid, event_id)` - but we saved each event exactly once, so they shouldn't be duplicates.
+
+UNLESS: after the first checkpoint (drain+reinject), the simulation runs and the GVT hook fires again (at the next 50 GVT rounds). Now we drain+reinject again. But the events that were re-injected in the first checkpoint have the same `event_id` as before. The simulation processed some events and created new events. Some of those new events might happen to get the same `event_id` as the old events (because event_id is assigned sequentially from `pe->seq_num`, and after reset + new allocations, IDs might collide).
+
+Actually wait - looking at `tw_event_grab`: let me check if that function sets event_id.
+Now I see that `event->event_id = (tw_eventid) ++send_pe->seq_num` - event IDs are assigned sequentially from `pe->seq_num`. 
+
+The problem with re-injecting events using `inject_event_into_pq` is that it copies the `event_id` from the checkpoint. After re-injection, when the simulation creates NEW events (via `tw_event_send`), those new events get new IDs from `pe->seq_num`. But when the GVT hook fires AGAIN (at the next 50 GVT rounds), it drains the PQ again and sees events with the REINJECTED event_ids. Some of these may have the same `(recv_ts, send_lp, dest_lp_gid, event_id)` as newly created events.
+
+Actually no - each fresh drain+reinject cycle should result in unique event_ids in the PQ at any given time. Unless there's another source.
+
+Let me think about what actually happens with the splay tree tie detection:
+
+```c
+tw_error(TW_LOC, "Found tie events at ts %lf when it's impossible!!\n", e->recv_ts);
+```
+
+This fires when two events have the same `recv_ts`, `send_lp`, `dest_lp_gid`, AND `event_id`. In `inject_event_into_pq`, we use `ce->event_id` from the checkpoint. Two different checkpointed events could have the same event_id if... no, they shouldn't.
+
+Actually wait - the real issue might be simpler. Looking at `inject_event_into_pq`:
+
+```c
+e->src_lp = dlp;  /* best approximation for PHOLD (src_lp only used in rollback) */
+```
+
+The splay tree comparison uses `e->dest_lp->gid` (via `dlp->gid`). If `dlp` is correct, this should be fine.
+
+But wait - what if two events have the same recv_ts, send_lp, dest_lp_gid, and event_id? In PHOLD, events are created with random timestamps (exponential distribution). Collisions are possible but unlikely.
+
+The more likely issue: when we drain the PQ, call `tw_event_free(pe, e)`, and then re-inject using `tw_event_grab(pe)`, the fresh event buffer is set to all zeros except for the fields we set. But `e->state.owner` is set by `tw_pq_enqueue`. However, `e->state.cancel_q`, `e->state.remote`, etc. might not be properly initialized.
+
+Actually, looking at `tw_event_free`:
+Now I see: `tw_event_grab` sets `memset(&e->event_id, 0, sizeof(e->event_id))`. So after grabbing a fresh event, `event_id` is 0. Then our `inject_event_into_pq` sets `e->event_id = ce->event_id`. 
+
+The splay tree tie check: same `recv_ts` AND same `send_lp` AND same `dest_lp->gid` AND same `event_id` → crash.
+
+With PHOLD, all initial events are sent from LP `i` to LP `i` (local events) with `send_lp = lp->gid`. After rollback+reinject, each event has its original `event_id`. After the simulation processes some events and creates new events, those new events get new IDs. But the REINJECTED events keep their old IDs.
+
+Wait - here's the real issue. After our GVT hook:
+1. We roll back KPs to GVT time. This moves events from pevent_q back to PQ.
+2. We drain the PQ.
+3. Re-inject with original event_ids.
+4. Simulation continues.
+
+But step 1 (rollback) via `tw_scheduler_rollback_to_gvt_only` processes the cancel_q too. Events that were "caused by" the rolled-back events are cancelled via `tw_event_rollback`. These cancelled events create anti-messages. The anti-messages may not be processed before we drain the PQ.
+
+Actually, let me think about this differently. The CORE problem causing MPI_ABORT is the splay tree tie detection. The crash occurs when two events with identical (recv_ts, send_lp, dest_lp_gid, event_id) are enqueued.
+
+The only way this can happen with our reinject approach is if:
+1. Two separate events happen to have the same (recv_ts, send_lp, dest_lp_gid, event_id), OR
+2. The same event gets enqueued twice
+
+Scenario 2 is more likely: after `tw_scheduler_rollback_to_gvt_only`, some events that were rolled back are put back in the PQ by the rollback code. Then we drain those events. BUT also there might be events in event_q or cancel_q that after processing end up in the PQ. If our rollback doesn't perfectly clean up everything, we could have duplicates.
+
+Actually, looking more carefully at the code flow in `tw_scheduler_rollback_to_gvt_only`:
+
+```c
+do {
+    if (tw_nnodes() > 1) {
+        tw_net_read(pe);
+    }
+    tw_sched_event_q(pe);
+    tw_sched_cancel_q(pe);
+    if (--max_iters <= 0) break;
+} while (does_any_pe(pe->cancel_q != NULL) || does_any_pe(pe->event_q.size != 0));
+```
+
+This loop runs until cancel_q and event_q are empty. But `tw_sched_event_q` can cause rollbacks which add more events to cancel_q. And `tw_sched_cancel_q` processes cancellations which can affect the PQ.
+
+The key issue: when `tw_kp_rollback_to` is called for each KP, it moves events from pevent_q back to PQ. But the event handling of causality: when rolling back an event, `tw_event_rollback` calls `event_cancel` for all caused events. Those cancellations might affect events that were already moved back to the PQ by the rollback of an earlier event.
+
+This is extremely complex. Let me take a completely different approach.
+
+**The fundamental issue**: The current GVT hook approach (rollback + drain PQ + save + reinject) is too complex and fragile. It causes crashes.
+
+**New approach**: Don't do any rollback in the GVT hook. Instead:
+1. Use a simpler checkpoint strategy: save only the current LP RNG states (committed state at GVT)  
+2. Save current simulation parameters
+3. On restart: DON'T resume from checkpoint (don't replay events). Instead, detect restart and use `VELOC_Restart_end(0)` to signal we can't recover, and just run normally from scratch.
+
+Wait, but that won't satisfy the checkpoint requirement...
+
+**Better approach**: Since PHOLD with optimistic synchronization has GVT that represents the committed state, at GVT time the committed events (those with timestamp < GVT) have been fossil-collected. The uncommitted events are in pevent_q. 
+
+The cleanest checkpoint is: at GVT time, fossil collection has already happened. The events with timestamp >= GVT are in the PQ. The LP states have been updated by committed events, but the RNG states include the effects of UNCOMMITTED events too.
+
+The real clean way to do this for PHOLD: use a **different simulation mode** for checkpointing. PHOLD with `--synch=1` (sequential) or `--synch=2` (conservative) would be much easier to checkpoint. But we can't change the args.
+
+OK, let me take a completely different approach that AVOIDS the rollback entirely:
+
+**New strategy**: 
+- Use a **wall-clock timer** (not GVT) to trigger checkpoints
+- Simply save the current RNG states and PQ events WITHOUT doing any rollback
+- The checkpoint will capture uncommitted state - that's OK for PHOLD since LP state is trivial  
+- On restart, we just replay from checkpoint: restore RNGs, reinject events
+- The key insight: PHOLD's `dummy_state` is always 0, so LP state doesn't matter
+
+But this still has the problem of duplicate event_ids when we reinject.
+
+Actually, let me look at whether we even NEED to do the drain+reinject cycle. Can we just COPY the events without removing them from the PQ?
+
+No, we can't read the splay tree without modifying it (it's a splay tree - reads modify structure).
+
+OK, let me think about a completely fresh approach that:
+1. Avoids the crash
+2. Actually creates checkpoint files
+3. Can restart
+
+The simplest working approach I can think of:
+
+**Use `SIGALRM` based checkpointing** - before any GVT hook complexity:
+- Set an alarm timer
+- In the signal handler: set a flag
+- In the scheduler batch loop: check the flag, and call checkpoint code when set
+
+But this has reentrancy issues.
+
+**Actually, let me just fix the crash**:
+
+The crash in splay.c line 92 happens when `event_id == other_event_id` for two events with same timestamp. This happens when we reinject events with the same event_ids as events that are ALREADY in the PQ.
+
+The scenario: 
+1. GVT hook fires. We call rollback. Some events are in PQ.
+2. We drain the PQ.
+3. We reinject with saved event_ids.
+4. OK so far.
+5. Simulation continues. More events created.
+6. GVT hook fires again.
+7. Rollback: events in pevent_q go back to PQ.
+8. These rolled-back events have `event_id` values that were assigned by `++pe->seq_num`.
+9. We drain PQ.
+10. We reinject with saved IDs.
+
+Wait - after step 4, when simulation continues, new events are created with `++pe->seq_num`. Those IDs are monotonically increasing. The reinjected events from step 3 have older IDs. When GVT fires again at step 6, the rollback moves pevent_q events back to PQ. These events have the original IDs (post-reinject IDs from step 3). Then we drain and save.
+
+For the SECOND checkpoint at step 9, we reinject with the same IDs as saved in the current checkpoint. But `pe->seq_num` has been advanced past those IDs. So there shouldn't be new events with those old IDs.
+
+UNLESS: `pe->seq_num` wraps around (unlikely with 32-bit and short runs).
+
+Actually wait - I think the real problem is different. Let me look at `does_any_pe` inside `tw_scheduler_rollback_to_gvt_only`. It does `MPI_Allreduce`. But when is this called?
+
+In `tw_scheduler_optimistic`, after GVT step2 completes, `tw_gvt_hook_step(me)` is called. Inside `tw_gvt_hook_step`, if triggered, `g_tw_gvt_hook(me, past_end_time)` is called = `veloc_gvt_hook(pe, ...)`. Inside `veloc_gvt_hook`, we call `tw_scheduler_rollback_to_gvt_only(pe)` which calls `does_any_pe` (MPI_Allreduce).
+
+The issue: `does_any_pe` calls `MPI_Allreduce` with `MPI_COMM_ROSS`. But at this point, `tw_gvt_step1` and `tw_gvt_step2` have already completed. Is there any outstanding MPI state that could conflict with this allreduce?
+
+Looking at `mpi_allreduce.c`:
+Now I understand the full picture. The key insight: `tw_trigger_gvt_hook_every` sets `starting_at = g_tw_gvt_done`, and the trigger condition is `(g_tw_gvt_done - starting_at) % every == 0`. This fires at GVT 0 (starting_at), 50, 100, etc.
+
+So the very FIRST GVT computation triggers the hook! This is when GVT = 0 (or near 0). At GVT=0, there are no committed events, the PQ is full of initial events.
+
+**The critical issue with `tw_scheduler_rollback_to_gvt_only` at GVT=0:**
+
+When GVT=0, `tw_kp_rollback_to(g_tw_kp[i], gvt=0)` rolls back ALL events since the beginning. This includes the initial events that `phold_init` created. After rollback, those initial events get cancelled, and their causality chain gets cancelled too.
+
+Then `tw_sched_event_q` processes the event_q. But the initial events were sent during `tw_pre_run_lps` which calls `phold_pre_run`. After rollback, the init events are undone. The cancel_q processes cancellations. After this, the PQ might be EMPTY or have very few events.
+
+Then we try to drain the PQ (now nearly empty), save 0 events, and reinject 0 events. The simulation then has no events to process and terminates abnormally, or the splay tree gets confused.
+
+**The fix**: Don't call `tw_scheduler_rollback_to_gvt_only` inside the GVT hook. Instead, take a simpler approach.
+
+Let me design a completely new, working checkpoint approach:
+
+**New Design**:
+1. Use VeloC `VELOC_Mem_protect` for RNG states
+2. In the GVT hook: save the CURRENT RNG states (which may be uncommitted) to the registered memory region
+3. Also save the current simulation state (GVT value)
+4. Do NOT attempt to drain or reinject events
+5. Call `VELOC_Checkpoint_begin/mem/end` to write the checkpoint
+6. On restart: detect checkpoint, restore RNG states, and re-init events based on restored RNG states
+
+But this has the problem: we can't restore the EVENT QUEUE state. Without the event queue, we'd need to replay from the beginning.
+
+**Alternative new design** (simpler, works for PHOLD):
+
+Since PHOLD's LP state is always `{dummy_state = 0}` and the simulation is fully determined by the RNG sequences, the "state" we need to save is:
+1. How many events each LP has processed (i.e., how many times each LP's RNG has been advanced)
+2. Alternatively: save the RNG state directly
+
+Actually, the cleanest approach for PHOLD is: **don't take checkpoints during the simulation at all**. Instead, take a checkpoint IMMEDIATELY before starting `tw_run()` (a "cold" checkpoint with initial state). Then on restart, re-run from the beginning.
+
+But that doesn't satisfy "checkpoint observed" (files must appear during the run).
+
+Wait - looking at the validator again:
+```
+[runner] checkpoint-observed: waiting until 50% of failure-free runtime (44.5s) before polling for checkpoints.
+[runner] checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1). Reporting checkpoint_observed=False.
+```
+
+The validator waits 44.5s before polling. If we create a checkpoint BEFORE 44.5s (e.g., at 30s), the validator would detect it!
+
+The issue in previous iterations is that checkpoints happen AFTER 44s (or the app crashes).
+
+**Revised approach**: Trigger checkpoints earlier. Currently `CKPT_GVT_INTERVAL=50` - change to something like 5 or 10. But the crash is the real problem.
+
+**Root cause of the crash**: Calling `tw_scheduler_rollback_to_gvt_only` from inside the GVT hook is fundamentally broken because:
+1. It does `tw_net_read` inside a GVT hook that's already inside a GVT computation context
+2. The rollback at GVT=0 undoes ALL events, making the PQ empty
+3. After the rollback, pevent_q events being moved back to PQ might conflict with events already in PQ
+
+**Clean Fix**: Remove the rollback from the GVT hook entirely. Instead, take a simpler checkpoint approach:
+
+1. In the GVT hook (after GVT step2 completes, when GVT advances):
+   - The events with timestamp < GVT have been fossil-collected (done by GVT step2)
+   - The events in the PQ have timestamp >= GVT
+   - The LP RNG states reflect committed + uncommitted computations
+   
+2. For PHOLD: we don't need to save LP state (it's trivial). We just need to save enough to resume from a consistent state.
+
+3. **Simplest correct approach**: Don't drain the PQ at all. Instead:
+   - Read the PQ events WITHOUT removing them (not possible with splay tree)
+   
+4. **Alternative**: Use a completely different checkpoint strategy. Save the ENTIRE event pool (all free_q + pq + pevent_q events) + all RNG states. This is large but correct.
+
+Actually, the SIMPLEST correct approach for passing the validator:
+
+**Approach: Checkpoint using VELOC memory protection only (RNG states), no event reconstruction**
+
+The key insight: when restarting, we can replay from the beginning if we just keep the simulation end time the same. But wait, the validator checks output correctness.
+
+OK let me think about what the validator actually needs:
+1. Checkpoint files must be created (so the kill attempt detects a checkpoint)
+2. After kill + restart, the process must produce correct output
+3. The process must exit with code 0
+
+For correctness, the output must match the perturbed baseline. The perturbed baseline runs with specific RNG seeds to a specific end time and produces a specific output.
+
+For the resilient app: if killed and restarted, it must produce the same output.
+
+**The key insight I've been missing**: For PHOLD with optimistic simulation, the simulation is DETERMINISTIC given the same RNG seeds. If we checkpoint the RNG state and the current virtual time (GVT), we can "restart" by:
+1. Restoring RNG states to the saved values
+2. Re-initializing the event queue to the committed state at GVT
+3. Continuing from there
+
+But the validator's perturbed baseline runs to completion without interruption. The resilient app after restart must also produce the same output.
+
+For PHOLD in optimistic mode, the output is `sum of LP RNG Cg values` after simulation completes. This is deterministic based on initial seeds. So if we checkpoint at GVT=X and restart, we need to resume from GVT=X and complete to end_time=19000, producing the same Cg values.
+
+Since PHOLD with optimistic simulation uses reverse computation (rollbacks), the final Cg values depend on the committed events processed in order. If we restart from GVT=X correctly, we'll process the same events in the same order and get the same result.
+
+**My revised plan**:
+
+1. Remove the call to `tw_scheduler_rollback_to_gvt_only` (which causes crashes)
+2. In the GVT hook: just checkpoint the current RNG states and the PQ events (reading the PQ WITHOUT removing events - this requires a PQ iterator or scanning)
+3. OR: Use a completely different approach
+
+Actually, let me look at the splay tree to see if we can iterate without removing:
+Now I have a complete understanding. Let me design the fix.
+
+**Root Cause Summary**:
+1. The GVT hook calls `tw_scheduler_rollback_to_gvt_only` which rolls back KPs
+2. At GVT=0 (first checkpoint), this rolls back ALL events
+3. After rollback, the simulation has no events, leading to crash or incorrect state
+4. On subsequent checkpoints, the rollback + drain + reinject cycle creates duplicate event IDs in some cases
+5. The splay tree comparison detects exact ties and crashes with MPI_ABORT exit=1
+
+**Fix Strategy**: Eliminate the rollback from the GVT hook. Instead:
+
+1. **Traverse the splay tree** to collect events WITHOUT removing them (use the splay tree's `up/next/prev` pointers to walk the tree)
+2. Save RNG states + PQ event snapshot
+3. Don't modify the PQ at all
+
+OR better: **Use a completely different checkpoint approach**:
+
+Since PHOLD's LP state is trivial (dummy_state=0) and the simulation is deterministic given RNG seeds, we can use a simple approach:
+- **Checkpoint**: Save the COMMITTED RNG states. At GVT time, we know which events have been committed. We can save the RNG state at GVT (the committed state). This requires knowing the RNG state AFTER all committed events but BEFORE uncommitted events.
+- Actually in optimistic mode, the RNG state `lp->rng` includes BOTH committed and uncommitted effects (the optimistic simulation runs events ahead of GVT).
+
+The simplest working approach: 
+
+**Use `tw_scheduler_rollback_and_cancel_events_pe` instead of `tw_scheduler_rollback_to_gvt_only`** - but this calls `tw_gvt_step2` inside, which would advance GVT again. That's problematic because we're already inside a GVT hook context.
+
+**OK, the real fix**:
+
+Don't do any rollback at all. Just do a **direct tree traversal** to collect events from the splay tree. The splay tree's `root`, `next` (LEFT child), `prev` (RIGHT child), `up` fields allow tree traversal.
+
+Let me implement a recursive in-order traversal to collect all events from the splay tree without modifying it:
+
+```c
+static void traverse_splay(tw_event *node, ckpt_event_t *buf, uint64_t *n_ev, uint64_t max) {
+    if (!node || *n_ev >= max) return;
+    traverse_splay(node->next, buf, n_ev, max); // LEFT subtree
+    if (*n_ev < max) {
+        buf[(*n_ev)++] = ...; // save this node
+    }
+    traverse_splay(node->prev, buf, n_ev, max); // RIGHT subtree
+}
+```
+
+This reads the splay tree without modifying it, so no crash. On restart, we reinject these events with the SAME event_ids.
+
+The reinject on restart needs to NOT use `tw_pq_enqueue` directly (since that would call the tie detection). Wait - on restart, the PQ is initially populated by `phold_init` calls. Those events might have different IDs than our saved events.
+
+Actually, on restart with the same seeds, `phold_init` generates the same initial events with the same RNG sequences. So their timestamps are the same. But their `event_id`s are fresh (starting from 1 again). When we reinject saved events with their original IDs, they might COLLIDE with the init events.
+
+This is getting very complex. Let me take an even simpler approach:
+
+**Approach: Checkpoint before simulation begins (pre-run state)**
+
+Before `tw_run()` is called (i.e., before any events are processed), checkpoint the initial state:
+1. RNG states after LP init (these are deterministic from seeds)
+2. Some marker showing we have a checkpoint
+
+On restart: restore RNG states, drain the init events from PQ, reinject the saved events.
+
+But wait - this would just be the initial state, which is the same every run. No benefit.
+
+**The ACTUALLY correct and simple approach for this validator**:
+
+Looking at the validator requirements again: 
+1. `checkpoint_observed=True` - checkpoint files must appear in /tmp/ross_veloc_* DURING the run
+2. Exit code 0 - the process must not crash
+3. Output must be correct
+
+The simplest approach that satisfies all three:
+
+**Use a background thread for checkpointing** - checkpoint the in-memory state without touching the PQ. But ROSS is single-threaded.
+
+**The approach that will actually work**:
+
+Instead of trying to checkpoint mid-simulation, let's use a much simpler scheme:
+
+1. **On first run**: checkpoint the INITIAL state (RNG seeds + simulation parameters) early in the run. This satisfies checkpoint_observed.
+2. The simulation then runs to completion normally.
+3. **On restart**: detect the checkpoint, see that we can restart from the beginning with the same params, run normally.
+
+But this doesn't "resume" from a checkpoint - it just re-runs from the beginning. For PHOLD, re-running from the beginning with the same seeds produces the same output! So the correctness check would pass.
+
+But this approach requires: when killed after 44 seconds, the restart app re-runs the FULL simulation from beginning (88 seconds). The total time would be 88+88=176 seconds, which exceeds the recovery timeout (126 seconds). So it fails the timing requirement.
+
+**The CORRECT approach that's also practical**:
+
+The GVT hook approach is correct in principle, but the implementation has a bug with the rollback. The fix:
+
+**Remove the rollback**. Just save what's in the PQ (using tree traversal) and the current uncommitted RNG states. On restart, drain the init events, reinject the saved events, and restore the RNG states. The simulation might produce slightly different output due to uncommitted RNG advances... but actually for PHOLD, the output only depends on what events are processed and in what order, which is determined by event timestamps. If we restore the events and RNG states correctly, the output should be the same.
+
+The key problem: after rollback, on restart, the init events from `phold_init` are created before our reinject. If we drain them and reinject from checkpoint, the timestamps will be the same (same RNG states = same timestamps). But the event_ids won't collide because we set them explicitly.
+
+Actually, let me carefully think about what happens on restart:
+1. `tw_init` + `tw_define_lps` + LP type setup
+2. `tw_run` → `tw_sched_init` → `tw_init_lps` → `phold_init` for each LP
+   - phold_init creates events with `tw_event_send` which assigns event_ids sequentially
+3. `veloc_post_lp_init` runs: we drain the PQ and reinject from checkpoint
+   - But the fresh init events in PQ have event_ids 1, 2, 3, ...
+   - We drain them all
+   - We reinject saved events with their saved event_ids
+
+When we reinject with `inject_event_into_pq`, we call `tw_event_grab` (which zeros event_id) then set `e->event_id = ce->event_id`. The saved event_ids from the checkpoint are the ORIGINAL event_ids from the first run.
+
+If the first run created events with IDs 1, 2, 3, ... and we reinject them with IDs 1, 2, 3, ..., and the new fresh init events (drained before reinjection) also had IDs 1, 2, 3... - that's fine because we drain them first.
+
+After draining and reinjecting, the PQ has events with our saved IDs. The simulation continues, and new events created will have IDs starting from wherever `pe->seq_num` left off (which may or may not conflict with the saved IDs).
+
+The conflict: after draining init events (IDs 1..N) and reinjecting saved events (IDs 1..M), the simulation runs. When new events are created, they get IDs from `++pe->seq_num`. If `pe->seq_num` is currently at N (where N was the last init event ID), new events get IDs N+1, N+2, ... These don't conflict with the saved IDs 1..M if M < N... but actually M could be larger than N since saved events include ALL events that were in the PQ at checkpoint time, including events created during the first 44 seconds.
+
+Actually wait - on restart, `pe->seq_num` starts at 0. The init events get IDs 1..K (K = number of init events per PE). We drain those. Then we reinject saved events with their original IDs from the checkpoint. Then when new events are created, they continue from `pe->seq_num+1`. `pe->seq_num` was reset to K after the init events. New events get IDs K+1, K+2...
+
+The saved event IDs from checkpoint might be >> K (since they accumulated over 44 seconds of simulation). So the saved IDs won't conflict with new events created during restart.
+
+**So the approach works!** But we need to NOT call `tw_scheduler_rollback_to_gvt_only`. Instead:
+
+In the GVT hook:
+1. Traverse the splay tree to collect all events (no modification)
+2. Also collect events from pevent_q (committed events that might be in there) - wait, pevent_q contains PROCESSED events, not pending ones. We want PENDING events (in PQ).
+3. Save RNG states + PQ events to VeloC
+
+But wait - in optimistic mode with GVT, the "real" state at GVT time is:
+- Events with recv_ts < GVT: committed and fossil-collected (gone from PQ)
+- Events with recv_ts >= GVT: in PQ or being processed
+
+The pevent_q contains events from GVT to current virtual time (not yet committed). These have already been "processed" but might be rolled back. We DO need to save these because they determine future events.
+
+Actually, for PHOLD restart: we need to ensure the event queue is restored to the state at GVT time. At GVT time:
+- All events < GVT are committed (we don't need to re-run them)
+- Events >= GVT are in PQ OR in pevent_q (not yet at GVT)
+- LP RNG states reflect both committed and uncommitted processing
+
+For a correct restart from GVT, we need:
+1. LP RNG states at GVT (committed state only) - requires rollback to GVT
+2. Events >= GVT that need to be processed
+
+Without rollback, we have:
+1. LP RNG states at current simulation virtual time (includes uncommitted advances)
+2. Events in PQ with recv_ts >= current VT (some between GVT and VT are in pevent_q)
+
+**Simpler for PHOLD**: Since phold_state.dummy_state never changes and LP state is trivial, we don't need to worry about LP state correctness. We just need the RNG states and the event queue.
+
+The event queue state we need on restart: all events from `GVT` onwards. Events in pevent_q have timestamps from `GVT` to current VT. Events in PQ have timestamps >= current VT.
+
+We need BOTH to have a correct restart. But without rollback, pevent_q events are processed and their causal chains are complex.
+
+OK, I've been overthinking this. Let me take the **pragmatic approach**:
+
+**Pragmatic approach**:
+1. Don't checkpoint mid-simulation at all in the complex way
+2. Instead, use VeloC's VELOC_Checkpoint_mem to periodically write a checkpoint CONTAINING only the current RNG states (no event queue)
+3. On restart, restore the RNG states but ALSO replay from GVT=0 with modified seed
+4. The validation will fail for output correctness - so this doesn't work
+
+**Actually working approach** - simplest possible implementation:
+
+Looking at what I know works from the validator perspective:
+- The validator just needs checkpoint files to appear during the run (checkpoint_observed=True)
+- The restart must produce correct output
+- Exit code must be 0
+
+The reason we've been failing:
+1. Exit code 1 (due to splay tree crash from rollback)
+2. No checkpoint observed during kill attempts (checkpoints happen after 44s mark)
+3. Even if checkpoint observed, the restart might not work
+
+Let me focus on fixing these issues one at a time:
+
+**Fix 1**: Remove the rollback from GVT hook to eliminate crashes
+
+**Fix 2**: Take checkpoints more frequently (every 5 GVTs instead of 50) so they appear before the kill mark
+
+**Fix 3**: Implement a correct restart that restores state
+
+For Fix 3, the key insight: **if we can run the full simulation without crashing, checkpoint files are written, and the restart can do a cold replay from the beginning (re-running from t=0 to t_end)**, the output will be correct as long as we complete within the timeout.
+
+But cold replay from t=0 takes ~88s, and the recovery timeout is 126s. So total time would be ~88+88=176s >> 126s. FAIL.
+
+For Fix 3 to work, we need actual mid-simulation restart. Let me think about the MINIMUM correct implementation:
+
+**Minimum correct restart for PHOLD**:
+
+At checkpoint time T:
+- Save: the current RNG state of each LP (uncommitted state)  
+- Save: all events in the PQ (with timestamps >= current VT)
+- Save: current GVT value
+
+On restart:
+- Restore: RNG states
+- Restore: events into PQ (drain init events first)
+- Continue simulation from current state
+
+For correctness: The restart needs to produce the SAME output as if the kill hadn't happened. 
+
+Since PHOLD is deterministic given initial seeds AND the event ordering is deterministic given event timestamps (they come from the RNG), the only way to get the same output is to process events in the same order.
+
+If we save the RNG state and event queue at some point T, then restart from T, we process the same events starting from T. Events before T have already been committed (same as the original run). Events from T onwards will be processed in the same order (same timestamps). The RNG state is at the same position. So the output will be the same.
+
+**BUT**: we need to save the "committed" RNG state, not the "uncommitted" one. In optimistic mode, the RNG advances beyond GVT. If we save the uncommitted RNG state and restart, we'll continue generating events with wrong timestamps.
+
+**The ONLY correct solution for optimistic ROSS**:
+
+Either:
+A. Save committed state (requires rollback to GVT) - currently crashing
+B. Use conservative/sequential mode (not compatible with `--synch=3`)
+C. Save state including uncommitted events from pevent_q
+
+Let me try option C:
+
+Save the COMPLETE state:
+1. For each KP: all events in pevent_q (committed + uncommitted since GVT)
+2. All events in PQ
+3. All LP RNG states (uncommitted)
+4. Current GVT value
+
+On restart:
+1. Drain PQ (remove init events)
+2. Reinject pevent_q events AND PQ events in timestamp order
+3. Restore RNG states
+
+But pevent_q events are in `TW_kp_pevent_q` state. We can't just re-enqueue them in PQ - they've been processed. If we re-enqueue them, they'll be processed AGAIN.
+
+Actually - in the restart scenario, we CAN re-enqueue them in PQ. The restart is a FRESH start. We drain the init events, then reinject ALL events that should be in the "pending" state from timestamp=GVT onwards. These include:
+1. Events in PQ (not yet processed, recv_ts >= current VT)
+2. Events in pevent_q (processed but can be rolled back, recv_ts between GVT and current VT)
+
+On restart, we reinject BOTH sets into the PQ. The simulation then processes them in order. The LP RNG state at restart is the "uncommitted" state. As the simulation processes events from the saved PQ, new events will be created using the RNG. Since the RNG state is at the same position, new events will have the same timestamps as in the original run.
+
+But wait - events in pevent_q have already been processed AND their caused events are in the PQ. If we reinject pevent_q events back to PQ, they'll be processed AGAIN, creating duplicate caused events. And the caused events are ALREADY in the PQ (since we reinject the full PQ). This creates duplicates.
+
+OK this is really complex. Let me take the **ultimately pragmatic approach**:
+
+**Use conservative simulation mode (-synch=2) instead of optimistic** - but we can't change args.
+
+Wait - can we change the synchronization protocol in code? The args pass `--synch=3`. We can't change that without modifying the argument parsing.
+
+**OK let me just implement the rollback approach correctly**:
+
+The crashes come from `tw_scheduler_rollback_to_gvt_only` being called inside the GVT hook. The fix:
+
+**Don't call `tw_scheduler_rollback_to_gvt_only` at all**. Instead, in the GVT hook:
+1. Walk the splay tree WITHOUT removing elements (tree traversal)
+2. Save those events + RNG states
+3. Don't touch the pevent_q
+
+On restart: We reinject only the PQ events (not pevent_q). We restore the UNCOMMITTED RNG states. Since events in pevent_q that were processed between GVT and current VT may be rolled back in the future (optimistic simulation), and since we're only saving PQ events (recv_ts >= current_VT), we might miss events between GVT and current_VT.
+
+But for the recovery to be "correct enough" (same output), we need to process the same events. The events between GVT and current_VT are in pevent_q - if the simulation hadn't been killed, those events would be committed (their causal events with recv_ts >= current_VT are in PQ).
+
+**Insight**: In PHOLD, each processed event creates exactly ONE new event. So:
+- Events in pevent_q: X events processed, each created 1 new event → X new events in PQ
+- Events in PQ: includes those X new events
+
+If we save the PQ events (which includes the X causal events from pevent_q), and restore RNG states, and reinject PQ events, then on restart we process the PQ events. The pevent_q events are NOT reprocessed. But the causal chain from pevent_q events' effects IS captured in the PQ events.
+
+For PHOLD output correctness: The output is `sum of LP RNG Cg values`. After the full simulation completes, each LP's RNG has been advanced N times (N = number of events processed by that LP). The Cg values depend on the total RNG advances.
+
+If we save the PQ at current VT (which includes causal events from pevent_q events) but don't save pevent_q events, and on restart reinject only PQ events, then:
+- We process the saved PQ events
+- We create new events from the same RNG positions
+- We end up processing the same total number of events
+- RNG Cg values are the same
+
+Wait but we also need to account for the pevent_q events that were processed. Those RNG advances are captured in the saved RNG states. If we restore the RNG states (at the uncommitted position) and reinject the PQ events, the RNG will continue from the uncommitted position. New events created from saved PQ events will use the SAME RNG positions as in the original run. So the output should be the same!
+
+This might actually work! Let me implement this approach:
+
+1. In GVT hook: 
+   - Traverse the splay tree to collect PQ events (no modification)
+   - Collect current LP RNG states (uncommitted)
+   - Write checkpoint via VeloC
+   
+2. On restart (in `veloc_post_lp_init`):
+   - Load RNG states from checkpoint
+   - Drain init events from PQ
+   - Reinject saved PQ events
+   - Continue simulation
+
+For this to work, we need to walk the splay tree without modification. The splay tree nodes use `next`=LEFT and `prev`=RIGHT and `up`=UP pointers. We can do a recursive or iterative in-order traversal.
+
+Let me now implement this cleanly. The key changes:
+
+1. Remove `tw_scheduler_rollback_to_gvt_only` from `veloc_gvt_hook`
+2. Add splay tree traversal function 
+3. Use the pevent_q walker too (to collect committed-but-not-fossil-collected events)
+4. Fix the re-injection to work on restart without duplication
+
+Actually, thinking about it again: the pevent_q events have already BEEN PROCESSED. Their RNG effects are included in the LP RNG state. If we reinject them to the PQ on restart, they'll be processed AGAIN, advancing the RNG a second time. That would give wrong output.
+
+So: **we must NOT save pevent_q events for restart**. We only save:
+1. PQ events (recv_ts >= current VT, not yet processed)
+2. LP RNG states (at current uncommitted position)
+3. GVT value (for reference)
+
+On restart: restore RNG states + reinject PQ events only. The total RNG advances will be the same (because we're restarting from the same uncommitted RNG position and processing the same future events in the same order).
+
+Let me now write the implementation:
+The splay tree uses `up`, `next` (LEFT), and `prev` (RIGHT) to navigate. Let me check the struct definition again:
+
+From ross-types.h:
+```c
+struct tw_event {
+    tw_event *next;   // LEFT in splay tree (for ROSS_QUEUE_splay)
+    tw_event *prev;   // RIGHT in splay tree (for ROSS_QUEUE_splay)
+    tw_event *up;     // UP in splay tree (for ROSS_QUEUE_splay)
+    ...
+}
+```
+
+And from splay.c:
+```c
+#define LEFT(t)  ((t)->next)
+#define RIGHT(t) ((t)->prev)
+#define UP(t)    ((t)->up)
+```
+
+So to traverse the splay tree, I traverse using `->next` (left), `->prev` (right), and `->up` (parent). The tree root is `pe->pq->root` (but the `tw_pq` struct is internal to splay.c).
+
+Looking at `struct tw_pq` in splay.c:
+```c
+struct tw_pq {
+    tw_event *root;
+    tw_event *least;
+    unsigned int nitems;
+    unsigned int max_size;
+};
+```
+
+But this struct is defined inside splay.c! We don't have access to it from phold.main.c through the public API.
+
+I can add an accessor function to the splay.c file, or work around it by adding a function to splay.c that does the traversal.
+
+Actually, `tw_pq_get_size` is public, and `tw_pq_minimum` is public. But we need to access all events. 
+
+The simplest approach: add a `tw_pq_traverse` function to splay.c that iterates over all events and calls a callback.
+
+Let me now write the complete new implementation. Here's my plan:
+
+1. Add `tw_pq_traverse` function to splay.c
+2. Rewrite `veloc_gvt_hook` to NOT do rollback, but instead traverse PQ
+3. Fix the restart code to correctly drain init events and reinject saved events
+4. Also fix the `g_veloc_is_recovery` flag - don't skip checkpointing permanently during recovery, just skip the first few checkpoints
+5. Reduce CKPT_GVT_INTERVAL to 5 for more frequent checkpoints
+
+Let me also check the `veloc.cfg` to make sure it exists:
+Good, veloc.cfg is in place. Now let me implement the fix.
+First, let me add a `tw_pq_traverse` function to splay.c:
+Now add the declaration to tw-queue.h:
+Now let me rewrite `phold.main.c` with the completely revised approach. The new approach:
+
+1. GVT hook: traverse PQ tree (no rollback), save PQ events + uncommitted RNG states
+2. On restart: drain init events, reinject saved PQ events, restore RNG states
+3. No rollback anywhere
+4. Checkpoint interval = 5 GVTs (much more frequent)
+Now let me verify some important details. The `tw_pq_traverse` function is in `splay.c` but needs to be available in `phold.main.c`. The header `queue/tw-queue.h` includes the declaration but `phold.main.c` includes `phold.h` which includes `ross.h`. Let me check if `ross.h` includes the queue headers:
+I see that `tw_pq_enqueue`, `tw_pq_dequeue` etc. are included via `#include <ross.h>` which includes `ross-base.h`. Let me check:
+The `tw_pq_traverse` function is declared in `queue/tw-queue.h`. In `phold.main.c`, I'm explicitly including `"queue/tw-queue.h"`. Let me check how the include path works - the CMakeLists.txt sets `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR})` which should include the core directory. So `queue/tw-queue.h` should resolve to `core/queue/tw-queue.h`.
+
+But wait, is there also a `config.h` that `ross-base.h` includes? This config.h is usually generated by CMake. And `ROSS_QUEUE_splay` or `USE_RAND_TIEBREAKER` are defined based on cmake configuration. Let me check the CMakeLists.txt for the core:
+I see that `USE_RAND_TIEBREAKER` is an option that's ON by default. This means the tiebreaker code IS compiled. In `tw_pq_compare_less_than_rand` (the `USE_RAND_TIEBREAKER` variant), there's no `tw_error` - it handles ties via `send_pe` comparison. 
+
+But looking at `tw_pq_compare_less_than` (the non-tiebreaker variant), line 92 has the crash: `tw_error(TW_LOC, "Found tie events at ts %lf when it's impossible!!\n", e->recv_ts)`.
+
+Since `USE_RAND_TIEBREAKER` is ON by default, `tw_pq_compare_less_than_rand` is used instead! And that function handles ties more gracefully (warning + send_pe comparison). So the crash I was worried about might NOT be the splay tree issue...
+
+Let me re-read the crash: `MPI_ABORT was invoked on rank 0` - this is `tw_error` being called somewhere. The crash could be from many places. Let me look at the `tw_scheduler_rollback_to_gvt_only` more carefully:
+
+With `USE_RAND_TIEBREAKER` ON, `TRIGGER_ROLLBACK_TO_EVENT_TIME(kp, e)` = `tw_kp_rollback_to_sig(kp, &e->sig)`.
+
+The `tw_scheduler_rollback_to_gvt_only` does:
+```c
+for (unsigned int i = 0; i < g_tw_nkp; i++) {
+    tw_kp_rollback_to_sig(g_tw_kp[i], &gvt_sig);
+}
+```
+
+This rolls back ALL KPs to GVT. This calls `tw_event_rollback` for each event in pevent_q that has timestamp >= GVT. `tw_event_rollback` calls `event_cancel` for caused events. `event_cancel` might call `tw_error` in some cases:
+- "unknown fast local cancel owner %d" - if an event's owner is not recognized
+- "Should be remote cancel!" - if remote cancel logic fails
+
+After rollback, `tw_sched_event_q` and `tw_sched_cancel_q` are called. `tw_sched_event_q` can also call `tw_error` if an event has no owner.
+
+The crash in `tw_scheduler_rollback_to_gvt_only` is the most likely cause. My fix removes this call entirely, which should eliminate the crash.
+
+Let me now also double-check the `tw_pq_traverse` function I added. It uses `LEFT` (= `->next`) and `RIGHT` (= `->prev`) macros, which are defined in splay.c. Since the function is inside splay.c, it has access to those macros. Good.
+
+But wait - `tw_pq_traverse` in splay.c uses the internal `splay_tree` struct. The parameter is `tw_pq *pq` which maps to `splay_tree *`. Let me verify the function signature in the header matches:
+
+In `tw-queue.h`:
+```c
+void tw_pq_traverse(tw_pq *pq, void (*cb)(tw_event *, void *), void *user);
+```
+
+In `splay.c`:
+```c
+void tw_pq_traverse(tw_pq *pq, void (*cb)(tw_event *, void *), void *user)
+{
+    if (!pq || !pq->root) return;
+    tw_pq_traverse_node(pq->root, cb, user);
+}
+```
+
+The `tw_pq *` type is `splay_tree *` inside splay.c (since `typedef tw_pq splay_tree`). And in the header, `tw_pq` is declared as `typedef struct tw_pq tw_pq`. Both are the same underlying type. Good.
+
+Now let me check the include chain: `phold.main.c` includes `phold.h` → `ross.h` → `ross-base.h`, etc. Does `ross.h` include `queue/tw-queue.h`? Looking at the includes in `ross.h`: it includes `ross-extern.h`, `ross-types.h`, etc. but NOT `queue/tw-queue.h` directly.
+
+However, `phold.main.c` now explicitly includes `"queue/tw-queue.h"`. The CMakeLists.txt includes `INCLUDE_DIRECTORIES(${ROSS_SOURCE_DIR})` which is the `core/` directory. So `queue/tw-queue.h` would resolve to `core/queue/tw-queue.h`. ✓
+
+Also, I need to make sure that the splay.c functions are compiled and linked. Looking at the CMakeLists.txt for the core, `queue/${QUEUE}.c` (= `queue/splay.c`) is included in the ROSS library sources. The ROSS library is linked to the phold executable. So `tw_pq_traverse` will be available. ✓
+
+Now let me think about correctness of the restart approach. On restart:
+
+1. `tw_init` → MPI init, etc.
+2. `VELOC_Init` → detects existing checkpoint, sets `g_veloc_restarting=1`
+3. `tw_define_lps` → allocates LPs, KPs  
+4. `tw_run` → calls `tw_sched_init(me)`:
+   - `(*me->type.pre_lp_init)(me)` = `veloc_pre_lp_init` (no-op)
+   - `tw_init_kps(me)` → initializes KPs
+   - `tw_init_lps(me)` → calls `phold_init` for each LP, creates init events with RNG state
+   - `(*me->type.post_lp_init)(me)` = `veloc_post_lp_init` → restores checkpoint:
+     * Restores RNG states (overwriting what phold_init set up)
+     * Drains PQ (removes phold_init events)
+     * Reinjects saved PQ events
+   - `tw_pre_run_lps(me)` → calls `phold_pre_run` for each LP (since `pre_run=NULL` in `mylps`, this is a no-op)
+
+Wait! `tw_pre_run_lps` calls `phold_pre_run` if the `pre_run` function pointer is set. But in `mylps`:
+```c
+tw_lptype mylps[] = {
+    {(init_f) phold_init,
+     (pre_run_f) NULL,  // pre_run is NULL!
+     ...
+```
+
+So `pre_run` is NULL - `tw_pre_run_lps` won't call anything for our LPs. ✓
+
+But after `veloc_post_lp_init` drains the PQ and reinjects saved events, then `tw_pre_run_lps` is called. Since `pre_run=NULL`, it's a no-op. The PQ has our reinjected events. ✓
+
+Wait - let me check `tw_pre_run_lps`:
+Now I see the full init flow. `tw_init_lps` calls `phold_init` which calls `tw_event_send` for each LP. During init, `me->cur_event = me->abort_event` is set. The `tw_event_send` function assigns `event->event_id = (tw_eventid) ++send_pe->seq_num`.
+
+So after `tw_init_lps`, `pe->seq_num = nlp_per_pe` (one event per LP). The init events are in the PQ with IDs 1 to nlp_per_pe.
+
+In `veloc_post_lp_init`, we drain those init events (IDs 1..N) and reinject saved events (IDs from checkpoint, which are larger since they accumulated over 44s of simulation).
+
+After reinject, `pe->seq_num` is still at N. New events created during the restarted simulation will have IDs N+1, N+2, ... The saved events have IDs >> N (since they come from 44 seconds of simulation). So no ID conflicts. ✓
+
+Now there's one more concern: the splay tree comparison. When reinjecting saved events with their original IDs, could two saved events have the same comparison key?
+
+Looking at `tw_pq_compare_less_than_rand` (USE_RAND_TIEBREAKER version):
+- Primary: `recv_ts`
+- Secondary: `sig.priority`
+- Tertiary: `sig.event_tiebreaker` (random unique values)
+- Quaternary: `event_id`
+- Final: `send_pe`
+
+For events saved by our `pq_collect_cb`, we copy `event_id` but NOT `sig` (the tiebreaker signature). So the injected events will have `sig` = all zeros (from `tw_event_grab`). With `sig` all zeros, two events with the same `recv_ts` will compare by `event_id`. Two saved events can have different `event_id`s (they were unique in the original PQ). ✓
+
+But wait - when we reinject, if two events have the same `recv_ts` AND the same `sig` (both all zeros), the comparison falls to `event_id`. If all event_ids are unique in our saved buffer, no collision. ✓
+
+But there's still the `send_pe` final comparison that could trigger `tw_error`. Let me re-read:
+
+```c
+if (ROSS_WARN_TIE_COLLISION)
+    printf("ROSS Splay Tree Warning: Identical Tiebreaker and Event IDs found - Implies RNG Collision\n");
+if(n->send_pe < e->send_pe)
+    return 1;
+else if (n->send_pe > e->send_pe)
+    return 0;
+else
+    tw_error(TW_LOC,"Identical events found - impossible\n");
+```
+
+Two events would only reach this final comparison if they have identical `recv_ts`, identical `sig`, AND identical `event_id`. This is only possible if the same event is enqueued twice. Since we're reading from a unique event set in the PQ (the tree traversal visits each node once) and each event has a unique ID in the original run, this won't happen. ✓
+
+But wait - there might be one edge case. During the original run, multiple events can have the same `recv_ts` (random coincidence). They'd be differentiated by their tiebreaker sig. When we save them, we copy `event_id` but not `sig`. When we reinject them with sig=0 and different event_ids, the comparison would be by event_id. Two events with same recv_ts and both sig=0 would compare by event_id. If their event_ids are different, they'd be correctly ordered. ✓
+
+OK I think the logic is sound. Let me now also make sure I haven't missed including `queue/tw-queue.h` in `splay.c`. Actually, `splay.c` already has `#include <ross.h>` which should include the queue header transitively. But `tw_pq_traverse` is declared in that header. Actually no - `ross.h` doesn't include `queue/tw-queue.h` directly. The header declarations in `queue/tw-queue.h` are used externally. Inside `splay.c`, the functions are DEFINED there, so the declaration isn't needed (the definition serves as its own declaration for the compilation unit).
+
+However, the function `tw_pq_traverse` in `splay.c` calls `tw_pq_traverse_node` which uses `LEFT` and `RIGHT` macros, which are defined in `splay.c`. Since `tw_pq_traverse_node` is a static function defined before `tw_pq_traverse` in the same file, this is fine. ✓
+
+Let me now also look at one potential issue: in `phold.main.c`, I removed `tw_scheduler_rollback_to_gvt_only` from the GVT hook. The old code called `tw_scheduler_rollback_to_gvt_only(pe)` which is declared in `ross-extern.h`. Since I'm no longer calling it, I don't need to worry about that declaration. ✓
+
+But I also removed `#include <limits.h>` since `INT_MAX` is still used. Let me check... yes, `INT_MAX` is used in `VELOC_Restart_test(CKPT_NAME, INT_MAX)`. `<limits.h>` is included in `ross.h` → included via `phold.h` → `ross.h` → already includes `<limits.h>`. Actually looking at `ross.h`:
+
+```c
+#include <limits.h>
+```
+
+Yes it's there. ✓
+
+Now let me also verify the `tw_pq_traverse` function doesn't have a recursion issue with very deep trees. The splay tree with many events could be deep. A recursive traversal might overflow the call stack. With ~10K-100K events, the tree depth could be up to O(N) in the worst case. Let me convert to an iterative traversal using the existing `least` pointer pattern:
+
+Actually, the splay tree after operations tends to be relatively balanced (log N depth typically). With 10K events, max depth is maybe 14. With 100K events, maybe 17. Stack overflow shouldn't be an issue. ✓
+
+But to be safe, let me make the traversal iterative using a manual stack or by using the `least` pointer:
+
+Actually, the simplest safe traversal is to just use the `least` and tree navigation. But implementing a proper iterative in-order traversal of a splay tree without modifying it requires tracking parent pointers - which are available via `up`. Let me implement a simpler approach: since we have `pq->least` (the minimum element) and we can navigate to the parent via `->up`, we can do a proper in-order successor traversal.
+
+Actually, for the purposes of checkpointing (which happens infrequently), a recursive traversal is fine. The depth of a splay tree is bounded by the number of elements, but in practice after many splay operations it's well-balanced. Let me keep the recursive approach but add a depth check if needed.
+
+Actually wait - with `--nlp=4000` and 4 MPI processes, that's 1000 LPs per process. Each LP has events in flight. With optimistic simulation advancing beyond GVT, there could be thousands of events per PE in the PQ. Let me estimate:
+
+With 1000 LPs/PE and `--extramem=100000` (100K extra events), the total event pool is about 100K events per PE. At any given time during simulation, maybe 10-50% are in the PQ. So PQ could have up to 50K events.
+
+For a recursive traversal with 50K events, the call stack would need 50K frames in the worst case (degenerate tree). Each frame is maybe 50 bytes → 2.5MB stack. Default stack is usually 8MB. This is risky.
+
+Let me implement an iterative in-order traversal instead:
+Hmm, wait. This iterative traversal using parent links is more complex. Let me think again.
+
+The standard way to do iterative in-order traversal with parent pointers:
+
+1. Start at minimum (leftmost = `pq->least`)
+2. For each node: visit it, then find its in-order successor
+3. In-order successor: if node has a right child, go right then leftmost. Otherwise, go up until we came from a left child.
+
+This is the "Morris traversal" variant or parent-pointer traversal. Let me simplify:
+
+```c
+void tw_pq_traverse(tw_pq *pq, ...) {
+    tw_event *cur = pq->least; // minimum element
+    while (cur) {
+        cb(cur, user);
+        cur = inorder_successor(cur);
+    }
+}
+
+static tw_event *inorder_successor(tw_event *node) {
+    if (RIGHT(node)) {
+        // go to rightmost's leftmost
+        tw_event *s = RIGHT(node);
+        while (LEFT(s)) s = LEFT(s);
+        return s;
+    }
+    // go up until we came from a left child
+    tw_event *p = UP(node);
+    while (p && node == RIGHT(p)) {
+        node = p;
+        p = UP(p);
+    }
+    return p;
+}
+```
+
+This is O(1) space (no stack) and correctly traverses all nodes. Let me rewrite:
+Now let me verify `pq->least` is the global minimum. From `tw_pq_dequeue`:
+```c
+tw_event *r = st->least;
+```
+And in `tw_pq_enqueue`:
+```c
+if (st->least == n)
+    st->least = e;
+```
+
+`st->least` is always the minimum element in the splay tree (the leftmost node). Starting from `least` and following in-order successors visits all nodes. ✓
+
+But wait - looking at the splay tree implementation more carefully. In `tw_pq_enqueue`, when a new node is inserted left of `st->least`, `st->least` is updated to the new node. So `pq->least` is always the minimum. ✓
+
+After `splay(e)` in `tw_pq_enqueue`, the newly inserted node `e` becomes the new root. This splay operation restructures the tree, but `pq->least` is still the minimum. ✓
+
+Now let me also check a potential issue: in `tw_pq_traverse`, when we do `while (LEFT(s)) s = LEFT(s)` to find the leftmost in the right subtree, and then assign `cur = s`. Since LEFT uses `->next` which is reset by `tw_pq_dequeue` to NULL, we must ensure the tree hasn't been modified. Since we're reading without modifying, this is safe. ✓
+
+Now let me verify the `inject_event_into_pq` function. One issue: on restart, after `veloc_post_lp_init` drains the init events and reinjects saved events, the `pe->seq_num` is still at `nlp_per_pe` (the number of init events that were created and drained). New events created during the restarted simulation will have IDs starting at `nlp_per_pe + 1`.
+
+The saved events from checkpoint have IDs from the original run (could be 1..N where N is large). If some saved event has an ID = nlp_per_pe+1 or similar, it could conflict with a new event created during restart.
+
+But the saved events in the PQ are events that were PENDING (not yet processed) at checkpoint time. These events were created during the original run with IDs up to the original `pe->seq_num`. Since the original run had been running for 44+ seconds with thousands of events processed, the saved event IDs should be >> nlp_per_pe (which is 1000). So no conflict. ✓
+
+Actually wait - I need to reconsider. The saved PQ events have their original event_ids. When we reinject them using `inject_event_into_pq`, we set `e->event_id = ce->event_id`. But `tw_event_grab` zeroes the event_id, so we're setting it correctly.
+
+But here's the key question: does the splay tree's insertion check for duplicate keys? Looking at `tw_pq_compare_less_than_rand` - it compares events and reaches `tw_error` only if `n->send_pe == e->send_pe` (completely identical). For two different events with the same recv_ts but different sigs or IDs, they would be ordered without error.
+
+For reinjected events:
+- `recv_ts`: from checkpoint (correct)
+- `sig`: all zeros (from tw_event_grab)
+- `event_id`: from checkpoint
+
+If two reinjected events have same `recv_ts`, their `sig` values will both be zero, so comparison falls to `event_id`. If their IDs are different, they're correctly ordered. Since the original PQ had unique events, and each event has a unique ID, no two reinjected events should have the same (recv_ts, sig, event_id). ✓
+
+Wait - but what about events from DIFFERENT PEs? In PHOLD with multiple MPI ranks, events can be sent from PE 0 to PE 1 (remote events). These "remote" events have `is_remote = 1`. On restart, we reinject them. But do remote events need special handling?
+
+Looking at `inject_event_into_pq`:
+```c
+if (ce->is_remote && pe->hash_t) {
+    e->state.remote = 1;
+    tw_hash_insert(pe->hash_t, e, (long)ce->send_pe);
+}
+```
+
+We're inserting the event into the hash table. But `pe->hash_t` is only non-NULL for optimistic mode. In optimistic mode with 4 MPI ranks, remote events ARE hash-tracked.
+
+But there's a problem: on restart, `pe->hash_t` starts fresh (empty). We're inserting reinjected remote events into the hash. When these events get processed and then rolled back later, `tw_event_rollback` will try to cancel caused events, and the cancel logic might try to remove from the hash. This should be fine as long as we don't double-insert.
+
+Actually for PHOLD with `--remote=0.25`, 25% of events are remote. So some saved events might have `is_remote=1`. We reinject them and add to hash. This should work correctly. ✓
+
+Let me now also think about the correctness of the OUTPUT.
+
+The validation output is: `sum of LP RNG Cg values` after full simulation to `--end=19000`.
+
+Original run (no restart):
+- Start with seeds X
+- Process events 1..N in order
+- Each event advances LP RNG once (for the dest choice) + once (for the timestamp)
+- After all events, each LP's Cg contains the checksum of all RNG advances
+
+Restarted run (checkpoint at time T):
+- Start with seeds X → init events created → init events DRAINED (in veloc_post_lp_init)
+- RNG states restored to checkpoint state (at time T)
+- Saved PQ events (those pending at time T) reinjected
+- Simulation continues from events at time T
+
+For correctness, we need: the events processed BEFORE checkpoint + events processed AFTER checkpoint (from reinjected events) = the same events as if there had been no checkpoint.
+
+The key question: do the saved PQ events at checkpoint time contain exactly the right events?
+
+In optimistic simulation, at checkpoint time (at some GVT computation):
+- Events with recv_ts < GVT: committed (fossil-collected, not in PQ or pevent_q anymore)
+- Events with GVT <= recv_ts < current_VT: in pevent_q (processed but not committed, may be rolled back)
+- Events with recv_ts >= current_VT: in PQ (not yet processed)
+
+Our checkpoint saves ONLY the PQ events (recv_ts >= current_VT). We're MISSING the pevent_q events (between GVT and current_VT).
+
+On restart, we reinject only PQ events. The simulation then processes them. But what about the events between GVT and current_VT? Those are NOT in our saved set!
+
+Wait - in PHOLD, each processed event creates exactly ONE new event. So:
+- A pevent_q event at timestamp T1 caused one new event at timestamp T2 > T1 (which is in PQ)
+- If T2 is in PQ and we saved it, we'll reinject it
+- When we process the reinjected event at T2, we create a new event at T3 > T2
+
+The pevent_q events (at timestamps between GVT and current_VT) have ALREADY been "done" - their effects are the new events they created (which are in PQ at timestamps >= current_VT, and we saved those). So we DON'T need to re-process the pevent_q events on restart! We just need their created events, which ARE in the PQ.
+
+But wait - what about the RNG advances made by pevent_q events? Those are captured in the saved (uncommitted) RNG states! When we restore the RNG states and reinject the PQ events, each reinjected event that gets processed will advance the RNG from the restored position (which already accounts for the pevent_q processing). So new events created will have the SAME timestamps as in the original run.
+
+WAIT - this is the key insight. Let me think more carefully:
+
+In the original run at checkpoint time T:
+1. Events 1..K were committed (recv_ts < GVT): LP RNG advanced K times for each LP
+2. Events K+1..M in pevent_q (GVT <= recv_ts < current_VT): LP RNG advanced M-K more times
+3. Events M+1..N in PQ (recv_ts >= current_VT): LP RNG NOT yet advanced for these
+
+Restored RNG state = state after K+M-K = M total advances per LP (uncommitted state)
+
+On restart:
+- Events M+1..N are reinjected into PQ
+- When event M+1 is processed, LP RNG is advanced ONCE more (for dest choice) → creates event N+1 with timestamp T_N+1
+- T_N+1 is determined by the RNG at this point
+
+In the original run:
+- Event M+1 was created by processing event M
+- After processing events 1..M, the RNG is at position M
+- Processing event M+1 advances RNG to M+1 → creates event N+1
+
+On restart, after processing event M+1 with RNG at position M (restored), the RNG advances to M+1 → creates event N+1 with the SAME T_N+1. ✓
+
+So the correctness argument holds! The final output (Cg values) will be the same because:
+1. The total number of RNG advances per LP is the same (determined by the number of events committed before end_time)
+2. The RNG advances are in the same order (events processed in same timestamp order)
+
+The restart correctly resumes from the checkpoint! ✓
+
+But there is one more potential issue: **what about remote events?**
+
+In PHOLD, 25% of events are remote (sent to a random LP on potentially a different PE). In optimistic mode, remote events go through the network. After the checkpoint:
+
+- Remote events that were SENT from PE 0 to PE 1 and are in PE 1's PQ: saved in PE 1's checkpoint ✓
+- Remote events that were SENT from PE 0 but haven't arrived at PE 1 yet (in transit): NOT saved! ❌
+
+When we restart, those in-transit remote events are LOST. PE 1's simulation would be missing those events.
+
+However, in practice at a GVT computation point, ALL messages that were sent BEFORE GVT have been received by ALL PEs (GVT guarantees this - it uses white message counting). Events in transit are "gray" messages that haven't been fully accounted for yet.
+
+Actually, the GVT computation in `tw_gvt_step2` ensures ALL messages sent before GVT have been received. So at the GVT hook (called after GVT step2), there should be no messages "in transit" for events with recv_ts < GVT.
+
+But for events with recv_ts between GVT and current_VT: these are events sent in the OPTIMISTIC zone (beyond GVT). They may be in-transit or in remote PEs' event_q.
+
+Our checkpoint saves only PQ events on each PE. Remote events that are in-transit (in the network buffers) are NOT saved. On restart, those events are lost.
+
+This is a correctness problem. However, for PHOLD with `--remote=0.25` and optimistic simulation, the committed events (with recv_ts < GVT) are fossil-collected. The events between GVT and current_VT may have been SENT to remote PEs but not yet received. Those events are NOT in the PQ of the destination PE - they're still "in flight".
+
+So on restart, those in-flight events are lost, and the destination PE won't receive them. This WILL cause incorrect output.
+
+Hmm. This is a fundamental challenge of checkpointing optimistic ROSS.
+
+OK so what can I do? Options:
+
+1. **Ignore this for now and hope the validator doesn't notice**: The validator checks for "near-equal" output (numeric tolerance). For PHOLD with 25% remote and the lost in-flight events, the output might be close but not exact. 
+
+2. **Use conservative mode instead** (`--synch=2`): But we can't change the args.
+
+3. **Checkpoint at GVT time when everything is consistent**: At GVT time, ALL events with recv_ts < GVT have been committed. We need to checkpoint the state JUST AFTER GVT commits all < GVT events. At this point:
+   - The network has no in-transit messages with recv_ts < GVT (guaranteed by GVT)
+   - The pevent_q has messages with recv_ts >= GVT (uncommitted)
+   - The PQ has messages with recv_ts >= current_VT
+
+4. **Roll back to GVT then checkpoint**: This was the original approach (rollback_to_gvt_only) that was crashing.
+
+The fundamental insight: to get a consistent checkpoint in ROSS optimistic mode, we need to either:
+A. Roll back to GVT (giving us a consistent state), OR
+B. Do a global coordination to capture in-transit messages too
+
+The crash in approach A was because of bugs in the rollback code. Let me fix those bugs instead.
+
+Actually, let me revisit why the rollback was crashing. The key error was: after calling `tw_scheduler_rollback_to_gvt_only(pe)` inside the GVT hook, the simulation crashed. 
+
+Looking at the crash context: the MPI_ABORT is called from `tw_error`. Let me figure out WHICH `tw_error` was hit.
+
+After the rollback in the GVT hook (which calls `tw_sched_event_q` and `tw_sched_cancel_q`):
+- `tw_sched_event_q` can call `tw_error(TW_LOC, "no owner!")` if an event has no owner
+- `tw_sched_cancel_q` can call `tw_error` too
+
+The issue might be simpler than I thought: after `tw_kp_rollback_to` is called for each KP, the events in pevent_q are moved back to PQ (via cancel_q chain). But `tw_sched_event_q` is called next, which processes the event_q. If any events in event_q were network messages that arrived AFTER the GVT hook fired, they might be processed by `tw_sched_event_q` and call rollback again, creating an infinite loop or corrupt state.
+
+Actually, the real issue might be simpler: the GVT hook is called while `pe->gvt_status = TW_GVT_NORMAL` (after step2 set it to NORMAL). When `tw_scheduler_rollback_to_gvt_only` calls `does_any_pe` (MPI_Allreduce), that MPI call happens INSIDE the GVT hook which is INSIDE the scheduler loop. But GVT step1 has already set `pe->gvt_status = TW_GVT_COMPUTE` and step2 reset it to `TW_GVT_NORMAL`. So the allreduce inside the hook might conflict with other pending MPI operations.
+
+Actually, looking at `tw_gvt_step2` (non-tiebreaker version): it does `MPI_Allreduce` for white messages, then ANOTHER `MPI_Allreduce` for GVT value. After step2, `pe->gvt_status = TW_GVT_NORMAL`. Then the GVT hook fires and does ANOTHER `MPI_Allreduce` (via `does_any_pe`). This should be fine - there's no outstanding MPI operation at this point.
+
+Let me look at what happens after `tw_kp_rollback_to` is called at GVT time.
+Now I see the rollback function: `tw_kp_rollback_to_sig` dequeues events from pevent_q and calls `tw_event_rollback` on each one, then re-enqueues to PQ. `tw_event_rollback` calls `event_cancel` for caused events. The caused events might be in:
+1. PQ (not yet processed) - in this case `event_cancel` removes from PQ directly
+2. event_q (received but not yet processed) - `local_cancel` adds to cancel_q
+3. Already sent over network - `tw_net_cancel` sends anti-message
+
+After all KPs are rolled back to GVT, all events with recv_ts >= GVT are in the PQ. The cancel_q and event_q should be empty after `tw_sched_cancel_q` and `tw_sched_event_q`.
+
+But here's the problem I missed: when `tw_event_rollback` is called for a pevent_q event, it calls `event_cancel` for each caused event. These caused events may be in the PQ. When `event_cancel` processes a TW_pe_pq event, it calls `tw_pq_delete_any` and `tw_event_free`. So the event is FREED.
+
+Then, after the rollback, we drain the PQ with `tw_pq_dequeue`. But the freed events are no longer in the PQ (they were freed). So we correctly get only the un-freed events.
+
+But here's the splay tree tie issue: when `tw_kp_rollback_to_sig` calls `tw_pq_enqueue(kp->pe->pq, e)` to re-enqueue a rolled-back event, it calls `splay(e)` to insert. If two rolled-back events have the same key, the comparison might fail.
+
+With `USE_RAND_TIEBREAKER=ON`, the comparison uses `tw_pq_compare_less_than_rand`. The `sig` field of each event is preserved during rollback (it's set when the event is created). So rolled-back events have their original `sig` values. As long as no two events have identical `(recv_ts, sig, event_id, send_pe)`, the insertion is safe. Since PHOLD uses random tiebreakers, this shouldn't happen.
+
+Actually, looking at the crash pattern in iters 3-6: the app crashes AFTER creating some checkpoint files. In iter_3, it created 36 files (failure-free) but still crashed. This means the rollback-based checkpoint worked for a while, then crashed.
+
+Possible scenario: after several successful checkpoints (drain+reinject cycles), some state gets corrupted. The corruption leads to a crash later.
+
+The root cause might be: after drain+reinject, some events in the PQ have `caused_by_me` pointers pointing to events that have been freed. When those events are later processed and rolled back, `tw_event_rollback` follows the `caused_by_me` chain and accesses freed memory (dangling pointer).
+
+Our fix (no drain+reinject during checkpointing) avoids this entirely. ✓
+
+**But the in-transit remote events problem remains**. Let me think about whether this actually causes incorrect output for PHOLD.
+
+For PHOLD with `--remote=0.25` in optimistic mode:
+- Remote events are sent via network to other PEs
+- At GVT time, ALL events with recv_ts < GVT have been received (guaranteed by GVT's white message counting)
+- Events with recv_ts >= GVT may be "in transit" (sent but not received)
+
+When we checkpoint at GVT time:
+- Each PE's PQ contains local events with recv_ts >= current_VT
+- Remote events for recv_ts between GVT and current_VT might be in other PEs' event_q or pevent_q
+
+On restart:
+- PE 0's checkpoint contains PE 0's PQ events
+- PE 1's checkpoint contains PE 1's PQ events
+- Remote events from PE 0 → PE 1 that were "in transit" are NOT in PE 1's PQ (they haven't been received yet)
+
+So after restart, PE 1 misses those in-transit events. This causes fewer events to be processed on PE 1, which changes the Cg fingerprint. The output would be WRONG.
+
+However: in PHOLD optimistic simulation, with GVT advancing steadily, by checkpoint time the simulation has processed many events. The "in-transit" events are those sent in the OPTIMISTIC zone (beyond GVT). After restart, those events are simply never created (because we don't replay the events that CREATED those remote events - those creator events are in pevent_q, which we don't save).
+
+Wait - actually, the creator events (pevent_q events) created both local events (which are in PQ and saved) AND remote events (which went to other PEs). If we don't save the remote events, and we don't re-process the creator events, those remote events are simply gone.
+
+This means: for each "remote-creator" event in pevent_q that would have been rolled back and its remote event cancelled - we're just ignoring it. On restart, that event is not re-processed, and no remote event is created. So the destination PE receives fewer events.
+
+BUT: those remote events would have been rolled back if the creator event was rolled back (which might happen in a subsequent GVT). So maybe they cancel each other out? No, that's not necessarily true.
+
+**OK this is a fundamental problem with our approach for remote events in optimistic simulation.**
+
+Let me think about what happens in PHOLD specifically:
+
+With `--remote=0.25` and GVT at some time T:
+1. Events with recv_ts < T: all committed, processed, and their remote events have been received
+2. Events with T <= recv_ts < current_VT: in pevent_q (optimistically processed)
+   - Some of these generated remote events that are in remote PEs' PQs or event_qs
+3. Events with recv_ts >= current_VT: in PQ
+
+On restart:
+- We reinject events from group 3 only
+- Group 2 events are lost (along with the remote events they generated)
+
+The remote events generated by group 2 that would have been IN the remote PE's PQ are NOT saved (because they haven't been received by the remote PE yet, or they're in the remote PE's event_q).
+
+Actually wait - "remote events generated by group 2" - if they have recv_ts >= current_VT, they WOULD be in the remote PE's PQ. And we save the remote PE's PQ. So those remote events ARE saved in the remote PE's checkpoint!
+
+Let me reconsider:
+
+A group 2 event at time T1 on PE 0 (T <= T1 < current_VT_PE0):
+- It was processed optimistically
+- It created one new event at time T2 > T1
+- If T2 >= current_VT_PE0 AND the dest is on PE 0: it's in PE 0's PQ ✓ (saved)
+- If T2 >= current_VT_PE0 AND the dest is on PE 1: it was SENT to PE 1 via network
+
+If the remote event (T2 >= current_VT_PE0) was sent to PE 1 via `tw_net_send`:
+- It's in PE 1's MPI buffer or event_q
+- When PE 1 calls `tw_net_read`, it receives this message and puts it in event_q
+- When `tw_sched_event_q` runs, it goes to PQ
+- So at checkpoint time (after GVT), this event might already be in PE 1's PQ!
+
+Is it guaranteed to be in PE 1's PQ at GVT time? GVT step2 calls `tw_net_read` repeatedly until `total_white == 0`. So ALL sent messages (that have been sent BEFORE the GVT computation started) have been received by all PEs. So after GVT step2, there are no in-transit messages. All remote events sent before GVT computation are in some PE's PQ or event_q.
+
+But wait - `tw_gvt_step2` calls `tw_net_read(me)` to consume all outstanding messages. After step2, `me->gvt_status = TW_GVT_NORMAL`. Then `tw_sched_event_q(me)` is called in the main scheduler loop AFTER step2. So after the GVT computation AND the subsequent `tw_sched_event_q`, all received messages are in the PQ.
+
+In `tw_scheduler_optimistic`:
+```c
+tw_gvt_step1(me);
+tw_sched_event_q(me);
+tw_sched_cancel_q(me);
+int const gvt_triggered = me->gvt_status;
+tw_gvt_step2(me);
+if (gvt_triggered) {
+    tw_gvt_hook_step(me);  // ← GVT hook fires here
+}
+```
+
+So the sequence is:
+1. `tw_gvt_step1` - starts GVT computation
+2. `tw_sched_event_q` - moves events from event_q to PQ
+3. `tw_sched_cancel_q` - processes cancel_q
+4. `tw_gvt_step2` - finishes GVT computation (reads network, computes GVT)
+5. GVT hook fires
+
+After step 4, `tw_gvt_step2` has read ALL outstanding network messages (via `tw_net_read` loop). These messages went to `event_q`. But `tw_sched_event_q` was called BEFORE step2 (in step 2 above). So messages received by `tw_net_read` in step2 are NOT yet in the PQ - they're still in event_q!
+
+This means: when the GVT hook fires (step 5), the event_q might still have messages from step 4's `tw_net_read` calls. These messages are NOT in the PQ.
+
+So our checkpoint (which traverses only the PQ) MISSES events that are in event_q after GVT step2!
+
+**BUT**: After the GVT hook returns, the scheduler loop continues:
+```c
+for (;;) {
+    tw_gvt_step1(me);
+    tw_sched_event_q(me);  // ← processes event_q
+    tw_sched_cancel_q(me);
+    ...
+    tw_gvt_step2(me);
+    if (gvt_triggered) {
+        tw_gvt_hook_step(me);  // ← GVT hook
+    }
+    ...
+    tw_sched_batch(me);
+}
+```
+
+After the GVT hook returns, `tw_sched_batch` is called. In the NEXT iteration of the scheduler loop, `tw_sched_event_q` processes the event_q and puts those events in the PQ.
+
+So the events in event_q at checkpoint time are events that have been RECEIVED by this PE but not yet moved to PQ. They have `recv_ts` values (since they're real events). They'll be processed in the next scheduler iteration.
+
+For our checkpoint: we miss events in event_q. On restart, those events are lost.
+
+**How significant is this?** 
+
+In PHOLD, events are sent with random destinations. 25% are remote. Those remote events that go to a different PE are received there. If a remote event was received but still in event_q when we checkpoint, it gets lost on restart.
+
+For the output to be correct, we'd need to also checkpoint event_q.
+
+**Let me add event_q checkpointing**:
+
+The event_q is a doubly-linked list (`tw_eventq`). We can traverse it:
+
+```c
+tw_event *ev = pe->event_q.head;
+while (ev) {
+    // save ev
+    ev = ev->next;
+}
+```
+
+Let me add this to our checkpoint. But there's a catch: event_q events have `state.owner = TW_pe_event_q`. On restart, when we reinject them, we need to inject them into the PQ directly (as if they'd been processed by `tw_sched_event_q`).
+
+Actually, we can just add event_q events to our saved buffer the same way as PQ events. On restart, inject them all into PQ.
+
+But wait - event_q events in `tw_sched_event_q` can also cause rollbacks (if they're straggler messages). On restart with the restored state, those events would simply be in the PQ and processed normally (no rollback needed since we're starting fresh).
+
+Let me update the checkpoint to also save event_q events. Let me read the `tw_eventq` structure:
+
+From ross-types.h:
+```c
+struct tw_eventq {
+    size_t size;
+    tw_event *head;
+    tw_event *tail;
+};
+```
+
+Events in event_q have `event->next` pointing to the next event in the list. Let me add event_q traversal.
+
+Actually, wait. Looking at `tw_eventq.h`:
+Now let me update the checkpoint to also include event_q events. The event_q uses head→next for traversal. Let me update `phold.main.c` to also save event_q events in the checkpoint callback:
+Wait, but I need to close the if block properly. Let me look at the current state of the code around that area:
+Good, the code looks correct. The event_q traversal is now included. Let me now think about one more concern: event_q events have `next` pointer that in the event_q context points to the next queued event. But in the splay tree context, `next` = LEFT child. When an event is in event_q (not in PQ), its `next/prev/up` might be from the old PQ position or from the event_q linkage.
+
+Looking at `tw_sched_event_q`: when an event is received into event_q, it has `state.owner = TW_pe_event_q`. Its `next` pointer is used by the event_q linked list. So yes, for events in event_q, `->next` is the next event in the event_q list, not a splay tree child pointer. Our traversal of event_q uses `eq = eq->next` which is correct for the linked list. ✓
+
+But wait - the event_q uses a doubly-linked list where `next` = next in queue and `prev` = previous in queue. The splay tree uses `next` = LEFT child, `prev` = RIGHT child. But an event can only be in ONE of these at a time. An event in event_q has owner=TW_pe_event_q and its `next/prev/up` are the queue links. ✓
+
+Now, an important concern: in `pq_collect_cb`, for events from event_q, `e->dest_lp` might be a raw pointer or might be a global ID. Let me check:
+
+When an event arrives from the network (`tw_net_read`), it's put into event_q. At this point, `event->dest_lp` might still be the global LP ID stored as a pointer (from the remote sender). `tw_sched_event_q` later calls `tw_getlocal_lp(event->dest_lpid)` to resolve the actual pointer... wait, let me check:
+
+Looking at `tw_sched_event_q`:
+```c
+dest_kp = cev->dest_lp->kp;
+```
+
+This accesses `dest_lp->kp`, so `dest_lp` must be a valid pointer. But for events received from the network, `dest_lp` might not be resolved yet.
+
+Actually, looking at `tw_event_send`:
+```c
+e->dest_lp = (tw_lp *) dest_gid;
+```
+
+Oh! When an event is created locally, `dest_lp` is initially set to the global ID cast to a pointer. Then in `tw_event_send`:
+```c
+if (dest_peid == g_tw_mynode) {
+    event->dest_lp = tw_getlocal_lp((tw_lpid) event->dest_lp);
+    ...
+    tw_pq_enqueue(send_pe->pq, event);
+```
+For local events, `dest_lp` is resolved to the actual LP pointer.
+
+For remote events: they go through `tw_net_send`. On the receiving end, `tw_net_read` puts them in event_q with `dest_lp` already set (I need to check network code).
+Line 368: `e->dest_lp = tw_getlocal_lp((tw_lpid) e->dest_lp);`
+
+So when a remote event is received via `recv_finish`, `dest_lp` is resolved to the actual LP pointer. After this, the event is put in event_q with `dest_lp` as a valid pointer. ✓
+
+So for events in event_q: `dest_lp` is a valid pointer (already resolved). Our `pq_collect_cb` accesses `e->dest_lpid` (not `e->dest_lp`):
+
+```c
+ce->dest_lp_gid = e->dest_lpid;
+```
+
+And `e->dest_lpid` should be the global LP ID. Let me verify: in `tw_event_send`:
+```c
+e->dest_lpid = dest_gid;
+```
+And in `recv_finish`, the event is received and `dest_lp` is updated but `dest_lpid` remains the same (it's set by the sender). ✓
+
+So our `pq_collect_cb` correctly captures both PQ events and event_q events. ✓
+
+Now let me think about pevent_q events (events already processed but not yet committed). Should we include those too?
+
+In optimistic mode, the pevent_q contains events with timestamps between GVT and current_VT. These have been PROCESSED, meaning:
+1. The event handler ran
+2. New events were CAUSED and sent (either to PQ or other PEs)
+3. The event is in pevent_q waiting to be committed or rolled back
+
+For PHOLD: when a pevent_q event (E1 at time T1) was processed:
+- It advanced the RNG once (for dest choice) → our RNG state is already past this
+- It advanced the RNG once (for timestamp of new event) → already past this
+- It created ONE new event E2 at time T2
+
+E2's destination:
+- If local: E2 is in local PQ (captured by our PQ traversal) ✓
+- If remote: E2 was sent to another PE via network
+
+In case E2 is remote and still in-transit (in the MPI buffer), it won't be in the destination PE's PQ or event_q yet. When we checkpoint, it's missed.
+
+However, during `tw_gvt_step2`, all sent messages are received (white message counting ensures this). After `tw_gvt_step2`, all messages sent BEFORE GVT computation started have been received. The GVT hook fires AFTER step2, so by that point, all sent messages should be in the receiving PE's buffers (received by `tw_net_read` in step2).
+
+After `tw_net_read` in step2, messages go to receiving PE's event_q. Then `tw_sched_event_q` moves them to PQ. But `tw_sched_event_q` is called at the START of each scheduler loop iteration (BEFORE step1), NOT after step2. So after GVT step2, received messages are in event_q, NOT in PQ.
+
+**KEY**: messages received during `tw_gvt_step2.tw_net_read` are in event_q. The GVT hook fires AFTER step2. At that point, event_q has those messages. Our checkpoint captures event_q events too. ✓
+
+So by capturing both PQ and event_q, we get ALL pending events. The pevent_q events (already processed) had their effects captured in the PQ events (their caused events). ✓
+
+**One remaining concern**: pevent_q events between GVT and current_VT created remote events that might have been sent to another PE. If those remote events are in the remote PE's event_q at checkpoint time, they ARE captured in the remote PE's checkpoint. ✓
+
+If the remote events are still "in the MPI buffer" (between send and recv) at checkpoint time... but after GVT step2 (which drains the network), all in-transit messages should be received. Since GVT ensures all white messages have been received, and GVT step2 keeps reading until `total_white == 0`, by the time GVT hook fires, all messages sent by pevent_q events should have been received by all PEs.
+
+Actually wait - `total_white` counts messages sent BEFORE GVT started (i.e., messages with recv_ts < GVT). What about messages sent DURING the GVT computation (optimistic zone messages)? Those are "gray" messages.
+
+Let me re-read the GVT protocol. In ROSS's mpi_allreduce GVT:
+- `s_nwhite_sent` = number of messages sent since last GVT
+- `s_nwhite_recv` = number of messages received since last GVT  
+- `local_white = s_nwhite_sent - s_nwhite_recv`
+- GVT converges when `total_white == 0` (all sent messages have been received)
+
+But this counts ALL messages sent during the GVT interval (not just those with recv_ts < GVT). So after `total_white == 0`, ALL messages sent since last GVT have been received.
+
+This includes messages sent by pevent_q events (optimistic zone). So after GVT step2, all those remote messages are in the receiving PE's `event_q` or `pq`. Our checkpoint captures event_q too. ✓
+
+Great, so our checkpoint is complete and consistent!
+
+Let me now verify one more thing: the splay tree traversal. After step2, `tw_sched_event_q` hasn't run yet (it runs in the NEXT scheduler loop iteration). So events in event_q are NOT in the PQ. Our checkpoint captures both. When restarting:
+- We inject all captured events into the PQ (both PQ events and event_q events)
+- The reinjected events may have different relative orderings than in the original run, but their timestamps are preserved, so the splay tree orders them correctly by timestamp
+
+One concern: event_q events might have `cancel_q=1` (if they're anti-messages). We should skip those. Let me add a filter:
+
+Actually, looking at `recv_finish`:
+```c
+if(e->state.cancel_q)
+{
+    // handle cancellation
+    tw_event_free(me, e);
+    return;
+}
+```
+
+Cancel events are handled immediately during `recv_finish` and freed. They never make it to event_q. So event_q only contains forward events. ✓
+
+But what about events in event_q that have `cancel_q=1` due to later cancellation? Looking at `local_cancel` and cancel processing: when a cancel_q event is processed, it removes from event_q and frees. So events in event_q with cancel_q=1 might exist briefly. Let me add the filter just to be safe:
+
+Let me update `pq_collect_cb` to skip cancelled events:
+Now let me also think about duplicate events. PQ and event_q events should not overlap (an event is in exactly ONE of these queues at any time). But could the same event appear in both? No, because `state.owner` distinguishes them. ✓
+
+Now let me think about correctness more carefully for the restart case.
+
+On restart after killing at time T_kill:
+- Saved state: PQ + event_q at GVT hook time T_ckpt <= T_kill
+- GVT at T_ckpt: let's call it G
+
+Key question: will the restart produce the same output as if no kill had happened?
+
+In the original run:
+- All events with recv_ts < G: committed and fossil-collected
+- Events with G <= recv_ts < current_VT_at_Tckpt: in pevent_q (processed, not committed)
+- Events with recv_ts >= current_VT_at_Tckpt: in PQ or event_q
+
+Our checkpoint saves events from the last category plus event_q at T_ckpt.
+
+On restart:
+1. Init events created (all same timestamps since same seeds)
+2. Init events DRAINED from PQ
+3. Saved events REINJECTED into PQ
+4. RNG states RESTORED to T_ckpt state
+
+The saved events are those from the PQ and event_q at T_ckpt. These are events with recv_ts >= current_VT_at_Tckpt.
+
+But what about events with G <= recv_ts < current_VT_at_Tckpt (the pevent_q events)?
+
+On restart:
+- We don't reinject pevent_q events
+- We restore RNG states to the state that includes pevent_q processing
+
+When restart processes the reinjected events (starting from recv_ts = current_VT_at_Tckpt):
+- Each reinjected event E1 at time T1 gets processed
+- In phold_event_handler: advances RNG once for dest choice, once for timestamp
+- Creates one new event E2 at time T2
+
+But in the ORIGINAL run:
+- The pevent_q events at times G..current_VT were processed BEFORE the reinjected events
+- Those pevent_q events also advanced the RNG
+- After all pevent_q events, the same reinjected events were processed from current_VT onwards
+
+The RNG state at the start of processing reinjected events is the SAME in both cases (we restore the uncommitted RNG state). So:
+- In original: pevent_q events processed (G to current_VT) → RNG at state S → reinjected events processed (current_VT onwards)
+- In restart: RNG restored to state S → reinjected events processed (current_VT onwards)
+
+Since the RNG state at S is the same, and the reinjected events are the same, the new events created will have the same timestamps and destinations. The output will be the same. ✓
+
+The only exception: if a pevent_q event sent a REMOTE event that went to another PE, and that remote event has recv_ts >= current_VT. In that case, the remote event would be in the destination PE's PQ (and we save that). ✓
+
+If the remote event has recv_ts < current_VT... that means the remote event would have been processed OPTIMISTICALLY at the destination PE (it's in pevent_q there). Its causal events (created by it) would be in that PE's PQ or event_q. We save those. ✓ The remote event's contribution to the RNG is captured in the restored RNG state. ✓
+
+So the restart is correct! Let me double-check the critical part: restoring the RNG state.
+
+We save `g_ckpt_rng_buf` which is the CURRENT (uncommitted) RNG state of each LP at checkpoint time. This includes:
+- RNG advances from committed events (recv_ts < G)
+- RNG advances from pevent_q events (G <= recv_ts < current_VT)
+
+On restart, we restore these states. Then we process reinjected events from current_VT onwards. These events advance the RNG the same way as in the original run. ✓
+
+Great, the approach is sound. Let me now also handle the case where `dest_lpid` might be 0 for some events. In PHOLD, LP IDs start from 0, so `dest_lpid=0` is valid. My check `if (!e->dest_lp && !e->dest_lpid)` would incorrectly skip LP 0. Let me fix this:
+Now let me also verify that `tw_pq_traverse` handles the case where `pq->least == NULL` correctly. In our implementation:
+
+```c
+if (!pq || pq->nitems == 0 || !pq->least) return;
+```
+
+If `nitems > 0` but `least == NULL`, there's a bug in the splay tree. Let's keep just `!pq->least` as the early exit (both conditions should agree, but the `!pq->least` check is sufficient).
+
+Actually I have a potential bug: `!pq->nitems == 0` evaluates as `(!pq->nitems) == 0` which is incorrect. Let me look at the current state:
+Good. The condition `pq->nitems == 0` is correct (no operator precedence issue). ✓
+
+Now let me do a final review of the complete `phold.main.c` to ensure correctness:
+The code looks good. Now there's one more concern: when we reinject events into the PQ on restart, events that are "remote" (from a different PE) have `is_remote=1`. In the original run, those remote events were hash-tracked. In restart, we reinject them and add to hash. But when they get fossil-collected later (committed), the fossil collect code tries to remove them from hash. This should be OK since we add them to hash on reinject. ✓
+
+But wait - there's a subtle issue. For remote events from PE X to PE Y: in the original run, PE X sent the event and PE Y received it. The `send_pe` = PE X's id. In our saved checkpoint on PE Y, `ce->is_remote = 1` and `ce->send_pe = PE X`.
+
+On restart (fresh run), when PE Y reinjects this event into PQ:
+```c
+if (ce->is_remote && pe->hash_t) {
+    e->state.remote = 1;
+    tw_hash_insert(pe->hash_t, e, (long)ce->send_pe);
+}
+```
+
+This inserts into hash with key `(long)ce->send_pe`. When the event is fossil-collected:
+```c
+if(e->event_id && e->state.remote)
+    tw_hash_remove(pe->hash_t, e, e->send_pe);
+```
+
+This removes using `e->send_pe = ce->send_pe = PE X`. ✓
+
+Also, if PE X sends an anti-message for this event during restart... but PE X is restarting fresh, so it won't send anti-messages for events that were committed in the previous run. The restart starts fresh with no network state. So no anti-messages will be sent for our reinjected events. ✓
+
+However - there's a subtle timing issue. When processing continues after restart, new events created might conflict with hash entries from reinjected events. But since we'll eventually fossil-collect the reinjected events (their recv_ts will be < GVT eventually), they'll be removed from hash. ✓
+
+Now let me also think about a potential issue: on restart, `pe->seq_num` starts at 0 (after init events get IDs 1..N). Our reinjected events have their original IDs from the checkpoint. New events created during restart get IDs starting from N+1. The reinjected event IDs may be >> N (from 44s of simulation). So no conflict. ✓
+
+BUT: could there be a conflict between TWO DIFFERENT reinjected events? In the original PQ, all events had unique (recv_ts, sig, event_id) combinations. When we reinject them with sig=0 (all zeros), the comparison falls to event_id. If two reinjected events have the same event_id, they'd conflict.
+
+For remote events: the `event_id` was assigned by the SENDING PE's seq_num. Two events from different PEs might have the same event_id! PE 0 might have event_id=100 and PE 1 might also have event_id=100.
+
+When PE X reinjects events, it rejects non-local events (events destined for other PEs). The `inject_event_into_pq` does:
+```c
+tw_lp *dlp = find_lp_by_gid(ce->dest_lp_gid);
+if (!dlp) return; // skip non-local
+```
+
+So PE X only injects events destined for its own LPs. But a "remote" event saved in PE X's checkpoint has destination LP on PE X (it was received by PE X). Its `send_pe` might be from any PE. Two such events from different sending PEs might have the same `event_id`.
+
+If two reinjected events on PE X have the same `recv_ts` AND `event_id` AND zero sig, the splay tree would reach the `send_pe` comparison. If `send_pe` differs, they're ordered correctly (no crash). ✓
+
+The final `tw_error("Identical events found")` requires identical `recv_ts, sig, event_id, AND send_pe`. This is essentially impossible for real simulation events (send_pe uniquely identifies the source). ✓
+
+OK I'm convinced the implementation is correct. Let me now also ensure the `tw-queue.h` declaration is correct:
+Good. Now let me also check whether `ROSS_QUEUE_splay` is defined (which is necessary for the `UP`, `LEFT`, `RIGHT` macros to work in the traverse function). Since `QUEUE=splay` is set in CMakeLists.txt, and this adds `-DROSS_QUEUE_splay` to the compiler flags, the `#ifdef ROSS_QUEUE_splay` in `splay.c` is active. But wait - the `splay.c` file doesn't use `#ifdef ROSS_QUEUE_splay` for its functions. It's compiled whenever `queue/splay.c` is included (which it is, since QUEUE=splay). So the functions are always compiled and available. ✓
+
+Now, let me check if there's a potential issue with how `tw_pq_traverse` is compiled. The function is in `splay.c`, which is compiled as part of the ROSS library. The declaration in `tw-queue.h` is included by `phold.main.c`. The linker will find the definition in the ROSS library. ✓
+
+Wait - there's one concern. The `tw-queue.h` header is included in `tw-eventq.h` which is included by `ross.h`. Let me check:
+
+Actually, from the include chain in `phold.main.c`:
+1. `phold.h` → `ross.h` → ... the queue header might or might not be included
+2. `queue/tw-queue.h` (explicit include) → declaration of `tw_pq_traverse`
+
+The explicit include `#include "queue/tw-queue.h"` ensures the declaration is available. ✓
+
+But wait - there's an issue with including `tw-queue.h` from `phold.main.c`. The `tw-queue.h` includes `ross-types.h`, which includes `ross-base.h`. This might conflict with the include chain from `phold.h` → `ross.h`. Let me check for include guards... `tw-queue.h` has `#ifndef INC_tw_queue_h` guard. `ross-types.h` has `#ifndef INC_ross_types_h` guard. These should prevent double inclusion. ✓
+
+Let me now also make sure the `tw_pq_traverse` function is NOT declared inside `#ifdef ROSS_QUEUE_splay`. Let me check what happens when compiled with a different queue type (hypothetically). Since we only use splay, this is fine. ✓
+
+Let me now look at one more potential issue: in `veloc_post_lp_init`, when we drain init events from PQ, we do:
+
+```c
+tw_event *ev;
+while ((ev = tw_pq_dequeue(pe->pq)) != NULL) {
+    ev->caused_by_me = NULL;
+    ev->cause_next   = NULL;
+    if (ev->state.remote && pe->hash_t && ev->event_id) {
+        tw_hash_remove(pe->hash_t, ev, (long)ev->send_pe);
+        ev->state.remote = 0;
+    }
+    tw_event_free(pe, ev);
+}
+```
+
+The init events from `phold_init` are local events (not remote), created by the LP itself. They have `state.remote=0` and `event_id` = non-zero (assigned by seq_num). Their `caused_by_me` is `NULL` (no event caused them during init - `me->cur_event = me->abort_event` is set, and `link_causality` would link them to abort_event). 
+
+Actually looking at `tw_event_send`:
+```c
+link_causality(event, send_pe->cur_event);
+```
+
+During init, `send_pe->cur_event = send_pe->abort_event`. So `link_causality(event, abort_event)` sets `event->cause_next = abort_event->caused_by_me; abort_event->caused_by_me = event`. 
+
+So init events are "caused by" the abort_event (which is the dummy event during init). When we free init events, `abort_event->caused_by_me` still points to them (dangling). But we're clearing `ev->cause_next = NULL` before freeing. The abort_event's chain is broken but that's OK since abort_event is reused. Actually, it could be problematic if the abort_event chain is followed later.
+
+Let me also set `abort_event->caused_by_me = NULL` before or after draining... Actually, this is what the original code did too (in the old `veloc_post_lp_init`). And the abort_event is reset at the start of each LP processing in `tw_init_lps`:
+```c
+me->cur_event = me->abort_event;
+me->cur_event->caused_by_me = NULL;
+```
+
+Actually no - this is set before each LP's init call. After all LPs are initialized, `abort_event->caused_by_me` has a long chain of all init events. When we drain the PQ and free those init events, we need to clean up this chain.
+
+However, looking at the original code in `tw_init_lps`:
+```c
+me->cur_event = me->abort_event;
+me->cur_event->caused_by_me = NULL;
+(*lp->type->init)(lp->cur_state, lp);
+```
+
+Each LP init clears `caused_by_me = NULL` and then sets it during the init. So after all LP inits, `abort_event->caused_by_me` has the LAST LP's init events. When we free those events without clearing `abort_event->caused_by_me`, it becomes a dangling pointer.
+
+But wait - during `veloc_post_lp_init`, `tw_init_lps` has ALREADY run, and `tw_pre_run_lps` hasn't run yet. Let me reset `abort_event->caused_by_me = NULL` during the drain:
+Now let me also think about another subtle issue: after restart, when the simulation processes reinjected events, those events have `caused_by_me = NULL` (we cleared it in `inject_event_into_pq`). When an event is processed in `tw_sched_batch`, the event handler runs and may create new events via `tw_event_send`. Those new events get linked to the current event via `link_causality`. So the causality chain works correctly for newly created events. ✓
+
+But the reinjected events themselves have `caused_by_me = NULL` and `cause_next = NULL`. When they're processed and their handler runs (calling `tw_event_send`), the new event's `cause_next = pe->cur_event->caused_by_me = NULL`. So `new_event->cause_next = NULL` initially, then set by `link_causality` to whatever was there. This is fine. ✓
+
+The `src_lp = dlp` assignment in `inject_event_into_pq` might be incorrect. In the original run, the src_lp of an event is the LP that SENT it (not the destination LP). For PHOLD local events: `src_lp = sender LP`, `dest_lp = same LP`. For remote events: `src_lp = sender LP (on different PE)`. 
+
+On restart, we set `e->src_lp = dlp` (the destination LP). This is WRONG for remote events where src_lp should be a different LP. However, for the restart simulation:
+- `src_lp` is used in `tw_event_rollback` for causality chains
+- `src_lp` is used in `event_cancel` to find the sending PE
+- For reinjected events that might be rolled back: they have no `caused_by_me` chain, so rollback is clean
+- If a reinjected event needs to be cancelled: `src_lp->pe` must be the PE that owns `src_lp`. If `src_lp = dlp` (destination LP on this PE), then `src_lp->pe = this_pe`. The cancel logic `if (send_pe->id == dest_peid)` would work.
+
+For remote reinjected events (from another PE): setting `src_lp = dlp` means the PE that "owns" this event is this_pe (not the original sender). This might cause issues if the event is later cancelled. But in a fresh simulation (restart), these reinjected events are starting fresh and shouldn't be cancelled (there's no anti-message for them since the original sender doesn't know we reinjected them).
+
+The main risk is: if a ROLLBACK occurs that needs to cancel this reinjected event. In optimistic mode, rollbacks can happen. If the reinjected event is in pevent_q (has been processed) and a straggler message triggers a rollback, `tw_event_rollback` is called which calls `event_cancel` for caused events. The reinjected event itself is being rolled back, not cancelling it - that's fine. The CAUSED events (those created when the reinjected event was processed) would be cancelled via `event_cancel`. The caused events have correct `src_lp` (they were created by the event handler). ✓
+
+For the reinjected event itself being in cancel_q (if it needs to be cancelled by an anti-message): this could happen if another PE sends an anti-message for this event. But no PE will send anti-messages for our reinjected events (they don't know about them). ✓
+
+So the `src_lp = dlp` is acceptable for our restart scenario. ✓
+
+Now let me look at one final important thing: the `tw_pre_run_lps` call. After `veloc_post_lp_init` runs (draining init events and reinjecting saved events), `tw_pre_run_lps` is called. For PHOLD, `pre_run = NULL`, so it's a no-op. ✓
+
+But wait! Actually, looking at the `phold_init` setup:
+```c
+tw_lptype mylps[] = {
+    {(init_f) phold_init,
+     (pre_run_f) NULL,  // pre_run is NULL
+     ...
+```
+
+`pre_run = NULL`. ✓
+
+Then after `tw_sched_init` (which calls `tw_init_lps`, `veloc_post_lp_init`, and `tw_pre_run_lps`), the simulation starts with `tw_scheduler_optimistic` or similar. The PQ now has our reinjected events. The simulation processes them in timestamp order. ✓
+
+Actually wait - I need to re-check. There's actually a complication. `tw_pre_run_lps` is called AFTER `veloc_post_lp_init`. In `phold.main.c`, the original PHOLD does have a `pre_run_f` function (`phold_pre_run`), but `mylps[0].pre_run = NULL`. So on restart, `phold_pre_run` won't be called. ✓
+
+Good. Let me now review the full flow once more:
+
+**Original Run**:
+1. Init: each LP creates 1 event via `phold_init`
+2. `veloc_post_lp_init`: g_veloc_restarting=0, no action
+3. Simulation runs
+4. GVT hook fires every 5 GVTs: saves PQ+event_q events + RNG states to VeloC
+5. At T_kill: mpirun kills all processes
+6. VeloC has checkpoint files
+
+**Restart Run**:
+1. Init: each LP creates 1 event via `phold_init`
+2. `veloc_post_lp_init`: g_veloc_restarting=1, loads checkpoint:
+   - Restores RNG states
+   - Drains init events from PQ
+   - Rejects saved PQ+event_q events
+3. Simulation continues from saved state
+4. No more GVT-hook checkpoints (or they happen but don't affect correctness)
+5. Simulation completes, writes validation_output.bin
+6. Exit code 0
+
+For the restart to complete within the recovery timeout (126s):
+- Kill at 50% of 88s = 44s
+- Restart must complete in 126s total
+- Restart takes 88s - 44s = 44s (from checkpoint time to end)
+- So total = 44s (kill) + 44s (restart) = 88s << 126s ✓
+
+For the first GVT run (which creates many checkpoints):
+- Checkpoint files appear in /tmp/ross_veloc_scratch within the first 5 GVTs
+- The validator polls for files starting at 44s into the run
+- If the first checkpoint happens before 44s, checkpoint_observed=True ✓
+- With 5 GVT intervals and the simulation taking 88s, GVT runs roughly every 88/20 ≈ 4.4s (if there are ~20 GVT rounds)
+- Actually with 4000 LPs per PE and gvt-interval=16 (default), GVT runs very frequently
+- First checkpoint should happen within a few seconds ✓
+
+Let me check the default `g_tw_gvt_interval` value. From the option definition:
+```c
+TWOPT_UINT("gvt-interval", g_tw_gvt_interval, "GVT Interval: ...")
+```
+
+What's the default? Let me check `ross-global.c`:
+`g_tw_gvt_interval = 16` - GVT runs every 16 iterations through the scheduler loop. In `tw_gvt_step1`:
+```c
+int const still_within_interval = ++gvt_cnt < g_tw_gvt_interval;
+if (still_within_interval && NOT_PAST_LOOKAHEAD(me) && ...) return;
+me->gvt_status = TW_GVT_COMPUTE;
+```
+
+So GVT runs every 16 scheduler iterations. With 4 MPI processes and lots of events (4000 LPs with extramem=100000), each scheduler batch processes up to 16 events. GVT runs approximately every 16*16 = 256 events processed.
+
+With checkpoint every 5 GVTs = every 5*16 = 80 scheduler iterations = 80*16 = 1280 events. In a 88s run with thousands of events per second, checkpoints should happen every few seconds. ✓
+
+The first checkpoint (at GVT #5) should happen well before 44s into the simulation. ✓
+
+But wait - `tw_trigger_gvt_hook_every(CKPT_GVT_INTERVAL)` sets `starting_at = g_tw_gvt_done` at the time of the call (which is 0 at startup). The trigger condition is `(g_tw_gvt_done - starting_at) % every == 0`. This fires at g_tw_gvt_done = 0, 5, 10, 15, ...
+
+The very FIRST GVT (g_tw_gvt_done=0) will fire the hook! And g_tw_gvt_done=0 means GVT=0. At GVT=0, there are events in the PQ (init events) with recv_ts > 0. So `past_end_time = me->GVT >= g_tw_ts_end = false`. ✓
+
+But wait - `past_end_time` check in `tw_gvt_hook_step`:
+```c
+bool const past_end_time = me->GVT >= g_tw_ts_end;
+```
+
+At GVT=0, `past_end_time = false`. The hook fires! At this point, our checkpoint saves:
+- PQ events (all init events with recv_ts > 0)
+- event_q events (any received remote events, likely none at GVT=0)
+- RNG states (after all LP inits)
+
+This first checkpoint is taken at the very beginning of the simulation, before much computation has happened. ✓
+
+On restart from this checkpoint:
+- Drain init events from PQ (same as what was saved!)
+- Reinject saved events (which are the same init events but with different IDs from tw_event_grab)
+- Restore RNG states
+
+Wait - there's a subtle issue! The init events in the original run have IDs from `++send_pe->seq_num` = 1, 2, 3, ... Their IDs are sequential from 1 to nlp_per_pe (1000 for 1000 LPs). The saved events have those IDs.
+
+On restart:
+1. `phold_init` creates new init events with IDs 1, 2, 3, ... again
+2. `veloc_post_lp_init` drains those init events (IDs 1..1000)
+3. Reinjects saved events: those saved events ALSO have IDs 1..1000!
+
+When we reinject saved event with ID 1 into the PQ, and there's no event with ID 1 in the PQ (we just drained it), there's no conflict. ✓
+
+But `pe->seq_num` is now at 1000 (from the init). When we reinject saved events with IDs 1..1000 (from the original checkpoint at GVT=0), those same IDs are reused. New events created during restart will have IDs 1001, 1002, ...
+
+The question is: when the reinjected events (IDs 1..1000) are in the PQ and new events (IDs 1001+) are also in the PQ, could there be a collision? No, because reinjected events have unique IDs from each other (ID 1 from LP 0, ID 2 from LP 1, etc.), and new events have different IDs (1001+). No collision. ✓
+
+But wait - the checkpoint at GVT=0 saves events with IDs 1..1000. But those are the INIT events. The RNG state after init is the state after each LP called `phold_init` once. The checkpoint saves this RNG state.
+
+On restart:
+- `phold_init` runs for each LP again → advances RNG once per LP per event (1 event each)
+- RNG state after init is the same as the original run after init (same seeds)
+- `veloc_post_lp_init` restores RNG states from checkpoint (which is the same state)
+- Reinjects the same init events (IDs 1..1000 with same timestamps)
+
+The simulation then processes these reinjected events (which are identical to what the original run would have processed next). The output should be identical! ✓
+
+But hold on - there's an issue with the GVT=0 checkpoint. The trigger condition fires at g_tw_gvt_done=0 (the first GVT). But is the first GVT computed before any events are processed? Let me trace:
+
+In `tw_scheduler_optimistic`:
+```c
+for (;;) {
+    tw_net_read(me);
+    tw_gvt_step1(me);  // sets gvt_status = COMPUTE after g_tw_gvt_interval iterations
+    tw_sched_event_q(me);
+    tw_sched_cancel_q(me);
+    int const gvt_triggered = me->gvt_status;
+    tw_gvt_step2(me);  // computes GVT
+    if (gvt_triggered) {
+        tw_gvt_hook_step(me);  // GVT hook
+    }
+    ...
+    tw_sched_batch(me);  // processes events
+}
+```
+
+`tw_gvt_step1` sets `gvt_status = COMPUTE` after `g_tw_gvt_interval = 16` iterations. The first GVT fires after 16 scheduler loop iterations. In each iteration, `tw_sched_batch` processes up to 16 events. So the first GVT fires after 16 iterations * up to 16 events/iter = up to 256 events processed.
+
+At the first GVT, some events have been processed. The pevent_q has those events. PQ has remaining events. The hook fires at g_tw_gvt_done=0.
+
+Hmm, but in `tw_trigger_gvt_hook_every`:
+```c
+g_tw_gvt_hook_trigger.every_n_gvt.starting_at = g_tw_gvt_done;
+```
+
+This is called in `main()` before `tw_run()`. At that point, `g_tw_gvt_done = 0`. The trigger condition: `(g_tw_gvt_done - 0) % 5 == 0` → fires at g_tw_gvt_done=0, 5, 10, 15, ...
+
+The hook fires when `g_tw_gvt_done - starting_at) % every == 0`. The FIRST check is at the first GVT computation (g_tw_gvt_done is incremented in step2). Let me trace:
+
+In `tw_gvt_step2`:
+```c
+me->gvt_status = TW_GVT_NORMAL;
+...
+g_tw_gvt_done++;
+```
+
+`g_tw_gvt_done` is incremented INSIDE step2. After step2, `g_tw_gvt_done = 1`. Then `tw_gvt_hook_step` is called with `g_tw_gvt_done = 1`.
+
+```c
+case GVT_HOOK_STATUS_every_n_gvt: {
+    int const starting_at = g_tw_gvt_hook_trigger.every_n_gvt.starting_at;  // = 0
+    int const every = g_tw_gvt_hook_trigger.every_n_gvt.nums;  // = 5
+    has_hook_been_triggered = (g_tw_gvt_done - starting_at) % every == 0;  // (1 - 0) % 5 == 1, not 0
+}
+```
+
+So at g_tw_gvt_done=1, the hook does NOT fire (1 % 5 = 1 ≠ 0). The hook fires at g_tw_gvt_done=5, 10, 15, ...
+
+Good, the hook fires at the 5th, 10th, 15th GVT computation. The first GVT does NOT trigger it. ✓
+
+So checkpoints happen at GVT #5, #10, #15, ... Each checkpoint takes a snapshot of the current state.
+
+With gvt_interval=16 and batch=16, each GVT takes ~256 events. 5 GVTs = 1280 events. At ~88s / total_events rate, the 5th GVT should happen within a few seconds. ✓
+
+Now I'm satisfied with the implementation. Let me do a final check on the complete state of changes:
+
+1. `splay.c`: Added `tw_pq_traverse` function ✓
+2. `tw-queue.h`: Added `tw_pq_traverse` declaration ✓
+3. `phold.main.c`: Completely rewritten checkpoint/restart logic ✓
+4. `veloc.cfg`: Already in place ✓
+5. `tw-sched.c`: `tw_scheduler_rollback_to_gvt_only` still present (used by other things?) - we no longer call it from our hook ✓
+
+Let me verify the `tw-sched.c` function `tw_scheduler_rollback_to_gvt_only` is declared in `ross-extern.h` (which was referenced before). It doesn't need to be removed since we just don't call it anymore.
+
+Actually, let me check whether there's any remaining reference to `tw_scheduler_rollback_to_gvt_only` in our new `phold.main.c`:
+Good, those are all removed. Let me also check for any compilation issues with the `ross-extern.h` - we need to make sure `tw_scheduler_rollback_to_gvt_only` declaration doesn't cause a "defined but not declared" issue. Actually, since it's declared in `ross-extern.h` and defined in `tw-sched.c`, it just gets linked. We don't call it from `phold.main.c` anymore but it's still in the library. ✓
+
+Let me also check for stale references:
+Good, `crv_add_custom_lp_snapshot` and `crv_lp_snapshotter` are declared in `crv-state.h` which is included via `ross.h`. ✓
+
+Let me now verify the complete current state of phold.main.c to make sure there are no compilation issues:
+The code looks complete. Now let me also check one thing: in the `veloc_gvt_hook`, I removed the `g_veloc_is_recovery` check. In the new design, we DON'T skip checkpointing during restart. This is intentional - even during restart, we checkpoint every 5 GVTs. But this means the restart also writes new checkpoints. That's fine - new checkpoints overwrite old ones (higher version numbers).
+
+Actually wait - on restart, we detect checkpoint version `ver` and set `g_veloc_version = ver`. The GVT hook increments `g_veloc_version` each time. So new checkpoints written during restart have versions `ver+1`, `ver+2`, etc. This is correct - VeloC handles versioning. ✓
+
+But there's a potential issue: if restart also writes checkpoints, and the simulation is killed again during restart, would the next restart use the new checkpoint? Yes, it would use the latest checkpoint (version = highest). That's correct behavior. ✓
+
+One last thing to check: does `VELOC_Route_file` work correctly when called during restart (when VeloC is in restart mode)? The `VELOC_Route_file` routes a filename to the actual storage path. During normal operation, it routes to the scratch dir. This should work correctly in both normal and restart mode. ✓
+
+Let me now do a final check on the build system to make sure `tw_pq_traverse` is exported properly. The `tw_pq_traverse` function is in `splay.c` which is compiled into the ROSS library. The `phold` executable links against ROSS. So `tw_pq_traverse` should be available at link time. ✓
+
+Let me also verify that there are no issues with the `bool` type in the GVT hook signature. The `veloc_gvt_hook` is:
+```c
+static void veloc_gvt_hook(tw_pe *pe, bool past_end_time) {
+```
+
+The `g_tw_gvt_hook` type is:
+```c
+extern void (*g_tw_gvt_hook) (tw_pe * pe, bool past_end_time);
+```
+
+`bool` requires `<stdbool.h>`. In `phold.main.c`, `bool` is available via:
+1. `phold.h` → `ross.h` → `ross-gvt-internal.h` → `stdbool.h` ✓
+
+Actually, let me also verify that `bool` is in scope. `ross-gvt-internal.h` includes `stdbool.h`. ✓
+
+Now let me do a comprehensive summary of all changes made:
+
+1. **`/ROSS/core/queue/splay.c`**: Added `tw_pq_traverse` function (iterative in-order traversal without modifying the tree)
+
+2. **`/ROSS/core/queue/tw-queue.h`**: Added `tw_pq_traverse` declaration
+
+3. **`/ROSS/models/phold/phold.main.c`**: Complete rewrite of VeloC checkpoint/restart logic:
+   - Removed `tw_scheduler_rollback_to_gvt_only` call (was causing crashes)
+   - New `pq_collect_cb` callback for tree traversal
+   - New `veloc_gvt_hook` that uses `tw_pq_traverse` + event_q traversal (no rollback)
+   - Fixed `veloc_post_lp_init` to correctly drain init events and reinject saved events
+   - Changed checkpoint interval from 50 to 5 GVTs
+   - Added `abort_event->caused_by_me = NULL` cleanup in drain
+   - Included `<stdbool.h>` implicitly via headers
+   - Removed `g_veloc_is_recovery` flag (no longer needed since we don't suppress checkpointing during restart)
+
+4. **`/ROSS/veloc.cfg`**: Already present (unchanged)
+
+Let me verify the `tw_pq_traverse` function signature once more for correctness, since `splay_tree` and `tw_pq` are the same type:
+
+In `splay.c`:
+```c
+typedef tw_pq splay_tree;
+```
+
+`tw_pq` is declared as `typedef struct tw_pq tw_pq` in `ross-types.h`. But the actual struct definition is:
+```c
+struct tw_pq {
+    tw_event *root;
+    tw_event *least;
+    unsigned int nitems;
+    unsigned int max_size;
+};
+```
+
+This is defined inside `splay.c` (not in the header). So `tw_pq_traverse` in `splay.c` can access `pq->root`, `pq->least`, `pq->nitems` directly (because the struct definition is in scope). ✓
+
+The public API only knows `tw_pq` as an opaque type (from `ross-types.h`: `typedef struct tw_pq tw_pq;`). That's fine - `tw_pq_traverse` is only CALLED from `phold.main.c` where it uses the opaque pointer. The function itself (in splay.c) has access to the internal struct. ✓
+
+Wait - actually there's a potential issue. In `ross-types.h`:
+```c
+typedef struct tw_pq tw_pq;
+```
+
+This declares `tw_pq` as an alias for `struct tw_pq`. The struct definition is in `splay.c`. But `tw_pq_traverse` is also accessed through the public API via `tw-queue.h`. When `phold.main.c` calls `tw_pq_traverse(pe->pq, ...)`, it passes a `tw_pq *` pointer. The function signature in `tw-queue.h` is `void tw_pq_traverse(tw_pq *pq, ...)`. This is fine because `pq` is an opaque pointer from phold.main.c's perspective. ✓
+
+Everything looks correct. Let me also make sure `<stdbool.h>` is included in `splay.c` for the `bool` type... actually, `splay.c` includes `<ross.h>` which includes `ross-gvt-internal.h` which includes `<stdbool.h>`. So `bool` is available in `splay.c`. But we don't use `bool` in `splay.c` (it's only in `phold.main.c` via the hook signature). ✓
+
+Let me check if there are any other files that need updating. The `CMakeLists.txt` for the phold model already correctly links against the ROSS library:
+```cmake
+TARGET_LINK_LIBRARIES(phold ROSS m ${VELOC_CLIENT_LIB})
+```
+
+And the ROSS library includes `queue/splay.c` which now has `tw_pq_traverse`. ✓
+
+I'm satisfied with the implementation. Let me update the todo list:
+Let me now do a final review of the key changes to make sure everything is correct and consistent:
+The implementation looks correct. Let me also verify there's no issue with the `pe->pq` being NULL during the `veloc_post_lp_init` call. Looking at `tw_sched_init`:
+
+```c
+void tw_sched_init(tw_pe * me) {
+    (*me->type.pre_lp_init)(me);
+    tw_init_kps(me);
+    tw_init_lps(me);
+    (*me->type.post_lp_init)(me);
+    tw_net_barrier();
+    tw_pre_run_lps(me);
+    ...
+```
+
+`veloc_post_lp_init` is called as `(*me->type.post_lp_init)(me)`. At this point:
+- `tw_init_kps` has run (KPs initialized)
+- `tw_init_lps` has run (LPs initialized, init events created in PQ)
+- `me->pq` must be initialized before this point
+
+Looking at `tw_run` → `setup_pes`:
+```c
+pe->pq = tw_pq_create();
+```
+
+`setup_pes` is called BEFORE `tw_sched_init`. So `pe->pq` is initialized. ✓
+
+Also, `tw_eventq_alloc(&pe->free_q, num_events_per_pe)` is called in `setup_pes`. So the free_q is populated. ✓
+
+Everything looks correct. The implementation should:
+1. Fix the crash (no more rollback in GVT hook)
+2. Create checkpoint files early in the simulation (at GVT #5)
+3. Allow restart from checkpoint to produce correct output
+
+Let me also look at a potential edge case: what happens when the PQ is empty at checkpoint time? With `--synch=3` (optimistic) and plenty of events, the PQ should never be empty during the simulation. But let's make sure our code handles it: `tw_pq_traverse(pe->pq, pq_collect_cb, &ctx)` calls `tw_pq_traverse` which returns early if `pq->nitems == 0 || !pq->least`. The callback won't be called. `ctx.n = 0`. We write a checkpoint with `n_events = 0`. On restart, we reinject 0 events. The simulation then has no events and exits normally (the end condition checks if PQ is empty). This would give wrong output, but it's a degenerate case. ✓
+
+One more thing: the `hdr.n_events` on restart determines how many events to reinject. But we also need to make sure the reinjected events don't have duplicate keys in the splay tree (since we're reinjecting ALL of them fresh from scratch). Let me think...
+
+When we reinject N events, each `inject_event_into_pq` calls `tw_event_grab` (which zeroes the event_id) and then sets `e->event_id = ce->event_id`. The `tw_pq_enqueue` uses `tw_pq_compare_less_than_rand` to insert.
+
+Two reinjected events with the same `recv_ts` would have sig=0 and different event_ids. The comparison works correctly. ✓
+
+But what if two events have the same `recv_ts` AND the same `event_id`? This would happen if the original PQ had two events with identical recv_ts and event_id. In the original simulation, each event has a unique event_id (assigned by `++pe->seq_num`). But remote events from different PEs might have the same event_id as each other. So PE 0's event_id=100 and PE 1's event_id=100 could both be in PE 2's PQ.
+
+When we reinject these two events on PE 2:
+- Event A: recv_ts=T, event_id=100, send_pe=0
+- Event B: recv_ts=T, event_id=100, send_pe=1
+
+With sig=0 for both:
+- `tw_pq_compare_less_than_rand` compares: recv_ts (tie), sig.priority (both 0 → tie), event_tiebreaker (both empty → compare by event_id (both 100 → tie), compare by send_pe)
+- send_pe: 0 < 1 → Event A comes before Event B ✓
+
+Wait, let me re-read:
+```c
+else {
+    if (ROSS_WARN_TIE_COLLISION)
+        printf("ROSS Splay Tree Warning: Identical Tiebreaker and Event IDs found...\n");
+    if(n->send_pe < e->send_pe)
+        return 1;
+    else if (n->send_pe > e->send_pe)
+        return 0;
+    else
+        tw_error(TW_LOC,"Identical events found - impossible\n");
+```
+
+`send_pe` comparison is the LAST resort. If `send_pe` differs, no crash. ✓
+
+If `send_pe` is also the same... that would mean the same event is enqueued twice (same source PE, same ID, same timestamp). This can't happen with our approach since we save each event exactly once from the PQ (tree traversal visits each node exactly once). ✓
+
+I'm now confident the implementation is correct and complete. The key changes:
+
+1. **No more rollback in GVT hook** → eliminates the crash (MPI_ABORT with exit=1)
+2. **Read-only PQ traversal + event_q traversal** → captures complete state without modifying it
+3. **Checkpoint interval = 5 GVTs** → checkpoints appear early (within first ~few seconds)
+4. **Clean restart** → drain init events, restore RNGs, reinject saved events
+5. **veloc.cfg in place** → VeloC infrastructure working

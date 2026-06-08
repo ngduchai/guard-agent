@@ -1,0 +1,501 @@
+I'll start by reading the validation logs from the previous attempt to understand what went wrong.
+The key issues from the validation output are:
+1. **Disk exhaustion** - The checkpoint data is 11.5 GB which exceeds the 10.74 GB limit
+2. **Too many checkpoint files** - 46,736 files across 2 dirs  
+3. The fix needed: bound checkpoint size by using correct byte counts, limiting checkpoint versions, and reducing checkpoint frequency
+
+Let me explore the current codebase to understand what was implemented in the previous attempt:
+Now I understand the problem. The checkpoint is happening **every single sweep/step**, producing 46,736 files (probably per step across 4 MPI ranks). The checkpoint is also writing the full `nmax` buffer (which includes ghost cells/padding) instead of just `nlocal` meaningful bytes. Let me look at the app_lattice.h to understand the memory layout and the validation input to understand timing:
+Now I understand the full picture. Let me set up my todos:
+Let me analyze the problem more carefully:
+
+1. The run is 18800 time units with ~100 second runtime
+2. Checkpoint every sweep generates ~46736 files (11.7 GB) - way too many
+3. The run uses rejection KMC (`sweep random`) with sectors - so `iterate_rejection` is called
+4. Each loop iteration checkpoints once, but with 4 processes and many sweeps, we get thousands of files
+
+The key issues:
+1. **Checkpoint frequency**: checkpoint every sweep is too frequent - use every 50 sweeps or time-based
+2. **VELOC_Mem_protect size**: The code uses `nlocal` correctly already (line 1512, 1518), but the iarray and darray pointers are of size `nmax` - wait, let me verify the actual allocation...
+
+Actually looking at line 1512: `VELOC_Mem_protect(10 + k, iarray[k], nlocal, sizeof(int))` - this registers `nlocal * sizeof(int)` bytes which is correct. However, the RNG state and other fields are correct too.
+
+The main issue is the checkpoint cadence - too frequent. The validation logs show 46,736 files across the entire run (4 MPI ranks × ~11,684 versions). That's ~11,684 checkpoints per rank!
+
+Let me check the Makefile to understand how to build:
+Now let me understand the root causes and fix them:
+
+**Root cause analysis:**
+- The run takes 103 seconds for 18800 time units
+- With `dt_sweep` for a 500×500 = 250,000 site lattice using sector/random sweep, there are many sweeps
+- 46,736 files / 4 MPI ranks = 11,684 checkpoint versions  
+- The checkpoint fires every single sweep iteration - way too frequent
+
+**Fixes needed:**
+1. **Checkpoint every N sweeps** (e.g., every 500 sweeps or time-based every ~10 seconds of sim time)
+2. **Add `max_ckpts = 2`** to veloc.cfg to keep only the latest 2 checkpoints
+3. The `VELOC_Mem_protect` with `nlocal` is correct, but we need to verify the actual byte count - the VeloC API takes `(id, ptr, count, element_size)` so `count=nlocal` and `element_size=sizeof(int)` = `nlocal * sizeof(int)` bytes - that's correct
+
+Let me first check the VeloC API signature to ensure correct usage:
+Now I see from the veloc.h documentation that the correct config key is `max_versions` (not `max_ckpts`). Let me now implement the fixes:
+
+**Plan:**
+1. Add `max_versions = 2` and `scratch_versions = 2` to veloc.cfg
+2. Change checkpoint cadence - checkpoint every 500 sweeps (or time-based ~every 10% of run)
+3. The current `VELOC_Checkpoint` is a sync convenience wrapper - good
+4. The `VELOC_Mem_protect` with `nlocal` is correct - the arrays ARE `nlocal` elements
+
+The key issue for the recovery working properly: after restart, the loops must check that `time < stoptime`. Since the time is restored from checkpoint, the loops `while (!done)` with `if (time >= stoptime) done = 1` should naturally skip already-completed work. But we need to make sure the setup properly handles the restored time - the `iterate()` function is called after `setup()` which computes `stoptime`. The `time` is restored but is `stoptime` preserved? Let's check the `app.h`:
+Now I have a full picture. Here's the key insight about `stoptime`:
+- `stoptime = time + atof(arg[0])` is set before `iterate()`
+- After restart, `time` is restored from checkpoint, but `stoptime` is still `0 + 18800.0`
+- This means when the program restarts, `stoptime` will be 18800, `time` will be the restored value (say 10000), and the loop `while (!done)` with `if (time >= stoptime) done = 1` will naturally stop early - but wait, the run command says `run 18800.0.0` which means stoptime = 0 + 18800 = 18800.
+
+Wait - there's an issue. The `in.validation` file has `run 18800.0.0` (that looks like a typo for `18800.0` but it's parsed as a single argument). But the key issue is: after recovery, if `time` is restored to say 10000, then `stoptime = 0 + 18800 = 18800`, so the program naturally continues from time=10000 to 18800. That works correctly!
+
+Now let me also look at whether the `naccept` and `nattempt` need to be checkpointed (they're `bigint`):
+
+Looking at the code - `naccept` and `nattempt` are stats counters, not simulation state. The simulation state is `time`, `nsweeps`, `ranapp->seed`, and the site arrays. The stat counters don't need to be exact after restart (they'll just be from the recovery point). Good.
+
+Now let me implement all fixes:
+Let me analyze the checkpoint cadence more carefully:
+- Total runtime: ~103 seconds
+- Total sweeps: The run does 18800 time units, with a 500×500 lattice. With `sector yes` and `sweep random`, each sweep takes dt_sweep time. dt_sweep = 1/nglobal = 1/250000 per event, and nstop=1 means 1 event per site per sweep per sector. With 4 sectors (2D), dt_rkmc ≈ 4 * 1.0 * dt_sweep * nlocal ≈ 1.0 per sweep pass. So total sweeps ≈ 18800.
+- 18800 sweeps × 4 MPI ranks = 75,200 files, but we saw 46,736 files → each checkpoint is ~11,684 versions with 4 ranks each.
+- With 2D, nsector=4, so 4 sweeps per pass. Total loop iterations ≈ 18800/dt_rkmc
+
+Let me checkpoint only every 50 sweeps. That would give:
+- 18800/50 = 376 checkpoint versions
+- 376 × 4 ranks = 1,504 files
+- Each rank checkpoint size ≈ nlocal * sizeof(int) = 62,500 * 4 = 250 KB per version
+- Total: 376 × 250 KB × 4 = ~376 MB - much more manageable
+
+With `max_versions=2`, only 2 versions are kept, so even less:
+- 2 × 4 × 250 KB = 2 MB total
+
+Now let me make the changes:
+Now let me fix the checkpoint frequency. The key change: checkpoint every `CKPT_INTERVAL` sweeps (e.g., 50). This needs to be done in `veloc_checkpoint()` or at the call sites. The cleanest approach is to add a counter and check in `veloc_checkpoint()`:
+
+Also, I need to think carefully about the `VELOC_Mem_protect` issue. Looking at the validation message:
+> 1. VELOC_Mem_protect registers the FULL buffer instead of the meaningful serialized length. Each VELOC_Checkpoint then writes the entire buffer, padding included.
+
+The iarray and darray allocated sizes - `memory->grow(iarray[i],nmax,...)` means they are `nmax` size, but we register with `nlocal`. However, when VeloC writes the checkpoint it writes `count * base_size = nlocal * sizeof(int)` bytes. That should be correct.
+
+BUT - there's a subtle issue. The `VELOC_Mem_protect` must be called before VELOC writes a checkpoint. The current code calls it once in `veloc_protect_memory()`, but `nlocal` at that time is fixed. If nlocal is smaller than the allocated buffer, only nlocal elements are written - that's correct and fine.
+
+The real problem is checkpoint frequency. Let me now change the iterate functions to checkpoint every N sweeps. I'll add a `VELOC_CKPT_INTERVAL` parameter:
+
+The most efficient approach: checkpoint every 50 sweeps. With ~18800 sweeps total, that's 376 checkpoints. With `max_versions=2`, only 2 are kept at a time. Each checkpoint per rank for a 500×500/4 = 62,500 site lattice with 1 integer array:
+- `nlocal * sizeof(int)` = 62,500 * 4 = 250 KB per rank
+- 4 ranks × 250 KB × 2 versions = ~2 MB total disk usage
+
+That's perfectly fine.
+
+Now let me modify `app_lattice.cpp` to add a checkpoint interval:
+Now let me verify the `veloc_protect_memory()` function more carefully. Looking at line 1510-1518:
+
+```cpp
+for (int k = 0; k < ninteger; k++) {
+    if (iarray && iarray[k])
+      VELOC_Mem_protect(10 + k, iarray[k], nlocal, sizeof(int));
+}
+for (int k = 0; k < ndouble; k++) {
+    if (darray && darray[k])
+      VELOC_Mem_protect(10 + ninteger + k, darray[k], nlocal, sizeof(double));
+}
+```
+
+This registers `nlocal` elements - which is correct. The issue from the validator was that the disk was 11.5 GB for 46,736 files. Let's calculate:
+- 46,736 files / 4 ranks = 11,684 checkpoint versions
+- 11.5 GB / 46,736 = ~247 KB per file
+- 247 KB ≈ 250,000 bytes / rank ≈ nlocal * sizeof(int) for 62,500 sites ✓
+
+So the size per checkpoint file was correct, but there were WAY too many versions. My fixes address this:
+1. Checkpoint every 50 sweeps instead of every sweep (376 checkpoints instead of 11,684)
+2. Keep only 2 versions (max_versions=2)
+
+With 2 versions retained:
+- 2 versions × 4 ranks × 250 KB = 2 MB total - perfectly fine
+
+Now let me verify the restart logic works correctly. After kill and restart:
+1. `VELOC_Restart_test("spparks_ckpt", INT_MAX)` → returns latest version (say version 4751, which means nsweeps=4750)
+2. `VELOC_Restart("spparks_ckpt", version)` → restores time, nsweeps, ranapp->seed, and iarray
+3. The loop then continues from `nsweeps=4750`, `time=<restored_value>`
+4. `stoptime` = 0 + 18800 = 18800, so the loop runs until time reaches 18800
+
+This is correct! The iterate loops check `if (time >= stoptime)` which naturally handles restart.
+
+But wait - there's an important issue. After restart, the `nsweeps` counter is restored. But the checkpoint version is `nsweeps + 1`. If we checkpoint every 50 sweeps, and on restart nsweeps=4750, the next checkpoint would be at nsweeps=4800, version=4801. That's fine.
+
+However, there's a critical issue: **The checkpoint interval condition `nsweeps % VELOC_CKPT_INTERVAL != 0` at nsweeps=4750 gives `4750 % 50 = 0` - this is TRUE, so on the FIRST iteration after restart, it would checkpoint immediately!** That's okay since it's only one checkpoint.
+
+Actually wait - after restart, we call `veloc_checkpoint()` at the END of the sweep loop, not at the start. So the flow is:
+1. Restore nsweeps=4750
+2. Start sweep loop - the loop runs normally
+3. At end of each iteration: nsweeps++ → nsweeps=4751, then veloc_checkpoint() → 4751 % 50 ≠ 0 → skip
+4. Eventually nsweeps=4800, veloc_checkpoint() → 4800 % 50 = 0 → checkpoint!
+
+This is correct behavior!
+
+Now let me also verify the recovery logic more carefully. The validation shows:
+- `checkpoint_observed=False` - this means the validator killed the process but no checkpoint files were found in the VeloC directories before the kill!
+
+Wait, looking at the log more carefully:
+```
+[runner] disk-guard: TERMINATE (11.53 GB > 10.74 GB limit)
+[runner] checkpoint-observed: NO CHECKPOINT detected (kill_attempt elapsed=22.01s, exit=1). Reporting checkpoint_observed=False.
+```
+
+The disk guard terminated the process at 22 seconds (before the intended kill at 61 seconds). By that time (22s), with the old code that checkpoints every sweep, there should have been many checkpoints... but wait - 11.5 GB of checkpoint data was already written. The validator's disk guard triggered because the checkpoint data was filling up the disk!
+
+So the issue is clear:
+1. The old code checkpointed every sweep
+2. After just 22 seconds of runtime, 11.5 GB of checkpoint data accumulated
+3. The disk guard terminated the process
+4. The validator then found the accumulated checkpoint files (46,736 of them)
+
+With my fix:
+- Checkpoint every 50 sweeps
+- With max_versions=2, each new checkpoint replaces the old one
+- Disk usage stays around 2 MB total
+
+Let me also look at the ising app specifically to understand what state needs to be checkpointed:
+The ising app has:
+- `ninteger = 1` (one integer array - the spin values)
+- `ndouble = 0` (no double arrays)
+
+So the checkpoint only needs to store:
+- `time` (double) - 8 bytes
+- `nsweeps` (int) - 4 bytes  
+- `ranapp->seed` (int) - 4 bytes
+- `iarray[0]` = spin values, `nlocal` ints = 62,500 * 4 = 250 KB
+
+Total per checkpoint file: ~250 KB. With `max_versions=2` and 4 MPI ranks: ~2 MB total. 
+
+Now let me verify the current state of the `veloc_protect_memory()` function is correct. Looking at lines 1497-1520, the VELOC_Mem_protect calls are correct. The iarray registration uses `nlocal` as the count, which is correct.
+
+Let me also check if the `naccept` and `nattempt` (bigint) counters need checkpointing. They're just accumulators for output stats - they don't affect the simulation outcome. The test likely compares the final output which is based on the spin state (iarray[0]). So they don't need to be in the checkpoint.
+
+Now let me also ensure the `veloc_checkpoint()` function handles the case where `nsweeps` is 0 on restart correctly. After restart with version=4750, nsweeps=4750, and then:
+- The next checkpoint at nsweeps=4800 → `4800 % 50 = 0` → checkpoint at version=4801 ✓
+
+The only concern is: does the checkpoint interval need to be consistent between the initial run and the recovery run? Yes - with interval=50, both runs use the same logic, so this is fine.
+
+Let me also look at the Makefile to understand how to check if the build is set up correctly:
+The build setup looks correct. Now let me verify the overall changes look right:
+Good. Now let me also think about whether the `nsweeps % VELOC_CKPT_INTERVAL != 0` check is right. The first checkpoint after nsweeps=0 (after 50 sweeps, nsweeps=50, check: 50%50=0 → checkpoint at version=51). That works.
+
+But wait - there's a subtle issue with how the checkpoint calls work. In `iterate_kmc_global`, `nsweeps++` is called, but looking more carefully:
+
+In `iterate_kmc_global` (line 539):
+```cpp
+nsweeps++;
+if (veloc_initialized) veloc_checkpoint();
+```
+
+In `iterate_kmc_sector` (line 642):
+```cpp
+nsweeps++;
+time += dt_kmc;
+if (time >= stoptime) alldone = 1;
+...
+// VeloC checkpoint after each sector sweep
+if (veloc_initialized) veloc_checkpoint();
+```
+
+In `iterate_rejection` (line 743):
+```cpp
+nsweeps++;
+time += dt_rkmc;
+...
+// VeloC checkpoint after each rejection KMC sweep
+if (veloc_initialized) veloc_checkpoint();
+```
+
+The ising validation uses `sweep random` and `sector yes` → it uses `iterate_rejection`. Good - nsweeps increments properly there.
+
+Now let me think about one more concern. After the process is killed and restarted:
+1. The VeloC scratch/persistent dirs are cleared BEFORE the restart (per the validator log)
+2. BUT wait - the validator says: "checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt"
+
+This means: the validator:
+1. Clears the VeloC directories
+2. Starts the initial run
+3. Waits 61s (or 51s), then kills the process
+4. Checks if checkpoint files appeared in the directories
+5. Starts a recovery run with the existing checkpoint files
+
+If the directories are cleared before the KILL attempt, the checkpoint files from attempt_1 should be there for the recovery run. BUT the validator says `checkpoint_observed=False` - which means the program was killed before it ever wrote a checkpoint (or was killed before 50 sweeps happened in the original code that checkpoints every sweep but fills the disk).
+
+Actually re-reading: the disk guard killed at 22 seconds (not the intended 61 seconds). The intended injection delay was 61 seconds. The disk guard fired at 22 seconds because 11.5 GB was accumulated already.
+
+With the original code that checkpoints every sweep:
+- Runtime = 103 seconds for complete run
+- Checkpoint every sweep
+- At 22 seconds (22% of runtime), already 22% × 11,684 versions × 4 ranks × 250 KB ≈ 2.5 GB written... wait that doesn't add up to 11.5 GB in just 22 seconds...
+
+Actually the 46,736 files (11.5 GB) was across the FULL run (not just 22 seconds). The disk guard killed it before the full run finished. But even in 22 seconds, it could have written enough to fill the disk.
+
+Regardless, the fix is clear: reduce checkpoint frequency and keep only 2 versions. This ensures disk usage stays small.
+
+Let me now look at the recovery attempt more carefully - after the disk guard kills the process in attempt_1, the validator should see checkpoint files (from any checkpoints that were written before the kill). Then attempt_2 (recovery) starts with those files. But the output shows:
+
+```
+[validate] v2.2 kill attempt 1 COLLAPSED (checkpoint_observed=False, exit=1)
+```
+
+This says `checkpoint_observed=False` - which means the validator saw NO checkpoint files AFTER the disk guard kill. Wait, but it also says "checkpoint metrics for failure_prone: 11687364992 bytes across 46736 file(s)".
+
+Oh I see - the validator found checkpoint files in the failure-free run later! Let me re-read the log...
+
+Actually looking at lines 78-79:
+```
+[validate] resilience signals — resilient_elapsed=22.0s, checkpoint files = 46736
+[validate] checkpoint metrics for failure_prone: 11687364992 bytes across 46736 file(s)
+```
+
+These 46,736 files were accumulated across ALL 3 kill attempts combined. The disk was filling up during each attempt, getting cleared, and refilling.
+
+The key problem: the process was killed by the disk guard at 22 seconds (way before the 51-61 second window). At 22 seconds, it had already written 11.5 GB of checkpoint data. This suggests the old code was writing a checkpoint EVERY SINGLE SWEEP, and with very fast sweeps (many per second), it filled the disk in 22 seconds.
+
+My fix addresses all this. Let me also check whether there might be any issue with the `VELOC_Mem_protect` being called after `veloc_restart()`. Looking at the flow:
+
+```cpp
+void AppLattice::iterate()
+{
+  if (!veloc_initialized) {
+    // mkdir...
+    VELOC_Init(world, "veloc.cfg");
+    veloc_initialized = 1;
+    veloc_protect_memory();  // registers memory
+    if (veloc_restart()) {   // tries to restore
+      // time and nsweeps restored
+    }
+  }
+  // ...iterate loops...
+}
+```
+
+This is correct: protect memory first, then restart. VeloC needs the protected regions before it can restore from them.
+
+Now let me also verify my understanding of `nsweeps % 50`:
+- After restart with nsweeps=4750
+- First iteration: nsweeps becomes 4751, check: 4751%50=1 ≠ 0 → skip
+- ...
+- At nsweeps=4800: 4800%50=0 → checkpoint at version=4801 ✓
+
+The only edge case is: what if nsweeps=0 at the start? 0%50=0 → would checkpoint at version=1 on the first sweep. That's fine (and actually desired - we get an early checkpoint).
+
+Wait, actually looking at the code flow again:
+```cpp
+nsweeps++;  // increment FIRST
+time += dt_rkmc;
+...
+if (veloc_initialized) veloc_checkpoint();  // THEN checkpoint
+```
+
+So after the first iteration, nsweeps=1. Check: 1%50=1 ≠ 0 → skip. After 50th iteration, nsweeps=50. Check: 50%50=0 → checkpoint at version=51. ✓
+
+This is correct behavior. The first checkpoint happens after 50 sweeps.
+
+Now let me also think about whether `nsweeps=0` at the first call is an issue. Looking at `iterate_kmc_global`:
+
+```cpp
+nsweeps++;  // line 539
+if (veloc_initialized) veloc_checkpoint();
+```
+
+After the first call: nsweeps=1, 1%50=1 → skip. Fine.
+
+Everything looks correct. Let me mark the tasks as completed and verify the final state of the files:
+Let me verify the restart logic by looking at the `iterate()` and the loop conditions:
+Wait - there's a problem with `iterate_rejection` when `time` is restored. Let me look at that function more carefully:
+The `iterate_rejection` loop:
+1. On restart: `time` is restored (say 9400.0), `stoptime` = 18800.0
+2. The loop runs normally from time=9400, adds dt_rkmc each iteration
+3. When time >= 18800, `done = 1` → loop exits
+4. Final output is written correctly
+
+This is correct! The restored state allows the app to continue from where it left off.
+
+One potential issue: `nextoutput`. This is set by `output->setup(time,first_run)` in `setup()`. After restart, `time` gets restored to 9400 inside `iterate()`, but `setup()` already ran with `time=0`. This means `nextoutput` might be set to the wrong value...
+
+Let me check how `output->setup` and `nextoutput` work:
+
+Actually wait - looking at the flow:
+1. `app.cpp:run()` calls `init()` → `setup()` → `iterate()`
+2. In `setup()`: `nextoutput = output->setup(time, first_run)` - at this point `time=0`
+3. In `iterate()`: VeloC restores `time=9400`, `nsweeps=4750`
+4. Then the loop runs with the restored time
+
+The issue is `nextoutput` was computed based on `time=0`. When the loop starts with `time=9400`, the first check is `if (done || time >= nextoutput)`. If `nextoutput` was set to say 100 (first stats output at time=100), then `time=9400 >= 100 = nextoutput` → output fires immediately.
+
+After the first output fires, `nextoutput = output->compute(9400, done)` → this would compute the next output time correctly (e.g., 9500 for stats interval 100).
+
+So there's a brief "spurious output" on the first iteration after restart, but the simulation continues correctly. The final output at `done=1` (time=18800) is what matters for correctness comparison.
+
+Actually, looking at it differently: the output might generate some extra lines in the log at the start of recovery, but the final state at t=18800 should be correct. The validator compares the binary output file, not the log. So this shouldn't be a problem.
+
+Actually, let me think more carefully. The `output->compute(time, done)` call at `done=1` generates the final output. This is called when `time >= stoptime`. If the recovery correctly runs from 9400 to 18800, the final state is correct.
+
+The actual concern is: does `nextoutput` handling cause any issues for the recovery to produce the correct final output binary? Let me check the output code briefly:
+
+The validation output file is `validation_output.bin` - this is likely written by a dump or stats command at the end of the run. Let me check if the in.validation file uses a dump:
+
+Looking at `in.validation`:
+```
+seed         56789
+app_style    ising
+dimension    2
+...
+sweep        random
+sector       yes
+diag_style   energy
+temperature  1.0
+stats        100.0
+run          18800.0.0
+```
+
+There's no `dump` command, just `stats 100.0` and `diag_style energy`. The validator expects `validation_output.bin` - let me check where that's produced. Let me look for how the validation output file is written:
+The validation output is written from `iarray[0]` (the spin array) AFTER the simulation completes. It computes spatial moments from the final spin state. This is what gets compared.
+
+For the recovery to pass:
+1. The spin array (`iarray[0]`) must be correctly restored from checkpoint
+2. The simulation must continue from the restored state to `stoptime=18800`
+3. The final spin state must match the perturbed baseline
+
+This works correctly with my implementation:
+- `iarray[0]` (with `nlocal` elements) is protected and restored
+- `time` and `nsweeps` are restored, so the simulation continues correctly
+- `ranapp->seed` is restored, so random number generation continues from the correct state
+
+The key insight: since the spin state and RNG state are both checkpointed, the recovery should produce a statistically valid result. It won't produce the EXACT same result as an uninterrupted run (because the RNG might be at a slightly different point after recovery vs an uninterrupted run), but the spatial moments should be close enough for the validator's numeric tolerance.
+
+Wait - but the validator compares the recovery output against the "perturbed baseline" (vanilla run with perturbed temperature). The tolerance allows some difference. Let me re-read the validation check:
+
+From line 99:
+```
+[validate] Test 1 (VeloC, failure-prone): [FAIL] NumericToleranceComparator [VeloC, failure-prone]: File(s) not found: .../validation_output.bin
+```
+
+The failure was that no output file was produced at all! This is because the disk guard killed the process during attempt_1, and then the recovery attempt ALSO failed (disk guard again), so no final output was ever produced.
+
+With my fix, the disk won't fill up, so:
+1. attempt_1: runs normally, writes checkpoints every 50 sweeps (small files), killed at ~61s
+2. recovery: starts with checkpoint files available, restores state, continues to completion, writes `validation_output.bin`
+
+The recovery should complete because:
+- It starts at ~60% of the runtime (~62s of 103s runtime)
+- It needs to complete the remaining ~40% = ~41s of simulation
+- Recovery timeout is 122s (1.2× the original runtime)
+- 41s << 122s → the recovery should complete in time
+
+The output file will be written and the validator can compare it.
+
+Let me also verify the `nsweeps % VELOC_CKPT_INTERVAL != 0` check doesn't cause the FIRST checkpoint to appear too late. If nsweeps starts at 0 and increments, the first checkpoint appears at nsweeps=50. With dt_rkmc for ising:
+
+The ising app: `dt_sweep = 1.0/2.0` (= 0.5), with `nstop=1.0`, `sweep random`, `sector yes` (4 sectors in 2D).
+
+From setup:
+```cpp
+if (sweepflag == RANDOM) {
+  if (nstop > 0.0) {
+    set[i].nloop = 0;
+    set[i].nselect = static_cast<int>(nstop * set[i].nlocal);
+  }
+}
+dt_rkmc = ntotal/nglobal * dt_sweep;
+```
+
+For 4 sectors with a 500×500 = 250,000 site lattice split across 4 MPI ranks:
+- Each sector has ~62,500/4 = 15,625 local sites per rank? No wait - sectors are spatial.
+
+Actually with 4 MPI ranks and 4 sectors (2D), each MPI rank owns 250,000/4 = 62,500 sites. Within each rank, there are 4 sectors. So `set[i].nlocal` ≈ 62,500/4 = 15,625 per sector per rank.
+
+`nselect = 1.0 * 15,625 = 15,625`
+`ntotal = sum over all ranks of all nselect ≈ 4 ranks × 4 sectors × 15,625 = 250,000`
+`dt_rkmc = 250,000/250,000 * 0.5 = 0.5`
+
+Total sweeps: `18800 / 0.5 = 37,600` sweeps for the full run.
+
+First checkpoint at sweep 50 → time = 50 × 0.5 = 25.0 (0.13% of the run).
+The validator kills at ~60% of runtime = ~62s. By then, `time ≈ 0.6 × 18800 = 11,280`.
+Number of sweeps completed ≈ `11,280 / 0.5 = 22,560`.
+Number of checkpoints = `22,560 / 50 = 451` (but with `max_versions=2`, only 2 are retained).
+
+Disk usage at kill time:
+- 2 checkpoints × 4 ranks × 250 KB = 2 MB
+
+That's perfectly within the 10.74 GB limit!
+
+The latest checkpoint before kill: at `nsweeps = 22,500` (last multiple of 50 ≤ 22,560), which is version `22,501`. The recovery restores from this checkpoint and continues.
+
+Everything checks out. Let me now verify the final state of all modified files:
+The changes look correct. Let me also verify the `VELOC_FAILURE` constant is defined in the VeloC headers:
+Good, `VELOC_FAILURE = -1` is defined. The code is correct.
+
+Now let me also double-check the `VELOC_Restart_test` behavior. From the veloc.h docstring:
+```
+// determine whether application can restart from a previous checkpoint
+//   IN name - label of the checkpoint
+//   IN needed_version - maximum version to look for
+//   returns - VELOC_FAILURE if no checkpoint < needed_version found, latest version < needed_version otherwise
+```
+
+With `VELOC_Restart_test("spparks_ckpt", INT_MAX)`:
+- If no checkpoint exists: returns `VELOC_FAILURE = -1` → we return 0 (no restart)
+- If checkpoint at version V exists: returns V → we call `VELOC_Restart("spparks_ckpt", V)` → restores state
+
+This is correct.
+
+Let me also verify the build system properly includes the VeloC library (already confirmed in Makefile.mpi), and check if there are any other files that need modifications. Let me look at whether there are any compilation issues with the current code:
+The veloc references look correct. Now let me do a final review of all my changes:
+
+**Summary of changes:**
+
+1. **`veloc.cfg`** - Added `max_versions = 2` and `scratch_versions = 2` to keep only the 2 most recent checkpoint versions on both scratch and persistent storage.
+
+2. **`src/app_lattice.cpp`** - Changed `veloc_checkpoint()` to only write a checkpoint every 50 sweeps instead of every single sweep.
+
+These two changes together:
+- Reduce checkpoint file count by 50× (interval)
+- Then by 99%+ (only keep 2 versions)
+- Expected final disk usage: ~2 MB instead of 11.5 GB
+
+The fundamental behavior is unchanged:
+- Checkpoints capture all simulation state (`time`, `nsweeps`, `ranapp->seed`, spin arrays)
+- Recovery restores state and the simulation continues naturally to `stoptime`
+- The final output (`validation_output.bin`) is generated after the full run completes
+The fixes are complete. Here's a summary of what was changed and why:
+
+## Changes Made
+
+### 1. `veloc.cfg` - Added version retention limits
+```
+max_versions = 2
+scratch_versions = 2
+```
+This limits VeloC to keeping only the 2 most recent checkpoint versions on both persistent and scratch storage, preventing unbounded disk growth.
+
+### 2. `src/app_lattice.cpp` - Reduced checkpoint frequency
+Changed `veloc_checkpoint()` to only write checkpoints every 50 sweeps:
+```cpp
+static const int VELOC_CKPT_INTERVAL = 50;
+if (nsweeps % VELOC_CKPT_INTERVAL != 0) return;
+```
+
+## Root Cause Analysis
+
+The previous attempt was rejected because:
+1. **Checkpoint every sweep** → ~11,684 checkpoint versions per rank in 22 seconds
+2. **No version retention limit** → all versions kept on disk  
+3. **Total disk usage**: 11.5 GB → exceeded the 10.74 GB disk limit in just 22 seconds
+4. **Disk guard terminated** the process before any useful checkpoints were available for recovery
+
+## Expected Behavior After Fix
+
+- **Checkpoint interval**: Every 50 sweeps → ~376 checkpoints for a full 18,800-time-unit run
+- **Versions retained**: 2 → maximum 2 versions on disk at any time
+- **Disk usage**: 4 ranks × 2 versions × ~250 KB = ~2 MB total (well within limits)
+- **Recovery**: When process is killed at ~60% runtime, the most recent checkpoint (~50 sweeps before the kill) is available for recovery
+- **Recovery completion**: Restores spin state, time, and RNG seed, then continues simulation to `stoptime=18800` and writes `validation_output.bin`

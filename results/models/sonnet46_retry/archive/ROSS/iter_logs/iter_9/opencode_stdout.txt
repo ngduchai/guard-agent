@@ -1,0 +1,402 @@
+I'll start by examining the previous attempt's failure logs and the current codebase to understand what needs to be fixed.
+The validate_stdout shows the recovery attempt timed out at 93.6s. The run was killed and never recovered. Let me look at the current codebase:
+Now let me look at other earlier iterations to understand the history of issues:
+Now I understand the full picture. The recovery attempt timed out - the restart run hung and never finished. This is the MPI deadlock described in the task prompt. Let me examine the code more carefully:
+Now I need to understand the deadlock. Looking at the code flow:
+
+1. **`veloc_post_lp_init`** is called from `tw_sched_init` via `(*me->type.post_lp_init)(me)` at line 482.
+2. After `post_lp_init`, there are `tw_net_barrier()` calls at lines 484 and 488.
+3. Inside `veloc_post_lp_init`, there are multiple early-return paths (`return`) that happen on some ranks but not others, BEFORE reaching those barriers.
+
+The problem is clear: `veloc_post_lp_init` has per-rank early returns. If rank 0 succeeds in restarting but another rank fails (or vice versa), some ranks return early while others continue and reach a barrier inside the collective VeloC operations. This causes an MPI deadlock.
+
+Also, `VELOC_Restart_begin`, `VELOC_Recover_mem`, `VELOC_Restart_end` are likely collective VeloC operations that need ALL ranks to call them together.
+
+Let me check what VeloC functions are collective:
+Now I have a clear understanding of the problem. Let me analyze the deadlock:
+
+**Root Cause of MPI Deadlock:**
+
+The `veloc_post_lp_init` function is called from `tw_sched_init`. After the hook returns, `tw_net_barrier()` is called. The issue is that `VELOC_Restart_begin`, `VELOC_Recover_mem`, and `VELOC_Restart_end` are all **collective operations** - they need ALL MPI ranks to call them together.
+
+When one rank hits an early-return path (e.g., `VELOC_Restart_begin` fails on rank X but not rank Y), rank X returns early from `veloc_post_lp_init`, but ranks that continued forward hit `VELOC_Recover_mem` (or similar collective). The returning rank goes to `tw_net_barrier()` while others block in the collective VeloC call - deadlock.
+
+Also, `VELOC_Restart_test` may return different values on different ranks, causing divergent code paths.
+
+**The fix:** Use `MPI_Allreduce` to agree on a global restart version and success/failure at each step, ensuring ALL ranks take the same path through the collective VeloC operations.
+
+Additionally, the checkpoint path in `veloc_gvt_hook` has a similar issue: if one rank exits early (OOM, overflow) before `VELOC_Checkpoint_begin`, while other ranks call it, that's a deadlock too.
+
+Let me also check whether `VELOC_Checkpoint_begin`, `VELOC_Restart_begin` etc. are actually collective:
+Now I understand the situation clearly. Based on the VeloC documentation and what we know about VeloC's collective mode (it was initialized with `MPI_COMM_WORLD`), the VeloC operations are collective and all ranks must call them together.
+
+The key bugs are:
+
+1. **In `veloc_post_lp_init`**: Multiple early returns before/after collective VeloC calls. If `VELOC_Restart_test` returns different values on different ranks (unlikely but possible), or if file operations fail on some ranks, we get divergent paths through collective operations.
+
+2. **The recovery timed out** - the recovery run ran for 93.6 seconds with exit code 1. This means the recovery run hung. The likely cause is:
+   - On restart, one rank fails to open the event file or read it
+   - That rank calls `VELOC_Restart_end(0)` or returns early
+   - But the VeloC call `VELOC_Restart_end` is collective - if one rank already called `VELOC_Restart_begin` and another didn't, deadlock occurs
+   - OR: the restart completes but then the simulation doesn't produce correct output within the time limit
+
+Wait - looking more carefully: the recovery attempt timed out. The timeout is 93.6s (1.06x failure-free ~88.5s). So the restart run ran for 93+ seconds and was killed. The issue could be:
+
+1. The restart run hangs due to MPI collective deadlock
+2. The restart run runs but produces wrong output or takes longer than expected
+
+Given the task prompt specifically diagnoses this as an "MPI deadlock", let me focus on fixing the collective operation issues.
+
+The key issue: `VELOC_Restart_begin` and `VELOC_Restart_end` are likely collective. If any rank fails before calling `VELOC_Restart_begin` (e.g., `ver <= 0` branch), but others did call it, we have a deadlock.
+
+But wait - `VELOC_Restart_test` should return the same value on all ranks since it's querying the same checkpoint directory. Let me think more carefully...
+
+Actually, looking at the validate output:
+```
+[runner] checkpoint-observed: detected 1 checkpoint file(s) in scratch/persistent dirs.
+[runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+```
+
+Then kill happens at 72.23s. The checkpoint was just detected. Then recovery starts.
+
+The issue may be that when VeloC is killed mid-checkpoint (via SIGKILL during write), the checkpoint state is corrupt or only partially written. When the recovery attempt starts, `VELOC_Restart_test` may return version X on some ranks but not others (or return success/failure differently per rank), causing some ranks to enter the restart code path while others return early.
+
+Or more likely: the `veloc_post_lp_init` hook works via `tw_sched_init`, which is called from `tw_run()`. The hook is called on each PE. In ROSS, there's only one PE per MPI rank. So each rank calls `veloc_post_lp_init` independently.
+
+The collective VeloC operations (`VELOC_Restart_begin`, `VELOC_Recover_mem`, `VELOC_Restart_end`, `VELOC_Checkpoint_begin`, `VELOC_Checkpoint_mem`, `VELOC_Checkpoint_end`) all require ALL ranks to call them simultaneously.
+
+If one rank's file open fails while another succeeds, or one rank's `VELOC_Restart_begin` fails while another succeeds, we get a split where:
+- Rank A: calls `VELOC_Restart_begin`, then `VELOC_Recover_mem`, then `VELOC_Restart_end(0)`, returns
+- Rank B: fails at file open, calls `VELOC_Restart_end(0)`, returns  
+
+If `VELOC_Recover_mem` is collective, rank B never calls it but rank A does → deadlock.
+
+The fix is: use MPI_Allreduce to synchronize success/failure at every step, ensuring all ranks call the same set of collective VeloC functions.
+
+Let me also look at the GVT hook for similar issues:
+
+In `veloc_gvt_hook`, the early returns happen:
+1. `if (past_end_time) return;` 
+2. `if (now - g_last_ckpt_wall < CKPT_WALL_INTERVAL) return;`
+3. `if (OOM) { free; return; }`
+4. `if (ctx.overflow) { free; return; }`
+
+These all happen BEFORE `VELOC_Checkpoint_begin`. Since `VELOC_Checkpoint_begin` is collective (all ranks must call it), if some ranks return early and others call it → deadlock.
+
+But wait - looking at the `tw_gvt_hook_step` code, the hook is called per-PE (i.e., per-rank). The timer check `(now - g_last_ckpt_wall < CKPT_WALL_INTERVAL)` will be different for different ranks since each rank has its own `g_last_ckpt_wall`. Actually they should all be updated simultaneously since all ranks checkpoint at the same GVT round, so `g_last_ckpt_wall` should be in sync... but it's a subtle timing issue.
+
+The most correct fix is to make all these collective decisions via `MPI_Allreduce`. Let me now write the fix:
+Now I'll completely rewrite `phold.main.c` with the proper fix. The key changes:
+
+1. **`veloc_gvt_hook`**: Use `MPI_Allreduce` to decide collectively whether to checkpoint. If ANY rank can't checkpoint (timer not yet, OOM, overflow), ALL ranks skip.
+2. **`veloc_post_lp_init`**: Use `MPI_Allreduce` to agree on whether to restart and whether each collective step succeeded. If ANY rank fails, ALL call the same fallback path (abort).
+Now let me check the veloc.cfg file:
+Good, the veloc.cfg looks correct. Now let me also look at the CMakeLists to ensure the build is correct:
+The build looks good. Now let me think more carefully about the specific recovery issue. Looking at the validate output again:
+
+```
+[runner] checkpoint-observed: recovery TIMEOUT after 93.6s; killing.
+[runner] checkpoint-observed: recovery attempt complete (elapsed=94.63s, exit=1, timed_out=True).
+```
+
+The recovery run was killed (timed out), with exit=1. This suggests either:
+1. The restart code is blocking (MPI deadlock)
+2. The restart code completes but takes too long
+
+The fact that it timed out at 93.6s strongly suggests an MPI deadlock.
+
+Let me re-examine the `veloc_post_lp_init` function more carefully to find ALL possible deadlock points. The key issue is:
+
+1. `VELOC_Restart_test` - Each rank queries its own checkpoint. If one rank's checkpoint files are incomplete (due to SIGKILL mid-write), it might return -1 while others return the version. We use `MPI_Bcast` to sync this.
+
+2. `VELOC_Restart_begin` - Collective. Our fix: all ranks call it.
+
+3. `VELOC_Recover_mem` - Collective. Our fix: all ranks call it.
+
+4. `VELOC_Restart_end` - Collective. Our fix: all ranks call it.
+
+But wait - there's another subtle issue. When we call `VELOC_Restart_end(0)` after `VELOC_Restart_begin` on the begin-failure path, is that correct? Looking at the code:
+
+```c
+if (!global_ok) {
+    /* Some rank failed to begin; ALL call end(0) to complete collective */
+    VELOC_Restart_end(0);
+```
+
+This might not be correct if `VELOC_Restart_begin` didn't actually start on all ranks (it returned failure on some). If `VELOC_Restart_begin` is a collective that needs all ranks to call it before `VELOC_Restart_end` is also collective, this could be problematic.
+
+A safer approach: if `VELOC_Restart_begin` fails, we should NOT call `VELOC_Restart_end`. But since we've already called `VELOC_Restart_begin` on all ranks (since we checked `global_ok` AFTER calling it on all ranks), we need to call `VELOC_Restart_end` regardless.
+
+Wait, looking at my code again:
+
+```c
+int rc = VELOC_Restart_begin(CKPT_NAME, ver);
+int local_ok = (rc == VELOC_SUCCESS) ? 1 : 0;
+int global_ok = all_ok(local_ok);
+
+if (!global_ok) {
+    VELOC_Restart_end(0);  // <- ALL ranks called Restart_begin already
+    ...
+```
+
+This is correct! All ranks already called `VELOC_Restart_begin` (it's not conditional). We then use `all_ok` to check if all succeeded. If any failed, all call `VELOC_Restart_end(0)`. This is the right pattern.
+
+Similarly for `VELOC_Recover_mem`:
+- ALL ranks call `VELOC_Restart_begin` ✓
+- ALL ranks call `VELOC_Recover_mem` ✓
+- If any `VELOC_Recover_mem` fails, ALL call `VELOC_Restart_end(0)` ✓
+
+For the file read failure:
+- ALL ranks already called `VELOC_Restart_begin` and `VELOC_Recover_mem` ✓
+- If any file read fails, ALL call `VELOC_Restart_end(0)` ✓
+
+This looks correct.
+
+Now for the GVT hook, the key change is the `MPI_Allreduce` before `VELOC_Checkpoint_begin`. This ensures all ranks agree before entering the collective checkpoint.
+
+But wait - there's another subtle issue in the GVT hook. The failure path after `VELOC_Checkpoint_begin` succeeds but `VELOC_Checkpoint_mem` fails:
+
+```c
+if (!all_ok(local_ok)) {
+    VELOC_Checkpoint_end(0);
+    ...
+```
+
+ALL ranks call `VELOC_Checkpoint_mem` first, then check if all succeeded. If any fails, ALL call `VELOC_Checkpoint_end(0)`. This is correct.
+
+Similarly for the file write failure - ALL ranks do their per-rank file writes, then use `all_ok(local_ok)` to collectively agree, then ALL call `VELOC_Checkpoint_end`. This is correct.
+
+Let me verify the code once more to make sure I haven't introduced any new issues:
+The code looks correct. Now let me think about one more potential issue: the `veloc_post_lp_init` hook.
+
+Looking at `tw_sched_init` in `tw-sched.c` (lines 477-507):
+
+```c
+void tw_sched_init(tw_pe * me) {
+    (*me->type.pre_lp_init)(me);
+    tw_init_kps(me);
+    tw_init_lps(me);
+    (*me->type.post_lp_init)(me);    // <-- Our hook
+    tw_net_barrier();                 // <-- Barrier after hook
+
+    tw_pre_run_lps(me);
+    tw_net_barrier();
+    ...
+}
+```
+
+After our hook completes, there's a `tw_net_barrier()`. Our hook's return must happen on all ranks before they reach this barrier. 
+
+The concern: if our hook returns at different times on different ranks (e.g., after `VELOC_Restart_end` on some ranks vs. early return for others), but since `MPI_Allreduce` itself is a barrier-like collective, all ranks should exit the hook at roughly the same time.
+
+Wait, there's one more issue I need to check. Looking at the `veloc_post_lp_init` function:
+
+```c
+static void veloc_post_lp_init(tw_pe *pe) {
+    if (!g_veloc_restarting) return;   // <-- Early return for non-restart case
+    ...
+```
+
+If some ranks have `g_veloc_restarting = 1` but others have `g_veloc_restarting = 0`, this early return is problematic. But we ensured in `main()` that `g_veloc_restarting` is set uniformly using `MPI_Bcast`:
+
+```c
+int ver = VELOC_Restart_test(CKPT_NAME, INT_MAX);
+MPI_Bcast(&ver, 1, MPI_INT, 0, MPI_COMM_WORLD);
+if (ver > 0) {
+    g_veloc_restarting = 1;
+    ...
+} else {
+    g_veloc_restarting = 0;
+    ...
+}
+```
+
+So `g_veloc_restarting` should be the same on all ranks. Good.
+
+But in `veloc_post_lp_init`, we call `VELOC_Restart_test` again! This could return a different value per rank on restart. The reason we call it again in the hook is to double-check. But now we use `MPI_Bcast` from rank 0 to ensure all ranks use the same version. So if the hook returns early on all ranks (all have same `g_veloc_restarting=1`), they all enter and call the same VeloC functions.
+
+Wait, I also call `VELOC_Restart_test` in the hook again. Let me reconsider if that's necessary. Since we already set `g_veloc_version = ver` in `main()`, we could just use `g_veloc_version` directly.
+
+Actually, looking at the code again - I removed the second `VELOC_Restart_test` call from the hook in my rewrite. Let me re-verify:
+
+In the new `veloc_post_lp_init`:
+```c
+static void veloc_post_lp_init(tw_pe *pe) {
+    if (!g_veloc_restarting) return;
+
+    /* All ranks query the restart version... */
+    int local_ver = VELOC_Restart_test(CKPT_NAME, INT_MAX);
+    int ver0 = local_ver;
+    MPI_Bcast(&ver0, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ...
+```
+
+I still call `VELOC_Restart_test` in the hook. This is fine since it's a local operation per-rank, not collective. We then use `MPI_Bcast` to agree on rank-0's value. This is correct.
+
+But actually - `VELOC_Restart_test` might itself be collective in some VeloC modes! Let me be safe and just use the version we already detected in `main()`:
+Now let me also think about a potential issue in the GVT hook. The `past_end_time` early return:
+
+```c
+static void veloc_gvt_hook(tw_pe *pe, bool past_end_time) {
+    /* Skip checkpoint at end of simulation */
+    if (past_end_time) return;
+```
+
+Looking at the scheduler code (`tw_gvt_hook_step` in `tw-sched.c`):
+```c
+g_tw_gvt_hook(me, past_end_time);
+```
+
+This is called on each rank's PE separately. `past_end_time` could differ per rank? Actually, looking at `tw_scheduler_optimistic`:
+```c
+bool const past_end_time = me->GVT >= g_tw_ts_end;
+```
+
+With GVT being global (computed by all-reduce), `past_end_time` should be the same on all ranks. But to be safe, let me also all-reduce this:
+
+Actually wait - looking at the scheduler more carefully, the GVT hook is called from `tw_gvt_hook_step` which is called AFTER `tw_gvt_step2` which is the GVT synchronization step. So `me->GVT` is indeed the globally agreed GVT. `past_end_time` should be the same on all ranks.
+
+But there's still the wall-clock timer issue in the checkpoint path. Since `MPI_Allreduce` is now used for the timer decision (`if (!all_ok(local_ready)) return;`), this handles any drift in wall-clock timers.
+
+However, there's still the EARLY RETURN at the top: `if (past_end_time) return;`. This is called before any collective. Since `past_end_time` is derived from global GVT (same on all ranks), this should be fine - either all ranks return or none do.
+
+The code looks correct. Let me do a final review of the key sections:
+Wait - I just realized there may be an issue with the `VELOC_Restart_end(0)` call in the begin-failure path. If `VELOC_Restart_begin` itself failed for ALL ranks, does `VELOC_Restart_end` still make sense to call? In VeloC, if begin failed, end might not be valid.
+
+But since we all-reduced `global_ok` AFTER all ranks called `VELOC_Restart_begin` (unconditionally), all ranks did call begin. So even if begin returned failure on some ranks, all ranks called begin. The question is whether `VELOC_Restart_end` should be called after a failed begin.
+
+Looking at the VeloC API - `VELOC_Restart_end` should always be called as the pair to `VELOC_Restart_begin`. Even if begin failed, end should be called to clean up.
+
+Actually, there's still a subtle issue here. When I wrote:
+
+```c
+int rc = VELOC_Restart_begin(CKPT_NAME, ver);
+int local_ok = (rc == VELOC_SUCCESS) ? 1 : 0;
+int global_ok = all_ok(local_ok);
+
+if (!global_ok) {
+    /* Some rank failed to begin; ALL call end(0) to complete collective */
+    VELOC_Restart_end(0);
+```
+
+This means: ALL ranks call `VELOC_Restart_begin`, then ALL ranks call `all_ok()` (which is an `MPI_Allreduce`), and then if not all successful, ALL call `VELOC_Restart_end(0)`. This is correct.
+
+But what if `VELOC_Restart_begin` internally blocks waiting for something? The VeloC library in "sync" mode (our config) should complete synchronously. So this should be fine.
+
+Let me now also verify the GVT hook doesn't have an issue with the `past_end_time` check. Looking at the scheduler more carefully:
+
+In `tw_gvt_hook_step` (tw-sched.c:616):
+```c
+bool const past_end_time = me->GVT >= g_tw_ts_end;
+```
+
+`me->GVT` is the globally agreed GVT. Since GVT is computed via MPI allreduce (it's the minimum of all local min-timestamp values), all ranks should have the same `me->GVT` after `tw_gvt_step2`. So `past_end_time` should be the same on all ranks.
+
+The code looks correct. Let me verify the full file one more time to catch any issues:
+The veloc.cfg already looks correct:
+
+```
+scratch = /tmp/ross_veloc_scratch
+persistent = /tmp/ross_veloc_persistent
+mode = sync
+max_versions = 1
+scratch_versions = 1
+```
+
+- `scratch` and `persistent` are absolute `/tmp` paths ✓
+- They differ from each other ✓
+- `mode = sync` ✓
+- `max_versions = 1` to avoid disk exhaustion ✓
+Let me do a final check to verify the full critical parts of the code:
+
+1. **GVT hook** - before any collective VeloC call, use `all_ok()` to agree globally
+2. **post_lp_init** - all ranks call the same sequence of VeloC collective operations
+
+Let me check one more potential issue - the `VELOC_Route_file` call in `veloc_post_lp_init`. This is called AFTER `VELOC_Restart_begin` and before `VELOC_Restart_end`. Is `VELOC_Route_file` collective? Based on the VeloC API description, `VELOC_Route_file` just provides a path - it's likely not collective. So calling it only on a successful path is fine.
+
+Let me verify the code doesn't have any issues with mixed phold_events_r%d.bin file naming. On restart, `VELOC_Route_file` should return the path to the correct per-rank file from the checkpoint. This is per-rank, so each rank opens its own file. Good.
+
+Now let me also think about the recovery correctness issue raised by the task prompt:
+
+> "resilience signals — resilient_elapsed=166.9s, original_elapsed=88.6s, ratio=1.88x; checkpoint files = 2; wall-time PASS at 1.2x (per-app cap, app=ROSS) = False, PASS at 1.7x (Validation A) = False, PASS at 1.9x (legacy) = True"
+
+The recovery timeout is 93.6s and the recovery run took 94.63s. The restart run needs to complete within 93.6s. Since the original run takes 88.5s, the restart (which should resume from ~2/3 through the simulation) should complete faster than the original. But if the restart code has an MPI deadlock, it hangs forever.
+
+My fix should resolve the deadlock, allowing the restart to complete within the timeout.
+
+One more concern: After the kill (at ~72s), the checkpoint was taken just before. The validator says "detected 1 checkpoint file(s)" and "waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL". The checkpoint might be from the first successful checkpoint at ~15s wall clock. The kill happens at 72s. So the checkpoint has the state at ~15s simulation time.
+
+When we restart:
+- We restore the state at the 15s checkpoint
+- Simulation resumes from that point
+- Simulation has to run the remaining time (~88-15 = 73s worth of simulation time)
+- In wall-clock terms, this could take roughly 73/88 * 88 = 73 seconds
+- Total restart time: ~73s wall-clock ≤ 93.6s timeout ✓
+
+So the math works out - the restart should complete within the timeout, AS LONG AS there's no deadlock.
+
+Let me verify the code handles the case where the checkpoint was taken mid-way through and the restart correctly resumes:
+
+- The GVT hook fires every 10 GVT rounds (wall-clock throttled to 15s)
+- At ~15s wall clock, a checkpoint is taken
+- The checkpoint saves: RNG states (uncommitted, i.e., reflecting all advances up to that point), and all pending PQ events
+- On restart: RNG states are restored, PQ is populated with the saved events
+- Simulation resumes from that state
+
+This is the "save-the-world" approach and should work correctly for PHOLD.
+
+Let me check if there are any issues with `phold_init` being called again on restart:
+
+On restart, `tw_init_lps` calls `phold_init` for each LP, which pushes initial events into the PQ. Then `veloc_post_lp_init` is called, which:
+1. Drains all events from the PQ (removing the init events)
+2. Re-injects the checkpointed events
+
+This is correct.
+
+But wait - `phold_init` also advances the LP's RNG! When `phold_init` runs:
+```c
+tw_event_send(tw_event_new(lp->gid, tw_rand_exponential(lp->rng, mean) + lookahead, lp));
+```
+
+This calls `tw_rand_exponential` which advances the RNG. Then on restart, `restore_rng_states` restores the RNG to its checkpointed value. So the RNG is correctly restored AFTER phold_init's advances are overwritten. Good.
+
+The key is that `restore_rng_states` is called in `veloc_post_lp_init`, which runs AFTER `tw_init_lps`. So even though `phold_init` advances the RNG, we restore it to the checkpoint state. ✓
+
+Everything looks correct. Let me mark the final task done:
+Here's a summary of what was done:
+
+## Root Cause
+The previous attempt (iter 8) had an **MPI deadlock in the restart path**. The recovery run timed out at 93.6s because:
+
+1. `VELOC_Restart_begin`, `VELOC_Recover_mem`, and `VELOC_Restart_end` are **collective MPI operations** — all ranks must call them together.
+2. The old `veloc_post_lp_init` had per-rank early returns between collective calls:
+   - If `VELOC_Restart_begin` failed on one rank, that rank returned early while others proceeded to call `VELOC_Recover_mem` → deadlock.
+   - If file open failed on one rank, it called `VELOC_Restart_end(0)` while another rank tried to call `VELOC_Recover_mem` first → deadlock.
+3. Similarly, `veloc_gvt_hook` had per-rank early returns (OOM, overflow) before `VELOC_Checkpoint_begin`, causing checkpoint deadlocks.
+
+## Fixes Applied
+
+### `models/phold/phold.main.c`
+
+1. **Added `all_ok()` helper** — wraps `MPI_Allreduce` with `MPI_LAND` to collectively decide go/no-go.
+
+2. **`veloc_gvt_hook` (checkpoint)**:
+   - Wall-clock timer decision now uses `all_ok(local_ready)` — if ANY rank's timer hasn't elapsed, ALL ranks skip.
+   - OOM/overflow abort uses `all_ok(local_ok)` — if ANY rank can't collect events, ALL abort.
+   - All ranks call `VELOC_Checkpoint_begin` → check with `all_ok` → either all proceed to `VELOC_Checkpoint_mem` or all call `VELOC_Checkpoint_end(0)`.
+   - All ranks call `VELOC_Checkpoint_mem` → check with `all_ok` → either all write files or all call `VELOC_Checkpoint_end(0)`.
+   - All ranks call `VELOC_Checkpoint_end` after agreeing on final success/failure.
+
+3. **`veloc_post_lp_init` (restart)**:
+   - Uses `g_veloc_version` (already broadcast from rank-0 in `main()`) instead of calling `VELOC_Restart_test` again.
+   - ALL ranks call `VELOC_Restart_begin` → check with `all_ok` → either all proceed or all call `VELOC_Restart_end(0)`.
+   - ALL ranks call `VELOC_Recover_mem` → check with `all_ok` → either all read files or all call `VELOC_Restart_end(0)`.
+   - File read success agreed upon with `all_ok` before proceeding.
+   - ALL ranks call `VELOC_Restart_end` at the end.
+
+4. **`main()` checkpoint detection** — uses `MPI_Bcast` to share rank-0's checkpoint version so all ranks have the same `g_veloc_version`.
+
+### `veloc.cfg` (unchanged from iter 8)
+- `scratch = /tmp/ross_veloc_scratch`, `persistent = /tmp/ross_veloc_persistent` (absolute, different paths)
+- `max_versions = 1`, `scratch_versions = 1` (keep only latest, ~1-2 MB vs 11 GB)
+- `mode = sync`

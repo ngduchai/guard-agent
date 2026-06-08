@@ -1,0 +1,638 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The key failure is: **exit=1** immediately when launched (elapsed=1.00s). The app crashes right away. Let me look at the current state of the code:
+Now let me look at the key issue - the app crashes immediately with exit=1 and MPI_ABORT. Let me check the ROSS core files for the functions being called:
+Now I understand the structure. The app crashes with exit=1 immediately. Let me check the veloc.cfg file and other previous iteration logs:
+Now I understand the full picture. The key insight from iter_5's analysis is:
+
+1. The app exits with code 1 immediately (elapsed=1.0s) - it's crashing right at startup
+2. There's an MPI_ABORT with errorcode 1 on rank 0
+3. The previous code had a `tw_scheduler_rollback_to_gvt_only` function added to tw-sched.c to avoid the problematic inner `tw_gvt_step2` calls
+
+Let me check the current state of the files to understand what was already done:
+Good. The `tw_scheduler_rollback_to_gvt_only` is already declared in `ross-extern.h`. Let me now check the current state of `tw-sched.c` to see if the function was already added:
+The `tw_scheduler_rollback_to_gvt_only` function is already in `tw-sched.c`. The code from iter_5 is already in place. Now let me understand the actual failure: the binary is crashing at exit=1 after just 1.00s with MPI_ABORT. Let me look at what's happening:
+
+The key observation: "NO CHECKPOINT detected (kill_attempt elapsed=1.00s, exit=1)" - the binary starts and crashes within 1 second. But the validate_stdout also says "checkpoint files = 4" for iter_5. Let me re-read iter_5's output more carefully:
+Critical insights:
+1. **4 checkpoint files** (not 28 like previous iterations) - only 1 checkpoint per rank, this means only 1 checkpoint was taken before the crash
+2. **The failure-free run** also exits with code 1 (after ~88 seconds), and also only creates 4 checkpoint files
+3. The crash happens DURING THE RUN (not at startup) - there are 4 checkpoint files created
+
+So the app runs, creates 1 checkpoint (4 files = 4 ranks × 1 file), then crashes with MPI_ABORT. This is key - the crash is happening AFTER the first checkpoint. Let me look at what changed between iter_4 and iter_5 more carefully, and analyze the `tw_scheduler_rollback_to_gvt_only` function.
+
+The critical bug is likely in the `tw_scheduler_rollback_to_gvt_only` function that was added. After the rollback, when `tw_sched_event_q` processes events that need rollback (straggler messages), it may cause an assertion failure. Or the MPI_Allreduce in `does_any_pe` called inside the loop while in the GVT hook context causes issues.
+
+Let me look at the GVT allreduce mechanism more carefully:
+Now I see something crucial! Looking at `tw_gvt_step2` (line 242):
+```c
+if(tw_event_sig_compare_ptr(&gvt_sig, &me->GVT_prev_sig) < 0)
+{
+    g_tw_gvt_no_change = 0;
+} else
+{
+    tw_copy_event_sig(&gvt_sig, &me->GVT_prev_sig);
+    g_tw_gvt_no_change++;
+    if (g_tw_gvt_no_change >= g_tw_gvt_max_no_change) {
+        tw_error(...)
+```
+
+The problem is: in `tw_scheduler_rollback_to_gvt_only`, after the rollback, the `does_any_pe` function inside the loop calls `MPI_Allreduce`. But this call happens while the GVT machinery's state is in a specific condition. The key issue: **`does_any_pe` is being called from `tw_scheduler_rollback_to_gvt_only` which is itself inside the GVT hook - so `me->s_nwhite_sent` and `me->s_nwhite_recv` might be in an inconsistent state**.
+
+Wait - the actual crash I see in iter_5 is different: "checkpoint files = 4" (only 1 checkpoint was written, so the crash happened during or after the FIRST checkpoint). And the failure-free run also creates only 4 checkpoint files and crashes.
+
+Let me think about this more carefully. The FIRST checkpoint is written successfully (4 files). Then during re-injection or during post-checkpoint processing, something crashes. Let me look at the `inject_event_into_pq` function more carefully:
+
+The `tw_event_grab(pe)` function - let me check what it does:
+Now I see something crucial in `tw_event_new_user_prio` line 107:
+```c
+if (offset_ts == 0) {
+    if (now_event->sig.tie_lineage_length >= MAX_TIE_CHAIN)
+        tw_error(TW_LOC, "Maximum zero-offset tie chain reached");
+```
+
+This checks `now_event->sig.tie_lineage_length`. For re-injected events, we set `e->event_id` and `e->sig` from the saved checkpoint data. But when the re-injected event is being PROCESSED and creates a new event (via `phold_event_handler` → `tw_event_new`), the `now_event` is the re-injected event (accessed via `send_pe->cur_event`). Since we restored `sig` from checkpoint, this should be fine.
+
+But wait - let me think about what happens in `inject_event_into_pq`. The current code sets various fields of the event but DOES NOT set `e->sig` (the `tw_event_sig` struct). Let me re-read the inject function:
+
+Looking at lines 167-201 of phold.main.c:
+```c
+e->recv_ts   = ce->recv_ts;
+e->send_ts   = ce->send_ts;
+e->send_pe   = (tw_peid)ce->send_pe;
+e->dest_lpid = ce->dest_lp_gid;
+e->dest_lp   = dlp;
+e->send_lp   = ce->send_lp_gid;
+e->src_lp    = dlp;
+e->event_id  = ce->event_id;
+
+#ifdef USE_RAND_TIEBREAKER
+    e->sig       = ce->sig;
+```
+
+The `sig` field is only set `#ifdef USE_RAND_TIEBREAKER`. If the binary is compiled WITHOUT `USE_RAND_TIEBREAKER`, then `e->sig` isn't set, but that's fine for splay tree ordering which uses `recv_ts` in that case.
+
+Now, the critical thing I notice: the code is already using `tw_scheduler_rollback_to_gvt_only` which was successfully added to `tw-sched.c`. But the binary still crashes with 4 checkpoint files (1 checkpoint successful, then crash).
+
+The crash must happen AFTER the first checkpoint is written but before (or during) the second one. Let me look at the MPI_ABORT message: "MPI_ABORT was invoked on rank 0 in communicator MPI_COMM_WORLD with errorcode 1." This is from `tw_error()` in ROSS.
+
+The most likely culprit is in `tw_scheduler_rollback_to_gvt_only` during the SECOND checkpoint attempt. The `does_any_pe` function in the loop calls `MPI_Allreduce`. This happens inside the GVT hook. But there's something subtle: the `gvt_cnt` counter.
+
+Looking at the main scheduler loop:
+1. `tw_gvt_step1(me)` - sets `me->gvt_status = TW_GVT_COMPUTE` when `++gvt_cnt >= g_tw_gvt_interval`
+2. `tw_gvt_step2(me)` - resets `gvt_cnt = 0` (line 278: `gvt_cnt = 0;`)
+
+But in `tw_scheduler_rollback_to_gvt_only`, we call `tw_sched_event_q` which is `static` - that's fine since it's in the same file. But `does_any_pe` calls `MPI_Allreduce` with `MPI_COMM_ROSS`. 
+
+The real issue: in `tw_gvt_step2`, after resetting `gvt_cnt = 0`, the MPI message counting is reset: `me->s_nwhite_sent = 0; me->s_nwhite_recv = 0;`. After our rollback in the hook, if `tw_net_read(pe)` receives more events (anti-messages), they update `pe->s_nwhite_recv`. Then when the main loop resumes and calls `tw_gvt_step2` again, the white message count might be inconsistent.
+
+But the critical issue might be much simpler. Let me look at the `does_any_pe` function: it does a collective `MPI_Allreduce`. **But this collective can ONLY work if ALL 4 ranks are calling it simultaneously**. 
+
+In `tw_scheduler_rollback_to_gvt_only`, the loop does:
+```c
+do {
+    if (tw_nnodes() > 1) {
+        tw_clock net_start = tw_clock_read();
+        tw_net_read(pe);
+        pe->stats.s_net_read += tw_clock_read() - net_start;
+    }
+    tw_sched_event_q(pe);
+    tw_sched_cancel_q(pe);
+    if (--max_iters <= 0) break;
+} while (does_any_pe(pe->cancel_q != NULL) || does_any_pe(pe->event_q.size != 0));
+```
+
+The `does_any_pe` call has two separate `MPI_Allreduce` calls:
+- First: `does_any_pe(pe->cancel_q != NULL)` 
+- Second: `does_any_pe(pe->event_q.size != 0)` (only called if first returns false due to short-circuit)
+
+Wait - actually in C, the `||` operator short-circuits. So if the first `does_any_pe` returns `true`, the second is not called! This means some ranks call 1 MPI_Allreduce and others might call 2, causing a deadlock or mismatch!
+
+**THIS IS THE BUG!** The short-circuit evaluation of `||` means that:
+- If rank 0 has `pe->cancel_q != NULL` → first `does_any_pe` returns true → second NOT called
+- If rank 1 has `pe->cancel_q == NULL` → first `does_any_pe` is called, then if any rank returns true, all get true → BUT THEN second `does_any_pe` might not be called on some ranks
+
+Wait, actually `does_any_pe(...)` itself is a function that calls `MPI_Allreduce`. So:
+- ALL ranks call `does_any_pe(pe->cancel_q != NULL)` (it's a function call, so all ranks evaluate it)  
+- The `||` short-circuits on the RESULT of the function call. So:
+  - If `does_any_pe(cancel_q != NULL)` returns TRUE on ALL ranks: second `does_any_pe` NOT called on any rank ← consistent!
+  - If `does_any_pe(cancel_q != NULL)` returns FALSE on ALL ranks: second `does_any_pe` called on all ranks ← consistent!
+
+So there's NO deadlock from the short-circuit. Good.
+
+Let me think differently. The crash produces only 4 checkpoint files. This means ONE checkpoint was successful. The binary then crashes. Looking at the flow again:
+
+1. First GVT hook (CKPT_GVT_INTERVAL=50): takes checkpoint successfully → 4 files
+2. Simulation continues
+3. Second GVT hook (interval=100): calls `tw_scheduler_rollback_to_gvt_only` → ...crashes
+
+OR:
+
+1. Checkpoint hook fires, takes checkpoint → 4 files
+2. Simulation continues with re-injected events
+3. Something in the simulation after checkpoint crashes
+
+The MPI_ABORT from ROSS suggests a ROSS `tw_error()` was called. The most likely ROSS error with PHOLD is "bad dest" (dest >= ttl_lps) or one of the queue errors.
+
+Let me look at the inject_event_into_pq more carefully. When we call `tw_pq_enqueue(pe->pq, e)`, the splay tree assigns `e->state.owner = TW_pe_pq`. But we also set `e->state.remote = 1` for remote events. Let me check what happens when the simulation tries to process a re-injected event with `state.remote = 1`:
+
+In `tw_sched_batch`:
+```c
+cev = tw_pq_dequeue(me->pq);
+clp = cev->dest_lp;
+ckp = clp->kp;
+me->cur_event = cev;
+```
+
+Then `phold_event_handler` is called, which calls `tw_event_new(dest, ...)` → `tw_event_send(event)`. In `tw_event_send`:
+Now I see the critical issue in `tw_event_rollback` at line 275:
+```c
+tw_rand_reverse_unif(e->src_lp->core_rng); //undo the tiebreaker rng
+```
+
+And in `event_cancel` at line 123:
+```c
+tw_pe *send_pe = event->src_lp->pe;
+```
+
+For our re-injected events, we set `e->src_lp = dlp` (the destination LP). This is wrong for remote events. Let me look at what `src_lp` is for normal events in the receive path to understand the correct value.
+
+Looking at `tw_event_send`:
+- For local events: `e->src_lp = sender` (set in `tw_event_new_user_prio`)
+- For remote events: the event is serialized and sent over the network
+
+When a remote event is received, `e->src_lp` is... what? Let me check network-mpi.c:
+I notice something important! At line 368:
+```c
+e->dest_lp = tw_getlocal_lp((tw_lpid) e->dest_lp);
+```
+
+For received remote events, `src_lp` is set in `tw_event_new_user_prio` on the SENDER's side and serialized as part of the event struct. On the RECEIVER's side, `src_lp` still contains the sender's LP pointer (which is invalid on the receiver side). ROSS doesn't reset `src_lp` on receive.
+
+This means remote events in PQ have `src_lp` pointing to SENDER's LP (invalid on receiver). But ROSS handles this by only using `src_lp` in specific ways.
+
+Now, the critical question: is the crash caused by something in our re-injection code itself, or is it something else?
+
+Looking at iter_5's output: **4 checkpoint files** = 1 checkpoint version × 4 ranks. In VeloC sync mode, files go to both scratch AND persistent, but the dir count is 2. So 4 files across 2 dirs = 2 files per dir = 1 version × (1 mem file + 1 event file) = wait, VeloC writes one combined file per rank per checkpoint. So: 4 files = 4 ranks × 1 file per rank, in ONE dir (scratch or persistent)? Or 2 files per rank × 2 ranks? That would mean only 2 ranks participated.
+
+Actually, with VeloC in sync mode, it writes to scratch and mirrors to persistent. The "2 dir(s)" means both scratch and persistent. So 4 files total = 2 per dir = 1 per rank × 2 files per dir (but with 4 ranks, 1 file per rank × 4 ranks = 4 files per dir)...
+
+I think the 4 files means ONE checkpoint of just the VELOC_Mem_protect data (1 file per rank), stored in ONE location (either scratch or persistent, since in sync mode they're combined). But this doesn't add up to 4 with 4 ranks.
+
+Wait - maybe `max_versions=0` doesn't mean keep-all; maybe it means VeloC only keeps the latest version. In any case, the checkpoint wrote 4 files (one per rank). This means we successfully checkpoint ONCE then crash.
+
+The key insight from iter_5: the validation says **"checkpoint files = 4"** and the crash happens within 1.00s. This is different from previous iterations which had 28 files. This iteration's code (with `tw_scheduler_rollback_to_gvt_only`) makes ONE checkpoint successfully, then crashes on the SECOND checkpoint attempt or during the simulation after the first checkpoint.
+
+Let me look more carefully at what's different about the approach. The crash happens when `tw_scheduler_rollback_to_gvt_only` is called the SECOND time. During the second rollback, events that were re-injected by the first checkpoint might now be in `pevent_q` (they were processed after the first checkpoint). When `tw_kp_rollback_to_sig` rolls them back from `pevent_q` to PQ, it calls `tw_event_rollback` on them, which processes `caused_by_me` chains.
+
+But wait - the re-injected events have `e->src_lp = dlp` (the local destination LP). When the event is processed after re-injection, it calls `link_causality(new_event, pe->cur_event)` where `pe->cur_event` = the re-injected event. The new event's `cause_next = re_injected_event->caused_by_me`, and `re_injected_event->caused_by_me = new_event`. 
+
+When the second rollback calls `tw_event_rollback(re_injected_event)` (because it was processed after checkpoint 1):
+1. Calls `phold_event_handler_rc` ✓
+2. Iterates `e = event->caused_by_me` (= new_event)
+3. Calls `tw_rand_reverse_unif(e->src_lp->core_rng)` where `e = new_event`, `e->src_lp = dlp` (correctly set by `tw_event_new_user_prio`) ✓
+4. Calls `event_cancel(e)` where `e = new_event`
+
+In `event_cancel(new_event)`:
+- `send_pe = new_event->src_lp->pe = dlp->pe` ✓ (local PE)
+- `dest_peid = new_event->dest_lp->pe->id`
+
+If `new_event->dest_lp` is a REMOTE LP (the event was created for a remote destination), then `event_cancel` goes to the remote branch... but `new_event->state.owner = TW_net_asend` (it was sent to network). That path calls `tw_net_cancel` ✓.
+
+Actually wait - if the re-injected event was originally a REMOTE event (from another rank), then `e->src_lp = dlp` is WRONG for `tw_rand_reverse_unif(e->src_lp->core_rng)`. The original sender's `core_rng` should be reversed, not `dlp->core_rng`. This corrupts `dlp->core_rng`, which could eventually lead to invalid RNG states.
+
+But looking at the `tw_event_rollback` loop:
+```c
+while (e) {
+    tw_event *n = e->cause_next;
+    e->cause_next = NULL;
+    tw_rand_reverse_unif(e->src_lp->core_rng);
+    event_cancel(e);
+    e = n;
+}
+```
+
+Here `e` iterates over the CHILDREN of the re-injected event (events it caused). These children have `src_lp` = the LP that processed the re-injected event (= `dlp`). So `tw_rand_reverse_unif(dlp->core_rng)` is correct for THESE children. ✓
+
+The issue I mentioned before about re-injected remote events having `src_lp = dlp` doesn't affect children's rollback.
+
+Let me now think about what actually happens in the SECOND checkpoint attempt. After the first checkpoint:
+1. Re-injected events have `state.remote = 1` (for originally remote events) and are in the hash table
+2. Simulation processes some events, creating new events
+3. Second GVT hook fires: `tw_scheduler_rollback_to_gvt_only` is called
+
+In `tw_kp_rollback_to_sig`: iterates `pevent_q` backwards, calling `tw_event_rollback` on processed events.
+
+For a PROCESSED re-injected event (was remote, has `state.remote = 1` in original, but after being freed and re-grabbed, `state.remote` was set in `inject_event_into_pq`):
+
+Actually, wait. In `inject_event_into_pq`, we set `e->state.remote = 1` for originally remote events. Then when the event is dequeued from PQ and processed in `tw_sched_batch`:
+```c
+cev->state.owner = TW_kp_pevent_q;
+tw_eventq_unshift(&ckp->pevent_q, cev);
+```
+
+The event is now in `pevent_q` with `state.remote = 1`. During the second rollback, `tw_kp_rollback_to_sig` dequeues this event from `pevent_q` and calls `tw_event_rollback`. In `tw_event_rollback`, children are cancelled via `event_cancel`.
+
+Then in `tw_sched_cancel_q`, the cancelled re-injected event (which is now in `cancel_q` from the rollback):
+- `cev->state.owner = TW_kp_pevent_q` → calls `tw_kp_rollback_event(cev)`
+
+Wait, no. After `tw_event_rollback`, the re-injected event is put back in PQ:
+Looking at `tw_kp_rollback_event`:
+```c
+void tw_kp_rollback_event(tw_event *event) {
+    tw_event_rollback(event);
+    tw_pq_enqueue(event->dest_lp->pe->pq, event);
+}
+```
+
+Actually, the flow in `tw_kp_rollback_to_sig` is:
+1. `e = tw_eventq_shift(&kp->pevent_q)` - removes from pevent_q
+2. `tw_event_rollback(e)` - reverses event handler, cancels children
+3. `tw_pq_enqueue(kp->pe->pq, e)` - puts back in PQ
+
+The re-injected event goes back to PQ with `state.owner = TW_pe_pq` (set by splay tree's enqueue).
+
+BUT wait - step 2 (`tw_event_rollback`) sets `dest_lp->pe->cur_event = event` (line 215). This sets the PE's current event to our re-injected event. After rollback completes, `pe->cur_event` is left pointing to the old rolled-back event. This might be OK since `cur_event` is updated in the next event processing.
+
+Actually, I think the real issue might be much simpler. Let me look at what `tw_sched_cancel_q` does when it encounters a re-injected event that was in `pevent_q` and then the anti-message arrives:
+
+After checkpoint 1 re-injection and the simulation running, if an anti-message arrives for a re-injected remote event that has ALREADY been processed (it's in `pevent_q`), the cancel_q gets this event with `state.owner = TW_kp_pevent_q`. Then in `tw_sched_cancel_q`:
+```c
+case TW_kp_pevent_q:
+    tw_kp_rollback_event(cev);
+    tw_event_free(me, cev);
+    break;
+```
+
+`tw_kp_rollback_event` calls `tw_event_rollback`. Inside rollback, children are cancelled. The children of our re-injected event have `src_lp = dlp` (correctly, since they were created by `phold_event_handler` with `sender = dlp`). 
+
+I think the actual bug might be something more specific. Let me look at the `assert` call in splay.c:
+I see! In the NON-USE_RAND_TIEBREAKER case (line 81):
+```c
+if( n->dest_lp->gid < e->dest_lp->gid )
+```
+
+This accesses `n->dest_lp->gid`. For our re-injected events, `e->dest_lp = dlp` (valid local LP pointer). So this is fine.
+
+But in `tw_pq_compare_less_than` (the non-tiebreaker version), if two events have the same `recv_ts`, `send_lp`, and `dest_lp->gid`, then they're compared by `event_id`. If two events have the same `recv_ts`, `send_lp`, `dest_lp->gid`, AND `event_id`, we get the `tw_error("Found tie events")`.
+
+When we re-inject events with the SAME `event_id` as the originals, and these re-injected events get processed and create new events with their own unique IDs... there's no collision. BUT: if the same event goes through drain-reinject TWICE (because it's in PQ both before and after rollback), we'd get a duplicate. Let me think if that's possible.
+
+After checkpoint 1:
+- Events drained from PQ, re-injected with same IDs
+- Some events processed (moved to pevent_q)
+- Second rollback: events from pevent_q moved back to PQ
+- BUT: events that were NEVER processed are still in PQ from the first re-injection
+
+At checkpoint 2's rollback, ALL events from pevent_q (that were processed) go back to PQ. These have the SAME event_id as the re-injected copies (because they ARE the re-injected events). No duplicates since each event is either in PQ or pevent_q, not both.
+
+Then we drain PQ at checkpoint 2 and save the event_ids. We re-inject with SAME IDs. No collision at this point (PQ was empty when we start re-injecting).
+
+So the splay tree shouldn't get duplicate events.
+
+Let me take a completely fresh look. The key fact: **4 files created, then crash with MPI_ABORT**. The crash could be in VELOC itself during the SECOND checkpoint attempt, or it could be in ROSS after the first checkpoint.
+
+Let me look at one more potential issue: the `does_any_pe` function is called inside the GVT hook. This hook is called from `tw_gvt_hook_step`. Inside `tw_gvt_hook_step`, `g_tw_gvt_hook` is called. The GVT hook then calls `tw_scheduler_rollback_to_gvt_only`. Inside that function, `does_any_pe` calls `MPI_Allreduce`. This is fine as long as all ranks are in sync.
+
+But there's a subtle issue: in `tw_gvt_step2`, the GVT is computed and `g_tw_gvt_done` is incremented. Then `tw_gvt_hook_step` is called. The hook trigger fires based on `(g_tw_gvt_done - starting_at) % every == 0`. After the hook fires in `tw_gvt_hook_step`, does the hook_trigger.status get disabled? Looking at the scheduler code:
+
+```c
+case GVT_HOOK_STATUS_every_n_gvt: {
+    int const starting_at = g_tw_gvt_hook_trigger.every_n_gvt.starting_at;
+    int const every = g_tw_gvt_hook_trigger.every_n_gvt.nums;
+    has_hook_been_triggered = (g_tw_gvt_done - starting_at) % every == 0;
+}
+```
+
+For `every_n_gvt`, it fires every N GVT computations. The trigger remains active (status not disabled). So it fires on EVERY multiple of N GVT computations. That's the correct behavior.
+
+After the hook fires and our `veloc_gvt_hook` runs, the main scheduler loop continues with `tw_sched_batch`. The simulation proceeds normally.
+
+Now let me think about what could cause a crash specifically AFTER the first successful checkpoint. The only thing different after checkpoint 1 is that:
+1. LP RNG states were "snapshotted" (collected)
+2. Events were drained and re-injected
+
+The drain-reinject means events are now using DIFFERENT event slots (newly grabbed from free_q). These new event slots have all fields reset to zero by `tw_event_grab` (memset of state, event_id). Then we set the specific fields we care about.
+
+BUT: `tw_event_grab` calls `memset(&e->state, 0, sizeof(e->state))`. The state field includes `owner`. We don't set `e->state.owner` explicitly in `inject_event_into_pq`. The `tw_pq_enqueue(pe->pq, e)` sets `e->state.owner = TW_pe_pq`.
+
+Wait - looking at `tw_event_grab`: it calls `memset(&e->state, 0, ...)` which zeros out the state. But then we don't set `e->state.remote` until AFTER `tw_pq_enqueue`. Let me re-read our inject function:
+
+```c
+tw_pq_enqueue(pe->pq, e);
+
+/* restore remote-event hash entry */
+if (ce->is_remote && pe->hash_t) {
+    e->state.remote = 1;
+    tw_hash_insert(pe->hash_t, e, (long)ce->send_pe);
+}
+```
+
+We call `tw_pq_enqueue` first (which sets `e->state.owner = TW_pe_pq`), then set `e->state.remote = 1`. But does `tw_pq_enqueue` preserve the `remote` flag? Let me check splay.c's enqueue:
+I see - `tw_pq_enqueue` sets `e->state.owner = TW_pe_pq` (line 253). It doesn't touch `state.remote`. So our code of setting `state.remote = 1` AFTER `tw_pq_enqueue` is fine.
+
+Now I need to think differently about the crash. Let me look at what "4 checkpoint files" actually means more carefully. In the previous iter (iter_4), there were 28 files. Now there are only 4. This suggests the code change in iter_5 (adding `tw_scheduler_rollback_to_gvt_only`) made something different happen.
+
+With 4 files = 1 checkpoint × 4 ranks (one file per rank), the VeloC only wrote ONE file per rank. That means VeloC only has the `VELOC_Mem_protect` data (not the event file via `VELOC_Route_file`). OR VeloC has both mem AND event files per rank but only wrote to the persistent dir (not scratch).
+
+Actually, the most likely explanation: 4 files = 4 ranks × 1 mem file per rank (no event files). This could happen if `VELOC_Route_file` fails or if the event file was written but VeloC's checkpoint tracking only counts the mem files.
+
+OR: The crash happens DURING the first checkpoint at VELOC_Checkpoint_end or VELOC_Route_file, so only some files were written.
+
+Wait - the iter_5 validate shows the failure-free run also creates 4 files and exits with code 1. The binary runs for ~88 seconds in the failure-free case but still crashes. This means the crash is happening near the END of the simulation (when `--end=19000` is reached) and ONLY ONE checkpoint was written in 88 seconds. This is strange because with CKPT_GVT_INTERVAL=50, we should get MANY more checkpoints.
+
+**Key insight**: if the crash happens right after GVT=50 (the first checkpoint), and the simulation only runs for 88 seconds of wall time, then checkpoint at GVT time ≈ 50 makes the binary crash and NOT produce any further checkpoints. But the failure-free run ran for 88 seconds... 
+
+Wait - I'm re-reading the failure-free output: "WARNING: failure-free resilient run exited with code 1". It ran to completion (88s) but exit code 1. This means the SIMULATION ITSELF completed (reached end_time=19000), but then something in our post-processing crashed.
+
+**THIS IS THE REAL BUG!**
+
+The failure-free run completes the ROSS simulation but exits with code 1 after the simulation ends. The crash is in our POST-SIMULATION code:
+
+```c
+/* Compute per-LP RNG Cg fingerprint and write validation output */
+{
+    int64_t local_rng_sum[4] = {0, 0, 0, 0};
+    ...
+    MPI_Reduce(local_rng_sum, global_rng_sum, 4, MPI_INT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+    ...
+}
+
+/* Finalize VeloC (keep checkpoints: cleanup=0) */
+VELOC_Finalize(0);
+
+free(g_ckpt_rng_buf);
+g_ckpt_rng_buf = NULL;
+
+tw_end();
+```
+
+After `tw_run()`, ROSS calls `tw_end()` internally... wait no. Looking at the main function:
+```c
+tw_run();
+...
+// compute per-LP RNG Cg fingerprint
+MPI_Reduce(...)
+...
+VELOC_Finalize(0);
+free(g_ckpt_rng_buf);
+tw_end();
+```
+
+The `tw_end()` calls `tw_net_stop()` which calls `MPI_Finalize()`. If `VELOC_Finalize(0)` calls something that triggers an error, that could crash. OR if `MPI_Reduce` fails because MPI is in an inconsistent state after ROSS's `tw_net_barrier`.
+
+Actually, wait. Looking at `tw_end()`:
+```c
+void tw_end(void) {
+    if(tw_ismaster()) {
+        fprintf(g_tw_csv, "\n");
+        fclose(g_tw_csv);
+    }
+    tw_gvt_finish();
+    tw_net_stop();
+}
+```
+
+And `tw_net_stop()`:
+Now I see! `tw_net_abort()` calls `MPI_Abort(MPI_COMM_ROSS, 1)`. And `tw_error()` calls `tw_net_abort()`. Let me verify:
+Good. `tw_error` calls `tw_net_abort` which calls `MPI_Abort(MPI_COMM_ROSS, 1)`. And the validator error says `MPI_ABORT was invoked on rank 0 in communicator MPI_COMM_WORLD` (since `MPI_COMM_ROSS = MPI_COMM_WORLD` in this code).
+
+Now the crucial question: What is causing `tw_error` to be called after the simulation completes? Looking at the failure-free run: it runs for 88 seconds (full simulation) then crashes. This means the simulation itself completes fine, but something after `tw_run()` fails.
+
+After `tw_run()`, our code does:
+1. `MPI_Reduce(local_rng_sum, global_rng_sum, 4, MPI_INT64_T, MPI_SUM, 0, MPI_COMM_WORLD)`
+2. Write `validation_output.bin`
+3. `VELOC_Finalize(0)`
+4. `free(g_ckpt_rng_buf)`
+5. `tw_end()`
+
+`tw_end()` calls `tw_gvt_finish()` then `tw_net_stop()` which calls `MPI_Finalize()`. 
+
+But wait - after `tw_run()`, `tw_net_stop()` hasn't been called yet, so MPI is still active. Our `MPI_Reduce` should work. Then `VELOC_Finalize` should work. Then `tw_end()` which calls `MPI_Finalize()`...
+
+Actually, I just realized: VELOC might call MPI operations in `VELOC_Finalize`. If VELOC internally uses MPI collectives in a way that conflicts with ROSS's pending operations, it could cause issues. But we pass `cleanup=0` to `VELOC_Finalize`.
+
+Or - could the issue be in `tw_gvt_finish()` calling `MPI_Type_free` and `MPI_Op_free` after we've already called `VELOC_Finalize`? But these are independent MPI operations.
+
+Actually, let me reconsider. The failure-free run exits with code 1. But the output file `validation_output.bin` is NOT found (line 92: "Skipping failure-free comparison: .../validation_output.bin not found"). This means the binary crashed BEFORE writing the validation output, which is in our code right after `tw_run()`:
+
+```c
+MPI_Reduce(...)
+if (g_tw_mynode == 0) {
+    FILE *sig_f = fopen("validation_output.bin", "wb");
+    ...
+}
+```
+
+The crash could be in `MPI_Reduce`. After `tw_run()`, ROSS calls `tw_scheduler_optimistic` which ends with:
+```c
+tw_net_barrier();
+(*me->type.final)(me);
+st_inst_finalize(me);
+tw_stats(me);
+tw_all_lp_stats(me);
+```
+
+Then `tw_run()` returns to our `main()`. At this point MPI is still active. But `me->type.final` calls our `veloc_pe_final` which does nothing.
+
+Wait - looking at the `tw_stats` function: does it do any MPI operations?
+
+Actually, the most likely issue: **`tw_gvt_finish()` is called from `tw_end()` AFTER our `MPI_Reduce`**. But `VELOC_Finalize` is called BEFORE `tw_end()`. If VELOC uses MPI internally and something goes wrong... but this is speculative.
+
+Let me look at the actual error more carefully. The validate says:
+```
+MPI_ABORT was invoked on rank 0 in communicator MPI_COMM_WORLD with errorcode 1.
+2 more processes have sent help message help-mpi-api.txt / mpi-abort
+```
+
+This means rank 0 called `MPI_Abort` and then 2 other ranks also called `MPI_Abort`. This is a ROSS `tw_error` triggered on rank 0.
+
+The most likely location: in `tw_scheduler_rollback_to_gvt_only` during the SECOND checkpoint (for the failure-prone run, this would be the SECOND checkpoint attempt, which crashes). For the failure-free run, it runs for 88 seconds completing the simulation, and the crash must be in the SECOND or later checkpoint attempt.
+
+Wait - but 4 files = only 1 checkpoint completed. So either:
+1. Only 1 checkpoint was taken before the simulation ended (failure-free), OR
+2. Subsequent checkpoint attempts failed silently (VeloC returned non-success), leaving only the first checkpoint's files
+
+For the FAILURE-FREE run specifically: the binary runs for 88 seconds and produces 4 checkpoint files. With CKPT_GVT_INTERVAL=50, we should get MANY more than 1 checkpoint in 88 seconds. But we only see 4 files.
+
+This could mean:
+- VeloC is keeping only 1 version (most recent) → subsequent checkpoints OVERWRITE the first → only 4 files remain
+- Or subsequent checkpoints fail silently (VELOC_Checkpoint_begin returns non-success)
+- Or the simulation doesn't actually trigger more GVT hooks
+
+With the `every_n_gvt` trigger and interval=50, there should be ~hundreds of GVT computations in 88 seconds. Each multiple of 50 should trigger the hook. So many checkpoint attempts should be made.
+
+The most likely explanation: **VeloC only keeps N versions in the scratch/persistent dirs**, and with SYNC mode, it overwrites old versions. The 4 files might represent the LAST successful checkpoint (most recent version × 4 ranks). Previous checkpoints were overwritten.
+
+This is actually good news for the FAILURE-FREE run - it means checkpoints ARE being written without crashing. The crash must be ELSEWHERE.
+
+Now with this understanding: **the failure-free run crashes in `tw_end()`**. Specifically, in `tw_gvt_finish()` → `MPI_Type_free`/`MPI_Op_free`... or in `tw_net_stop()` → `MPI_Finalize()`.
+
+But why would those fail? After VELOC_Finalize, if VELOC somehow corrupts MPI state... OR maybe the issue is simpler:
+
+**The validation output is not found** because `fopen("validation_output.bin", "wb")` is called in the CURRENT WORKING DIRECTORY, but the validator's CWD might be different. OR: `g_tw_mynode == 0` check fails... but 0 is always the master node.
+
+Wait, I just re-read: the validator says "Last stderr lines" for the failure-free run include the MPI_ABORT. The validator also says "Skipping failure-free comparison: .../validation_output.bin not found." This means the validation_output.bin file is not where the validator expects it.
+
+The validator expects validation_output.bin in the CWD where the binary runs. The binary runs from `cwd=/home/ndhai/.../correctness/resilient_clean`. If `fopen("validation_output.bin", "wb")` is called with a relative path, it writes to that CWD. The validator looks for it in `.../resilient_clean/validation_output.bin`.
+
+But the CRASH (MPI_ABORT) means the binary exited with code 1. The crash prevents the validation_output.bin from being written (the crash must happen before writing the file).
+
+**KEY REALIZATION**: The MPI_ABORT is happening BEFORE the simulation completes (not after). The failure-free run appearing to "run for 88 seconds" might just be because the validator waited 88 seconds before timing out.
+
+Actually no - the validator says `elapsed=88.1s` for the original baseline. The failure-free run uses a different elapsed measurement.
+
+Let me re-read the failure-free section. The validate shows the failure-free run starts (line 80) and then:
+- Line 82: "WARNING: failure-free resilient run exited with code 1"
+- Line 83: "checkpoint metrics for failure_free: 3849936 bytes across 4 file(s)"
+
+These metrics are measured AFTER the binary exits. The 88 second time is for the ORIGINAL (unmodified) binary. The resilient binary probably also runs for ~88 seconds (the simulation time doesn't change much).
+
+So the failure-free run:
+1. Starts
+2. Runs ROSS simulation for ~88 seconds
+3. Takes periodic checkpoints (4 files remain after VeloC cleanup)
+4. Crashes with MPI_ABORT
+5. Validation_output.bin not written (crash before that)
+
+The crash happens INSIDE the simulation (not after). Most likely it's in the GVT hook - in `tw_scheduler_rollback_to_gvt_only`. 
+
+Now I understand better. The crash happens during the SECOND or later checkpoint attempt. After the first checkpoint, something changes that causes subsequent checkpoint attempts to crash.
+
+Looking at `tw_scheduler_rollback_to_gvt_only` more carefully: it calls `does_any_pe` which is defined INSIDE `tw-sched.c`:
+
+```c
+static inline bool does_any_pe(bool val) {
+    bool global_val;
+    if(MPI_Allreduce(&val, &global_val, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_ROSS) != MPI_SUCCESS) {
+        tw_error(TW_LOC, "MPI_Allreduce for custom rollback and cleanup failed");
+    }
+    return global_val;
+}
+```
+
+This is fine on its own. But the issue might be that the LOOP in `tw_scheduler_rollback_to_gvt_only` has a problem. After calling `tw_sched_event_q(pe)` (which moves events from event_q to PQ with rollbacks if needed), `tw_sched_cancel_q(pe)` (which processes cancelled events), the `does_any_pe` check looks at `pe->cancel_q` and `pe->event_q.size`. But `tw_sched_event_q` and `tw_sched_cancel_q` might generate NEW entries in `cancel_q` or `event_q` via their processing (e.g., a rollback in `tw_sched_event_q` might generate anti-messages that go into the network, which could come back as new events in `event_q`). This is a legitimate infinite-loop scenario.
+
+But the `max_iters = 200` limit prevents an infinite loop. When `max_iters` hits 0, the loop breaks.
+
+The actual crash must be in something else. Let me think about what ROSS error is triggered on rank 0 specifically (not all ranks).
+
+Looking at the MPI_ABORT: "2 more processes have sent help message help-mpi-api.txt / mpi-abort" - this means 3 ranks called MPI_Abort (rank 0 + 2 others). The 4th rank just saw the abort from others.
+
+This is triggered by `tw_error` which is called from `tw_net_abort` which calls `MPI_Abort(MPI_COMM_ROSS, 1)`. When rank 0 calls MPI_Abort, other ranks might also call tw_error around the same time.
+
+The most likely ROSS error: **"GVT decreased"** in `tw_gvt_step2`. After our rollback in `tw_scheduler_rollback_to_gvt_only`, the GVT state might be inconsistent.
+
+Let me look at what happens to `me->GVT_sig` after `tw_scheduler_rollback_to_gvt_only`:
+
+In our function:
+```c
+void tw_scheduler_rollback_to_gvt_only(tw_pe * pe) {
+    tw_event_sig const gvt_sig = pe->GVT_sig;  // save current GVT
+    for (unsigned int i = 0; i < g_tw_nkp; i++) {
+        tw_kp_rollback_to_sig(g_tw_kp[i], &gvt_sig);  // rollback KPs
+    }
+    
+    do {
+        if (tw_nnodes() > 1) {
+            tw_net_read(pe);
+            ...
+        }
+        tw_sched_event_q(pe);
+        tw_sched_cancel_q(pe);
+        if (--max_iters <= 0) break;
+    } while (does_any_pe(pe->cancel_q != NULL) || does_any_pe(pe->event_q.size != 0));
+}
+```
+
+`pe->GVT_sig` is NOT modified here. ✓
+
+But wait - inside `tw_sched_event_q`, when a straggler message is processed:
+```c
+if (CMP_KP_TO_EVENT_TIME(dest_kp, cev) > 0) {
+    TRIGGER_ROLLBACK_TO_EVENT_TIME(dest_kp, cev);
+```
+
+This calls `tw_kp_rollback_to_sig(kp, &cev->sig)`. This rollback might modify `kp->last_sig`. But does it modify `pe->GVT_sig`? No - `tw_kp_rollback_to_sig` only touches `kp->pevent_q` and `kp->last_sig`.
+
+After our function returns, the main scheduler loop continues:
+```c
+// (GVT hook step called - our hook ran)
+if (STIME_FROM_PE(me) > g_tw_ts_end)
+    break;
+tw_sched_batch(me);
+```
+
+The main loop checks GVT (`STIME_FROM_PE(me)`) and if it's past end time, breaks. If not, processes events via `tw_sched_batch`.
+
+Then on the NEXT iteration:
+```c
+tw_net_read(me);
+tw_gvt_step1(me);
+tw_sched_event_q(me);
+tw_sched_cancel_q(me);
+int const gvt_triggered = me->gvt_status;
+tw_gvt_step2(me);
+```
+
+In `tw_gvt_step2`:
+```c
+if (tw_event_sig_compare_ptr(&me->GVT_sig, &gvt_sig) > 0)
+    tw_error(TW_LOC, "PE %u GVT decreased...");
+```
+
+Here `me->GVT_sig` is the current GVT (from previous step2). `gvt_sig` is the newly computed GVT. If the newly computed GVT < me->GVT_sig, we get "GVT decreased" error.
+
+**This is the actual bug!** After our rollback, the PQ contains events with recv_ts >= GVT_T (the checkpoint GVT). But during `tw_sched_event_q` processing (inside `tw_scheduler_rollback_to_gvt_only`), some events from `event_q` might have recv_ts < GVT_T (stragglers that arrived after we computed GVT_T). When `tw_sched_event_q` processes these stragglers:
+- It calls `tw_kp_rollback_to_sig(kp, &cev->sig)` to rollback the KP to the straggler's time
+- But the straggler's sig < GVT_T sig! This violates the GVT invariant.
+
+Wait - but `recv_finish` in network-mpi.c has this check:
+```c
+if(tw_event_sig_compare_ptr(&e->sig, &me->GVT_sig) < 0)
+    tw_error(TW_LOC, "%d: Received straggler from %d: %lf < GVT", ...);
+```
+
+So ROSS itself prevents events with sig < GVT from being received. Events in event_q should all have sig >= GVT_T. ✓
+
+Hmm, then what happens with `tw_sched_event_q`? It processes events from `event_q`. Each event has `state.owner = TW_pe_event_q`. The check:
+```c
+if (CMP_KP_TO_EVENT_TIME(dest_kp, cev) > 0) {
+    TRIGGER_ROLLBACK_TO_EVENT_TIME(dest_kp, cev);
+}
+```
+
+For USE_RAND_TIEBREAKER:
+```c
+#define CMP_KP_TO_EVENT_TIME(kp, e) tw_event_sig_compare_ptr(&kp->last_sig, &e->sig)
+#define TRIGGER_ROLLBACK_TO_EVENT_TIME(kp, e) tw_kp_rollback_to_sig(kp, &e->sig);
+```
+
+So if `kp->last_sig > cev->sig` (KP has processed events beyond this point), rollback happens. After our initial rollback to GVT_T, `kp->last_sig = GVT_T`. For any event from event_q with `sig >= GVT_T`, `kp->last_sig <= cev->sig` → no rollback needed. ✓
+
+OK so `tw_sched_event_q` shouldn't cause any extra rollbacks when called from `tw_scheduler_rollback_to_gvt_only`. 
+
+Let me now focus on the `me->s_nwhite_sent` and `me->s_nwhite_recv` issue. These are reset to 0 in `tw_gvt_step2` line 271: `me->s_nwhite_sent = 0; me->s_nwhite_recv = 0;`. After our hook, the main loop calls `tw_gvt_step2` again. At this point, `me->s_nwhite_sent` and `me->s_nwhite_recv` are in the state they were left in after the main loop's `tw_gvt_step2`. Our hook's `tw_net_read` calls inside `tw_scheduler_rollback_to_gvt_only` might have received more messages, incrementing `me->s_nwhite_recv`. This would make the white-message count incorrect.
+
+But actually, the GVT white-message counting is:
+- `s_nwhite_sent`: messages sent since last GVT (incremented in `tw_net_send`)
+- `s_nwhite_recv`: messages received since last GVT (incremented in `recv_finish`)
+
+After `tw_gvt_step2`, both are reset to 0. If our hook receives messages (via `tw_net_read`), it increments `s_nwhite_recv`. When the next `tw_gvt_step2` runs, `local_white = s_nwhite_sent - s_nwhite_recv`. If we received messages without sending corresponding ones, `local_white < 0`. The global sum `total_white = 0` only when all messages are balanced. If `total_white != 0`, the step2 loop keeps reading messages until balanced.
+
+This is fine - it just means the next GVT computation might take a bit longer to drain all in-flight messages. No crash from this.
+
+I'm going to take a completely different approach now. Instead of analyzing the complex interaction, let me look at what the SIMPLEST possible change would be to fix the crash.
+
+The key observation: in iter_5, we already have `tw_scheduler_rollback_to_gvt_only` in tw-sched.c and it's being called. The binary is writing ONE checkpoint then crashing. 
+
+Let me look at the actual error text. The validate says MPI_ABORT on rank 0. Let me look at the opencode_stdout for iter_5 more carefully to see if there's a specific error message:
+
+The opencode_stdout has already been read (it's the analysis log). Let me look at what actual ROSS error message appears. Unfortunately I can't see the actual stderr from the binary since the validate_stdout only shows the last few lines.
+
+Let me take a pragmatic approach. The current implementation in iter_5 uses `tw_scheduler_rollback_to_gvt_only` which calls `tw_sched_event_q`, `tw_sched_cancel_q`, and `does_any_pe`. These are all called from INSIDE a GVT hook, which means they're called in a very specific context.
+
+Let me look at the SIMPLEST possible fix: **avoid calling `tw_scheduler_rollback_to_gvt_only` entirely** and just save the current (possibly speculative) state, but save it CORRECTLY.
+
+The key insight from the opencode_stdout analysis: With speculative state checkpoint + restart, on restart there are NO straggler messages, so speculative events are processed without rollback. This could produce different results.
+
+However, looking at the validate_stderr for iter_5:
