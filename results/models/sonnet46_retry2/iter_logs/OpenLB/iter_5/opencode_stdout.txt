@@ -1,0 +1,213 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The key failure is on line 76: `output_correct=False`. The recovery ran successfully (exit code 0, timing ok), but the output after recovery doesn't match the baseline. This means the checkpoint/restart is not properly restoring state - the simulation starts from scratch instead of resuming from the checkpoint.
+
+Let me look at the current state of the code:
+Now I understand the problem. The validation shows:
+- Test 1 (failure-prone): FAIL - output doesn't match baseline after recovery
+- Test 2 (failure-free): PASS - clean run is fine
+
+The issue is that after recovery, the output is wrong. Looking at the code more carefully:
+
+1. The simulation writes `validation_output.bin` with lattice statistics at the END.
+2. When we restart from a checkpoint (say at step 50000), we resume the simulation from step 50001.
+3. The problem: the `startIT` loop starts from `startIT`, but **`iT=0` output block is skipped** during restart. However, the key issue is the simulation state after restart.
+
+Let me look at the failure more carefully. The failure message says `max_abs_diff=4.500e+05` which is huge. This suggests the lattice state isn't being properly serialized/deserialized with `sLattice.save()` and `sLattice.load()`.
+
+Let me check if OpenLB's `sLattice.save()` method accepts a raw buffer:
+Now let me check the `BufferSerializable` interface to understand how `save`/`load` work:
+Good. So `sLattice.save(ckpt_buf)` and `sLattice.load(ckpt_buf)` are correct API calls. The issue must be something else.
+
+Let me re-examine the failure carefully. The issue: after recovery, the output doesn't match the baseline. Looking at the validate output again:
+
+- The checkpoint is at step 50000 (first checkpoint)
+- Kill happens at ~80 seconds into the run
+- Recovery attempt 2 runs for ~60 seconds total
+- The recovery is successful (exit 0)
+
+But the output comparison fails. Let me think about what happens:
+
+1. Run 1: starts at iT=0, checkpoints at iT=50000, then gets killed
+2. Run 2: should restart from iT=50001 and complete to totalIT
+3. The output validation binary is written at the end
+
+The issue might be that `startIT = saved_iT + 1` starts from step 50001, but:
+- `getResults(myCase, iT, timer)` at `iT==0` creates the VTM writer master file. When restarting, `iT != 0`, so this block is skipped. That's fine.
+- The key issue: the loop starts with `setTemporalValues(myCase, iT)` AFTER the checkpoint call, meaning that when restarting, the momentum state should be loaded correctly.
+
+Wait, I see a subtle problem. Let me look more carefully:
+
+In the loop:
+```cpp
+for (std::size_t iT = startIT; iT < totalIT; ++iT) {
+    if (iT > 0 && iT % CKPT_INTERVAL == 0) {
+        // checkpoint
+    }
+    setTemporalValues(myCase, iT);
+    sLattice.collideAndStream();
+    getResults(myCase, iT, timer);
+}
+```
+
+When we restart at `startIT = saved_iT + 1 = 50001`, the lattice state has been loaded. But `setTemporalValues` uses `iT` to compute the velocity boundary condition. The issue is that after restart at iT=50001, the velocity field is correct, but `setTemporalValues` will update momentum if `iT % iTupdate == 0`. This should be fine.
+
+Let me look at the statistics reading at the end:
+```cpp
+sig_buf[0] = static_cast<double>(stats.getTime());
+```
+
+`stats.getTime()` — what does this return? It might return only the steps since the last `collideAndStream`, not the total steps. Let me check:
+So `getTime()` returns `latticeTime` - a counter. Let's check how it increments:
+Now let me look at the superLattice.hh to understand when `incrementTime()` and `collectStatistics()` are called:
+I see that `getStatistics().incrementTime()` is called within `collectStatistics()`, which is called each time `collideAndStream()` executes. So `getTime()` returns the number of `collideAndStream` calls. When we restart, only the remaining steps are executed, so `getTime()` after recovery would return `(totalIT - startIT)` steps, while a clean run returns `totalIT` steps. This means `sig_buf[0]` (lattice time) will differ between recovery and clean run.
+
+**That's the core bug!** The `stats.getTime()` returns the number of steps taken SINCE initialization, not since the start of the simulation. On a cold run, it's ~769000. On a recovery run starting at step 50001, it's ~719000. So `sig_buf[0]` differs by ~50000 between recovery and clean runs.
+
+Wait, but is `sig_buf[0]` even a valid discriminator? Let me re-read:
+
+```
+sig_buf[0] = static_cast<double>(stats.getTime());
+```
+
+Looking at the failure: `max_abs_diff=4.500e+05`. This is about 450,000 which could indeed be caused by the time counter (totalIT - startIT ≈ 769000 - 50001 ≈ 719000 vs 769000, difference ≈ 50000). But 450000 is much bigger...
+
+Let me think again. `max_abs_diff=4.500e+05` - the comparison is between double arrays of 6 values. If `sig_buf[0]` (time) is the issue, the max difference would be around 50000, not 450000.
+
+Actually wait - the checkpoint at iT=50000 is taken, but then the actual kill happens at ~80 seconds. Given the loop structure, by 80 seconds the simulation has progressed further beyond iT=50000. Let me recalculate:
+
+- Total steps: ~769000
+- Full runtime: ~132 seconds
+- Steps/sec: ~5826
+- Kill at 80.66 seconds → ~470,000 steps taken in run 1
+- First checkpoint at iT=50000 (not subsequent ones?)
+
+Wait, `CKPT_INTERVAL = 50000`. So checkpoints are at: 50000, 100000, 150000, ... All previous checkpoints overwrite since `max_versions=1`. The last checkpoint before kill at step ~470000 would be at iT=450000.
+
+So restart happens at iT=450001. Steps remaining: 769000 - 450001 = ~319000 steps.
+
+The time counter difference would be: 769000 vs 319000 → diff = 450,000 ≈ the `max_abs_diff=4.500e+05`!
+
+**This confirms the problem!** The lattice statistics `getTime()` counter starts from 0 on restart, but the validation expects it to show the total steps (as in a full clean run). After recovery, `getTime()` returns only `(totalIT - startIT)` steps.
+
+The fix: I need to reset the time counter to the correct value after loading from checkpoint. After restarting from step N, I should set the time counter to N (since N steps were already "done" before the checkpoint).
+
+Let me check how to reset the time:
+- `resetTime(size_t value = 0)` - yes, exists in LatticeStatistics!
+- `getStatistics().resetTime(startIT)` after `sLattice.load(ckpt_buf)`
+
+But wait - `sLattice.load()` might reset the statistics internally via `postLoad()`. Let me verify by looking at how the serializable interface works for the super lattice:
+I see that `getSerializableSize()` and `getBlock()` only serialize the block lattices, NOT the `_statistics` (including `latticeTime`). So when we do `sLattice.load(ckpt_buf)`, the `latticeTime` is NOT loaded from the checkpoint - it stays at 0 (freshly initialized).
+
+This means after loading from checkpoint and running the remaining steps, `getTime()` returns only `(totalIT - startIT)` steps, not `totalIT`.
+
+**The fix:** After loading from checkpoint, set `sLattice.getStatistics().resetTime(saved_iT)` to account for the steps already completed before the checkpoint.
+
+But wait - let me also consider whether the block statistics time is also wrong. Looking at `collectStatistics()`, it calls `_block[iC]->getStatistics().incrementTime()` too. So after restart, block times start from 0.
+
+Let me now also re-read the validation output more carefully:
+
+```
+max_abs_diff=4.500e+05
+```
+
+The sig_buf has 6 doubles. The maximum difference is 450,000. The lattice time would be the largest value (around 769,000). If restart happened at step 450,000, then recovery computes 769,000 - 450,001 ≈ 319,000 steps. The clean run does 769,000 steps. Difference = 769,000 - 319,000 ≈ 450,000.
+
+This exactly matches! The `sig_buf[0] = stats.getTime()` is the problem.
+
+The fix is simple: after loading from checkpoint, call `sLattice.getStatistics().resetTime(saved_iT)` (and potentially block-level statistics too).
+
+But I also need to verify: does the lattice state itself (the distributions/populations) get correctly serialized? The serialization only covers block lattice data, which should include the populations. Let me verify the `sig_buf` values:
+
+- `sig_buf[2]` (avg_rho): should be same if state is correct
+- `sig_buf[3]` (avg_energy): should be same if state is correct  
+- `sig_buf[4]` (max_uSqr): should be same if state is correct
+- `sig_buf[5]` (phys_peak_velocity): should be same if state is correct
+
+If only `sig_buf[0]` (time) differs, the `max_abs_diff` would be ~450,000 (from time) and the other values would match. That fits perfectly with what we see.
+
+So the fix is:
+1. After `sLattice.load(ckpt_buf)`, call `sLattice.getStatistics().resetTime(saved_iT)` to set the time counter to the checkpoint step.
+
+But actually, we should think about what the clean run produces. In a clean run, `getTime()` after all steps = totalIT (769,000 roughly). In recovery, it = totalIT - startIT. We need it to equal totalIT after recovery too.
+
+The solution: reset the time counter after loading: `sLattice.getStatistics().resetTime(saved_iT)`. Then as the remaining steps run, it increments from `saved_iT` to `totalIT`.
+
+Wait, but there's another subtlety. `collectStatistics()` is called from `collideAndStream()`, which calls `incrementTime()`. The loop runs `iT` from `startIT` to `totalIT-1`, so `collideAndStream()` is called `(totalIT - startIT)` times, incrementing the time `(totalIT - startIT)` times from the initial value.
+
+After `sLattice.load(ckpt_buf)`, `latticeTime` = 0 (since it's not serialized).
+If I `resetTime(saved_iT)`, then after the loop, time = saved_iT + (totalIT - startIT) = saved_iT + (totalIT - (saved_iT + 1)) = totalIT - 1.
+
+But in a clean run, time = 0 + totalIT = totalIT.
+
+So I need `resetTime(saved_iT + 1)` to get the same final time.
+
+Wait, let me be more precise:
+- clean run: starts at iT=0, ends at iT=totalIT-1, calls collideAndStream totalIT times → time = 0 + totalIT = totalIT
+- recovery: starts at iT=startIT = saved_iT+1, ends at iT=totalIT-1, calls collideAndStream (totalIT-startIT) = (totalIT - saved_iT - 1) times
+
+After `resetTime(saved_iT + 1)`, final time = saved_iT + 1 + (totalIT - saved_iT - 1) = totalIT. ✓
+
+So the fix: call `sLattice.getStatistics().resetTime(saved_iT + 1)` after loading from checkpoint.
+
+Let me also check if block statistics matter. The validation compares the super lattice statistics (collected via `collectStatistics()` which gathers across all blocks), not per-block stats. So only the super-level `_statistics.latticeTime` matters for `getTime()`.
+
+Now let me make the fix:
+Now let me rebuild the project to make sure the change compiles:
+Now let me also look at the previous validation logs to understand if there were earlier iterations:
+Good. Now let me verify my fix is correct by re-reading the modified file:
+The fix is in place. Let me now verify the logic once more:
+
+In a cold run:
+- `latticeTime` starts at 0
+- `collideAndStream()` calls `collectStatistics()` which calls `incrementTime()` each iteration
+- After `totalIT` iterations: `latticeTime = totalIT`
+
+In a recovery run (checkpoint at `saved_iT`, restart at `startIT = saved_iT + 1`):
+- `latticeTime` starts at 0 after construction
+- After `sLattice.load(ckpt_buf)`: `latticeTime` is still 0 (not serialized)
+- After `sLattice.getStatistics().resetTime(startIT)`: `latticeTime = startIT`
+- Loop runs from `startIT` to `totalIT-1`: `(totalIT - startIT)` collideAndStream calls
+- Final `latticeTime = startIT + (totalIT - startIT) = totalIT` ✓
+
+This matches the clean run's final value.
+
+Let me also check whether there could be any other issue with the output. Let me look at what `stats.getMaxU()` returns - it calls `maxVect[maxU]` from the last `collectStatistics()` call, which aggregates from all blocks. This should be the same as a cold run (assuming the lattice state is correctly loaded).
+
+Let me also look at the veloc.cfg in the source root to make sure it's correct:
+Good. The veloc.cfg is correct.
+
+Let me also check other previous iteration logs to see if there were any other issues I should be aware of:
+Let me also quickly look at the iter_3 validate output to understand the history:
+Interesting! In iter_3, there were NO checkpoints (0 checkpoint files). In iter_4, there were 8 checkpoint files. So the iter_3 → iter_4 change fixed the checkpoint detection issue, but introduced the output mismatch.
+
+Now my analysis is confirmed:
+- iter_4: checkpointing works (8 files found), recovery completes (exit 0), but output doesn't match because `stats.getTime()` is wrong after recovery.
+
+The fix I made — `sLattice.getStatistics().resetTime(startIT)` — should make the final `latticeTime` equal in both recovery and clean runs.
+
+Let me double-check by looking at how `getTime()` is used in the validation output:
+
+From the code:
+```cpp
+sig_buf[0] = static_cast<double>(stats.getTime());
+```
+
+After a clean run: `getTime() = totalIT` (769,xxx steps)
+After recovery starting at `saved_iT + 1`:
+- Before fix: `getTime() = totalIT - startIT` (smaller by ~450,000)  
+- After fix: with `resetTime(startIT)`, `getTime() = startIT + (totalIT - startIT) = totalIT` ✓
+
+The fix is correct. Let me also verify that the other sig_buf values (energy, rho, maxU) are consistent. These come from the last `collectStatistics()` call (from the last `collideAndStream()`), which aggregates the current block lattice states. Since the lattice state is properly loaded from the checkpoint, these values should match a clean run.
+
+Let me also confirm the `getMaxU()` return: `maxVect[maxU]` which is the velocity magnitude (not squared), set in `collectStatistics()`. That should also be correct.
+
+The fix looks complete and correct. Let me verify the final state of the modified file one more time:
+The fix is complete. Here's a summary of what was wrong and what was fixed:
+
+**Root cause:** The validation output `validation_output.bin` includes `sig_buf[0] = stats.getTime()`, which is the lattice statistics time counter (number of `collideAndStream()` calls). This counter is **not** part of the serialized lattice state, so after loading from a checkpoint, it starts at 0 instead of at the checkpoint step number.
+
+After recovery from checkpoint at step N (say 450,000) with total steps ~769,000:
+- Without fix: `getTime()` = 769,000 - 450,001 ≈ 319,000 → differs from clean run by ~450,000 → matches `max_abs_diff=4.500e+05`
+- With fix: `getTime()` = 450,001 + (769,000 - 450,001) = 769,000 = same as clean run ✓
+
+**Fix applied** (`bstep2d.cpp:463`): After loading the lattice state from the VeloC checkpoint, call `sLattice.getStatistics().resetTime(startIT)` to initialize the time counter to `startIT`. Then as the remaining `(totalIT - startIT)` steps run, the counter increments to `totalIT`, matching the clean run's value exactly.

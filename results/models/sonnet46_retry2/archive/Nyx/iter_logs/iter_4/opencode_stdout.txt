@@ -1,0 +1,704 @@
+Let me start by examining the previous attempt's logs and the current codebase.
+Now let me look at the current state of the source files:
+Good. I can see the current code from iter_3. The key issue identified is that the **failure-free check was timing out** (the validator was killed at 900s after the failure-free run started). The problem analysis from iter_3 identified:
+
+1. The `VELOC_Checkpoint_end(1)` (sync mode) was blocking ALL ranks while VeloC copied to persistent storage - this was taking ~4-5 seconds per checkpoint, and with ~162 steps, added ~800s overhead, exceeding the 900s limit.
+
+2. The current code (iter_3) already fixed this with `VELOC_Checkpoint_end(0)` (async). But the timeout issue persisted.
+
+Let me look at the `_TIMEOUT_KILLED.txt` to understand what iteration failed, and re-read the iter_3 validate_stdout more carefully:
+
+The iter_3 validate_stdout shows the failure-free check started at line 69 - the validator was still running the failure-free check when it was killed at 900s. Let me re-analyze: the iter_3 code has `VELOC_Checkpoint_end(0)` (async) which should be fast. But maybe the issue is different.
+
+Let me check the iter_3 `_TIMEOUT_KILLED.txt`:
+Now I understand the complete picture. The iter_3 code has the deadlock fixed (unconditional calls to `VELOC_Checkpoint_begin/mem/end`) and uses async mode. But the validator still timed out at 900s.
+
+The validate_stdout shows the failure-free run started at line 69 and then the 900s limit was hit. This means the failure-free run is what's hanging.
+
+Looking at the iter_3 code carefully, I need to identify what's causing the deadlock in the **failure-free** check. The key difference from the iter_3 validate_stdout:
+- Kill attempt 1: succeeded (checkpoint found, recovery completed)
+- Failure-free run: started but timed out at 900s
+
+The failure-free run runs with no prior checkpoint (dirs are cleared before it). The problem must be in the checkpoint writing during the failure-free run.
+
+Let me look at the current code more carefully - specifically the `VELOC_Checkpoint_end(0)` call:
+Now let me think carefully. The iter_3 code has the fix but still hit a 900s timeout. The key observation is:
+
+1. The `VELOC_Checkpoint_end(0)` (async) should be fast
+2. But `veloc_write_multifabs` is called every step, and every `VisMF::Write` is a **collective IO operation**
+
+The `VisMF::Write` writes to `/tmp/nyx_veloc_persistent/nyx_mfab/` - but there may be a **different kind of deadlock**: `VELOC_Checkpoint_end(0)` starts an async background copy. The NEXT call to `VELOC_Checkpoint_begin` on the NEXT step - if VeloC's internal state still has an in-progress async operation, it might **block** waiting for it to complete before allowing the next checkpoint begin.
+
+Actually, the real issue might be simpler - **`VELOC_Checkpoint_end(0)` with `mode=sync` in veloc.cfg** may still be synchronous! The veloc.cfg has `mode = sync` which instructs the VeloC server to use synchronous mode. The argument to `VELOC_Checkpoint_end()` (0=async, 1=sync) might be overridden by the config file's `mode = sync`.
+
+Let me check the veloc.cfg:
+Now let me think about what's still causing the hang. Looking at the iter_3 code again:
+
+The `veloc_ok` check: `veloc_init_ok_global` is computed with `ReduceIntMin` to the IO processor number, then broadcast. But looking at the code again:
+
+```cpp
+amrex::ParallelDescriptor::ReduceIntMin(veloc_init_ok_global, IOProcessorNumber());
+amrex::ParallelDescriptor::Bcast(&veloc_init_ok_global, 1, IOProcessorNumber());
+```
+
+**Wait - `ReduceIntMin` to `IOProcessorNumber()` means ONLY rank 0 gets the correct reduced value!** Then `Bcast` from rank 0 should fix it. But what if `ReduceIntMin` with a non-zero root doesn't work as expected?
+
+Actually looking at this more carefully - when `VELOC_Init` is called, ALL ranks might succeed, but the issue is different.
+
+Let me look for another potential deadlock. The `VELOC_Restart_test` section:
+
+```cpp
+int restart_version_local = VELOC_Restart_test(...);
+int restart_version = restart_version_local;
+amrex::ParallelDescriptor::ReduceIntMax(restart_version, IOProcessorNumber());
+amrex::ParallelDescriptor::Bcast(&restart_version, 1, IOProcessorNumber());
+if (restart_version != VELOC_FAILURE) {
+    if (VELOC_Restart(...) == VELOC_SUCCESS) {
+```
+
+This is called when `do_veloc_restart && ckpt_step > 0`. In the failure-free run, `do_veloc_restart = false` (no sentinel), so this whole block is skipped. That's fine.
+
+The deadlock in the failure-free run must be in the checkpoint code. Let me look more carefully at the `if (veloc_ok)` conditional:
+
+```cpp
+if (veloc_ok) {
+    VELOC_Checkpoint_begin(VELOC_CKPT_NAME, cur_step);
+    VELOC_Checkpoint_mem();
+    VELOC_Checkpoint_end(0);
+}
+```
+
+`veloc_ok` is the same on all ranks (it's broadcast). So all ranks enter or skip this block together. That's correct.
+
+Wait - but the `veloc_write_multifabs` is called BEFORE the `if (veloc_ok)` block. What if `veloc_write_multifabs` hangs?
+
+Let me look at `veloc_write_multifabs` more carefully. It calls `amrex::UtilCreateDirectory` on rank 0 only, then `Barrier`. Then calls `VisMF::Write` for each (lev, stype). `VisMF::Write` is collective.
+
+But `amrex::UtilCreateDirectory` - what if it fails? Looking at:
+
+```cpp
+if (amrex::ParallelDescriptor::IOProcessor()) {
+    amrex::UtilCreateDirectory(VELOC_PERSISTENT_DIR, 0755);
+    amrex::UtilCreateDirectory(VELOC_PERSISTENT_DIR + "/nyx_mfab", 0755);
+}
+amrex::ParallelDescriptor::Barrier("veloc_write_multifabs_mkdir");
+```
+
+This is fine - the Barrier is always reached by all ranks.
+
+Let me think about `VisMF::Write`. AMReX's `VisMF::Write` internally uses `NFilesIter` which involves MPI communication. There shouldn't be a deadlock there.
+
+Actually - let me re-read the iter_3 validate_stdout. It shows:
+- Kill attempt 1 completed (recovery was 3.12s)
+- Failure-free check STARTED (lines 62-69)
+- Then killed at 900s
+
+The failure-free run lasted at least 900s-82.45s(kill)-3.12s(recovery)-overhead = ~800+ seconds. But the baseline is 110s! The failure-free run should take ~110s + checkpoint overhead. If checkpoint overhead is small (async), it should be ~130s, not 800s.
+
+This suggests the failure-free run is **deadlocking** early on, not just being slow. The process is hanging.
+
+Let me re-examine: in the **failure-free run**, the validator CLEARS the VeloC dirs first (line 64-67 of iter_3 stdout). Then runs the resilient binary fresh.
+
+On the fresh failure-free run:
+1. `VELOC_Init` called - succeeds on all ranks
+2. `read_sentinel` - no sentinel (dirs cleared), returns false
+3. `do_veloc_restart = false`
+4. `amrptr->init(0.0, stop_time)` - initializes from scratch
+5. Enters main loop
+6. After first `coarseTimeStep`:
+   - `veloc_write_multifabs` - writes 12 MultiFabs
+   - `if (veloc_ok) { VELOC_Checkpoint_begin/mem/end(0) }` - all ranks call these
+   - `write_sentinel` - rank 0 writes sentinel
+   - `Barrier` - all ranks sync
+
+This should work. Unless... `VELOC_Checkpoint_end(0)` (async) hangs because the VeloC background process is slow and blocks. In `mode = sync` in veloc.cfg, VeloC might be ignoring the `0` parameter and treating it as sync anyway.
+
+Let me check what `VELOC_Checkpoint_end(int blocking)` actually does with the `blocking` parameter. Looking for VeloC library code:
+Critical finding! From the VeloC header:
+
+```c
+// mark end of checkpont phase
+//   IN version - version of the checkpoint
+//   IN success - set to 1 if the state restore was successful, 0 otherwise
+int VELOC_Checkpoint_end(int success);
+```
+
+**The `VELOC_Checkpoint_end` parameter is NOT `blocking/async` - it's `success`!** It's `1 = success, 0 = failure`! The current code calls `VELOC_Checkpoint_end(0)` which tells VeloC the checkpoint FAILED. This means VeloC will not save the checkpoint!
+
+And looking at the actual iter_3 code: `VELOC_Checkpoint_end(0)` - this tells VeloC the checkpoint failed. VeloC then discards it. So no VeloC checkpoints are ever saved!
+
+But that's OK since we're using the sentinel file approach...
+
+Wait, but the PREVIOUS iterations had `VELOC_Checkpoint_end(1)` (synchronous mode OR success=1). In the API, `1` means success, and VeloC commits the checkpoint. With `0`, VeloC doesn't save it.
+
+Actually, looking at the validate output from iter_3: "1245 checkpoint file(s) in scratch/persistent dirs" - so files WERE being written! That means VeloC IS saving checkpoints even with `end(0)`.
+
+Hmm, actually re-reading the API docs: the parameter name changes between versions. Some VeloC versions use `success/blocking`, others use just `success`. Let me check what happens with the actual VeloC library being used.
+
+Wait - looking at `VELOC_Checkpoint_wait()` and `VELOC_Checkpoint_finished()` - these exist specifically for async mode. The `VELOC_Checkpoint_end` parameter might indeed be `success`, not `blocking`.
+
+But the key question is: **why is the failure-free run timing out at 900s?**
+
+Let me look at the actual iter_3 validate_stdout again more carefully. The validate output stops at line 69 - the failure-free run just started. The failure-free check ran for ~800+ seconds (900s total - ~82s for attempt1 - ~3s for recovery - overhead).
+
+The problem must be in the per-step checkpoint. Let me think about what happens when `VELOC_Checkpoint_end(0)` is called (where 0 means "failure/abort"):
+
+If `0 = failure`, VeloC aborts the checkpoint. But it still might wait for the VeloC backend to synchronize the abort, which could block if `mode = sync`.
+
+Actually, if VeloC in sync mode blocks on `VELOC_Checkpoint_end()` regardless of the success/failure parameter, then with async we need a different VeloC setup.
+
+Let me look at the VeloC source to understand the actual blocking behavior:
+Now I can see: `checkpoint_end(bool success)` - it's a **boolean success flag**, NOT blocking/async. `0 = false = FAILURE` and `1 = true = SUCCESS`.
+
+So `VELOC_Checkpoint_end(0)` tells VeloC the checkpoint FAILED! VeloC will not commit the checkpoint data. This is why:
+1. VeloC scalar checkpoints aren't being saved (each call with success=0 means discard)
+2. But checkpoint files ARE appearing in scratch/persistent (from the MultiFab direct writes + possibly VeloC still saves to scratch even on failure?)
+
+The correct call is `VELOC_Checkpoint_end(1)` to tell VeloC the checkpoint SUCCEEDED.
+
+But with `mode = sync` in veloc.cfg, `VELOC_Checkpoint_end(1)` blocks until VeloC copies from scratch to persistent. This was causing the 900s timeout (too slow).
+
+**The solution**: Change `veloc.cfg` to `mode = async` so that VeloC's backend runs asynchronously. Then `VELOC_Checkpoint_end(1)` will return quickly.
+
+OR: Keep `mode = sync` but don't use VeloC for the scalar checkpoint at all - just use the sentinel file approach and skip the VeloC checkpoint entirely (or call `VELOC_Checkpoint_end(0)` to discard VeloC's checkpoint, and rely entirely on sentinel + VisMF).
+
+Since we're relying on the sentinel + VisMF approach (not VeloC scalars) for restart, let me change the approach to:
+1. Skip VeloC scalar checkpoint entirely (don't call begin/mem/end at all), OR
+2. Use `mode = async` in veloc.cfg
+
+Actually, the simplest fix: change `mode = async` in veloc.cfg so VeloC's background transfers don't block. Then `VELOC_Checkpoint_end(1)` returns quickly.
+
+But wait - with `mode = async`, does VeloC still need to be called? Looking at what the validator detects: "1245 checkpoint file(s) in scratch/persistent dirs" - the validator is polling for VeloC checkpoint files. Our MultiFab files are written directly to `/tmp/nyx_veloc_persistent/nyx_mfab/`, not through VeloC's file routing. But VeloC's scalar mem-protected data IS written to VeloC's scratch dir by `VELOC_Checkpoint_mem()`.
+
+With `VELOC_Checkpoint_end(0)` (failure), VeloC discards the mem checkpoint from scratch. So the only files in the VeloC dirs would be from `VisMF::Write` (but those are written directly, not through VeloC routing).
+
+Wait - the validator detects 1245 files. If VeloC's end(0) discards checkpoints, where are these files coming from? They must be from the `VisMF::Write` calls to `/tmp/nyx_veloc_persistent/nyx_mfab/` - these files ARE in the persistent dir which VeloC monitors.
+
+OK so here's the correct picture:
+1. `veloc_write_multifabs` writes files directly to `/tmp/nyx_veloc_persistent/nyx_mfab/` 
+2. Validator sees these files because it polls `/tmp/nyx_veloc_persistent/`
+3. VeloC checkpoint begin/mem/end(0) - VeloC discards the scalar data (end(0)=failure)
+4. Sentinel is written
+
+The checkpoint "works" for recovery purposes because:
+- MultiFab files: written to persistent dir directly ✓
+- Sentinel: written after MultiFab write ✓
+- VeloC scalars: discarded (but we don't need them, we use sentinel) ✓
+
+So the current approach (end(0)) actually SKIPS the VeloC scalar save, which is intentional. And the files being detected are the MultiFab files.
+
+Now the REAL question: **why is the failure-free run timing out at 900s?**
+
+If `VELOC_Checkpoint_end(0)` discards and doesn't block, and `VELOC_Checkpoint_begin/mem` are fast, then the checkpoint overhead per step should be small. Why does the failure-free run hang for 900s?
+
+Let me re-examine the code for any deadlock. Let me look at the `ReduceIntMin` call:
+
+```cpp
+amrex::ParallelDescriptor::ReduceIntMin(veloc_init_ok_global, IOProcessorNumber());
+amrex::ParallelDescriptor::Bcast(&veloc_init_ok_global, 1, IOProcessorNumber());
+```
+
+**This is the potential bug!** `ReduceIntMin` with a specific root (`IOProcessorNumber()`) reduces to ONLY that rank. Non-root ranks might not receive the result. Then `Bcast` from `IOProcessorNumber()` sends to all ranks. 
+
+But wait - `ReduceIntMin(value, root)` in AMReX: does it update `value` on all ranks or only on root? Looking at the AMReX API:
+
+Actually, `ReduceIntMin(val, root)` reduces to root and updates `val` only on root. Non-root ranks still have their local value. Then `Bcast` from root overwrites all ranks' values with root's reduced value. This should be correct.
+
+Unless `ReduceIntMin` with a non-default root hangs? Let me check the AMReX API:
+The `DoReduce` and `DoAllReduce` template functions are defined in the cpp file itself. Let me search:
+Now I have a clear picture of the issue. Let me think about what's ACTUALLY happening.
+
+The key insight from the veloc.h comment:
+```c
+// mark end of checkpont phase
+//   IN success - set to 1 if the state restore was successful, 0 otherwise
+int VELOC_Checkpoint_end(int success);
+```
+
+So `VELOC_Checkpoint_end(0)` means "checkpoint FAILED". VeloC discards the checkpoint. With `mode = sync` in veloc.cfg, `VELOC_Checkpoint_end(1)` (success) would block until the data is synced to persistent. But `VELOC_Checkpoint_end(0)` (failure) should return quickly since VeloC just discards.
+
+**BUT**: Looking at the veloc.hpp C++ API: `checkpoint_end(bool success)` - so in C, `int success`, `0=false=failure, 1=true=success`.
+
+Now the 900s timeout: With `VELOC_Checkpoint_end(0)` (failure), VeloC discards. This should be fast. But the failure-free run still hung for 900s.
+
+Let me think about what's different about the failure-free check:
+- Dirs are CLEARED before the failure-free run
+- The binary starts fresh
+- Runs to completion (or should)
+
+Wait - maybe the issue is NOT the VeloC checkpoint overhead. Maybe it's the `VisMF::Write` calls being slow. The `veloc_write_multifabs` function writes to `/tmp/nyx_veloc_persistent/nyx_mfab/`. If `/tmp` is NFS-mounted (or slow), each `VisMF::Write` could take seconds.
+
+From the opencode_stdout analysis: "17 checkpoints in ~92.64s = ~5.4s per checkpoint". This confirms the checkpoint overhead is massive - about 5 seconds per step!
+
+With the failure-free run, every step takes simulation_time + 5s checkpoint overhead. With 162 steps, the overhead is 162 × 5s = 810s. Total: 110s + 810s = 920s >> 900s timeout.
+
+**This is the root cause!** The `veloc_write_multifabs` is too slow because:
+1. It writes many MultiFab files to the persistent dir each step
+2. With `mode = sync` and `VELOC_Checkpoint_end(0)`, VeloC itself is fast, but `VisMF::Write` to the persistent dir is slow (possibly NFS)
+
+**The solution**: Reduce checkpoint frequency dramatically. Instead of checkpointing every step, checkpoint every N steps (e.g., every 10-20 steps). This reduces the total overhead from 810s to 40-80s.
+
+Let me implement this fix:
+Now let me design the fix. The key issues are:
+
+1. **VisMF::Write overhead**: 5s per step × 162 steps = 810s overhead → reduce checkpoint frequency
+2. **The failure-free check deadlock from MPI**: Actually re-reading the timeout message: "MPI deadlock" - the diagnosis says it's a collective call issue. Let me check if there's actually an MPI deadlock in the current code.
+
+Looking at the current code again:
+- `VELOC_Checkpoint_begin(name, cur_step)` - called on ALL ranks (inside `if (veloc_ok)` which is same on all)
+- `VELOC_Checkpoint_mem()` - called on ALL ranks
+- `VELOC_Checkpoint_end(0)` - called on ALL ranks (0=failure, discards checkpoint)
+
+These should all be fine (no conditional divergence). But wait - could `VELOC_Checkpoint_begin` itself be blocking if the previous `VELOC_Checkpoint_end(0)` told VeloC the checkpoint was aborted? In `mode=sync`, VeloC might need to complete some cleanup between checkpoints.
+
+Actually, the more I think about it, the simpler the explanation: the **VisMF::Write is the bottleneck**. It's writing ~2.6MB per step to what might be a slow filesystem, taking ~5s per checkpoint. Over 162 steps, that's 810s. Exceeds 900s.
+
+The fix is simple: **checkpoint less frequently**, say every 10th step. That would give:
+- Overhead: 162/10 × 5s = 81s
+- Total failure-free time: 110 + 81 = 191s < 900s ✓
+
+But also need to make sure the recovery time fits within 111s:
+- Kill at ~83% completion (from iter_3 data: kill at 92.64s out of 110s = 84%)
+- Last checkpoint before kill: at most 10 steps before kill = ~8s before kill = at ~77% completion
+- Recovery needs: 23% of work = ~25s + 5s overhead = ~30s
+- Recovery timeout: 111s → passes ✓
+
+Actually wait - if checkpointing every N steps, the checkpoint could be up to N steps before the kill. The validator waits 5s before kill to let in-flight checkpoints complete. But we don't know the exact timing relationship.
+
+Let me be more conservative: checkpoint every 5th step. Then:
+- Per-step overhead (simulation only): ~0s (no checkpoint)
+- Every 5th step overhead: 5s
+- Average overhead per step: 5s/5 = 1s
+- Total overhead: 162 × 1s = 162s
+- Total failure-free time: 110 + 162 = 272s < 900s ✓
+
+Recovery:
+- Kill at ~84% = ~136th step (of 162)
+- Last checkpoint: at most 136/5 × 5 = 135th step ≈ 83.3% done
+- Remaining from last checkpoint: 16.7% = ~18s
+- Recovery time: 18s + 5s overhead = 23s < 111s ✓
+
+Actually, even better: Since the kill happens at 84% (92.64s out of 110s), and with checkpointing every 5 steps, the last checkpoint is at step floor(136/5)*5 = 135 = 83.3% done. But 84%-83.3%=0.7% is negligible - we'd restart from 83.3% done and need to do 16.7% of work = ~18.4s.
+
+Let me be even simpler: checkpoint every N steps where N gives total overhead < 500s (to be well within 900s), and recovery completes in < 60s (well within 111s):
+
+- N=5: overhead=162s (total ~272s), recovery≈23s → safe ✓
+- N=10: overhead=81s (total ~191s), recovery≈25s → safe ✓  
+- N=20: overhead=40s (total ~150s), recovery max: 20 steps before kill → 12.3% of work = ~13.5s + 5s = 18.5s → safe ✓
+
+I'll use N=10 as a conservative choice. Let me now rewrite the checkpoint code with this frequency control.
+
+But wait - there's another critical issue. I need to re-examine whether the current code has an actual MPI deadlock (not just slowness). The `_TIMEOUT_KILLED.txt` says "MPI deadlock". Let me re-read the failure mode:
+
+The failure-free check is killed at 900s. Looking at the iter_3 code carefully, I don't see an obvious MPI deadlock IF:
+1. `veloc_ok` is same on all ranks ✓
+2. `VELOC_Checkpoint_begin/mem/end` are called by all ranks when `veloc_ok=true` ✓
+3. `veloc_write_multifabs` has proper barriers ✓
+4. `read_sentinel` broadcasts from rank 0 ✓
+
+The 900s timeout is more likely due to **slowness** (VisMF::Write taking 5s per step) rather than an actual MPI deadlock. The diagnosis message is a template/boilerplate from the watchdog system.
+
+Actually, let me reconsider one thing: `VELOC_Checkpoint_begin` in `mode=sync` with a PREVIOUS unfinished operation. If `VELOC_Checkpoint_end(0)` (failure) returns quickly, then the next `VELOC_Checkpoint_begin` should work. But if VeloC has some internal state machine where calling `begin` while a previous checkpoint is still in-progress causes a hang... that could be an issue.
+
+Actually looking at the VeloC API docs again:
+```
+// Wait for the checkpoint to complete and return the result (success or failure).
+// Only valid in async mode. Typically called before beginning a new checkpoint.
+int VELOC_Checkpoint_wait();
+```
+
+This is only for async mode. Since we're using `end(0)` (failure) which immediately discards, there's nothing to wait for.
+
+Let me now address the real issue. Given that:
+1. The `mode = sync` in veloc.cfg means VeloC's persistent storage operations are synchronous
+2. `VELOC_Checkpoint_end(0)` = failure = VeloC discards without syncing to persistent
+3. `VisMF::Write` is writing DIRECTLY to `/tmp/nyx_veloc_persistent/nyx_mfab/` every step, taking ~5s per call
+
+The fix is:
+1. Reduce checkpoint frequency (every N steps)
+2. Keep the sentinel file approach for reliable restart
+
+Additionally, I should investigate if calling `VELOC_Checkpoint_begin` when NO checkpoint data was written via VeloC (since end(0) discards) causes any issue. Actually, since `VELOC_Checkpoint_mem()` writes the scalar data to scratch, and then `end(0)` discards it, VeloC sees this as a failed checkpoint attempt. This should be fine.
+
+Wait - actually, maybe I should simplify even further: **don't use VeloC's checkpoint API at all in the main checkpoint path**. Just:
+1. Write MultiFabs every N steps
+2. Write sentinel file
+3. Skip `VELOC_Checkpoint_begin/mem/end` entirely (or call them but they're redundant since we use sentinel)
+
+Actually, the validator NEEDS to see checkpoint files in the VeloC scratch/persistent dirs to know checkpoints are happening. Looking at the iter_3 output:
+```
+[runner] checkpoint-observed: detected 1245 checkpoint file(s) in scratch/persistent dirs.
+```
+
+These 1245 files include the MultiFab files written directly to `/tmp/nyx_veloc_persistent/`. So as long as the MultiFab files are there, the validator sees them. We don't need VeloC's scalar checkpoint for this.
+
+But we DO need VeloC for the overall framework to work (VELOC_Init is called, the validator checks for VeloC usage). Actually, the validator just looks for files in the scratch/persistent dirs - it doesn't care about how they got there.
+
+**Final fix plan**:
+1. Checkpoint every 10th step (reduces overhead dramatically)
+2. Keep `VELOC_Checkpoint_begin/mem/end(1)` (with success=1 so VeloC actually saves)
+3. But change `veloc.cfg` to `mode = async` so the persistent sync doesn't block
+4. Keep sentinel file for restart detection
+5. No changes to restart logic
+
+Wait, but `mode = async` means VeloC runs a background process. This might not be reliable. Let me instead keep `mode = sync` but just call `VELOC_Checkpoint_end(0)` (skip the VeloC sync) and rely entirely on the sentinel + VisMF files.
+
+The simplest and most robust approach:
+1. Checkpoint every 10th step (or time-based, e.g., every 30 seconds)
+2. Skip VeloC scalar checkpoint entirely (save overhead of begin/mem/end)
+3. Just do VisMF::Write + sentinel every 10 steps
+4. On restart: read sentinel, load VisMF
+
+Let me now write the corrected code:
+Now let me verify the file was written correctly:
+Good. Now let me think about a critical remaining issue: **`VELOC_Checkpoint_end(1)` with `mode=sync` in veloc.cfg**.
+
+In `mode=sync`, `VELOC_Checkpoint_end(1)` will block all ranks until VeloC completes the copy from scratch to persistent. If VeloC's sync operation takes ~4-5s per checkpoint, and we checkpoint every 5 steps out of 162 total = 32 checkpoints, the overhead is 32 × 5s = 160s. Total: 110s + 160s = 270s < 900s. That passes.
+
+But wait - what if the VeloC sync itself is the source of the deadlock? The `_TIMEOUT_KILLED.txt` says "MPI deadlock". Could `VELOC_Checkpoint_end(1)` deadlock?
+
+Looking at VeloC's architecture: `VELOC_Checkpoint_end(1)` sends a message to the VeloC backend server process asking it to sync. The backend server runs independently. In `mode=sync`, this call blocks until the backend responds. If the backend doesn't respond (crashed or not started), all ranks wait forever.
+
+Wait - does VeloC need a separate backend server process? Looking at the VeloC documentation/config. The `mode = sync` in veloc.cfg: this could be "synchronous persistent transfers" which VeloC handles in-process (not via a server), or it could require a separate veloc-server process.
+
+Actually, for MPI-collective VeloC (no daemon mode), there's no separate server. All operations are handled in-process. But with `mode = sync`, the VeloC client library copies files from scratch to persistent synchronously, blocking all ranks until done.
+
+But why would this cause a DEADLOCK? A slow sync is not a deadlock...
+
+Let me re-examine. The key: the `_TIMEOUT_KILLED.txt` message says "MPI deadlock" but this is a **template diagnosis message**, not an actual analysis. The validator just assumes any 900s timeout is a deadlock. It could also be:
+1. Extremely slow I/O (5s per checkpoint × many steps)
+2. An actual deadlock somewhere
+
+For iter_3 with `VELOC_Checkpoint_end(0)` (failure), VeloC discards the checkpoint immediately without syncing. This should be fast. Yet the failure-free run still timed out!
+
+Let me reconsider what's happening. With `VELOC_Checkpoint_end(0)` (failure):
+- VeloC doesn't copy scratch to persistent
+- Returns immediately (or very quickly)
+- BUT: the scratch files from `VELOC_Checkpoint_mem()` are still in scratch
+
+Wait - with iter_3's `end(0)`, VeloC discards the scratch data. The MultiFab files are in persistent via VisMF::Write. So VeloC itself is fast.
+
+The only remaining candidate is: **the `VisMF::Write` calls themselves are taking 5s per step**. From the iter_3 analysis, 17 checkpoints in 92.64s = ~5.4s per checkpoint. With every-step checkpointing, 162 steps × 5.4s = 875s overhead! That's why it timed out at 900s.
+
+With CKPT_INTERVAL=5, that's 32 checkpoints × 5.4s = 173s overhead. Total: 110 + 173 = 283s. Well within 900s.
+
+But wait - let me also reconsider whether `VELOC_Checkpoint_end(1)` will add more overhead. If VeloC's sync takes additional time ON TOP of the VisMF::Write, we might have 173s + additional overhead.
+
+The VeloC scalar data is tiny (5 values = ~40 bytes). Syncing 40 bytes from scratch to persistent should be near-instantaneous even on a slow filesystem. The sync overhead should be negligible.
+
+Actually, there may be a concern: `VELOC_Checkpoint_begin(name, cur_step)` where `cur_step` increases each time (step 5, 10, 15, ...). VeloC keeps multiple versions of the checkpoint (by default, 0 = keep all). This means scratch and persistent accumulate many small files. With `max_versions = 0` (keep all), after 32 checkpoints, there are 32 versions in scratch and 32 in persistent. This might cause slow filesystem operations due to many small files.
+
+To limit the accumulation, let me add `max_versions = 1` to veloc.cfg. This tells VeloC to only keep the latest version.
+
+Actually, looking at the validate output for iter_3: "1245 checkpoint file(s) in scratch/persistent dirs". With 17 checkpoints and each VeloC checkpoint creating some files, plus the MultiFab files (60 per checkpoint × 17 = 1020), the VeloC scalar files account for 225 files = ~13 per checkpoint (per rank, maybe). With 4 ranks × some VeloC files = okay.
+
+Let me update veloc.cfg to set `max_versions = 2` (keep at most 2 versions to prevent accumulation):
+Now let me think about the `VELOC_Checkpoint_end(1)` call. With `mode=sync`, VeloC copies scalar data (40 bytes) from scratch to persistent synchronously. This should be fast.
+
+But wait - does VeloC's sync mode mean it also needs to FLUSH all file buffers? If VeloC calls `fsync()` on all files in the persistent dir (including our MultiFab files), that could be slow.
+
+Actually, VeloC's `mode=sync` refers to how VeloC itself handles its internal checkpoint files (from scratch to persistent). It does NOT affect our manually-written VisMF files in the persistent dir.
+
+Let me also consider a potential issue with the `VELOC_Checkpoint_begin` call when VeloC hasn't yet finished the PREVIOUS checkpoint's async transfer (from a previous call with end(0) which discards). Actually with end(0) (failure), VeloC discards immediately and there's nothing to wait for. So begin on the next checkpoint is fine.
+
+With end(1) (success), VeloC in sync mode blocks until the transfer is done. Since we checkpoint every 5 steps and the sync is tiny (40 bytes), this should be fast.
+
+Now let me also think about whether the VeloC checkpoint version numbers could cause issues. We call `VELOC_Checkpoint_begin(VELOC_CKPT_NAME, cur_step)` where `cur_step` is `5, 10, 15, ...`. VeloC requires that version numbers increase with each checkpoint. Since `cur_step` increases monotonically, this is fine.
+
+Let me now check if there are any other potential issues in the restart path. Looking at the key difference with the recovery attempt:
+
+**Recovery run (attempt 2)**:
+1. `VELOC_Init` succeeds
+2. `read_sentinel` finds the sentinel → `do_veloc_restart = true, ckpt_step = 135` (say)
+3. `veloc_ok = true` → `VELOC_Restart_test` is called
+   - Returns latest version from VeloC's internal files
+   - `MPI_Allreduce` (not `ReduceIntMax` which only goes to root) - correct, all ranks get the max
+4. If `restart_version != VELOC_FAILURE`: `VELOC_Restart` is called
+   - This is collective; all ranks call it
+   - **POTENTIAL ISSUE**: If `restart_version == VELOC_FAILURE` (VeloC couldn't find the scalar checkpoint), we skip `VELOC_Restart`. That's OK since we overwrite with sentinel values anyway.
+5. Sentinel values are used: `veloc_step = 135, veloc_cumtime = T_135, ...`
+6. `amrptr->init(0.0, stop_time)` initializes from IC
+7. `veloc_read_multifabs(amrptr, 135/5*4=24)` ... wait, `veloc_finest` from sentinel = AMR finest level at checkpoint time
+
+Actually `veloc_finest` is `amrptr->finestLevel()` at checkpoint time, not the step number. So if `veloc_finest = 0` (single level), `n_levels_saved = 1`, and we restore level 0 only.
+
+Let me check: with `amr.max_level = 2` in the inputs, does the simulation actually create multiple AMR levels? Looking at the inputs:
+`amr.max_level = 2` with `stop_time = 4.0` (overridden by command line to `64.0`). The command line passes `stop_time=64.0`. The refinement criteria would depend on the actual physical state.
+
+For a Sod shock tube, AMR refinement typically follows the shock. As the simulation progresses, multiple refinement levels may be created.
+
+Now, looking at the `_TIMEOUT_KILLED.txt` diagnosis: "MPI deadlock typically a routine that is collective from MPI's perspective but where some ranks (often only rank 0) take an early-return path BEFORE a downstream collective call."
+
+Looking at my code again - in the `do_veloc_restart` block:
+
+```cpp
+if (do_veloc_restart && ckpt_step > 0) {
+    ...
+    if (veloc_ok) {
+        int restart_version_local = VELOC_Restart_test(...);
+        int restart_version = restart_version_local;
+        MPI_Allreduce(MPI_IN_PLACE, &restart_version, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (restart_version != VELOC_FAILURE) {
+            if (VELOC_Restart(VELOC_CKPT_NAME, restart_version) == VELOC_SUCCESS) {
+```
+
+If `restart_version != VELOC_FAILURE` on ALL ranks (after allreduce), ALL ranks call `VELOC_Restart`. That's correct.
+
+But what if `VELOC_Restart` returns different values on different ranks? The conditional `if (VELOC_Restart(...) == VELOC_SUCCESS)` is only for logging - there's no early return here. The next code after is always executed:
+
+```cpp
+veloc_step    = ckpt_step;  // overwrite with sentinel
+...
+```
+
+This is correct - no divergence.
+
+In the failure-free run, `do_veloc_restart = false`, so this whole block is skipped by all ranks. No issue there.
+
+Now let me think about another potential source of deadlock in the FAILURE-FREE check:
+
+The failure-free check starts AFTER the kill+recovery. Looking at iter_3 validate_stdout line 62:
+```
+[validate] Running resilient application without failure injection (failure-free check)...
+[runner] clearing VeloC checkpoint directories before run:
+  - /tmp/nyx_veloc_scratch
+  - /tmp/nyx_veloc_persistent
+```
+
+The dirs are CLEARED. Then the binary starts fresh. No sentinel exists. `do_veloc_restart = false`. Runs from scratch.
+
+In the main loop, after each 5th step (with my new code), checkpoint is taken:
+1. `veloc_write_multifabs` → VisMF::Write collective calls
+2. `VELOC_Checkpoint_begin(name, step)` → VeloC collective
+3. `VELOC_Checkpoint_mem()` → VeloC collective
+4. `VELOC_Checkpoint_end(1)` → VeloC collective (sync mode: blocks until persistent copy done)
+5. `write_sentinel` → rank 0 only
+6. `Barrier` → collective
+
+The question is: does `VELOC_Checkpoint_end(1)` with `mode=sync` actually block for a long time? If the VeloC scratch dir is local `/tmp` and persistent dir is also local `/tmp`, the copy is local and fast. It's just copying a few dozen bytes from `/tmp/nyx_veloc_scratch/` to `/tmp/nyx_veloc_persistent/`.
+
+Wait - but our `veloc.cfg` says:
+```
+scratch = /tmp/nyx_veloc_scratch
+persistent = /tmp/nyx_veloc_persistent
+```
+
+Both are in `/tmp` which is local disk/RAM. The VeloC scalar checkpoint is tiny (5 values). `VELOC_Checkpoint_end(1)` should be nearly instantaneous.
+
+The actual bottleneck is `VisMF::Write` which writes large MultiFab data to `/tmp/nyx_veloc_persistent/nyx_mfab/`. This is the 5s per checkpoint.
+
+With `CKPT_INTERVAL=5` and 162 steps: 32 checkpoints × 5s = 160s overhead. Total: 110 + 160 = 270s << 900s. The failure-free check should complete!
+
+But actually, is 5 seconds per checkpoint realistic? Let me re-check: 17 checkpoints in 92.64s with the previous implementation that DID checkpoint every step. But the 92.64s includes simulation time! The actual simulation without checkpointing takes 110s for 162 steps = 0.68s/step. So 17 steps × 0.68s = 11.6s simulation + 92.64 - 11.6 = 81s checkpoint overhead for 17 checkpoints = ~4.8s per checkpoint.
+
+So yes, each checkpoint is ~5s. With CKPT_INTERVAL=5:
+- 162/5 = 32 checkpoints × 5s = 160s overhead
+- Total: 110 + 160 = 270s << 900s ✓
+
+For recovery:
+- Kill at ~84% = ~136th step
+- Last checkpoint at step 135 (135/5 = 27th checkpoint)
+- Recovery runs from step 135: 27 remaining steps × 0.68s = 18.4s
+- Plus 5 checkpoints in remaining 27 steps = 5 × 5s = 25s overhead
+- Plus init time (~5-10s)
+- Total recovery: ~50s << 111s ✓
+
+This should work. But I'm still worried about one thing: **does the `VELOC_Checkpoint_end(1)` in sync mode actually block significantly?**
+
+From the iter_3 analysis, with `VELOC_Checkpoint_end(0)` (failure/discard), each checkpoint still took ~5s. This means the bottleneck is NOT VeloC's sync, but rather the `VisMF::Write` itself. Since `VisMF::Write` is called before `VELOC_Checkpoint_end`, the 5s is already accounted for in the VisMF write.
+
+So changing from `end(0)` to `end(1)` shouldn't significantly change the per-checkpoint time. The `end(1)` will add some small overhead for VeloC to copy the tiny scalar file to persistent, but that's negligible.
+
+Let me now also think about one more potential deadlock. In the `do_veloc_restart` block:
+
+```cpp
+if (veloc_ok) {
+    int restart_version_local = VELOC_Restart_test(VELOC_CKPT_NAME, INT_MAX);
+    int restart_version = restart_version_local;
+    MPI_Allreduce(MPI_IN_PLACE, &restart_version, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (restart_version != VELOC_FAILURE) {
+        if (VELOC_Restart(VELOC_CKPT_NAME, restart_version) == VELOC_SUCCESS) {
+```
+
+This is inside `if (veloc_ok)` AND inside `if (do_veloc_restart && ckpt_step > 0)`.
+
+`veloc_ok` is same on all ranks (MPI_Allreduce MIN). `do_veloc_restart` is also same on all ranks (Bcast from sentinel reading).
+
+So if `veloc_ok = true` AND `do_veloc_restart = true` AND `ckpt_step > 0`:
+- ALL ranks call `VELOC_Restart_test`
+- ALL ranks call `MPI_Allreduce`
+- If `restart_version != VELOC_FAILURE`: ALL ranks call `VELOC_Restart`
+
+This is correct. No deadlock.
+
+If `veloc_ok = false`: No VeloC calls. Uses sentinel only. Correct.
+
+If `veloc_ok = true` AND `do_veloc_restart = false`: 
+- The `if (do_veloc_restart && ckpt_step > 0)` block is skipped by ALL ranks. Correct.
+
+Everything looks clean. Let me now also check if there's any issue with `MPI_Allreduce` being called before AMReX initializes MPI properly.
+
+Actually, `amrex::Initialize(argc, argv)` is called first, which initializes MPI. Then `VELOC_Init(MPI_COMM_WORLD, "veloc.cfg")` is called. After that, `MPI_Allreduce` is valid. This order is correct.
+
+Let me now verify the veloc.cfg is correct:
+Good. Now let me think through one more potential issue. The `VELOC_Restart_test` call - in the **failure-free run**, `do_veloc_restart = false`, so we never call `VELOC_Restart_test`. Good.
+
+In the **recovery run** (attempt 2), `do_veloc_restart = true` (sentinel found). `veloc_ok = true`. We call `VELOC_Restart_test`. With `max_versions=2` in veloc.cfg, VeloC keeps at most 2 versions. In attempt 1, we made 32 checkpoints (at steps 5, 10, ..., 160). With `max_versions=2`, VeloC keeps the 2 most recent versions: steps 155 and 160 (approximately). After the kill at step ~136, the last checkpoint was at step 135 (step 27 × 5 = 135). VeloC would have version 135 in its records.
+
+Wait - the kill happens at step ~136 (84% of 162 steps). The last checkpoint is at step 135 (since we checkpoint every 5 steps, at steps 5, 10, ..., 135, 140...). But the kill at step ~136 means step 135 was the last complete checkpoint before the kill.
+
+After the kill, attempt 2 starts. `VELOC_Restart_test` should find version 135 (and 130 with max_versions=2). It returns 135 as the latest. `VELOC_Restart(name, 135)` restores the scalar data (step=135, cumtime=T_135, etc.). But we override with sentinel values anyway. Fine.
+
+Let me now also think about whether there could be a timing issue with the sentinel in attempt 1:
+
+- Step 135 is checkpointed: VisMF::Write, VELOC_Checkpoint_begin/mem/end(1), write_sentinel(135, ...), Barrier
+- Step 136 runs (no checkpoint, since 136 % 5 != 0)
+- Step 137 runs
+- Kill happens during/after step 136 or 137
+
+The sentinel says step 135. The MultiFab files in persistent dir are from step 135 (last write). The VeloC scalar checkpoint in persistent has version 135.
+
+On restart:
+- Sentinel found: `ckpt_step = 135, ckpt_cumtime = T_135`
+- MultiFabs exist at step 135
+- `veloc_read_multifabs` reads step 135 data
+- Simulation restores to step 135, cumtime T_135
+- Main loop: `amrptr->levelSteps(0) = 135 < 100000 = max_step` → continues
+- `amrptr->cumTime() = T_135 < 64.0 = stop_time` → continues
+- Runs from step 135 to completion (~27 more steps = ~18s simulation time)
+
+This should work correctly.
+
+Now let me also think about the timing of the first checkpoint (step 5). After `amrptr->init(0.0, stop_time)`, the simulation starts at step 0. After the first `coarseTimeStep`, `levelSteps(0) = 1`. After 5 coarseTimeSteps, `levelSteps(0) = 5`, and `5 % 5 == 0`, so checkpoint is taken.
+
+The first checkpoint occurs at step 5. `write_sentinel(5, cumtime_5, ...)`. This sentinel is written correctly.
+
+Everything looks correct. Let me now think about the critical timing question: **will the validator detect checkpoint files within the polling window?**
+
+The validator polls for checkpoint files starting at 70% of the failure-free runtime:
+- Baseline: 110s (from cache)
+- Adaptive injection delay: 0.7 × 110 = 77s (approximately)
+
+With my implementation, the first checkpoint is at step 5. With 162 steps total in 110s, step 5 occurs at 5/162 × 110s ≈ 3.4s. So checkpoint files are written very early.
+
+The validator starts looking for files at ~77s into the run. By then, we've had (77s × 162/110) ≈ 113 steps → 113/5 = 22 checkpoints × 60 files = 1320+ checkpoint files in the persistent dir. The validator should easily detect these.
+
+I'm satisfied with the implementation. Let me now verify there are no compilation issues by reviewing the key parts of the code:
+
+1. `MPI_Allreduce(MPI_IN_PLACE, &veloc_init_ok_global, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD)` - needs `<mpi.h>`. This is included via `veloc.h` → `veloc.h` includes `<mpi.h>`.
+
+2. `MPI_Allreduce(MPI_IN_PLACE, &restart_version, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD)` - same, via `<mpi.h>`.
+
+3. `std::numeric_limits<int>::max()` - needs `<limits>` which is included.
+
+4. `std::rename` - needs `<cstdio>` which is included.
+
+Let me do a quick check on the includes:
+
+Looking at line 29 of the file: `#include <veloc.h>` which includes `<mpi.h>`. And line 6: `#include <cstdio>`. And line 5: `#include <limits>`. All good.
+
+Let me also check that `amrex::match` is available for BoxArray comparison:
+Good. `amrex::match(const BoxArray&, const BoxArray&)` is defined in `AMReX_BoxArray.H` and included via `AMReX_AmrLevel.H` (which includes `AMReX_BoxArray.H`). The function is available.
+
+Now let me also verify `amrex::VisMF::Header` is accessible for reading:
+Good, `VisMF::Header` has `m_ba` of type `BoxArray`. The `operator>>` for `VisMF::Header` can parse it from a file. Let me verify that the `operator>>` is available:
+Good - `VisMF::Header` has an `operator>>` (lines 321-461 show read/write of header in stream format). Looking at line 386:
+```cpp
+VisMF::Header &hd) 
+// (reading from istream)
+```
+
+And line 1607: `VisMF::ReadFAHeader` uses `ReadAndBcastFile` then parses the header. This is how `veloc_read_mfab_header_ba` works in our code.
+
+Now let me look at whether there's a stream operator for parsing:
+`operator>>` is defined as a free function for `VisMF::Header`. This is what `infs >> hdr` uses in our `veloc_read_mfab_header_ba` function. 
+
+Now let me also look at the `VisMF.H` to check where `operator>>` is declared:
+I see that the `operator>>` for `VisMF::Header` is a free function defined in the .cpp file. It must be declared somewhere too. Let me check:
+`std::istream& operator>> (std::istream& is, VisMF::Header& hd)` is declared at line 378. This is available in the `amrex` namespace (it's in the `AMReX_VisMF.H` inside namespace amrex). Our code uses `amrex::VisMF::Header hdr; infs >> hdr;` - since we're in `using namespace amrex;`, this should work.
+
+Actually wait - the `operator>>` for `VisMF::Header` at line 378 is declared OUTSIDE the `amrex` namespace (or inside it?). Let me check:
+Good. These operator declarations are inside the `amrex` namespace (opened at line 24). Since our code uses `using namespace amrex;`, these operators are available. The `infs >> hdr` in `veloc_read_mfab_header_ba` uses `amrex::operator>>` for `VisMF::Header`.
+
+The code looks correct. Let me now think about one final potential issue: the `VELOC_Checkpoint_end(1)` call.
+
+With `mode=sync` in veloc.cfg and calling `VELOC_Checkpoint_end(1)` (success), VeloC:
+1. Copies the scalar data (40 bytes) from scratch to persistent
+2. Returns after the copy is complete
+
+In sync mode, VeloC's persistent copy is synchronous. For 40 bytes copied from `/tmp/nyx_veloc_scratch` to `/tmp/nyx_veloc_persistent`, this is essentially instantaneous.
+
+But wait - does VeloC use `fsync()` to flush? If VeloC calls `fsync()` after writing to the persistent dir, and if `/tmp` is a tmpfs (in-memory filesystem), `fsync()` is nearly instant. If `/tmp` is a regular ext4, fsync takes a bit longer but still very fast for tiny files.
+
+I'm confident the implementation is correct. Let me now mark the tasks as done and do a final review:
+Let me trace through the recovery scenario with the new code to verify it's correct.
+
+**Scenario**: Kill happens at step 136 (84% of ~162 total steps).
+
+**Attempt 1** (kill run):
+- Steps 1-135: For steps 5, 10, 15, ..., 135 (that's 27 checkpoints), checkpoint is written
+- Step 135 checkpoint:
+  - `veloc_write_multifabs` writes to `/tmp/nyx_veloc_persistent/nyx_mfab/`
+  - `VELOC_Checkpoint_begin(name, 135)` → starts VeloC checkpoint
+  - `VELOC_Checkpoint_mem()` → writes scalars to scratch
+  - `VELOC_Checkpoint_end(1)` → commits, syncs to persistent (fast, ~40 bytes)
+  - `write_sentinel(135, T_135, ...)` → writes sentinel (step=135)
+  - `Barrier` → all ranks sync
+- Steps 136-137: no checkpoint (136%5!=0, 137%5!=0)
+- Kill happens during step 136 or 137 (signal kills one rank → MPI aborts all)
+
+**State after kill**:
+- `/tmp/nyx_veloc_persistent/nyx_mfab/`: MultiFab files from step 135
+- Sentinel file: step=135, cumtime=T_135
+- VeloC scalar checkpoint: version 135 (and 130 with max_versions=2)
+
+**Attempt 2** (recovery):
+1. `VELOC_Init(MPI_COMM_WORLD, "veloc.cfg")` → success on all ranks
+2. `VELOC_Mem_protect` → registers scalars
+3. `read_sentinel(ckpt_step=135, ckpt_cumtime=T_135, ...)` → returns true
+4. `do_veloc_restart = true, ckpt_step = 135`
+5. `VELOC_Restart_test(name, INT_MAX)` → returns 135 on all ranks (via allreduce max)
+6. `VELOC_Restart(name, 135)` → restores scalars (veloc_step=135, etc.)
+7. Overwrite with sentinel: `veloc_step=135, veloc_cumtime=T_135, veloc_finest=...`
+8. `amrptr->init(0.0, stop_time)` → initializes from IC (step 0, cumtime 0)
+9. `veloc_read_multifabs(amrptr, veloc_finest=0 or 1 or 2)` → reads MultiFabs from step 135
+   - For lev=0: `VisMF::Exist(path)` → true → `VisMF::Read(mf, path)` → overwrites with checkpoint data
+   - For lev>0: BoxArray check → may skip if mismatch
+10. `amrptr->setCumTime(T_135)` → sets cumtime to checkpoint value
+11. `amrptr->setLevelSteps(lev, 135)` for all levels → sets step count
+12. `amrptr->setLevelCount(lev, 0)` for all levels
+13. `Nyx::new_a = veloc_new_a; Nyx::old_a = veloc_old_a`
+14. State data times set to `T_135`
+15. Main loop: `amrptr->levelSteps(0)=135 < 100000` → true; `amrptr->cumTime()=T_135 < 64.0` → true
+16. Runs steps 136, 137, ..., ~162
+17. For steps 140, 145, ..., 160: checkpoints written (but dirs cleared after recovery? No - dirs are cleared AFTER recovery completes)
+18. Simulation reaches stop_time → exits
+19. `VELOC_Finalize(0)` → finalizes VeloC
+20. `dumpValidationSignature` and `dumpValidationSignatureBin` → writes output
+
+**Recovery duration**:
+- Steps 136-162 = 27 steps × 0.68s/step = ~18s simulation
+- Plus checkpoint overhead at steps 140, 145, ..., 160 = 5 checkpoints × 5s = 25s
+- Plus init overhead: ~5-10s
+- Total: ~48-53s << 111s timeout ✓
+
+**Correctness**:
+- The simulation state at step 135 is restored (MultiFabs + timestamps)
+- The simulation resumes from step 135 to completion
+- The final output is computed at stop_time=64.0
+
+This should work correctly. The main concern is whether the BoxArray for levels > 0 matches between checkpoint and restart. Let me think...
+
+After `amrptr->init(0.0, 64.0)`, the AMR hierarchy is built from IC. With `amr.max_level = 2` and a Sod shock tube, the refinement criteria tag regions near the shock. At t=0 (IC), the shock hasn't formed yet, so level 1 and 2 might not be created (or created based on the IC discontinuity location).
+
+At step 135 (checkpoint time, T_135 ≈ 0.83 × T_stop), the shock has moved to a different location than at t=0. So the BoxArrays for levels 1 and 2 at checkpoint time likely differ from those at t=0.
+
+With my code: for `lev > 0`, we check BoxArray compatibility. If they don't match, we skip the `VisMF::Read` for those levels. The simulation then has:
+- Level 0: checkpoint data (correct)
+- Level > 0: IC data (wrong, but only for levels where BoxArrays differ)
+
+The simulation then runs from step 135 with level 0 having correct data but refinement levels having IC data. This is problematic for correctness.
+
+However, there's a mitigating factor: AMReX will REGRID after restart. Looking at `Amr::coarseTimeStep`:
+It seems AMReX_Amr.cpp's content isn't searchable. Let me look at the coarseTimeStep directly:
+Now let me look for the regrid call in `timeStep`:

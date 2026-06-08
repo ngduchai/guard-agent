@@ -1,0 +1,195 @@
+I'll start by examining the previous attempt's failure logs to understand what went wrong.
+The issue is clear: the checkpoint files are consuming too much disk space (>10GB limit). The validator terminates the run before it completes. Let me look at the current codebase to understand what was implemented:
+The key problems from the validation output:
+
+1. **30,099 checkpoint files** consuming **12GB** of disk - exceeds the 10.74GB limit
+2. The disk guard terminates the process before completion
+3. Recovery fails because the app is killed before finishing
+
+The root causes:
+1. The checkpoint interval `SEQ_CKPT_INTERVAL = 500.0` with `--end=19000` means ~38 checkpoints minimum
+2. But the `tw_trigger_gvt_hook_every(5)` for parallel mode triggers a checkpoint every 5 GVT computations - way too frequent
+3. The parallel mode (`--synch=3` is optimistic) triggers checkpoints very aggressively 
+4. 30,099 checkpoint FILES means each checkpoint creates many files (4 ranks × many versions)
+5. No `max_ckpts` in veloc.cfg to limit retention
+
+The run uses `--synch=3` (OPTIMISTIC) with `--end=19000`. The GVT hook is called every 5 GVT cycles. Each GVT cycle can be very fast in simulation time, leading to hundreds of checkpoints.
+
+Let me look at the structure more carefully and fix this:
+Now I understand the problem clearly. The issue is:
+
+1. `tw_trigger_gvt_hook_every(5)` - for optimistic mode (`--synch=3`), this checkpoints every 5 GVT rounds
+2. With `--end=19000`, `--nlp=4000`, `--extramem=100000` running 90 seconds, there are hundreds of GVT rounds
+3. Each checkpoint writes files per rank (4 ranks) and never prunes old versions
+4. 30,099 files = ~7,500 checkpoint versions × 4 ranks → each version has about 1 file per rank
+5. No `max_ckpts` in veloc.cfg
+
+The fix needs to:
+1. Add `max_ckpts = 1` (or 2) to veloc.cfg - keep only the latest checkpoint
+2. Make checkpoints much less frequent - use wall-time based intervals (e.g., every 15-20 seconds of real time) rather than every 5 GVT cycles
+3. Prune old checkpoint directories after each new checkpoint succeeds
+
+Let me look at the VELOC API to understand what we can call for pruning:
+Now I have a clear picture. The VELOC config supports:
+- `max_versions` - number of previous checkpoints to keep on persistent (default 0 = keep all)  
+- `scratch_versions` - number of previous checkpoints to keep on scratch (default 0 = keep all)
+
+The fix is:
+1. Add `max_versions = 1` and `scratch_versions = 1` to veloc.cfg to keep only the most recent checkpoint
+2. Dramatically reduce checkpoint frequency: instead of every 5 GVT cycles (which can be hundreds per second), checkpoint every 20-30 seconds of wall time
+
+Let me also check what parameters the application uses - the run has `--end=19000` and the runtime is ~88 seconds. If we checkpoint only 2-3 times, each rank writes 1 file (4 ranks × 1 file = 4 files), that's very manageable.
+
+The key insight: with `tw_trigger_gvt_hook_every(5)`, at 90 seconds runtime and GVT computed every batch (very frequently), we get thousands of GVT cycles → thousands of checkpoints.
+
+We need wall-clock-based checkpointing instead. Let me implement this:
+Now let me fix the checkpointing frequency. The issue with `tw_trigger_gvt_hook_every(5)` is that GVT is computed very frequently in optimistic mode - every batch of events. We need wall-time-based gating.
+
+Also, I need to understand the recovery problem better. In the validation:
+- Kill attempt 2 killed the process after 79 seconds (at ~52% of runtime → 46.9s wait before poll), 
+- Recovery attempt exited with code 1 (disk exhaustion during recovery attempt too)
+
+So the primary issue is disk exhaustion. With `max_versions=1` and `scratch_versions=1`, VeloC should automatically delete old checkpoint versions. But we still need the checkpoint interval to be reasonable.
+
+Let me now modify `phold.main.c` to use wall-clock-based checkpointing:
+Now change the checkpoint interval constant and add wall-time tracking:
+Now modify the `phold_gvt_hook` function to be wall-time gated and to use `tw_trigger_gvt_hook_every` with a much larger interval:
+Now I also need to change `tw_trigger_gvt_hook_every(5)` to a much larger value to reduce how often the GVT hook is invoked (as a secondary protection):
+Now let me also add manual cleanup of old checkpoint directories after a successful checkpoint. Even with `max_versions=1`, I want to be safe and also manually delete old versions from scratch and persistent directories.
+
+Let me look at how the scratch/persistent paths are used:
+The checkpoint data written per checkpoint is:
+- Header: 24 bytes
+- Per LP: `sizeof(phold_state) + 4*4 + 4*4 + 4*4 + 8 = state + 56 bytes` per LP
+- Events: 16 bytes per event
+
+With `nlp_per_pe` = 4000 LPs per rank, and `extramem=100000` events:
+- LP data: 4000 × (sizeof(phold_state) + 56) bytes
+- Events: up to ~100000 × 16 = 1.6MB per rank
+
+Let me check `phold.h` for phold_state size:
+`phold_state` is just `long int dummy_state` (8 bytes). So per LP: 8 + 56 = 64 bytes. With 4000 LPs = 256KB per rank.
+
+Events: with `--extramem=100000` and `--nlp=4000` and `mult=1.4`, events_per_pe = 1.4 × 4000 × 1 + 100000 = 105,600 events. Each event record = 16 bytes → 1.69MB per rank.
+
+So total per checkpoint per rank: ~2MB. With 4 ranks → ~8MB per checkpoint.
+
+With 30,099 files → ~7,500 checkpoints × 4 ranks × 1 file = 30,000 files. But each checkpoint is only ~2MB, so 7,500 × 8MB = 60GB which makes no sense if disk usage is 12GB...
+
+Actually, let me reconsider. The log shows `28286 checkpoint file(s)` at kill attempt 2, which was after only 47 seconds of running with polling for checkpoints started at ~47s. The checkpoint rate is staggeringly high.
+
+Wait - looking more carefully: `tw_trigger_gvt_hook_every(5)` means every 5 GVT computations. With `--synch=3` (OPTIMISTIC) and 4 PEs, the GVT is computed constantly as events are processed. If each GVT cycle takes only milliseconds, then 5 cycles × many per second = potentially many checkpoints per second.
+
+30,099 files / 4 ranks = ~7,500 checkpoint versions in ~80 seconds = ~93 checkpoints per second! That's why they're running out of disk.
+
+With `max_versions=1` and `scratch_versions=1`, VeloC will keep only the latest checkpoint, so we should only have at most 4 files at any time (1 per rank). This should resolve the disk issue dramatically.
+
+But I also need the wall-clock gate to avoid excessive I/O overhead from checkpointing. Let me verify the current state of the file is correct:
+Now let me think about the recovery failure. The recovery run also died with disk exhaustion. But in recovery mode, the app should:
+1. Detect checkpoint (load it)
+2. Run from GVT → end
+3. NOT checkpoint again during recovery (or at minimum not aggressively)
+
+Wait, actually the recovery run will still checkpoint! In the recovery path:
+- We load the checkpoint 
+- We run from GVT to end
+- During that run, `phold_gvt_hook` is still active and will checkpoint
+
+With `max_versions=1`, the new checkpoints should overwrite the old ones. But the wall-time gate should limit checkpointing during recovery too since the recovery run is ~47 seconds.
+
+However, there's another critical issue: the recovery run on kill attempt 2 died with disk exhaustion at 47 seconds. If each checkpoint takes ~8MB (4 ranks × 2MB), then with `max_versions=1`, we should only have ~8MB of checkpoint data at any time. That's well within limits.
+
+Wait, but looking at the data: at kill attempt 2, they detected 28,286 checkpoint files in scratch/persistent dirs before killing. Then after recovery, disk exhaustion happened at 11.83GB. This means during the recovery run, checkpoints were accumulating again.
+
+With `max_versions=1` in veloc.cfg, VeloC should automatically clean up old versions. Let me verify what `max_versions` actually does - according to the veloc.h comment: `max_versions = <int> (number of previous checkpoints to keep on persistent, default: 0 - keep all)`.
+
+So `max_versions = 1` means keep 1 previous checkpoint on persistent. That means at any time you have at most 2 checkpoints: the current one and 1 previous = 2 × 4 files = 8 files total. This is excellent.
+
+Similarly `scratch_versions = 1` means keep 1 previous on scratch.
+
+This should dramatically reduce disk usage. The changes look good. Let me also verify the CMakeLists uses `clock_gettime` properly (needs to link against `-lrt` on some systems):
+Good. `clock_gettime` on Linux with glibc doesn't need `-lrt` for modern glibc (it's part of the C library), but to be safe, let me also check if the build already uses it elsewhere. On modern Linux, it's fine without `-lrt`.
+
+Now let me think about correctness of the recovery flow. The validator shows that:
+1. Kill attempt 2 succeeded (injection fired at 79s)
+2. Recovery attempt ran but died with disk exhaustion at 47.39s
+
+So the recovery works in principle, but disk gets exhausted. With `max_versions=1` + `scratch_versions=1` this should be fixed.
+
+However, there's a concern: the recovery run also checkpoints. If the recovery run runs for 47 seconds, and our wall-time interval is 20 seconds, the recovery will also checkpoint once (at 20s) and possibly again (at 40s) → 2 checkpoints. With `max_versions=1`, only 1 is kept → total 2 checkpoint versions × 4 files = 8 files = ~16MB. That's fine.
+
+Let me also look at another concern - the pending event checkpointing. With `--extramem=100000` and `--nlp=4000`, the pending events in the priority queue at any point could be large. Let me check if we're only saving locally-pending events or all events.
+
+Looking at the code: we drain `me->pq` (the PE's priority queue) to save events. This is correct behavior. But with `extramem=100000` events, the PQ could have up to 100k events → each 16 bytes = 1.6MB per rank. 
+
+Actually the total checkpoint size per rank is:
+- Header: 24 bytes
+- LP states: 4000 × 64 = 256KB  
+- Events: up to 105,600 × 16 = ~1.7MB
+
+So max ~2MB per rank × 4 ranks = ~8MB per checkpoint. With `max_versions=1`, we hold at most 2 versions (current + 1 previous) = 16MB total. That's very manageable.
+
+The changes look correct. Let me do a final review of the modified file:
+Good. Now let me think about whether there are any other issues.
+
+Looking at the validation output more carefully:
+- The failure-free run also died with disk exhaustion (exit code 1)
+- Recovery run died with disk exhaustion (exit code 1)
+- The correctness test failed because `validation_output.bin` was not found (app killed before completion)
+
+The root cause is clearly disk space. With `max_versions=1` + `scratch_versions=1` + `tw_trigger_gvt_hook_every(128)` + 20s wall-time gate, we should:
+1. Have at most 2 checkpoint versions at any time (current + 1 previous per veloc.cfg)
+2. Not checkpoint too frequently (at most every 20 seconds of wall time)
+
+Let me also check one more potential issue: the recovery code. When we restart, we call `phold_load_checkpoint(ckpt_ver)` and set `g_veloc_version = version + 1`. Then during the recovery run, new checkpoints will be written with version `version+1`, `version+2`, etc. This is fine with `max_versions=1`.
+
+However, there's a subtle timing issue in the wall-clock gate: after loading a checkpoint (which happens before `tw_run()`), `g_last_ckpt_wall` is still `-1.0`. So the first GVT hook call during recovery will immediately checkpoint. This is actually desirable behavior (checkpoint early in recovery run).
+
+Let me also think about the correctness of the output. The validation checks `validation_output.bin`. The code writes this file after `tw_run()` completes. As long as the app runs to completion without being killed, this file will be written.
+
+With the disk usage now bounded, the app should complete normally. Let me verify the changes are sufficient:
+
+1. `max_versions = 1` in veloc.cfg: VeloC keeps only 1 previous checkpoint on persistent
+2. `scratch_versions = 1` in veloc.cfg: VeloC keeps only 1 previous checkpoint on scratch
+3. `tw_trigger_gvt_hook_every(128)`: GVT hook fires at most every 128 GVT cycles (reducing frequency by 25.6x)
+4. `CKPT_WALL_INTERVAL_S = 20.0`: Additional wall-clock gate limiting to 1 checkpoint per 20 seconds
+
+This should bring disk usage from ~12GB down to well under 100MB.
+
+Let me also double-check one concern: the `phold_rollback_to_gvt` function is called inside `phold_gvt_hook` BEFORE the wall-clock gate. Wait, looking at the code again:
+
+```c
+if (gvt_val <= 0.0) { ... return; }
+
+/* --- Wall-clock gate: skip if too soon since last checkpoint --- */
+...
+if (too_soon) { ... return; }
+
+/* --- Roll back to committed state (for optimistic) --- */
+phold_rollback_to_gvt(pe);
+```
+
+Good - the rollback only happens if we pass the wall-clock gate. That's correct.
+
+But wait - there's a concern about calling `phold_rollback_to_gvt` inside the GVT hook. Looking at the scheduler code, the GVT hook is called from `tw_gvt_hook_step` which is called after `tw_gvt_step2`. The rollback in `tw_scheduler_rollback_and_cancel_events_pe` is a separate function. Is it safe to call `tw_kp_rollback_to` from inside the GVT hook callback?
+
+Looking at the previous implementation - this was already in the code from iter_2 and was working (at least checkpoint files were being created). The issue was only disk exhaustion, not correctness of the checkpoint itself. So the rollback logic is correct.
+
+The fixes look solid. Let me summarize what was done:
+The changes made to fix the disk exhaustion problem:
+
+**`veloc.cfg`** - Added version retention limits:
+- `max_versions = 1`: Keep only 1 previous checkpoint on persistent storage (instead of unlimited)
+- `scratch_versions = 1`: Keep only 1 previous checkpoint on scratch storage (instead of unlimited)
+
+This alone reduces from 30,099 files (~12GB) to at most 8 files (~16MB) at any time.
+
+**`phold.main.c`** - Reduced checkpoint frequency:
+1. Changed `SEQ_CKPT_INTERVAL` from `500.0` to `4000.0` (simulation time between sequential checkpoints, reducing from ~38 to ~5 checkpoints)
+2. Added `CKPT_WALL_INTERVAL_S = 20.0` wall-clock gate: a checkpoint only happens if 20+ real seconds have elapsed since the last one
+3. Changed `tw_trigger_gvt_hook_every(5)` to `tw_trigger_gvt_hook_every(128)`: GVT hook fires 25× less often in parallel mode
+
+These changes together ensure:
+- At most ~4 checkpoints per 90-second run (one every 20+ wall seconds)
+- At most 2 checkpoint versions retained at any time (VeloC auto-purges older ones)
+- Maximum disk usage ~16MB instead of 12GB

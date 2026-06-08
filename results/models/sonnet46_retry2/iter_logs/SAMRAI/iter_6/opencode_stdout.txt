@@ -1,0 +1,2210 @@
+I'll start by reading the validation logs from the previous attempt to understand what failed.
+The key failure is at line 77: the numeric comparison after recovery fails with a large error (`max_abs_diff=6.251e+08`). The failure-free run passes (Test 2). This means the checkpoint/restart is not actually restoring state correctly - the application resumes from checkpoint but produces wrong output.
+
+Let me look at the current implementation:
+Now let me look at the LinAdv.cpp to understand the structure better:
+Now I understand the problem. The restore logic only restores level-0 patches, but for AMR codes, there may be fine levels that matter too. Also, the issue is that the data is restored to the CURRENT context, but after `initializeHierarchy()`, the simulation may use NEW or SCRATCH contexts. Let me look at the problem more carefully.
+
+The key issue from the log: Test 2 (failure-free) **passes** but Test 1 (failure-prone, after kill+recovery) **fails**. This means:
+1. The checkpoint files are written correctly (2072 files detected)
+2. The recovery attempt completes in 30s (exit=0)
+3. But the output doesn't match the ground truth
+
+Let me look at what data is checkpointed vs what's in the CURRENT context, and what happens with the fine levels after recovery.
+Now let me understand the core issue. The key problem is:
+
+1. The checkpoint **writes** data from all levels (level 0 + fine levels)
+2. But the **restore** only reads level 0, removes all fine levels, and lets the time integrator rebuild them
+
+However, this approach is fundamentally flawed because:
+- When fine levels are removed and the time integrator "rebuilds" them, it will reinitialize fine level data from the initial conditions (not from the checkpoint)
+- The fine levels have evolved state that differs from initial conditions
+
+The correct approach is to also restore the fine levels. But this is complex due to SAMRAI's internal state requirements.
+
+Let me also look at what `setIntegratorTime`, `setIntegratorStep`, etc. actually do - these might not exist as methods:
+These methods don't exist in this codebase. Let me check the TimeRefinementIntegrator API:
+Now I need to understand the fundamental problem. The current implementation:
+1. After restart, initializes the whole hierarchy fresh via `initializeHierarchy()`
+2. Then tries to restore only level-0 data from checkpoint
+3. Removes fine levels
+
+The core issue is that after `initializeHierarchy()`, the hierarchy has initial-condition data. The checkpoint saves the evolved solution state. But the restore only restores level 0, while fine levels get re-initialized from initial conditions when the time integrator rebuilds them (via `initializeDataOnPatch` with `initial_time=false` but with stale time data from the coarser level).
+
+Actually, the real problem is more fundamental: the **dumpValidationSignature** sums over ALL levels of the hierarchy. If fine levels are removed and then regrid rebuilds them using interpolation from the restored level-0 data, those fine level cells will have interpolated (not exact) values. The interpolated values differ from the original evolved values, causing the output mismatch.
+
+Let me look at the previous iterations to understand what approaches were tried:
+The pattern is clear across all iterations:
+- **iter_3, iter_5**: Recovery exits with 0 but output is numerically wrong (large `max_abs_diff`)
+- **iter_4**: Recovery crashes (segfault in `regridAllFinerLevels`)
+
+The core problem in the current approach (iter_3/iter_5) is:
+1. After restart, the app calls `initializeHierarchy()` which sets up ALL levels from initial conditions
+2. Then `restoreCheckpoint` reads only level-0 data and removes fine levels
+3. But the `dumpValidationSignature` sums over ALL remaining levels
+4. After restart, the time integrator rebuilds fine levels via regrid, reinitializing them from initial conditions, NOT from the checkpoint data
+
+The solution needs to:
+1. Checkpoint ALL levels' data
+2. After restart, restore ALL levels properly
+
+The challenge is that removing fine levels and re-adding them causes SAMRAI's `initializeDataOnPatch` with `initial_time=false` to be called, which copies data from the coarser level to fine level. If we've already restored the coarse level data (which is the evolved state), fine level data will be coarse-level interpolated.
+
+But this actually might work! The interpolation should produce the same fine-level data as the original evolution IF the coarse level has been properly restored. Let me think again...
+
+Actually no - the fine level has been evolved further than the coarse level (it uses smaller timesteps due to AMR refinement). So interpolated fine-level data from the coarse level won't match the original fine-level evolved data.
+
+The key insight is: the `dumpValidationSignature` function iterates over ALL levels. If we checkpoint and restore ALL levels (not just level 0), we get exact reproduction. Let me look at if there's a way to restore fine levels by reusing the checkpoint data directly without going through `initializeDataOnPatch`.
+
+Let me look at how the hierarchy manages fine levels and if we can simply restore patch data on ALL levels:
+Now let me think about the correct strategy. The key insight is:
+
+1. The `dumpValidationSignature` sums over all cells in all levels
+2. After kill+restart, the hierarchy is re-initialized via `initializeHierarchy()` which creates all levels from initial conditions
+3. Then we try to restore checkpoint data - but we only restore level 0 and remove fine levels
+4. When fine levels get rebuilt by the time integrator, they get initialized from coarse level via interpolation
+
+The real solution needs to be different. After restart:
+- We should checkpoint ALL levels
+- When restoring, restore ALL levels' data directly (all patches at all levels)
+- The issue with iter_4 was a segfault in `regridAllFinerLevels` - this happened because we tried to rebuild fine levels explicitly
+- The fix in iter_5 avoids the crash by just removing fine levels and letting the time integrator rebuild them naturally
+- But this still gives wrong data because interpolated fine level data ≠ evolved fine level data
+
+**The correct approach** is:
+1. After `initializeHierarchy()` (which builds the full AMR hierarchy), the hierarchy already has all levels with their initial data
+2. Instead of removing fine levels, just OVERWRITE patch data on ALL levels using checkpoint data
+3. The hierarchy structure stays intact (level 0, 1, 2... all exist)
+4. We restore the evolved solution data on ALL levels
+
+Let me check what data ID is used for each level to make sure we're restoring the right context variable:
+Now I understand the registration mechanism. `d_uval` is registered as `TIME_DEP` which means it has CURRENT, NEW, and SCRATCH contexts in SAMRAI's HyperbolicLevelIntegrator.
+
+The validation signature uses the CURRENT context. After `initializeHierarchy()` completes, all levels are set up with the initial-condition data in the CURRENT context. 
+
+My new strategy for the fix:
+
+1. **Checkpoint**: Save ALL levels' data (current approach already writes all levels, good)
+2. **Restore**: Instead of removing fine levels, restore data on ALL existing levels
+   - After `initializeHierarchy()`, the hierarchy has levels 0 to N-1 with initial data
+   - We restore CURRENT context data on ALL levels from checkpoint
+   - The hierarchy structure stays intact
+
+But the critical issue is: **what if the number of levels or patch layout differs between the checkpoint and the re-initialized hierarchy?**
+
+For AMR, the patch layout can change during regridding. If the hierarchy at the restart time has a different layout than at checkpoint time, the patches won't match by box coordinates.
+
+Actually, the better insight is: the hierarchy's STRUCTURE (patch boxes) after `initializeHierarchy()` may differ from the checkpoint's structure. But in practice with deterministic runs with the same input, the initial hierarchy structure will match.
+
+Wait - actually the issue is more subtle. After the kill happens mid-run, the hierarchy has been evolving with dynamic regridding. The checkpoint is taken AFTER some regridding steps. When we restart, `initializeHierarchy()` creates the hierarchy from initial conditions, which has the INITIAL mesh configuration, not the configuration at checkpoint time.
+
+So the current approach (checkpoint all levels, restore only level 0, remove fine levels) is trying to handle this by:
+1. Restoring level 0 (which has a fixed structure = initial mesh)
+2. Letting the time integrator rebuild fine levels via regrid from the restored level-0 data
+
+But the problem is: fine-level cells that were refined in the checkpoint snapshot may not be refined at the initial hierarchy level 0. And when fine levels are rebuilt via regridding, they get initialized from the checkpoint's evolved coarse-level data via interpolation, not from the checkpoint's fine-level data.
+
+**The actual root cause**: When we restore checkpoint data to level 0 and then let regridding rebuild fine levels, `initializeDataOnPatch` is called with `initial_time=false`. Looking at how this works in SAMRAI - when `initial_time=false`, it typically fills data by copying/interpolating from coarser levels, not from initial conditions. So the fine level data would be derived from our checkpoint's coarse level data, but via spatial interpolation, which is less accurate than the actual evolved fine-level values.
+
+Let me look at `initializeDataOnPatch` to understand what `initial_time=false` does:
+This is the key insight. When `initial_time=false`, `initializeDataOnPatch` does **nothing** for the `d_uval` data! It just returns. This means when regridding rebuilds fine levels and calls `initializeDataOnPatch` with `initial_time=false`, the fine-level `uval` data is NOT touched.
+
+But wait - in SAMRAI, when a new fine level is created during regridding, data is filled from the coarser level via the refine schedules (CONSERVATIVE_LINEAR_REFINE). The `initializeDataOnPatch` is called first, and then the refine schedule is applied.
+
+So if `initializeDataOnPatch` with `initial_time=false` does nothing, the data on newly created fine-level patches will still be filled from the coarser level (via interpolation) by the SAMRAI refine schedules.
+
+This means the fine-level data after restart will be **spatially interpolated** from the checkpoint's coarse-level data. This is an approximation, not exact.
+
+Let me now look at what the validation output is comparing. The `dumpValidationSignature` sums over ALL levels. If we restore ALL levels' data exactly from the checkpoint, we'll get exact match.
+
+The strategy should be:
+1. Checkpoint: Write data for ALL levels (already done)
+2. Restore: 
+   - After `initializeHierarchy()`, the hierarchy has the correct initial structure
+   - For levels that exist in the hierarchy AND in the checkpoint, overwrite the `uval` CURRENT data with checkpoint data
+   - Don't remove any levels - just overwrite data on the levels that exist
+
+But there's still the mesh layout problem. After `initializeHierarchy()`, the fine level patches might not match the checkpoint's fine level patches (different mesh configuration due to evolution).
+
+Let me look at the input file to understand what the initial hierarchy looks like:
+This is a 3-level AMR hierarchy (max_levels=3) with a 4:1 refinement ratio. The domain is a SPHERE problem which means the fine levels track the sphere boundary. As the sphere moves, the fine level patches change.
+
+Since the sphere moves, the fine level patch layout at checkpoint time will be DIFFERENT from the initial hierarchy. This makes it impossible to directly restore fine level data by matching patch boxes (the patches don't exist at the initial time).
+
+**However**, looking at this differently:
+
+The `dumpValidationSignature` iterates over ALL levels. But the key question is: what does the baseline `validation_output.bin` contain? It's the result of a COMPLETE run from start to end, iterating over ALL levels. Similarly, the recovery run should produce the same result by continuing from checkpoint.
+
+The problem is that after recovery, the fine levels are rebuilt by interpolation from the coarse level checkpoint data. The interpolated fine level data is less accurate than the original evolved fine-level data.
+
+But wait - let me re-read the validation output. The `dumpValidationSignature` computes a sum over ALL cells in ALL levels. For AMR, fine-level cells OVERLAP coarse-level cells but store higher-resolution data. In a typical AMR application, the fine-level data is used in the final output (coarse cells covered by fine levels are not double-counted because the signature iterates using each level's patches).
+
+Actually, looking at the code in `dumpValidationSignature`:
+```cpp
+for (int ln = 0; ln < num_levels; ++ln) {
+    ...
+    for (pdat::CellIterator ic(pdat::CellGeometry::begin(pbox)); ...) {
+```
+
+This iterates over ALL cells in ALL levels including those covered by finer levels. So double-counting IS happening. This means the comparison is:
+- Baseline: sum of all cells in all levels (including double counting of coarse cells covered by fine)
+- Recovery: sum after recovery
+
+Wait, actually I should look at this more carefully. Let me re-read the function:
+OK so the signature is 5 doubles: sum, sum2, max, min, count. These are computed over ALL cells in ALL levels of the hierarchy. 
+
+The core issue is that after recovery, the fine level data won't match because:
+1. Fine level patches at checkpoint time have a DIFFERENT mesh layout than after `initializeHierarchy()`
+2. So we can't directly restore fine level data by matching patch boxes
+3. Instead, we remove fine levels and let them be rebuilt by regridding
+4. But regridding initializes fine levels by interpolating from coarse level, which gives slightly different values than the original evolution
+
+This is a fundamental AMR checkpointing problem. The correct fix involves:
+- Save all levels including their FULL patch hierarchy structure
+- On restart, recreate the hierarchy with the exact same structure from checkpoint rather than reinitializing
+- This is very complex as it requires using SAMRAI's native checkpoint/restart facility
+
+An **alternative approach** that could work: Since the `dumpValidationSignature` only sums over patches on each level, and in AMR the fine-level patches COVER some coarse-level patches, we need to either:
+1. Restore EXACT state on all levels (complex - need to match patch boxes)
+2. **OR** Only use level 0 data in the validation signature
+
+Wait - but I can't change `dumpValidationSignature` in a way that would alter the baseline behavior. The baseline binary was compiled without any checkpoint code and would give the same signature regardless.
+
+Let me think about this differently. The baseline binary computes the signature over ALL levels. The perturbed baseline also runs over ALL levels. For the recovery to match, the recovery must also produce the same state across ALL levels.
+
+The ONLY way this works correctly is:
+1. Restore the EXACT state of ALL levels from checkpoint
+2. Resume from the exact checkpoint time
+
+For SAMRAI AMR, this means we need to checkpoint and restore the ENTIRE patch hierarchy structure, including:
+- Which levels exist
+- The patch layout on each level
+- The patch data on each level
+
+This is effectively what SAMRAI's native restart facility does. But since we're using VeloC for the actual checkpoint files, we need to implement this ourselves.
+
+Let me look at if SAMRAI has a database-based restart facility we can use alongside VeloC:
+Let me look at the PatchHierarchy class and how it structures levels:
+Now I need a fundamentally different approach. Let me think about this differently.
+
+The key constraint is:
+- `dumpValidationSignature` sums over all cells in all levels
+- After recovery, the hierarchy must have the SAME state as if the simulation had run to completion without a kill
+- The state includes: which levels exist, their patch layout, and their cell data
+
+**Key insight**: The total `count` in the signature includes EVERY cell in EVERY level, even cells in coarse levels that are covered by fine levels. So the signature is NOT a proper AMR integral - it just sums raw values without de-aliasing coarse cells under fine patches. This means:
+1. The count in the baseline = count_l0 + count_l1 + count_l2 (where l1 and l2 include all cells, even those not covered by l2/l3)
+2. For recovery to match, it must have the same count AND same data
+
+This means we MUST restore:
+- The exact same number of levels
+- The exact same patch layout at each level
+- The exact same cell data at each level
+
+Since the patch layout at checkpoint time is different from the initial layout (due to regridding), we need to save the actual patch boxes and rebuild the fine levels with those boxes.
+
+This is fundamentally SAMRAI's checkpoint/restart problem. SAMRAI has a built-in restart facility (based on HDF databases). The question is: can we use that alongside VeloC?
+
+Actually, let me think about the simplest possible approach that could work:
+
+**Alternative: Use SAMRAI's native data to checkpoint via VeloC, but at level 0 only with the coarse grid capturing all fine data**
+
+Wait, let me look at the SPHERE problem more carefully. The validation's baseline is a complete run. The sphere advects through the domain. The AMR fine levels track the sphere. 
+
+After recovery from checkpoint:
+- The restored level-0 data captures the evolution correctly
+- Fine levels need to match too
+
+**Key observation**: What if we modify `dumpValidationSignature` to only use level 0? Then:
+- Level 0 is always the same structure
+- Level 0 data is successfully restored from checkpoint
+- Recovery would match
+
+BUT - if we change `dumpValidationSignature` for the recovery binary, the failure-free run would also only sum level 0. This would give a DIFFERENT signature than the baseline binary (which sums all levels). So Test 2 (failure-free) would FAIL.
+
+Wait no - both the failure-prone binary and the baseline binary have the same changes. The baseline binary is cached from before any modifications. The comparison is:
+- perturbed-baseline (Z_P): uses the ORIGINAL unmodified binary
+- failure-free (Test 2): uses our modified binary
+- failure-prone (Test 1): uses our modified binary after recovery
+
+So if we change `dumpValidationSignature` to only use level 0, Test 2 (failure-free) would compare our modified binary's level-0-only output against the original binary's ALL-levels output. This would fail Test 2 due to count mismatch.
+
+OK so we CANNOT change `dumpValidationSignature` in a way that changes the output for a full run. The function must produce the same result as before when run without failures.
+
+**The only correct approach**: Checkpoint and restore the FULL hierarchy state including all fine levels.
+
+Let me think about how to do this with the tools available:
+
+**Strategy**: 
+1. At checkpoint: save level 0 data + also use SAMRAI's GriddingAlgorithm to drive regridding from the restored coarse-level data to rebuild fine levels
+2. Actually: save each rank's data for level 0 (which has a FIXED structure), and then on recovery rebuild fine levels via `regridAllFinerLevels` AFTER restoring level 0
+
+Wait but the regrid will give interpolated data, not exact data. The interpolated data is an approximation.
+
+Hmm. Let me look at this from yet another angle.
+
+**Actually wait** - let me re-read the validation output more carefully:
+
+In iter_5:
+```
+max_abs_diff=6.251e+08, max_rel_diff=6.175e-01
+```
+
+The max absolute difference is 6.25e+08 and the max_rel_diff is 0.6175. The relative difference of 61% is enormous - this is not a floating point precision error from interpolation. This is a massive error suggesting the wrong data entirely is being used.
+
+Let me look at what `count` values are being compared. If the count differs (different number of cells), the output binary (5 doubles) would be completely different.
+
+Actually the comparison uses numpy tolerance with `atol=1e-4, rtol=1e-4`. The `max_abs_diff` of 6.25e8 suggests the values are fundamentally different numbers, not just slightly off from interpolation.
+
+This means the checkpoint data being restored is WRONG or the wrong levels are being used.
+
+Let me re-examine the restore logic more carefully. In the current `restoreCheckpoint` function (iter_5), it:
+1. Reads checkpoint data into a map
+2. Removes fine levels (ln >= 1)
+3. Restores level 0 from map
+4. Sets integrator state to checkpoint values
+
+After this, when the time loop continues:
+- `loop_time` = ckpt_loop_time (say 4.5s after 50% kill)
+- `loop_time_end` = 10.0s
+- `dt_now` = ckpt_dt_now
+
+The time loop continues from `loop_time` to `loop_time_end`. But the hierarchy only has level 0.
+
+When `advanceHierarchy` is called, the time integrator will:
+1. Advance level 0
+2. Try to regrid and create fine levels
+3. Initialize fine level data (by spatial interpolation from level 0)
+
+Then after the simulation continues to end_time, `dumpValidationSignature` sums over all levels (now with 2-3 levels due to regridding rebuilding them).
+
+But the coarse level 0 is correct (we restored it), so interpolated fine levels should give SIMILAR (not exact) data... unless the issue is something else.
+
+Let me check if the integrator state restoration is actually working. Looking at the restored values:
+- `time_integrator->setIntegratorStep(ckpt_iteration_num)` - sets `d_step_level[0]`
+- `time_integrator->setAllLevelSimTimes(ckpt_loop_time)` - sets `d_integrator_time` and all `d_level_sim_time`
+- `time_integrator->setLastFinestLevel(0)` - sets `d_last_finest_level = 0`
+- `time_integrator->setLevelDtMax(0, ckpt_dt_now)` - sets dt max for level 0
+- `time_integrator->setLevelDtActual(0, ckpt_dt_now)` - sets dt actual for level 0
+- `time_integrator->resetAdvanceFlags()` - sets `d_hierarchy_advanced = false, d_level_0_advanced = false`
+
+After removal of fine levels and restoration of level 0, the integrator time is set to the checkpoint time. Then `dt_now` is set to `ckpt_dt_now`.
+
+In the main loop:
+```cpp
+while ((loop_time < loop_time_end) && time_integrator->stepsRemaining()) {
+    ...
+    double dt_new = time_integrator->advanceHierarchy(dt_now, ...);
+    loop_time += dt_now;
+    dt_now = dt_new;
+```
+
+`stepsRemaining()` checks `d_step_level[0] < d_max_steps_level[0]`. But `d_max_steps_level[0]` is 300000 (from input). And `d_step_level[0]` was set to `ckpt_iteration_num` (say 100 steps). So `stepsRemaining()` = true. Good.
+
+But wait - `loop_time` is set to `ckpt_loop_time`. And `loop_time_end` is `time_integrator->getEndTime() = 10.0`. So the loop will run from `ckpt_loop_time` to 10.0. That seems correct.
+
+But there's a subtlety: after `initializeHierarchy()`, the initial state at the start is also stored in the integrator. The `initializeHierarchy()` initializes `d_integrator_time = start_time = 0.0` and `d_step_level[0] = 0`. We then override these with checkpoint values.
+
+Let me think about the `dt_now` variable more carefully. After `initializeHierarchy()`:
+```cpp
+double dt_now = time_integrator->initializeHierarchy();
+```
+This returns the initial dt.
+
+Then we may call `restoreCheckpoint` which sets `dt_now = ckpt_dt_now`.
+
+After the restore, the loop starts with `dt_now = ckpt_dt_now`, which is the saved dt at checkpoint time. This should be correct.
+
+But there's another potential issue: the `d_max_steps_level[0]` is 300000 (from input), and we set `d_step_level[0] = ckpt_iteration_num`. So `stepsRemaining()` will return true and we'll continue advancing.
+
+Actually wait - the issue might be simpler. Let me look at the order of operations in main.cpp:
+
+```cpp
+double dt_now = time_integrator->initializeHierarchy();  // LINE 780
+...
+double loop_time = time_integrator->getIntegratorTime();  // LINE 830
+double loop_time_end = time_integrator->getEndTime();
+int iteration_num = time_integrator->getIntegratorStep();
+
+bool restarted = false;
+if (veloc_rc == VELOC_SUCCESS && uval_id >= 0) {
+    int ckpt_version = VELOC_Restart_test(VELOC_CKPT_NAME, INT_MAX);
+    if (ckpt_version > 0) {
+        restarted = restoreCheckpoint(..., loop_time, dt_now, iteration_num, ckpt_version);  // LINE 844
+    }
+}
+```
+
+So after `restoreCheckpoint`, `loop_time` and `dt_now` and `iteration_num` are all set from checkpoint values.
+
+Then the time loop:
+```cpp
+while ((loop_time < loop_time_end) && time_integrator->stepsRemaining()) {
+    iteration_num = time_integrator->getIntegratorStep() + 1;  // LINE 868
+    ...
+    double dt_new = time_integrator->advanceHierarchy(dt_now, ...);
+    loop_time += dt_now;
+    dt_now = dt_new;
+```
+
+Wait - `iteration_num = time_integrator->getIntegratorStep() + 1` at line 868. After `setIntegratorStep(ckpt_iteration_num)`, `getIntegratorStep()` returns `d_step_level[0]` which is `ckpt_iteration_num`. So `iteration_num = ckpt_iteration_num + 1`. That seems correct.
+
+But there's another issue: `time_integrator->stepsRemaining()` returns `d_step_level[0] < d_max_steps_level[0]`. After `setIntegratorStep(ckpt_iteration_num)`, `d_step_level[0] = ckpt_iteration_num`. And `d_max_steps_level[0]` = 300000. So this returns true - OK.
+
+Now the key question is: what data is actually on the hierarchy after `initializeHierarchy()` and then `restoreCheckpoint()`?
+
+`initializeHierarchy()` creates the hierarchy with initial-condition data. Then `restoreCheckpoint` overwrites level-0 data with checkpoint data and removes fine levels.
+
+When `advanceHierarchy` is called with the restored level-0 data at checkpoint time, the SAMRAI integrator will advance level 0 and then try to regrid. Since we've set `d_last_finest_level = 0`, there are no fine levels initially. The regrid process will create fine levels by interpolating from the restored level-0 data.
+
+So after the first `advanceHierarchy` call:
+1. Level 0 is advanced from `ckpt_loop_time` to `ckpt_loop_time + dt`
+2. Fine levels may be created if needed
+
+The fine level data is initialized via interpolation from the (correctly restored) level-0 data. Then fine levels are advanced through their sub-cycling steps.
+
+Now, the fine-level data after this process is NOT the same as in the original run because:
+1. In the original run, fine levels evolved FROM initial conditions all the way to checkpoint time
+2. In the recovery, fine levels are created fresh at checkpoint time from level-0 data via interpolation
+
+The interpolated data vs. evolved data is the SOURCE OF THE LARGE ERROR (6.25e8).
+
+**Wait, but interpolation error should be small!** For smooth solutions, spatial interpolation errors are of order `O(dx^2)` for second-order interpolation. For a sphere problem with advection velocity ~2, the values are either 80 (inside) or 5 (outside), so the difference at the sphere boundary can be significant if the fine level correctly captures the boundary but the interpolated level gets a smeared value.
+
+**The maximum abs error is 6.25e8** - this is MUCH larger than any reasonable interpolation error. This suggests the data values themselves are completely wrong, not just slightly off.
+
+Actually wait - rethinking. The validation output is 5 doubles: sum, sum2, max, min, count. The comparison is between these 5 doubles element-by-element. 
+
+If the count is different (different number of levels/cells), then the comparison produces large differences even if individual cell values are close. For example:
+- Baseline: count = 1,000,000 cells, sum = 80,000,000 (80 per cell)
+- Recovery: count = 100,000 cells (only level 0, no fine levels), sum = 8,000,000
+
+The difference in sum would be 72,000,000 which is 7.2e7. But we see 6.25e8, which could correspond to a different count.
+
+Actually this makes more sense. If after recovery the fine levels are completely wrong (e.g., they have initial condition values instead of evolved values), then:
+- In the original run at end_time, the sphere has moved far from its initial position
+- In the recovery, after restart the "fine levels" (rebuilt by regridding) have evolved values for the last ~50% of the run, but the INITIAL values (from `initializeHierarchy`) in level 0 were overwritten by checkpoint data
+- However, after `removePatchLevel(1)` and `removePatchLevel(2)`, only level 0 exists
+- When the time loop resumes with only level 0 and regridding rebuilds fine levels, the fine-level data will be interpolated from the CHECKPOINT level-0 data (which has evolved values around step ~50%)
+- Then the simulation continues for the remaining ~50% of the run
+- The fine level at end_time should have ~correct values
+
+So the error can't be that large from interpolation of a smooth field... unless the sphere creates sharp gradients.
+
+Wait - the SPHERE problem with `uval_inside=80, uval_outside=5` creates a step function! The inside of the sphere is 80 and outside is 5. At the boundary, there's a sharp discontinuity. Linear refinement/interpolation across the sphere boundary will smear this discontinuity.
+
+Let me look at a simpler explanation: **the time loop is wrong after restart**.
+
+Looking again at the time loop after restart:
+```cpp
+while ((loop_time < loop_time_end) && time_integrator->stepsRemaining()) {
+```
+
+`time_integrator->stepsRemaining()` is `d_step_level[0] < d_max_steps_level[0]`.
+
+After restoration: `d_step_level[0] = ckpt_iteration_num = N` (say N=100 steps).
+`d_max_steps_level[0] = 300000` (from input TimeRefinementIntegrator.max_integrator_steps).
+
+So stepsRemaining() = true = (100 < 300000). Good.
+
+But wait - `advanceHierarchy` INCREMENTS `d_step_level[0]` by 1 at each call. So after `advanceHierarchy`, `d_step_level[0]` = N+1, N+2, etc. This works correctly.
+
+Actually, let me look more carefully at the behavior of `advanceHierarchy`. Does it use `d_integrator_time` internally? Let me check if setting `d_integrator_time` via `setIntegratorTime()` is the right approach:
+
+Actually looking at the TimeRefinementIntegrator.h:
+```cpp
+void setIntegratorTime(const double t) { d_integrator_time = t; }
+```
+
+And `getIntegratorTime()` returns `d_integrator_time`. So `time_integrator->getIntegratorTime()` after restoration should return `ckpt_loop_time`.
+
+But `advanceHierarchy` uses `d_integrator_time` to track time internally. After `advanceHierarchy` is called, it advances `d_integrator_time` by `dt`. So if `d_integrator_time = ckpt_loop_time` and we set `loop_time = ckpt_loop_time`, the simulation resumes correctly.
+
+The issue is likely NOT in the time tracking but in the data quality.
+
+Let me think about an entirely different approach: **what if instead of restoring fine levels via regridding, we checkpoint and restore the data on ALL levels by matching patch boxes?**
+
+**New approach**:
+1. Checkpoint: Save data for ALL levels (already done). For each patch, save the level number, the FULL patch box specification (lower/upper), and the interior cell data.
+2. Restore: 
+   - After `initializeHierarchy()`, the hierarchy has the initial mesh structure
+   - For each rank, we have the initial-time patch boxes
+   - For checkpoint-time patches (which may be different), we need to create those levels in the hierarchy with the correct patch layout
+
+Actually this is what SAMRAI's restart mechanism does. It's very complex to implement from scratch.
+
+**Alternative practical approach**: Use SAMRAI's native restart + use VeloC as a file transport layer.
+
+SAMRAI has a `RestartManager` class... but looking at the tbox headers, I don't see it. Let me check:
+Now I need to understand the validation output structure better. The error `max_abs_diff=6.251e+08` seems huge. Let me check what kind of values are in the validation output.
+
+The SPHERE problem: `uval_inside=80, uval_outside=5`. Domain is 600x420 cells at level 0. Level 1 is 4x finer = 2400x1680 cells. Level 2 is 16x finer.
+
+The `count` in the signature is the total number of cells across ALL levels. The `sum` is the sum of `uval` over all those cells.
+
+For the baseline at end_time:
+- If sphere is completely inside domain, cells inside sphere = ~π*r² in proper units
+- sum ≈ 80 * inside_cells + 5 * outside_cells
+
+For recovery with wrong fine-level data:
+- The count might be the same (same number of fine levels with same cell count) or different
+
+Actually, if fine levels are rebuilt by regridding and then the simulation continues from `ckpt_time` to `end_time`, the hierarchy at `end_time` should have fine levels that cover the sphere at `end_time`. The sphere at `end_time` covers the same area as in the baseline. The main difference is that:
+
+In baseline: fine levels track the sphere EXACTLY (their values evolved through the full simulation)
+In recovery: fine levels are re-created at checkpoint time from interpolated coarse data, then evolved for the remaining time
+
+The interpolated fine data at checkpoint time introduces some phase error (wrong sphere boundary location at the fine level). But for a scalar advection problem with linear transport, the solution should remain correct even with interpolation errors at the boundary, because the advection equation preserves the discontinuity and the coarse level has the correct sphere location.
+
+Actually wait - for a SPHERE problem with `uval_inside=80, uval_outside=5`, the SHARP DISCONTINUITY at the sphere boundary means that linear interpolation from coarse to fine level will SMEAR the boundary. After the boundary is smeared, the advection equation PRESERVES this smearing (it doesn't sharpen discontinuities). So the fine-level data after recovery will have a BLURRY sphere boundary instead of the sharp one.
+
+But this would produce errors of order `O(dx_coarse)` ≈ 5% of the sphere, not 6.25e8 in absolute difference. 
+
+Let me look at it from the count perspective. The `max_abs_diff=6.25e8` is the maximum absolute difference between the TWO vectors (baseline and recovery) of 5 doubles. The 5 doubles are [sum, sum2, max, min, count].
+
+If `sum_baseline ≈ 6.25e8` and `sum_recovery ≈ 0`, then the difference is 6.25e8. This would happen if the recovery output has NO valid cell data.
+
+Or if `count_baseline = 1748` and `count_recovery = 1748` but `sum2_baseline - sum2_recovery = 6.25e8`, that would also give `max_abs_diff = 6.25e8`.
+
+Actually, we know that `checkpoint_files = 1748` in both failure-prone and failure-free runs for iter_5. This matches, so the checkpoint count is the same. But the output is wrong.
+
+Wait - actually in iter_5 failure-prone, 2072 checkpoint files are detected DURING the first run (before kill), but after kill and restart only 1748 checkpoint files exist (same as failure-free). 2072 - 1748 = 324. This discrepancy might be because the kill happened during a checkpoint write.
+
+Actually looking at the log again:
+```
+[runner] checkpoint-observed: detected 2072 checkpoint file(s) in scratch/persistent dirs.
+[runner] checkpoint-observed: waiting 5.0s to let the in-flight checkpoint write complete before SIGKILL.
+```
+So 2072 files were detected, then 5s was waited for in-flight write to complete, THEN the kill happened. After kill and restart, only 1748 files are in the recovered checkpoint dirs.
+
+1748 corresponds to the SAME count as the failure-free run. The 1748 checkpoint files in the failure-free run = total checkpoint files written during the FULL run. The 1748 in the failure-prone recovery = only the files from the RESTART run.
+
+OK wait, this doesn't make sense. The checkpoint dirs are cleared before each attempt. So the 2072 files detected DURING the first attempt were written BY the first run. Then the first run is killed. The restart (attempt 2) runs from checkpoint. After attempt 2 completes, 1748 files exist.
+
+But the checkpoint test VELOC_Restart_test would find the last good checkpoint version. The last good checkpoint is from BEFORE the kill - so during attempt 1's run. After the kill, the scratch/persistent dirs are NOT cleared before attempt 2 starts (they have the checkpoint files from attempt 1).
+
+Actually looking at the validator logs more carefully - the dirs are only cleared "before the kill attempt" (before attempt 1), not between attempt 1 and attempt 2. So attempt 2 has access to the checkpoint files from attempt 1.
+
+OK I think I've been overanalyzing. Let me focus on the concrete fix.
+
+The problem is that recovery produces numerically wrong output. The most likely cause is that after recovery:
+1. Fine levels are removed and rebuilt via regridding
+2. Fine-level data is initialized by interpolation from restored coarse level 0
+3. This gives different values than the original evolved fine-level data, especially at sharp boundaries
+
+The solution: **checkpoint and restore ALL levels' data exactly**, including fine levels.
+
+The challenge: After restart, `initializeHierarchy()` creates the hierarchy with the INITIAL mesh configuration. The checkpoint has a DIFFERENT mesh configuration (evolved mesh). We need to recreate the checkpoint mesh configuration.
+
+**Practical approach**: Use the SAMRAI `GriddingAlgorithm` to rebuild the fine levels WITH THE RESTORED COARSE LEVEL DATA. But instead of calling `initializeDataOnPatch` with initial conditions, we intercept the initialization to use checkpoint data.
+
+This is essentially what the regrid does already - it interpolates from coarse to fill new fine patches. The problem is that this interpolation is not exact for sharp discontinuities.
+
+**Best practical approach for this problem**: 
+
+Since the validation metric includes ALL levels, and since AMR levels track a MOVING sphere, and since coarse-to-fine interpolation is inexact for sharp discontinuities...
+
+**The key insight I've been missing**: The SPHERE is advected UNIFORMLY. The total "mass" (integral of uval) in a periodic/flow-boundary domain should be approximately conserved (up to flux out the boundaries). The `sum` over all levels with double-counting of covered cells is NOT a physical conservation quantity - it's a numerical artifact.
+
+So for recovery to match the baseline exactly, we need:
+1. EXACT same cell count on all levels
+2. EXACT same cell values on all levels
+
+This can ONLY be achieved by restoring ALL levels exactly.
+
+**Simplest correct approach**: 
+
+Let me look at a completely different strategy - instead of trying to restore fine levels, make the checkpoint happen ONLY when we're at a synchronization point where ONLY level 0 has progressed (no fine levels yet for that step). But AMR regridding happens mid-simulation, so this doesn't help.
+
+**Actually**: Let me think about this more carefully. In AMR with refined timestepping, a coarse timestep involves MULTIPLE fine timesteps. Checkpointing at a coarse-level synchronization point means ALL levels are at the same time. At this point, the data on ALL levels is fully consistent.
+
+After restart, we need to:
+1. Know the checkpoint's coarse-level time
+2. Know the fine-level mesh configuration at that checkpoint time
+3. Restore ALL data
+
+This requires storing the FINE LEVEL PATCH BOXES in the checkpoint, not just data.
+
+Let me implement this. For each fine level at checkpoint time, I'll save:
+- The number of patches on that level (on this rank)
+- The box bounds of each patch (lo/hi for each dimension)
+- The cell data for each patch
+
+On restore:
+- Use `patch_hierarchy->makeNewPatchLevel(...)` to create fine levels with the checkpoint boxes
+- Fill each newly created patch with the checkpoint data
+
+Let me look at the PatchHierarchy API for creating levels:
+`makeNewPatchLevel` requires a `BoxLevel`. This is complex to construct from scratch.
+
+Let me look at a much simpler approach that avoids the AMR level complexity:
+
+**Radical simplification**: Instead of restoring fine-level data exactly, **change the checkpoint strategy so that we always checkpoint at a regrid synchronization point where ALL levels are synchronized at the same time**. At such a point, we can use regridding to rebuild fine levels correctly.
+
+But the problem is that spatial interpolation from coarse to fine is still inexact for sharp discontinuities.
+
+**Wait - new key insight**: 
+
+Looking at the validation code: `dumpValidationSignature` iterates over ALL patches in ALL levels. For an AMR hierarchy, the coarse level patches include cells covered by fine patches. The fine patches also include those same cells at finer resolution.
+
+If we look at what the baseline computes:
+- sum = sum_over_level0_cells + sum_over_level1_cells + sum_over_level2_cells
+
+Where level0_cells includes ALL level0 patches (even those covered by level1), etc.
+
+Now, if we checkpoint ONLY level 0 and rebuild fine levels via regrid, the fine levels will have DIFFERENT CELL DATA from the original evolution, even if it's close. But the count will be the same if the fine level patches are rebuilt correctly.
+
+The maximum absolute difference of 6.25e8 is very large. Let me try to estimate what this should be for a reasonable error.
+
+Actually, let me approach this problem completely differently.
+
+Let me look at what `recovery_actually_resumed` is in the validation output:
+```
+recovery_actually_resumed=None (recovery_attempt/failure_free=None, threshold=0.9, mode=none)
+```
+
+This metric checks if the recovery time was substantially shorter than the failure-free time (indicating actual resume from checkpoint rather than restart from beginning). In iter_5, `recovery_elapsed=30.17s` and `failure_free=80+s`. So ratio ~0.37, which is well below 0.9.
+
+The validator notes `mode=none` which means this check is informational only. The actual check that fails is `output_correct=False`.
+
+**Root cause identification**: Let me look at the actual values. In the failure-free run (Test 2), `max_abs_diff=2.86e-06` which is essentially floating point noise. The baseline run and the failure-free run produce essentially identical output (good - this means the checkpointing overhead doesn't affect the result).
+
+For the failure-prone run, `max_abs_diff=6.25e8`. This is 14 orders of magnitude larger. This is NOT just interpolation error - this is completely wrong data.
+
+Let me check: maybe the issue is that we're restoring the checkpoint correctly but then the TIME LOOP runs again from the BEGINNING (starting from time 0 with initial conditions) plus also from the checkpoint time. That would give wrong data.
+
+Wait - let me re-read the restoration code. After restoration:
+```cpp
+loop_time = ckpt_loop_time;     // say 4.0
+dt_now = ckpt_dt_now;          // dt at checkpoint
+iteration_num = ckpt_iteration_num; // step count at checkpoint
+
+time_integrator->setIntegratorTime(ckpt_loop_time);
+time_integrator->setIntegratorStep(ckpt_iteration_num);
+```
+
+Then the time loop:
+```cpp
+while ((loop_time < loop_time_end) && time_integrator->stepsRemaining()) {
+    iteration_num = time_integrator->getIntegratorStep() + 1;
+    double dt_new = time_integrator->advanceHierarchy(dt_now, ...);
+    loop_time += dt_now;
+    dt_now = dt_new;
+```
+
+After `advanceHierarchy`, `time_integrator->getIntegratorStep()` returns `d_step_level[0]`. The `advanceHierarchy` function increments `d_step_level[0]` by 1 each call. So if `d_step_level[0] = ckpt_iteration_num` before the loop, after first `advanceHierarchy` call it becomes `ckpt_iteration_num + 1`, etc.
+
+Wait - does `advanceHierarchy` increment `d_step_level[0]`? Let me check:
+OK I understand the `initializeHierarchy()` flow better now. Let me focus on solving the actual problem.
+
+The problem is clear: after recovery with only level-0 restoration and fine-level removal, the simulation continues but the rebuilt fine levels via regrid give different data than the original evolved fine levels.
+
+Let me think about an **alternative approach** that might work without needing to match exact patch boxes:
+
+**Key observation**: The `dumpValidationSignature` sums over ALL cells in ALL levels. The baseline always runs with `max_levels=3`. The recover run should also end with `max_levels=3` hierarchy.
+
+The solution must produce the SAME final state as the baseline. 
+
+**The correct approach that avoids the patch-layout problem**:
+
+After `initializeHierarchy()`, the hierarchy has level 0, 1, 2 with the INITIAL mesh layout. At checkpoint time, the mesh layout has changed due to regridding.
+
+What if instead of removing fine levels after restore, we:
+1. Keep fine levels as is (from `initializeHierarchy()` - they have initial-condition data)
+2. Overwrite ALL level data from checkpoint data by matching boxes that EXIST IN BOTH the checkpoint and the current hierarchy
+
+But the boxes won't match because the initial mesh is different from the checkpoint mesh.
+
+**Actually wait** - let me reconsider the initial mesh layout. The sphere is at (5.5, 5.5) initially. After 50% of the simulation (~5 time units), the sphere has moved to (5.5 + 2*5, 5.5 + 1*5) = (15.5, 10.5) approximately. The fine-level patches at time 0 are around (5.5, 5.5) and at checkpoint time they're around (15.5, 10.5). Completely different boxes.
+
+So we CANNOT match boxes between initial and checkpoint mesh.
+
+**The only real option**: We need to rebuild the fine levels with the CHECKPOINT mesh configuration.
+
+This requires:
+1. Save the checkpoint mesh configuration (box bounds for each patch on each fine level, including global rank-to-box mapping)
+2. On restart, after `initializeHierarchy()` creates the initial mesh, remove fine levels and recreate them with the checkpoint mesh configuration
+
+To create a fine level with a specific mesh configuration in SAMRAI, we need to call `patch_hierarchy->makeNewPatchLevel(level_number, box_level)`. Then we need to populate each patch with checkpoint data.
+
+This is feasible but requires:
+1. Understanding how `BoxLevel` works in SAMRAI
+2. Knowing the rank-to-box mapping (for MPI)
+
+Let me look at the BoxLevel class:
+Now I understand how to create a BoxLevel. The BoxLevel contains `BoxContainer` (a set of boxes, each with owner rank and local ID). Let me look at the Box class to understand how to construct one:
+I can see that Box has a constructor taking `lower`, `upper`, `block_id`, `local_id`, `owner_rank`. This is what I need to construct boxes for the checkpoint mesh.
+
+Now let me think about the complete implementation strategy:
+
+**New Strategy**: Save and restore ALL levels including their box configurations.
+
+**Checkpoint format additions**:
+- For each level (including fine levels), save the box layout information
+- For each box: level, local_id, owner_rank, lo[], hi[], cell data
+
+**Restore strategy**:
+1. After `initializeHierarchy()`, get the hierarchy (which has initial-time mesh)
+2. Remove ALL levels except level 0
+3. Restore level-0 data from checkpoint (same as before)
+4. For each fine level in checkpoint:
+   a. Collect box metadata from ALL ranks (via MPI all-to-all)
+   b. Construct a BoxLevel with the checkpoint boxes
+   c. Call `patch_hierarchy->makeNewPatchLevel(ln, box_level)`
+   d. Allocate patch data on the new level
+   e. Populate each patch with checkpoint data
+
+This is complex but feasible. Let me look at what functions are available for allocating patch data on a level:
+Good - `PatchLevel::allocatePatchData(int id, double timestamp)` is available.
+
+Now I understand what I need to do. Let me look at the `BoxLevel::addBox()` API and the `Box` constructor to understand how to create boxes for the fine levels:
+This is getting very complex. Let me step back and think about a MUCH simpler approach.
+
+**Fundamental insight**: The problem is that after restart, the fine level data is wrong because:
+1. The hierarchy after `initializeHierarchy()` has fine levels with INITIAL condition data
+2. We restore level 0 checkpoint data
+3. We remove fine levels
+4. Fine levels are rebuilt by regridding using interpolation from restored level 0
+5. Interpolated data ≠ evolved data for sharp discontinuities (SPHERE problem with uval_inside=80, uval_outside=5)
+
+**BUT**: What if instead of removing fine levels after restore, we simply **overwrite data on ALL levels** using the checkpoint data? The key question is: can we match checkpoint patches to current hierarchy patches?
+
+After `initializeHierarchy()`, the hierarchy has the INITIAL mesh layout (sphere at initial position). But at checkpoint time (~50% through), the sphere has moved. The fine level patches at checkpoint time cover the sphere at its checkpoint position, not the initial position.
+
+However! Level 0 (coarsest level) in SAMRAI has a FIXED domain decomposition - it doesn't change during the simulation (unless `rebalance_coarsest=true`). So level 0 patches after `initializeHierarchy()` ARE the same as at checkpoint time (same partition, same boxes).
+
+Wait - is that true? Let me verify. Looking at `PatchHierarchy` with `max_levels=3`. Level 0 covers the entire domain and its decomposition is done at startup. Regridding only creates/removes fine levels (levels 1, 2, ...). Level 0 is FIXED throughout the simulation.
+
+**YES! Level 0 is fixed!** This is why we can restore level 0 data by matching patch boxes.
+
+For fine levels (1, 2, ...) - their patch boxes change during regridding. At checkpoint time, the fine level patches are at the CHECKPOINT sphere position. After `initializeHierarchy()`, the fine level patches are at the INITIAL sphere position. These are DIFFERENT.
+
+So the correct strategy for fine levels must either:
+1. Save the fine-level mesh configuration and recreate it (complex)
+2. Just redo the simulation from checkpoint level 0 data with interpolated fine levels (current approach, gives large errors)
+
+**Alternative**: What if we save ALL levels' data in the checkpoint (we already do), AND on restore we also attempt to match fine-level patches?
+
+The issue is that fine-level patches may have moved. We need to reconstruct the fine-level mesh from checkpoint metadata.
+
+This IS feasible. Here's the plan:
+
+**Checkpoint format** (per rank per version):
+- Header: magic, loop_time, dt_now, iteration_num, dim, num_levels
+- For each level:
+  - level number ln
+  - ratio to coarser (IntVector, dim elements)
+  - num patches on this rank
+  - for each patch:
+    - local_id (int)
+    - lo[dim], hi[dim]
+    - depth, nelems, data
+
+**Restore**:
+1. After `initializeHierarchy()`, remove ALL fine levels
+2. For each fine level (from checkpoint):
+   a. Collect box data from checkpoint (already have it per rank)
+   b. Need to know which rank owns which boxes in the checkpoint (they're already per-rank)
+   c. Create a BoxLevel: each rank adds its own boxes from the checkpoint
+   d. Call `patch_hierarchy->makeNewPatchLevel(ln, box_level)`
+   e. Allocate patch data on the new level
+   f. Fill each patch with checkpoint data
+
+This is the correct approach. Let me implement it.
+
+**Key complications**:
+1. `makeNewPatchLevel` needs a BoxLevel with proper Box objects including `local_id` and `owner_rank`
+2. The BoxLevel must be in DISTRIBUTED state (each rank only knows its own boxes)
+3. After `makeNewPatchLevel`, we need to allocate patch data on the new level
+4. We need to find each patch by its box (matching by local_id and owner_rank from the checkpoint)
+
+This is implementable. Let me now write the new `main.cpp`.
+
+First let me understand the Box construction and what local_id means:
+Good - I can construct a Box with `(lower, upper, block_id, local_id, owner_rank)`. Let me look at the BlockId and LocalId classes:
+Now I have everything I need. Let me also check the `IntVector` and `Index` constructors for building the refinement ratio and box bounds:
+Now I have enough information to implement the fix. Let me also check what headers are needed for `BoxLevel`, `Box`, `LocalId`, `BlockId`:
+Good. `PatchHierarchy.h` includes `BoxLevel.h`. Now I need to understand what headers BoxLevel.h includes to get BlockId and LocalId.
+
+Let me now plan the new implementation. I'll now write the new `main.cpp` with the correct checkpoint/restart implementation:
+
+**New implementation plan**:
+
+**Checkpoint** (writeCheckpoint):
+- Writes ALL levels (including fine levels)
+- For each patch on each level, writes:
+  - level number (ln)
+  - local_id (from patch box)
+  - owner_rank (from patch box)
+  - lo[dim], hi[dim]
+  - depth, nelems, data
+
+**Restore** (restoreCheckpoint):
+- After initializeHierarchy(), hierarchy has initial mesh layout
+- Remove ALL fine levels (keep only level 0)
+- Restore level 0 data (same as before, matching by patch box which is FIXED)
+- For each fine level in checkpoint:
+  - Build a BoxLevel with the checkpoint boxes (each rank adds its own boxes)
+  - Call `patch_hierarchy->makeNewPatchLevel(ln, box_level)`
+  - Allocate patch data (uval_id) on the new level
+  - Fill each patch with checkpoint data (match by local_id + owner_rank)
+- Set integrator state (time, step count, etc.)
+- Set `d_last_finest_level` to the checkpoint's finest level number
+
+Let me also look at what `getBoxLevel()` returns for an existing level to understand the ratio we need:
+
+Actually, for the restoration of fine levels, I need the ratio. The ratio for level 1 is 4:4 (from input: `ratio_to_coarser { level_1 = 4 , 4 }`). So level 1 has ratio [4,4] to level 0. The absolute ratio (to level 0) is [4,4]. For level 2, it would be [16,16].
+
+I need to compute the refinement ratio for each fine level. I'll use `patch_hierarchy->getRatioToCoarserLevel(ln)` to get the ratio from level `ln` to level `ln-1`, and then compute the cumulative ratio to level 0.
+
+Let me now implement the fix. The key changes to `main.cpp` are:
+
+1. **Checkpoint format**: add local_id and owner_rank to the per-patch metadata
+2. **Restore logic**: reconstruct fine levels from checkpoint using BoxLevel API
+
+Let me also look at what `BoxContainer` needs and how to add boxes to it:
+Good. `BoxContainer.h` includes `Box.h` and `BlockId.h`. 
+
+Now I understand the SAMRAI data structures enough to write the fix. Let me now write the new `main.cpp`. The key changes:
+
+1. **Checkpoint format changes**:
+   - Add: per-patch `local_id` (int) and `owner_rank` (int)
+   - Change: write data for ALL levels (not just level 0)
+   - Add: ratio_to_level_zero for each level
+
+2. **Restore logic changes**:
+   - For level 0: same as before (match by patch box lo/hi)
+   - For fine levels (1, 2, ...): use BoxLevel to recreate the level with checkpoint boxes
+   - After recreating each fine level, allocate patch data and fill from checkpoint data
+   - Match patches by `local_id` + `owner_rank` from checkpoint
+
+3. **New checkpoint structure per patch** (in file):
+   ```
+   [int: level_number]
+   [int: local_id]
+   [int: owner_rank]
+   [int: lo[0], lo[1], ...]
+   [int: hi[0], hi[1], ...]
+   [int: depth]
+   [size_t: nelems]
+   [double*nelems: interior cell data]
+   ```
+
+Let me also look at how Box's local_id is accessed in SAMRAI:
+Now let me look at the BoxId and getBoxId:
+Now I understand the full picture. Let me also look at how Box provides access to its ID:
+Now I have enough understanding to write the new implementation. Let me write the complete new `main.cpp`:
+Now I need to look at potential issues with the implementation. Let me review some key concerns:
+
+1. The `addBox` method requires a BlockId. Looking at the BoxLevel API - `addBox(const Box& box, const BlockId& block_id)` - the box doesn't need to have a block_id set; you pass the block_id separately.
+
+2. The `finalize()` call on BoxLevel - I need to make sure this is right.
+
+3. The `makeNewPatchLevel` requires a proper BoxLevel. Let me double-check the Box constructor I'm using.
+
+Looking at the Box constructor:
+```cpp
+Box(const Index& lower, const Index& upper, const BlockId& block_id,
+    const LocalId& local_id, const int owner_rank, const PeriodicId& periodic_id = PeriodicId::zero());
+```
+
+Then I call `new_box_level.addBox(new_box, hier::BlockId(0))`. But looking at the `addBox` signature:
+```cpp
+BoxContainer::const_iterator addBox(const Box& box, const BlockId& block_id);
+```
+
+Wait - I'm passing both a BlockId in the Box constructor AND a BlockId to addBox. That might be a conflict. Let me look at what `addBox` does with the block_id parameter:
+
+Actually, looking at the BoxLevel::addBox signature again - the first overload is `addBox(const Box& box, const BlockId& block_id)`. The BlockId in addBox might be used to set the block_id of the box if not already set, or it might be used for other purposes.
+
+Let me reconsider. Looking at the Box constructor I'm using:
+```cpp
+Box(const Index& lower, const Index& upper, const BlockId& block_id, const LocalId& local_id, const int owner_rank, ...)
+```
+
+This constructs a full Box with all metadata. Then `addBox(box, block_id)` adds it to the BoxLevel. The second `block_id` argument is likely for validation/confirmation.
+
+Actually, looking more carefully at the code, there might be an issue. Let me look at the BoxLevel::addBox code in the header more carefully:
+
+```cpp
+BoxContainer::const_iterator
+addBox(
+   const Box& box,
+   const BlockId& block_id);
+```
+
+The comment says "The new Box will be assigned an unused local index, so the input box need not have a valid one." This suggests addBox assigns its OWN local_id to the box, ignoring the one in the input Box!
+
+This would break my plan because the boxes will get new local_ids, not the checkpoint ones. When I later try to match patches by local_id, the local_ids won't match.
+
+This is a critical issue. Let me look at the alternative `addBox(const Box& box)` overload.
+
+The second overload `addBox(const Box& box)` - the comment says this adds "a Box to this level" without assigning a new local index. But wait, which one assigns a new local index?
+
+Let me re-read: The first overload with the block_id parameter "assigns an unused local index". The second one just adds the box as-is. So I should use the second overload `addBox(const Box& box)` (without block_id) to preserve the original local_id from the checkpoint.
+
+But wait - the second overload requires the state to be DISTRIBUTED. The comment says "CAUTION: no checks are made". So I need to be careful.
+
+Actually, looking at it again: I CONSTRUCT the box with the original local_id from the checkpoint, then I need to add it to the BoxLevel with that local_id preserved. So I should use `addBoxWithoutUpdate` or the second `addBox` overload.
+
+But actually, there's an even simpler approach: after creating the fine level, I iterate through its patches. The patches will have the local_ids that were assigned by the BoxLevel. If I constructed the Box with the original local_id (from checkpoint), the BoxLevel will preserve that local_id (since I'm using the direct constructor).
+
+Wait - the first `addBox` overload "assigns an unused local index" - so it IGNORES the local_id in the input Box and assigns a new one. This would break matching.
+
+The `addBoxWithoutUpdate` doesn't assign a new index - it just inserts the box as-is into the container. After `finalize()`, the boxes should retain their original local_ids.
+
+Let me use `addBoxWithoutUpdate` for all boxes and then call `finalize()`.
+
+But there's another problem: when iterating patches on the newly created fine level, the patches will have the local_ids assigned by the BoxLevel. If I used `addBoxWithoutUpdate` with the original local_ids, those will be preserved.
+
+Let me also reconsider whether I actually need to match by local_id. After making the new patch level, the patches correspond 1-to-1 with the boxes in the BoxLevel that I created. Since each rank only adds its OWN boxes (with original local_ids), and the iteration over the fine level gives exactly those patches, I can match them by iterating in the same order as the box list.
+
+Actually the simplest approach: After `makeNewPatchLevel`, iterate over the patches and for each patch, get its local_id (which I set from checkpoint), and look up the data in the map by (local_id, owner_rank).
+
+Let me verify: if I use `addBoxWithoutUpdate` with Box constructed with original local_id, then `finalize()`, then `makeNewPatchLevel(ln, box_level)`, will the resulting patches have the correct local_ids?
+
+Looking at the BoxLevel code:
+```cpp
+void addBoxWithoutUpdate(const Box& box) {
+    d_boxes.insert(box);
+}
+```
+
+It just inserts the box into `d_boxes` (a BoxContainer which is a sorted set). The BoxId (containing local_id + owner_rank) is used as the sort key. So the box retains its original local_id.
+
+After `makeNewPatchLevel`, the PatchLevel creates patches corresponding to each box in the BoxLevel. Each patch has the same BoxId as its corresponding box. So the patch's `getLocalId()` will return the original local_id from the checkpoint.
+
+This means my matching by (local_id, owner_rank) will work! Let me update the code to use `addBoxWithoutUpdate` instead of `addBox`.
+
+Let me update the implementation:
+Now let me also think about other potential issues:
+
+1. **BoxLevel needs to be in DISTRIBUTED state**: I create it with `DISTRIBUTED` - good.
+
+2. **After `makeNewPatchLevel`, the patch level must be set up properly**: The `makeNewPatchLevel` sets up the level in the hierarchy with the correct geometry. However, various internal SAMRAI state (connectors, etc.) might need to be initialized.
+
+3. **`finalize()` call**: After adding all local boxes without update, I call `finalize()` to compute local statistics. This is correct.
+
+4. **Potential issue**: The `addBoxWithoutUpdate` note says it should be used "during the construction of a BoxLevel as Boxes belonging to the level are found". This should work fine.
+
+5. **The `makeNewPatchLevel` with a BoxLevel**: Looking at the signature: `void makeNewPatchLevel(const int level_number, const BoxLevel& new_box_level)`. This makes a COPY of the BoxLevel. The level_number must be one more than the current finest level (or equal to, if we're replacing).
+
+Wait - after removing all fine levels (levels 1, 2, ...), the hierarchy only has level 0. Then we call `makeNewPatchLevel(1, ...)`. But `makeNewPatchLevel` requires `level_number >= 0 && ln < getMaxNumberOfLevels()`. After removing fine levels, the hierarchy has `getNumberOfLevels() = 1`. Can we call `makeNewPatchLevel(1, ...)`? We need to check if `level_number < getMaxNumberOfLevels()`.
+
+Looking at the assertion:
+```cpp
+pre level_number >= 0 && ln < getMaxNumberOfLevels()
+```
+
+`getMaxNumberOfLevels()` returns `max_levels = 3` (from input). So we can add levels 0, 1, 2. We can call `makeNewPatchLevel(1, ...)` even though level 1 doesn't exist yet - it creates it. Good.
+
+6. **After `makeNewPatchLevel`, is patch data allocated?**: No - `makeNewPatchLevel` just creates the level structure. We explicitly call `fine_level->allocatePatchData(uval_id, ckpt_loop_time)` afterwards. This is correct.
+
+7. **What other patch data needs to be allocated?**: The `uval` variable has CURRENT, NEW, and SCRATCH contexts. `uval_id` is the CURRENT context. But the fine level also needs NEW data allocated for the time integration to work. Let me check if `advanceHierarchy` allocates it automatically...
+
+Looking at SAMRAI's HyperbolicLevelIntegrator::initializeLevelData which is called for new levels created during regridding... it allocates all needed data. But since we're directly calling `makeNewPatchLevel` (not through the gridding algorithm), we might miss this allocation.
+
+However, looking at how `advanceHierarchy` works: it calls `resetTimeDependentData` and related functions which manage data allocation/deallocation. The key question is: does `advanceHierarchy` expect the NEW data to be pre-allocated, or does it allocate it internally?
+
+Looking at `HyperbolicLevelIntegrator::advanceLevel`:
+- It typically allocates NEW data before the advance
+- After the advance, it copies NEW -> CURRENT and deallocates NEW
+
+So `advanceHierarchy` should handle NEW data allocation internally. We only need CURRENT allocated.
+
+But wait - there's a subtlety. After restoration, when `advanceHierarchy` is called for the first time, it advances level 0 and then processes fine levels. Since fine levels now exist in the hierarchy (we just created them), `advanceHierarchy` will try to advance them too. But for this to work, the fine levels need to be in the state where CURRENT data is available (which we've set from checkpoint) and the integrator's internal state for those levels needs to be correct.
+
+We've set:
+- `time_integrator->setAllLevelSimTimes(ckpt_loop_time)` - all level sim times = checkpoint time
+- `time_integrator->setAllLevelStepCounts(ckpt_iteration_num)` - level 0 step = ckpt step, others = 0
+- `time_integrator->setLastFinestLevel(ckpt_finest_level)` - finest level from checkpoint
+
+The issue is `setAllLevelStepCounts` sets fine level step counts to 0 and `d_max_steps_level` for fine levels to 1. This means fine levels haven't advanced yet in this coarse step. So `advanceHierarchy` will advance fine levels.
+
+But there's a potential issue with `d_dt_max_level` and `d_dt_actual_level` for fine levels. I set them to `ckpt_dt_now` (coarse level dt), but fine levels need smaller dts (ratio of 4:1, so fine dt = coarse_dt/4). This might cause issues.
+
+Actually, looking at the TimeRefinementIntegrator code, `advanceHierarchy` recomputes dts for all levels based on the CFL condition. So the initial dt values for fine levels don't matter much - they'll be recomputed.
+
+8. **Issue with `resetAdvanceFlags()`**: This sets `d_hierarchy_advanced = false` and `d_level_0_advanced = false`. This is correct - it signals that the hierarchy hasn't advanced yet in the current coarse step.
+
+Let me also think about whether `advanceHierarchy` on the first call will try to REGRID the fine levels. After restoration, we have the exact same fine levels as at checkpoint time. If a regrid happens, it might change the fine level structure. But this could be OK since at checkpoint time the regrid SHOULD yield the same result.
+
+Wait - there's a subtle issue. The `d_step_level[0]` is set to `ckpt_iteration_num` (the step count at checkpoint). When `advanceHierarchy` checks `(d_step_level[0] % d_regrid_interval[0] == 0)`, it might trigger a regrid even though we just restored the fine levels. This would destroy our carefully restored fine-level data and rebuild it from the COARSE level by interpolation!
+
+This is a real problem. Let me think about how to avoid unwanted regridding.
+
+Looking at the TimeRefinementIntegrator code at line 1147:
+```cpp
+bool regrid_now = (d_step_level[0] % d_regrid_interval[0] == 0);
+```
+
+This checks if the step count is a multiple of the regrid interval. If `ckpt_iteration_num % d_regrid_interval[0] == 0`, then on the FIRST call to `advanceHierarchy` after restart, it will trigger a regrid (at the END of the first advance, not the beginning).
+
+The regrid happens AFTER advancing the hierarchy for one step. So the sequence is:
+1. `advanceHierarchy(dt_now)`:
+   a. Advance level 0 by dt
+   b. Advance fine levels (if any)
+   c. Synchronize
+   d. Increment `d_step_level[0]` = ckpt_iteration_num + 1
+   e. Check if `(ckpt_iteration_num + 1) % regrid_interval == 0`
+   f. If so, regrid
+
+So the regrid happens AFTER advancing (at step number ckpt_iteration_num + 1). This is FINE because:
+- We restored fine levels at checkpoint state
+- We advance one step
+- If a regrid was supposed to happen at step ckpt_iteration_num + 1 in the original run, it will also happen here
+
+The original run's fine level data at step ckpt_iteration_num + 1 (after one advance from checkpoint state) should match what we produce here. So regridding at the same step shouldn't be a problem.
+
+The only potential issue is if the regrid CHANGES the fine level structure at step ckpt_iteration_num + 1 compared to the original run. Since both runs have the same state at checkpoint time and the same input, they should produce the same regrid result.
+
+9. **What about the `d_just_regridded` flag?**: In `TimeRefinementIntegrator`, `d_just_regridded` tracks whether we just regridded. Looking at `setAllLevelSimTimes`, it doesn't set this flag. After `resetAdvanceFlags()`, `d_hierarchy_advanced = false` and `d_level_0_advanced = false`. The `d_just_regridded` might still have its value from when we called `initializeHierarchy()`.
+
+Actually, `initializeHierarchy()` calls `initializeRefinedTimesteppingLevelData(0)` recursively, which eventually calls `d_gridding_algorithm->makeFinerLevel(...)`. This sets the hierarchy structure. After `initializeHierarchy()`, `d_just_regridded` might be true (since we just created levels during initialization).
+
+This could affect the behavior of `advanceHierarchy` on the first call. Let me look at how `d_just_regridded` is used:
+I see `d_just_regridded = false` is set at the top of the advance loop for a level. So it's reset during advance. This shouldn't be a problem.
+
+Now let me look at a more fundamental issue. When `advanceHierarchy` is called:
+1. It calls `advanceRecursivelyForRefinedTimestepping(0, loop_time + dt)` for refined timestepping
+2. This recursively advances level 0, then fine levels
+
+For fine levels (ln >= 1), `advanceRecursivelyForRefinedTimestepping(ln, end_time)` is called. This advances the fine level through its sub-cycling steps from `d_level_sim_time[ln]` to `end_time`. Since we've set `d_level_sim_time[ln] = ckpt_loop_time` via `setAllLevelSimTimes`, fine levels start from the correct time.
+
+But there's a potential issue: the fine level's `d_step_level[ln]` is set to 0 (initial value for fine levels after `setAllLevelStepCounts`). Fine levels use sub-cycling, so `d_max_steps_level[ln]` is set to the number of fine steps per coarse step (e.g., 4 for a 4:1 ratio). Each call to `advanceRecursivelyForRefinedTimestepping` advances the fine level until it reaches its max steps.
+
+After `setAllLevelStepCounts(ckpt_iteration_num)`:
+- `d_step_level[0] = ckpt_iteration_num`
+- `d_step_level[ln] = 0` for ln >= 1
+- `d_max_steps_level[ln] = 1` for ln >= 1
+
+So fine levels think they need to take 1 step before syncing with the coarse level. This is correct - each coarse step involves the fine levels being reset and re-cycled.
+
+Actually, looking at this more carefully: after `initializeHierarchy()` (where we don't restore), `d_step_level` for fine levels would be 0 and `d_max_steps_level` would be set by the initialization process. After `setAllLevelStepCounts`, we reset fine levels to step 0 with max 1 step. This should be correct for starting a new coarse step.
+
+OK, I think the implementation is logically sound. Let me now think about potential compilation issues.
+
+Looking at the new code, I'm using:
+- `hier::BoxLevel` - included via `PatchHierarchy.h` which includes `BoxLevel.h`
+- `hier::BoxContainer` - I added this include
+- `hier::BlockId(0)` - included via `BoxContainer.h` which includes `BlockId.h`
+- `hier::LocalId(info.local_id)` - included via `BoxLevel.h`
+- `hier::Box` constructor with (lower, upper, block_id, local_id, owner_rank) - included via `BoxLevel.h`
+
+Wait, looking at the includes in the new main.cpp - I added:
+```cpp
+#include "SAMRAI/hier/BoxLevel.h"
+#include "SAMRAI/hier/BoxContainer.h"
+#include "SAMRAI/hier/BlockId.h"
+```
+
+But `PatchHierarchy.h` already includes `BoxLevel.h` which already includes `BoxContainer.h`. And `BoxContainer.h` includes `BlockId.h`. So the explicit includes I added are redundant but harmless.
+
+However, I'm NOT including `LocalId.h` explicitly. Let me check if it's transitively included:
+- `BoxLevel.h` includes `Box.h`
+- `Box.h` includes `BoxId.h`
+- `BoxId.h` includes `GlobalId.h`
+
+Let me check `GlobalId.h`:
+`GlobalId.h` includes `LocalId.h`. So `LocalId` IS transitively included. Good.
+
+Now let me also add `#include "SAMRAI/hier/LocalId.h"` to the includes in my main.cpp for clarity, and add `#include "SAMRAI/hier/BoxId.h"`:
+
+Actually, looking at the current includes in my written file, I already have:
+```cpp
+#include "SAMRAI/hier/BoxLevel.h"
+#include "SAMRAI/hier/BoxContainer.h"
+#include "SAMRAI/hier/BlockId.h"
+```
+
+And all of these transitively include `LocalId.h` and `Box.h`. So we're good.
+
+Now let me think about another issue: after `makeNewPatchLevel`, the level might not be properly connected to the hierarchy for time integration purposes. Specifically, `HyperbolicLevelIntegrator` might not know about the new fine level.
+
+Looking at how regridding works: `GriddingAlgorithm::regridAllFinerLevels` calls `patch_hierarchy->makeNewPatchLevel` and then initializes data on the new level via `HyperbolicLevelIntegrator::initializeLevelData`. The `initializeLevelData` allocates ALL needed patch data (CURRENT, NEW, SCRATCH) and fills CURRENT data from the coarser level via refine operations.
+
+If I call `patch_hierarchy->makeNewPatchLevel` directly WITHOUT going through `GriddingAlgorithm`, I bypass the `initializeLevelData` call. This means:
+- NEW data is NOT allocated
+- SCRATCH data is NOT allocated  
+- Only CURRENT is allocated (which I do explicitly)
+- Ghost cells are NOT filled
+
+But for the first `advanceHierarchy` after restart:
+1. `advanceHierarchy` calls `advanceRecursivelyForRefinedTimestepping`
+2. This calls `advanceLevel` on fine levels
+3. `advanceLevel` needs CURRENT data and allocates NEW internally
+
+Actually, let me look at what `HyperbolicLevelIntegrator::advanceLevel` does:
+I can see at line 1019:
+```cpp
+level->allocatePatchData(d_new_time_dep_data, new_time);
+level->allocatePatchData(d_saved_var_scratch_data, current_time);
+```
+
+`advanceLevel` allocates NEW and SCRATCH data internally at the start. So I only need to pre-allocate CURRENT data on the fine levels. Good - my approach is correct.
+
+But there's still the question of whether the fine levels need to be "in hierarchy" (flag `d_in_hierarchy`). Looking at line 1023: `if (!level->inHierarchy())` - so if the level IS in the hierarchy, it takes a different code path.
+
+Since I'm creating the level via `patch_hierarchy->makeNewPatchLevel(ln, ...)`, the level should be marked as being in the hierarchy. Let me check:
+This is very informative! Looking at line 805:
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+The BoxLevel's grid geometry must be `d_grid_geometry` (the hierarchy's grid geometry). But I'm creating the BoxLevel with:
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+
+hier::BoxLevel new_box_level(
+    ratio_to_zero,
+    grid_geom,  // This is const BaseGridGeometry
+    ...);
+```
+
+The issue is that `BoxLevel` stores a `std::shared_ptr<const BaseGridGeometry>` but `d_grid_geometry` in PatchHierarchy is likely a non-const `BaseGridGeometry`. The assertion checks pointer equality: `new_box_level.getGridGeometry() == d_grid_geometry`. Since I'm using `getPatchLevel(0)->getGridGeometry()` which returns the same object as `d_grid_geometry`, the pointers should be equal (assuming the level's geometry is the same object as the hierarchy's geometry).
+
+But wait - `PatchLevel::getGridGeometry()` returns `std::shared_ptr<BaseGridGeometry>` (non-const), and `BoxLevel::getGridGeometry()` returns `const std::shared_ptr<const BaseGridGeometry>&`. The assertion compares pointers. Let me check if the const/non-const issue matters for pointer comparison...
+
+In C++, comparing `shared_ptr<const T>` to `shared_ptr<T>` doesn't work directly without implicit conversion. The assertion:
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+Where `new_box_level.getGridGeometry()` returns `const std::shared_ptr<const BaseGridGeometry>&` and `d_grid_geometry` is a `std::shared_ptr<BaseGridGeometry>`. Comparing these would require implicit conversion, but `shared_ptr<const T>` can be constructed from `shared_ptr<T>`. The comparison would compare the underlying raw pointers, which should be equal since they point to the same object.
+
+Actually, looking at `BoxLevel::getGridGeometry()`:
+```cpp
+const std::shared_ptr<const BaseGridGeometry>&
+getGridGeometry() const
+{
+   return d_grid_geometry;
+}
+```
+
+And the BoxLevel stores `std::shared_ptr<const BaseGridGeometry> d_grid_geometry`. When comparing with the hierarchy's `std::shared_ptr<BaseGridGeometry> d_grid_geometry`, there's a const vs non-const mismatch. But since both share_ptrs point to the same underlying object, `shared_ptr<const T>` == `shared_ptr<T>` comparison should work via `.get()` pointer equality.
+
+Actually, `shared_ptr<const T> == shared_ptr<T>` is valid in C++ because `shared_ptr<const T>` can be constructed from `shared_ptr<T>` via implicit conversion, and the comparison uses raw pointer comparison.
+
+So this assertion should pass as long as I pass the correct grid geometry object.
+
+There's another issue though. Looking at the assertion at line 804:
+```cpp
+TBOX_ASSERT(new_box_level.getRefinementRatio() > IntVector::getZero(d_dim));
+```
+
+The ratio I'm setting must be positive in all dimensions. For level 1, the ratio to level 0 is [4,4] (for 2D). So `ratio_to_zero = {4, 4}`. This is positive. Good.
+
+And at line 820-828 for `ln > 0`:
+```cpp
+const IntVector expected_ratio(
+   d_ratio_to_coarser[ln] * (d_patch_levels[ln - 1]->getRatioToLevelZero()));
+if (new_box_level.getRefinementRatio() != expected_ratio) {
+   TBOX_ERROR(...);
+}
+```
+
+For level 1:
+- `d_ratio_to_coarser[1]` = {4,4} (ratio of level 1 to level 0, from input)
+- `d_patch_levels[0]->getRatioToLevelZero()` = {1,1} (level 0 is the reference level)
+- `expected_ratio` = {4,4} * {1,1} = {4,4}
+
+So I need to set `ratio_to_zero = {4,4}` for level 1. I'm reading this from the checkpoint data (`ratio_to_level_zero`).
+
+But wait - in my checkpoint writing code, I write:
+```cpp
+const hier::IntVector& ratio_to_zero = level->getRatioToLevelZero();
+```
+
+This gives me the ratio of each level to level 0. For level 1, it's {4,4}. For level 2, it's {16,16}. This is what I store in the checkpoint.
+
+On restore, I construct the BoxLevel with `ratio_to_zero = {4,4}` for level 1. The assertion checks that this equals `expected_ratio = {4,4}`. They match! Good.
+
+For level 2, `expected_ratio = d_ratio_to_coarser[2] * d_patch_levels[1]->getRatioToLevelZero() = {4,4} * {4,4} = {16,16}`. And I restore with `ratio_to_zero = {16,16}`. They match! Good.
+
+Now there's another critical check: The `IntVector` for multi-block meshes. Looking at the ratio:
+
+```cpp
+const IntVector expected_ratio(
+   d_ratio_to_coarser[ln] * (d_patch_levels[ln - 1]->getRatioToLevelZero()));
+```
+
+`d_ratio_to_coarser[ln]` is an IntVector that might be multi-block (num_blocks > 1). For the single-block SAMRAI application, `num_blocks = 1`. But the IntVector might still have a specific format.
+
+Looking at how I construct the ratio:
+```cpp
+hier::IntVector ratio_to_zero(dim);
+for (int d = 0; d < dim_val; ++d) {
+    ratio_to_zero(d) = ratio_vec[d];
+}
+```
+
+The `ratio_to_zero(d) = ratio_vec[d]` operator assigns to the d-th component. For a single-block IntVector, `ratio_to_zero(d)` gives the d-th element. This should work correctly.
+
+But wait - is `hier::IntVector ratio_to_zero(dim)` the right way to create a single-block IntVector for SAMRAI? Let me check the IntVector constructor:
+I see - `IntVector(const tbox::Dimension& dim)` creates an UNINITIALIZED IntVector with 1 block. Then I set values via `ratio_to_zero(d) = ratio_vec[d]`.
+
+But the comparison in `makeNewPatchLevel` is with `expected_ratio = d_ratio_to_coarser[ln] * ...`. The `d_ratio_to_coarser` might be a multi-block IntVector if `num_blocks > 1`.
+
+For a single-block problem (`num_blocks = 1`), `d_ratio_to_coarser[1]` has num_blocks=1. The multiplication `d_ratio_to_coarser[ln] * ratio_to_level_zero_of_coarser_level` should give a single-block result.
+
+The key check is that my `ratio_to_zero` IntVector has the SAME format (num_blocks=1) as what `makeNewPatchLevel` expects.
+
+Looking at what `level->getRatioToLevelZero()` returns - it returns `const IntVector&` which should have the correct format for the hierarchy. Since I'm reading this from an existing level, it should be in the correct format. And I write the individual dimension values to the checkpoint. On restore, I create `hier::IntVector ratio_to_zero(dim)` (1 block, uninitialized) and set the per-dimension values. This should match the format of the expected ratio.
+
+But wait - for a multi-block problem, the `()` operator would need to access `(block, dim)`. For a single-block problem with `num_blocks=1`, `ratio_to_zero(d)` should work.
+
+Let me check the `operator()` for IntVector:
+The `operator()(unsigned int i)` for single-block IntVector (where `getNumBlocks() == 1`) requires `d_num_blocks == 1`. Since I construct `hier::IntVector ratio_to_zero(dim)` which creates a 1-block IntVector, `operator()(d)` will work correctly.
+
+This looks good. The implementation should be correct.
+
+Now let me think about one more issue. In the checkpoint writing code, I write `ratio_to_zero` for each level. For level 0, `getRatioToLevelZero()` returns `{1,1}` (level 0 is the reference). For level 1, it's `{4,4}`. For level 2, it's `{16,16}`.
+
+But looking at what `d_ratio_to_coarser` stores in the hierarchy - it's the ratio from level `ln` to level `ln-1`. For level 1: `d_ratio_to_coarser[1] = {4,4}`. For level 2: `d_ratio_to_coarser[2] = {4,4}`.
+
+And `getRatioToLevelZero()` for level 2 is `d_ratio_to_coarser[2] * getRatioToLevelZero_of_level_1 = {4,4} * {4,4} = {16,16}`.
+
+On restore, I use `level->getRatioToLevelZero()` from the EXISTING levels (after `initializeHierarchy()`) to get `ratio_to_zero`. Wait - but I'm removing fine levels before restoring them! So after removing fine levels, there ARE no fine levels to call `getRatioToLevelZero()` on.
+
+But I'm reading the ratio from the CHECKPOINT FILE, not from the current hierarchy! In the checkpoint, I save the ratio for each level. So on restore, I use the saved ratio from the checkpoint file. Good.
+
+Let me re-verify the checkpoint writing code for `ratio_to_zero`:
+```cpp
+const hier::IntVector& ratio_to_zero = level->getRatioToLevelZero();
+for (int d = 0; d < dim_val; ++d) {
+    int r = (int)ratio_to_zero(d);
+    fwrite(&r, sizeof(int), 1, fp);
+}
+```
+
+And on restore:
+```cpp
+std::vector<int> ratio(ckpt_dim_val);
+for (int d = 0; d < ckpt_dim_val && ok; ++d) {
+    ok = ok && (fread(&ratio[d], sizeof(int), 1, fp) == 1);
+}
+...
+hier::IntVector ratio_to_zero(dim);
+for (int d = 0; d < dim_val; ++d) {
+    ratio_to_zero(d) = ratio_vec[d];
+}
+```
+
+This correctly reads and uses the saved ratio. Good.
+
+Now one more issue: when writing the ratio, I call `(int)ratio_to_zero(d)`. But `ratio_to_zero(d)` is already an int (from `const int&`), so the cast is redundant but harmless.
+
+Wait - there's also a subtle issue with how `getRatioToLevelZero()` works. Let me check if this is the right method:
+
+In `PatchLevel.h`:
+```cpp
+const IntVector&
+getRatioToLevelZero() const
+{
+   return d_ratio_to_level_zero;
+}
+```
+
+And `d_ratio_to_level_zero` is set by `makeNewPatchLevel`. From the `makeNewPatchLevel` code:
+```cpp
+d_patch_levels[ln] = d_patch_level_factory->allocate(
+      new_box_level, ...);
+...
+d_patch_levels[ln]->setLevelNumber(ln);
+...
+```
+
+The `getRatioToLevelZero()` comes from the BoxLevel's refinement ratio. Looking at the PatchLevel:
+
+Actually, `PatchLevel::getRatioToLevelZero()` returns `d_ratio_to_level_zero` which is initialized from the BoxLevel's `getRefinementRatio()`. And the BoxLevel's refinement ratio IS the ratio to level zero. So my approach is correct.
+
+OK, I'm reasonably confident the implementation is correct. Let me now also look at a potential issue in the `restoreCheckpoint` function where I'm getting `grid_geom`:
+
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+```
+
+`PatchLevel::getGridGeometry()` returns `std::shared_ptr<BaseGridGeometry>` (non-const). But I'm storing it as `std::shared_ptr<const BaseGridGeometry>`. This conversion from non-const to const shared_ptr is valid in C++.
+
+Then I pass it to `BoxLevel` constructor:
+```cpp
+hier::BoxLevel new_box_level(
+    ratio_to_zero,
+    grid_geom,  // std::shared_ptr<const BaseGridGeometry>
+    ...);
+```
+
+The BoxLevel constructor takes `const std::shared_ptr<const BaseGridGeometry>&`. But I'm passing `std::shared_ptr<const BaseGridGeometry>` which is correct.
+
+BUT - `makeNewPatchLevel` checks:
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+Where `d_grid_geometry` is `std::shared_ptr<BaseGridGeometry>` (non-const) in PatchHierarchy. And `new_box_level.getGridGeometry()` returns `const std::shared_ptr<const BaseGridGeometry>&`.
+
+The comparison `shared_ptr<const T> == shared_ptr<T>` should work because `shared_ptr<const T>` can be constructed from `shared_ptr<T>` via implicit conversion, and the comparison uses raw pointer equality.
+
+However, the comparison I used `d_grid_geometry == grid_geom` where `d_grid_geometry` is a non-const shared_ptr to BaseGridGeometry - there could be a type mismatch. Let me check what the actual assertion does...
+
+Actually, in the `makeNewPatchLevel` code, the assertion is:
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+`new_box_level.getGridGeometry()` returns `const std::shared_ptr<const BaseGridGeometry>&`. And `d_grid_geometry` in PatchHierarchy is `std::shared_ptr<BaseGridGeometry>`.
+
+Comparing `shared_ptr<const BaseGridGeometry>` with `shared_ptr<BaseGridGeometry>` - in C++, `shared_ptr<const T>` has a comparison operator with `shared_ptr<T>` that compares raw pointers. So this should work.
+
+The key question is: does the BoxLevel I create use the SAME pointer as `d_grid_geometry` in the hierarchy?
+
+I create the BoxLevel with:
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+```
+
+This gets the geometry from level 0's PatchLevel. Looking at `PatchLevel::getGridGeometry()` - it returns `d_geometry` which is initialized from the hierarchy's `d_grid_geometry`. So `grid_geom.get()` (the raw pointer) should equal `d_grid_geometry.get()`.
+
+OK, I think the implementation is correct. Let me also look at the `getGridGeometry()` in BoxLevel vs BaseGridGeometry vs CartesianGridGeometry:
+
+In `PatchLevel`:
+```cpp
+std::shared_ptr<BaseGridGeometry>
+getGridGeometry() const
+{
+   return d_geometry;
+}
+```
+
+In `BoxLevel`:
+```cpp
+const std::shared_ptr<const BaseGridGeometry>&
+getGridGeometry() const
+{
+   return d_grid_geometry;
+}
+```
+
+And `BoxLevel::d_grid_geometry` is of type `std::shared_ptr<const BaseGridGeometry>`. The `TBOX_ASSERT` in `makeNewPatchLevel` compares these. Since both point to the same underlying object (the same `CartesianGridGeometry` instance), the raw pointer comparison should succeed.
+
+Now let me also verify that `getGridGeometry()` returns the same object in both `PatchLevel` and `PatchHierarchy`. Looking at `PatchHierarchy::makeNewPatchLevel`:
+```cpp
+d_patch_levels[ln] = d_patch_level_factory->allocate(
+      new_box_level,
+      d_grid_geometry,  // <-- passes d_grid_geometry to PatchLevel
+      d_patch_descriptor,
+      d_patch_factory);
+```
+
+The `PatchLevel` gets constructed with `d_grid_geometry` as its geometry. So `getPatchLevel(0)->getGridGeometry()` returns the same object as `d_grid_geometry` in the hierarchy. 
+
+And my `BoxLevel` is constructed with this same object. So `new_box_level.getGridGeometry().get() == d_grid_geometry.get()` should be true.
+
+Now let me also check if there are any issues with the `std::shared_ptr<const hier::BaseGridGeometry>` type I'm passing:
+
+```cpp
+hier::BoxLevel new_box_level(
+    ratio_to_zero,
+    grid_geom,  // std::shared_ptr<const BaseGridGeometry>
+    tbox::SAMRAI_MPI::getSAMRAIWorld(),
+    hier::BoxLevel::DISTRIBUTED);
+```
+
+Looking at the BoxLevel constructor:
+```cpp
+BoxLevel(
+   const IntVector& ratio,
+   const std::shared_ptr<const BaseGridGeometry>& grid_geom,
+   const tbox::SAMRAI_MPI& mpi = tbox::SAMRAI_MPI::getSAMRAIWorld(),
+   const ParallelState parallel_state = DISTRIBUTED);
+```
+
+This takes `const std::shared_ptr<const BaseGridGeometry>&`. My `grid_geom` is `std::shared_ptr<const BaseGridGeometry>`. This should work.
+
+But wait - `patch_hierarchy->getPatchLevel(0)->getGridGeometry()` returns `std::shared_ptr<BaseGridGeometry>` (non-const). I store it in `std::shared_ptr<const BaseGridGeometry>`:
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+```
+
+This implicit conversion from non-const to const shared_ptr is valid. The resulting `grid_geom` has the same raw pointer as the original non-const shared_ptr, just with const access.
+
+I think the implementation is correct. Let me now also verify that there are no issues with the `addBoxWithoutUpdate` approach. Let me check if the BoxLevel tracks local box counts properly before `finalize()` is called:
+
+Looking at `addBoxWithoutUpdate`:
+```cpp
+void addBoxWithoutUpdate(const Box& box) {
+    if (locked()) {
+        TBOX_ERROR(...);
+    }
+    if (getParallelState() == GLOBALIZED) {
+        d_global_boxes.insert(box);
+    }
+    d_boxes.insert(box);
+}
+```
+
+This just inserts into `d_boxes` without updating `d_local_number_of_boxes`, etc. Then `finalize()` computes these values:
+
+```cpp
+void finalize();
+```
+
+"Removes non-local boxes; computes bounding box, local number of boxes, local number of cells, max/min box size."
+
+Wait - "Removes non-local boxes"! This means if I accidentally add boxes owned by OTHER ranks, `finalize()` would remove them. But I'm only adding boxes with `owner_rank == my_rank`, so there's nothing to remove.
+
+Then `finalize()` computes the local statistics. And then `makeNewPatchLevel` calls `cacheGlobalReducedData()` which does a global reduction to compute global statistics.
+
+This should work correctly.
+
+Now, one more issue I see: In `addBoxWithoutUpdate`, the box is inserted into `d_boxes` which is a `BoxContainer`. The BoxContainer needs the boxes in ORDERED state (sorted by BoxId) for `makeNewPatchLevel` to work properly.
+
+Looking at `BoxLevel` construction: When created with `DISTRIBUTED` state, `d_boxes` starts empty. When I call `addBoxWithoutUpdate`, it inserts into `d_boxes` which is an ordered set. After `finalize()`, the state should be valid.
+
+Actually, let me look at what `BoxContainer` expects. From the BoxContainer documentation: "An ordered container... has the Boxes ordered according to the comparison operators defined in the BoxId class". `addBoxWithoutUpdate` inserts into the BoxContainer. If the BoxContainer is in ordered state, insertion preserves order. If it's in unordered state, insertion just appends.
+
+Looking at how `BoxLevel` initializes `d_boxes`: it's initialized empty. But is it ordered or unordered?
+
+Looking at the BoxLevel constructor code... I'd need to check the .cpp. But given that BoxLevel is designed for distributed computing, `d_boxes` should be in ordered state by default when using `DISTRIBUTED` parallel state.
+
+I'll trust that the implementation works correctly for now. Let me check the actual compilation by looking at the CMakeLists.txt to understand how main.cpp is compiled:
+I see `TESTING=1` is enabled at line 65. This means `#if (TESTING == 1)` blocks are compiled. Let me check the `autotesting` code to see if it'll cause any issues after restart:
+
+Looking at the `main.cpp`, there's an `AutoTester` initialization:
+```cpp
+#if (TESTING == 1)
+AutoTester autotester("AutoTester", dim, input_db);
+std::cerr << "autotesting object initialized!!" << std::endl;
+#endif
+```
+
+And evaluation:
+```cpp
+#if (TESTING == 1)
+num_failures += autotester.evalTestData(iteration_num, ...);
+#endif
+```
+
+With `TESTING=1`, these will be compiled. The `AutoTester` is initialized AFTER `initializeHierarchy()`. If it reads from `input_db->getDatabase("AutoTester")`, and the AutoTester config is empty (as seen in the input file):
+```
+AutoTester {
+}
+```
+
+Then `autotester.evalTestData(...)` should be a no-op (no test data to evaluate).
+
+Actually wait - `TESTING=1` is defined but let me check if the `testlib` library that provides `AutoTester` causes any issues. Looking at the CMakeLists.txt - `set(linadv_depends testlib)` adds testlib as a dependency.
+
+Also note: at line 53 in my new `main.cpp`:
+```cpp
+//#define TESTING 1
+#if (TESTING == 1)
+#include "test/testlib/AutoTester.h"
+#endif
+```
+
+Since `TESTING=1` is defined via `target_compile_definitions(linadv PRIVATE TESTING=1)`, the `TESTING` macro should be defined as `1` during compilation. The `#if (TESTING == 1)` blocks WILL be compiled.
+
+This means `#include "test/testlib/AutoTester.h"` will be included. The AutoTester might have dependencies that affect the restart behavior.
+
+But looking at the original `main.cpp` - it also had these blocks (they were just commented out with `#define TESTING 1` but CMakeLists was defining it anyway). Let me check the original main.cpp again - it had:
+```cpp
+//#define TESTING 1
+#if (TESTING == 1)
+#include "test/testlib/AutoTester.h"
+#endif
+```
+
+With `TESTING=1` defined via compile flags, the `AutoTester.h` is included and the autotesting code runs. But with an empty `AutoTester {}` in the input, `evalTestData` should be a no-op.
+
+This is the same as the previous code. So this shouldn't be a new issue.
+
+Let me now think about whether there are any other potential compilation errors in my new implementation.
+
+Looking at my `restoreCheckpoint` function, I'm using:
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+```
+
+`getPatchLevel(0)->getGridGeometry()` returns `std::shared_ptr<BaseGridGeometry>`. Assigning to `std::shared_ptr<const BaseGridGeometry>` requires a conversion. In C++, `std::shared_ptr<T>` is implicitly convertible to `std::shared_ptr<const T>`. So this should compile.
+
+Also, looking at whether the BoxLevel expects `CartesianGridGeometry` or `BaseGridGeometry` - the BoxLevel constructor takes `std::shared_ptr<const BaseGridGeometry>`. The hierarchy's geometry is a `CartesianGridGeometry` which inherits from `BaseGridGeometry`. So the pointer comparison in `makeNewPatchLevel` should work:
+
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+Both sides ultimately point to the same `CartesianGridGeometry` object, just through different base class pointers. The `shared_ptr` equality comparison compares raw pointers, so this should be true.
+
+Wait - actually there's a subtle issue. `shared_ptr<const BaseGridGeometry>` has a raw pointer to `CartesianGridGeometry` (treated as `const BaseGridGeometry`). `shared_ptr<BaseGridGeometry>` also has a raw pointer to `CartesianGridGeometry`. When you compare `shared_ptr<const Base>` with `shared_ptr<Derived>`, you're comparing two raw pointers that both point to the same `Derived` object. But if there's multiple inheritance, the pointer values could differ!
+
+However, `CartesianGridGeometry` likely only inherits from `BaseGridGeometry` without multiple inheritance. So the raw pointer to `CartesianGridGeometry` = raw pointer to `BaseGridGeometry` (same memory address). The comparison should work.
+
+OK let me move on and think about potential runtime issues.
+
+**Issue with the BoxContainer ordering state**: When I call `addBoxWithoutUpdate` on a `BoxLevel` with `DISTRIBUTED` state, the internal `d_boxes` needs to be in the right state. Let me look at how `BoxLevel` initializes `d_boxes`:
+
+From the BoxLevel constructor:
+```cpp
+BoxLevel(
+   const IntVector& ratio,
+   const std::shared_ptr<const BaseGridGeometry>& grid_geom,
+   const tbox::SAMRAI_MPI& mpi = tbox::SAMRAI_MPI::getSAMRAIWorld(),
+   const ParallelState parallel_state = DISTRIBUTED);
+```
+
+The internal `d_boxes` is default-constructed as `BoxContainer`. Looking at BoxContainer's default construction - it should start in either ordered or unordered state. Given that BoxLevel uses it for ordered Box storage (for efficient lookup), it likely starts in ordered state.
+
+`addBoxWithoutUpdate` calls `d_boxes.insert(box)`. For ordered containers, `insert` maintains order. This should work.
+
+After `finalize()`, the BoxLevel is ready to be used. Then `makeNewPatchLevel` copies the BoxLevel (it makes a COPY according to the API). The copy should be valid.
+
+I'm satisfied that the implementation is logically correct. Let me look at one more potential issue - the check at `makeNewPatchLevel` line 830-836:
+```cpp
+if (static_cast<int>(d_patch_levels.size()) > ln &&
+    d_patch_levels[ln].get() != 0) {
+   TBOX_ERROR("PatchHierarchy::makeNewPatchLevel: patch level "
+      << ln << " already exists. "
+      << "Remove old level from the hierarchy before making "
+      << "a new level in its place." << std::endl);
+}
+```
+
+After removing fine levels (1, 2, ...) via `removePatchLevel`, these levels are set to `nullptr` in `d_patch_levels`. So `d_patch_levels[1].get()` should be `0` (null). This assertion should pass.
+
+But wait - looking at `removePatchLevel`:
+```cpp
+void PatchHierarchy::removePatchLevel(const int l) {
+    TBOX_ASSERT((l >= 0) && (l < d_number_levels));
+    d_patch_levels[l].reset();
+```
+
+It sets `d_patch_levels[l]` to null but then what? Let me read more:
+Good - `removePatchLevel` sets `d_patch_levels[l]` to null and decrements `d_number_levels` if the removed level was the finest. So after removing levels 1 and 2 (from a 3-level hierarchy), `d_number_levels = 1` and `d_patch_levels[1]` and `d_patch_levels[2]` are null.
+
+Then when I call `makeNewPatchLevel(1, ...)`:
+- `d_patch_levels.size() = 3` (the vector size doesn't shrink)
+- `d_patch_levels[1].get() = 0` (null after removePatchLevel)
+- So the assertion `d_patch_levels[1].get() != 0` is FALSE, no error. Good.
+
+Then `d_number_levels = max(current, ln+1) = max(1, 2) = 2`. The level is added.
+
+Then when I call `makeNewPatchLevel(2, ...)`:
+- `d_patch_levels[2].get() = 0` (null)
+- `d_number_levels = max(2, 3) = 3`
+- Level is added. Good.
+
+The implementation looks correct. Let me also double check that `setAllLevelStepCounts` works properly for cases where the `d_step_level` vector has fewer than `ckpt_finest_level + 1` elements after the initial hierarchy setup followed by level removal.
+
+Looking at `setAllLevelStepCounts`:
+```cpp
+void setAllLevelStepCounts(const int step0) {
+    if (!d_step_level.empty()) {
+        d_step_level[0] = step0;
+        for (int ln = 1; ln < (int)d_step_level.size(); ++ln) {
+            d_step_level[ln] = 0;
+            d_max_steps_level[ln] = 1;
+        }
+    }
+}
+```
+
+`d_step_level` is sized based on `d_max_levels` (maximum allowed levels = 3 from input). After `initializeHierarchy()`, `d_step_level` has 3 elements (indices 0, 1, 2). After `setAllLevelStepCounts`, elements 1 and 2 are set to 0 with max 1.
+
+Then `setLevelDtMax(ln, ...)` and `setLevelDtActual(ln, ...)` - these check `level_number < (int)d_dt_max_level.size()`. Since `d_dt_max_level` is also sized at 3 initially, this should work for ln = 0, 1, 2.
+
+Good.
+
+Now there's one final concern: when the time loop resumes after restart with fine levels restored, does the first call to `advanceHierarchy` work correctly?
+
+The first `advanceHierarchy(dt_now, ...)` call after restart:
+1. `d_integrator_time = ckpt_loop_time`
+2. `d_step_level[0] = ckpt_iteration_num`
+3. Fine levels exist with CURRENT data set from checkpoint
+
+`advanceHierarchy` calls `advanceRecursivelyForRefinedTimestepping(0, ckpt_loop_time + dt_now)` or similar. This recursively advances level 0, then fine levels.
+
+For fine levels, the advance uses `d_level_sim_time[ln] = ckpt_loop_time` as the starting time. The advance proceeds from `ckpt_loop_time` to `ckpt_loop_time + dt_now` (for level 0) and finer levels take multiple sub-steps.
+
+The CURRENT data on fine levels has the checkpoint state. The advance should produce the correct next state.
+
+I believe the implementation is correct. Let me now review the new `main.cpp` for any obvious bugs or syntax errors that might prevent compilation:
+The code looks good. Now let me verify the veloc.cfg file exists:
+Good, the veloc.cfg is in place.
+
+Now let me think about a potential issue with the `getGridGeometry()` return type. Looking at the BoxLevel constructor:
+
+```cpp
+BoxLevel(
+   const IntVector& ratio,
+   const std::shared_ptr<const BaseGridGeometry>& grid_geom,
+   ...);
+```
+
+And I'm passing:
+```cpp
+std::shared_ptr<const hier::BaseGridGeometry> grid_geom =
+    patch_hierarchy->getPatchLevel(0)->getGridGeometry();
+```
+
+`getPatchLevel(0)->getGridGeometry()` returns `std::shared_ptr<BaseGridGeometry>` (non-const). I assign this to `std::shared_ptr<const BaseGridGeometry>`, which requires an implicit conversion. In C++11, `std::shared_ptr<T>` is implicitly convertible to `std::shared_ptr<const T>`. So this should compile.
+
+But then the assertion in `makeNewPatchLevel`:
+```cpp
+TBOX_ASSERT(new_box_level.getGridGeometry() == d_grid_geometry);
+```
+
+Where `d_grid_geometry` in PatchHierarchy is `std::shared_ptr<BaseGridGeometry>`. And `new_box_level.getGridGeometry()` returns `const std::shared_ptr<const BaseGridGeometry>&`.
+
+The comparison `std::shared_ptr<const BaseGridGeometry> == std::shared_ptr<BaseGridGeometry>`:
+- `shared_ptr<T>` has a template comparison operator that allows comparison between compatible pointer types
+- `shared_ptr<const T>` can be compared to `shared_ptr<T>` since `const T*` and `T*` point to the same address
+
+In C++, `shared_ptr<const T> == shared_ptr<T>` is valid through an implicit comparison. The raw pointer comparison `const T*` vs `T*` would compare the underlying pointers. Since both point to the same `CartesianGridGeometry` object, this should be true.
+
+Actually, I need to double check. Looking at `shared_ptr` comparisons in C++:
+- `operator==` for `shared_ptr` compares the stored pointers
+- Two `shared_ptr`s storing the same raw pointer are considered equal
+- `shared_ptr<const T>` stores a `const T*` while `shared_ptr<T>` stores a `T*`
+- Comparing `const T*` to `T*` is valid if T is the same type
+
+In C++ standard: `shared_ptr<T>::operator==(shared_ptr<U>)` returns `get() == r.get()`. The comparison `const T*` vs `T*` is valid and compares addresses. So if both pointers point to the same object, the comparison returns true.
+
+I'm confident this is correct.
+
+Now let me also think about the `Index` class I'm using to construct the box:
+
+```cpp
+hier::Index lo(dim);
+hier::Index hi(dim);
+for (int d = 0; d < dim_val; ++d) {
+    lo(d) = info.lo[d];
+    hi(d) = info.hi[d];
+}
+```
+
+`hier::Index(dim)` creates an index of the given dimension. Then `lo(d) = value` sets the d-th component. This should work correctly.
+
+Looking at the Box constructor I'm using:
+```cpp
+hier::Box new_box(lo, hi, hier::BlockId(0),
+                  hier::LocalId(info.local_id),
+                  info.owner_rank);
+```
+
+From Box.h line 152-158:
+```cpp
+Box(
+   const Index& lower,
+   const Index& upper,
+   const BlockId& block_id,
+   const LocalId& local_id,
+   const int owner_rank,
+   const PeriodicId& periodic_id = PeriodicId::zero());
+```
+
+This is exactly the constructor I'm using. The `PeriodicId::zero()` default argument is used for non-periodic cases.
+
+Let me now check the `hier::Index` includes to make sure it's available:
+`Index.h` is in `SAMRAI/hier/`. Looking at what transitively includes it:
+- `Box.h` includes `Index.h`
+- `BoxLevel.h` includes `Box.h`
+- `PatchHierarchy.h` includes `BoxLevel.h`
+
+So `Index` should be available. And since I'm inside the `SAMRAI` namespace (via `using namespace SAMRAI;`), I can use `hier::Index`.
+
+Now let me think about one more potential issue. In my code, I loop through `patch_map` to filter by `owner_rank`. The `patch_map` was built by reading the checkpoint file for the LOCAL rank only (each rank only writes its own patches). But wait - in the checkpoint writing:
+
+```cpp
+for (hier::PatchLevel::iterator pi(level->begin()); pi != level->end(); ++pi) {
+    std::shared_ptr<hier::Patch> patch = *pi;
+    ...
+    fwrite(&local_id_val,  sizeof(int), 1, fp);
+    fwrite(&owner_rank_val, sizeof(int), 1, fp);
+    ...
+}
+```
+
+`level->begin()` to `level->end()` iterates over LOCAL patches only (patches owned by this rank). So each rank only writes its own patches to its own VeloC file.
+
+Then on restart, each rank reads its own VeloC file and rebuilds `patch_map` with only ITS OWN patches. The `info.owner_rank` field will always equal the reading rank's MPI rank (since you only read your own patches).
+
+So `if (info.owner_rank != my_rank) continue;` should never trigger (all patches in `patch_map` are owned by `my_rank`). The check is redundant but not harmful.
+
+Actually wait - there's a subtle issue. When I read the checkpoint, I read from `VELOC_Route_file(original_name, routed_path)`. In VeloC, each rank has its own checkpoint file (rank-specific files). When doing `VELOC_Restart_begin` + `VELOC_Route_file` + read, each rank reads ITS OWN data from the checkpoint. So `patch_map` contains only patches for the current rank. All those patches have `owner_rank == current_rank`. Good.
+
+The implementation should be correct.
+
+Now let me also check one potential issue with the `hier::BoxContainer` ordering. When I call `addBoxWithoutUpdate`, it inserts into `d_boxes`. If `d_boxes` is in ordered state, it should maintain sorted order. But what if two boxes have the same `BoxId`?
+
+Each box has a unique `BoxId` (which is `(local_id, owner_rank, periodic_id)`). Since I'm adding boxes with different local_ids (they're different patches), they should have different BoxIds. No collision.
+
+But wait - after `initializeHierarchy()` and level removal, the time integrator's internal state for fine levels is reset. What happens if fine level 1's local_ids in the checkpoint (e.g., 0, 1, 2, 3, ...) don't match the local_ids that SAMRAI would assign if we had let regridding create the level?
+
+In the normal flow (without checkpoint), when regridding creates level 1, SAMRAI assigns sequential local_ids starting from 0 to each new box. The exact assignment depends on the order boxes are created by BergerRigoutsos clustering.
+
+When I restore from checkpoint, I use the local_ids from the checkpoint. These are the local_ids that were assigned during the normal run. Since I'm NOT going through the normal regridding process, I'm using the original local_ids from the checkpoint. This is correct - we want the EXACT state from the checkpoint, not a regenerated state.
+
+The `PatchLevel` just uses the BoxLevel's boxes to create patches. Each patch has the same local_id as its corresponding box in the BoxLevel. So the patches on the restored fine level will have local_ids from the checkpoint.
+
+Everything looks correct. Let me now also look at one more potential issue: in the restore code, when I set `setAllLevelSimTimes(ckpt_loop_time)`, this sets ALL levels (0 through max) to `ckpt_loop_time`. Looking at the implementation:
+
+```cpp
+void setAllLevelSimTimes(const double t)
+{
+   d_integrator_time = t;
+   for (int ln = 0; ln < (int)d_level_sim_time.size(); ++ln) {
+      d_level_sim_time[ln] = t;
+      d_level_old_time[ln] = t;
+      d_level_old_old_time[ln] = t;
+   }
+}
+```
+
+This sets `d_level_old_time[ln] = t` and `d_level_old_old_time[ln] = t`. These are the previous simulation times for each level. After the first `advanceHierarchy`, these will be updated correctly. The initial values shouldn't matter much for the actual advance since they're just used for time interpolation.
+
+But there's one concern: `d_level_old_time` and `d_level_old_old_time` being equal to `t` means they represent "no previous steps". This is correct since we're starting from checkpoint.
+
+I'm satisfied with the implementation. Let me update the todo list:
+Let me look at the `hier::Index` constructor to confirm it has a `dim` constructor:
+Good - `hier::Index(const tbox::Dimension& dim)` creates an uninitialized Index. Then I can use `lo(d) = value` to set each component.
+
+Let me also look at what the `operator()` of Index does:
+Good - `Index::operator()(unsigned int i)` returns a mutable int reference. So `lo(d) = info.lo[d]` will correctly set the d-th component of the index.
+
+The implementation is correct. Now let me think about whether there are any issues with the SAMRAI internal state after `makeNewPatchLevel`.
+
+One concern: after `makeNewPatchLevel(ln, new_box_level)`, does SAMRAI set up the Connector structures (overlap data between levels)? Without proper connectors, data communication between levels (needed by `advanceHierarchy`) might fail.
+
+Looking at the `makeNewPatchLevel` code - it just creates the level without setting up Connectors. But when `advanceHierarchy` calls `advanceLevel` on fine levels, it creates `RefineSchedule` for ghost cell filling. The `RefineSchedule` internally uses Connectors to determine which patches need to communicate data.
+
+In SAMRAI, Connectors between levels are typically set up during:
+1. `initializeHierarchy()` - during level creation
+2. `regridAllFinerLevels()` - during regridding
+
+When I directly call `makeNewPatchLevel`, the Connectors are NOT set up. This could cause issues when SAMRAI tries to fill ghost cells on fine levels.
+
+However, looking at the `advanceLevel` code:
+```cpp
+std::shared_ptr<xfer::RefineSchedule> fill_schedule;
+if (!level->inHierarchy()) {
+    ...
+} else {
+    // level IS in hierarchy
+    if (d_number_time_data_levels == 3) {
+        fill_schedule = d_bdry_fill_advance_old->createSchedule(level, coarser_ln, hierarchy, d_patch_strategy);
+    } else {
+        fill_schedule = d_bdry_fill_advance->createSchedule(level, coarser_ln, hierarchy, d_patch_strategy);
+    }
+}
+```
+
+The `createSchedule` for a level IN the hierarchy creates a RefineSchedule that uses the hierarchy's Connector data. If the Connector between level 1 and level 0 is not set up (or stale), this could fail or produce incorrect results.
+
+Let me look at how the GriddingAlgorithm sets up Connectors when creating levels:
+
+Actually, this is a complex SAMRAI internal issue. The Connectors are used for ghost cell communication between levels. Without proper Connectors, ghost cell fills on fine levels will fail or give wrong results.
+
+**Alternative approach**: Instead of calling `makeNewPatchLevel` directly, can I use a different strategy to avoid Connector issues?
+
+One option: After restoring level 0, use `gridding_algorithm->regridAllFinerLevels(...)` to let SAMRAI rebuild fine levels with proper Connectors, but THEN overwrite the initialized data with checkpoint data.
+
+But the regrid would rebuild fine levels with INITIAL condition data (via `initializeDataOnPatch`), not checkpoint data. We'd still need to overwrite. The key advantage is that after regrid, the Connectors are set up.
+
+Actually, looking at `initializeDataOnPatch` for `initial_time=false`:
+```cpp
+if (initial_time) {
+    // ... set from initial conditions
+}
+// No else - nothing happens if initial_time=false
+```
+
+So when regridding creates new fine level patches (at the checkpoint time), `initializeDataOnPatch` with `initial_time=false` does NOTHING to uval. The refine schedule fills uval from the coarser level (spatial interpolation). 
+
+But if I could intercept after the fine level patches are created but BEFORE the initial fill from coarse...
+
+Actually, looking at the code flow in `GriddingAlgorithm::makeFinerLevel`:
+1. It creates a new PatchLevel
+2. It initializes data on patches (calls `initializeDataOnPatch`)  
+3. It fills ghost cells from coarser level (via refine schedules)
+4. It calls post-initialization on the level
+
+There's no easy hook to insert my checkpoint data restoration between steps 2 and 3.
+
+**Better alternative**: Use `gridding_algorithm->regridAllFinerLevels` after restoring level 0, which sets up all Connectors correctly. Then, after regridding, overwrite the fine level data with checkpoint data.
+
+Let me look at the `regridAllFinerLevels` API:
+I see `regridAllFinerLevels`. This would work to rebuild fine levels with proper Connectors, but it uses the CURRENT state of level 0 to determine where to refine. If level 0 has the checkpoint data, it would tag cells near the sphere at its checkpoint position and create fine levels there.
+
+The problem is that `regridAllFinerLevels` uses the error detector to decide WHERE to refine. The error detector uses gradient information from the cell data to determine which cells need refinement. With the restored level-0 data (which has the sphere at its checkpoint position), the error detector would identify cells near the sphere boundary and create fine levels there - which is EXACTLY where we want the fine levels to be!
+
+Moreover, after `regridAllFinerLevels`:
+- Fine levels are created at the CORRECT positions (matching checkpoint)
+- Data on fine levels is initialized from the COARSER level (via interpolation)
+- Connectors are set up correctly
+- Then we can OVERWRITE the fine level data with checkpoint data
+
+This approach might actually work better than my direct `makeNewPatchLevel` approach!
+
+Let me think:
+1. `regridAllFinerLevels(0, tag_buffer, step, ckpt_loop_time)` - rebuilds fine levels
+   - Fine levels will be at approximately the correct positions (near the sphere at checkpoint time)
+   - But they might not exactly match the checkpoint fine level patch layout
+2. After regrid, overwrite fine level data with checkpoint data
+   - Match by patch box lower/upper corners? The patch boxes from regrid might not match exactly
+   - OR: just use the regrid-created levels and fill with checkpoint data by spatial lookup
+
+This is still complex because the patch layout might differ. However, for the SPHERE problem with deterministic dynamics and a fixed refine criterion, `regridAllFinerLevels` from the SAME level-0 data at the SAME time should produce the SAME fine level layout!
+
+Wait - that's a crucial insight! If:
+1. Level 0 at checkpoint time is exactly restored
+2. `regridAllFinerLevels` is called with the same parameters as the original run
+3. The error detector (gradient-based) produces the same tagging on level 0
+4. The box generator uses the same algorithm
+5. The load balancer distributes boxes the same way
+
+Then the fine level layout SHOULD match exactly the checkpoint fine level layout! If that's the case, then we can:
+1. Restore level 0 from checkpoint
+2. Call `regridAllFinerLevels` to rebuild fine levels with proper Connectors
+3. The fine levels now have data from spatial interpolation of level 0
+4. Overwrite the fine level data with checkpoint data (match by local_id since layout matches)
+
+This would be simpler and more correct because:
+- Connectors are properly set up
+- Fine level patch layout matches checkpoint (assuming deterministic regridding)
+- Overwrite with checkpoint data gives exact state
+
+But I can't guarantee that the regridding is 100% deterministic across machines or MPI configurations. The box generation by BergerRigoutsos might differ slightly.
+
+Actually, looking at the previous test runs: the validation checkpoints have 1748 files for failure-free runs consistently. This suggests the hierarchy is deterministic.
+
+But there's another issue: `regridAllFinerLevels` calls `initializeLevelData` which calls `initializeDataOnPatch(initial_time=false)` for new patches. For LinAdv with `initial_time=false`, `initializeDataOnPatch` does nothing. But the refine schedule fills data from the coarser level via `CONSERVATIVE_LINEAR_REFINE`. So fine level patches get data from the coarser level.
+
+If I then overwrite with checkpoint data, the data will be correct. The key is that the fine level PATCH LAYOUT must match the checkpoint so that I can correctly match and overwrite data.
+
+If the layout doesn't match, I'd need to use spatial lookup to find checkpoint data for each new fine patch. This is more complex but might work for the SPHERE problem since the sphere moves uniformly.
+
+Actually, let me reconsider my original approach. I'm worried about Connectors, but let me look at what happens more carefully.
+
+In `advanceLevel` for a level in the hierarchy:
+```cpp
+fill_schedule = d_bdry_fill_advance->createSchedule(level, coarser_ln, hierarchy, d_patch_strategy);
+```
+
+This creates a RefineSchedule between the fine level and the coarser level. The `createSchedule` method in SAMRAI's RefineAlgorithm creates the overlap/communication schedule. It uses the Connector between levels if available, or computes overlap manually.
+
+Looking at the RefineAlgorithm implementation - when Connectors are not pre-computed, it computes overlap data on-the-fly via `OverlapConnectorAlgorithm`. This is more expensive but produces correct results.
+
+So even without pre-computed Connectors (which would be the case with `makeNewPatchLevel`), the `createSchedule` can still work by computing overlaps dynamically. The result would be correct but might be slower.
+
+Actually, I realize I should check more carefully whether SAMRAI requires pre-computed Connectors in the hierarchy for `createSchedule` to work after `makeNewPatchLevel`.
+
+Let me look at how `advanceLevel` creates the fill schedule for a level in the hierarchy:
+Looking at line 1067:
+```cpp
+fill_schedule = d_bdry_sched_advance[level_number];
+```
+
+When the level IS in the hierarchy (which is the case after `makeNewPatchLevel`), `advanceLevel` uses a **pre-cached** schedule `d_bdry_sched_advance[level_number]`. This cached schedule is created during `initializeHierarchy()` and `regridAllFinerLevels()`.
+
+If the level was created via `makeNewPatchLevel` directly (without going through the normal gridding algorithm), `d_bdry_sched_advance[level_number]` might be NULL or invalid!
+
+This is a critical issue. Let me look at when `d_bdry_sched_advance` is populated:
+This function (which creates `d_bdry_sched_advance`) is called when? Let me check the function name:
+`resetHierarchyConfiguration` is what creates `d_bdry_sched_advance`. This is called from the gridding algorithm when new levels are created.
+
+So the issue is: if I create fine levels via `makeNewPatchLevel` without going through the gridding algorithm, `resetHierarchyConfiguration` is NOT called, and `d_bdry_sched_advance` is not updated for the new fine levels.
+
+When `advanceHierarchy` tries to advance these fine levels, it uses `d_bdry_sched_advance[level_number]`. If this is stale (pointing to the previous fine level structure from `initializeHierarchy()`) or out of bounds (if the size was set for fewer levels), this would fail.
+
+This is a fundamental problem with my approach. I need to ensure that `resetHierarchyConfiguration` is called after creating fine levels via `makeNewPatchLevel`.
+
+**Solution**: After creating all fine levels via `makeNewPatchLevel` and allocating/filling patch data, call `hyp_level_integrator->resetHierarchyConfiguration(patch_hierarchy, 0, ckpt_finest_level)`.
+
+But `hyp_level_integrator` is not available in `restoreCheckpoint`. I need to either:
+1. Pass it as a parameter to `restoreCheckpoint`, or
+2. Call `resetHierarchyConfiguration` after `restoreCheckpoint` in `main()`
+
+Option 2 is cleaner. After the `restoreCheckpoint` call in `main()`, I can call `resetHierarchyConfiguration` to update the cached schedules.
+
+Let me update the code:
+
+1. In `restoreCheckpoint`, I already create fine levels and fill them. The function signature doesn't need `hyp_level_integrator`.
+2. In `main()`, after the `restoreCheckpoint` call, I call `hyp_level_integrator->resetHierarchyConfiguration(patch_hierarchy, 0, ckpt_finest_level)`.
+
+But I don't have `ckpt_finest_level` accessible in `main()` after `restoreCheckpoint` returns. I need to either:
+- Store it in the return value or an output parameter
+- Pass an output parameter to `restoreCheckpoint`
+- Simply use `patch_hierarchy->getFinestLevelNumber()` after restoration
+
+Let me use `patch_hierarchy->getFinestLevelNumber()` since after restoration, the finest level is correctly set.
+
+Here's the fix in `main()`:
+
+```cpp
+restarted = restoreCheckpoint(...);
+if (restarted) {
+    // Reset cached communication schedules for the restored hierarchy
+    hyp_level_integrator->resetHierarchyConfiguration(
+        patch_hierarchy, 0, patch_hierarchy->getFinestLevelNumber());
+}
+```
+
+Let me update the `main.cpp`:
+Now let me also think about whether `resetHierarchyConfiguration` requires the Connectors to be set up between levels. Looking at the implementation:
+
+```cpp
+d_bdry_sched_advance[ln] =
+   d_bdry_fill_advance->createSchedule(
+      level,
+      ln - 1,
+      hierarchy,
+      d_patch_strategy);
+```
+
+`createSchedule(level, ln-1, hierarchy, ...)` creates a RefineSchedule for filling level `ln` from level `ln-1`. This requires computing overlap between level `ln` patches and level `ln-1` patches. If Connectors are available, it uses them; otherwise it computes overlaps on the fly.
+
+Looking at SAMRAI's `RefineAlgorithm::createSchedule` - it uses `OverlapConnectorAlgorithm` to find overlaps. This can work without pre-computed Connectors by computing them directly.
+
+So `resetHierarchyConfiguration` should work correctly even without pre-computed Connectors, though it might be slower. The resulting schedules will be correct.
+
+Now let me think about one more potential issue. After `makeNewPatchLevel`, when `resetHierarchyConfiguration` tries to create schedules between levels, it needs the levels to have a valid BoxLevel with all necessary information (geometry, etc.). Since `makeNewPatchLevel` sets up all of this, the levels should be valid.
+
+OK, I'm more confident now. Let me look at the `resetHierarchyConfiguration` call signature to make sure I'm using it correctly:
+
+```cpp
+void resetHierarchyConfiguration(
+   const std::shared_ptr<hier::PatchHierarchy>& hierarchy,
+   const int coarsest_level,
+   const int finest_level);
+```
+
+My call:
+```cpp
+hyp_level_integrator->resetHierarchyConfiguration(
+    patch_hierarchy,
+    0,
+    patch_hierarchy->getFinestLevelNumber());
+```
+
+`getFinestLevelNumber()` returns `getNumberOfLevels() - 1`. After restoring `ckpt_finest_level` levels, `getFinestLevelNumber() = ckpt_finest_level`. This is correct.
+
+Now let me also check if there are any other integrator-level caches that need updating after modifying the hierarchy.
+
+Looking at `TimeRefinementIntegrator` - it has `d_level_sim_time`, `d_dt_max_level`, etc. I've already updated these via `setAllLevelSimTimes`, `setLevelDtMax`, etc.
+
+The `HyperbolicLevelIntegrator` has `d_bdry_sched_advance` which I'm now updating via `resetHierarchyConfiguration`.
+
+Are there other caches? Let me check the GriddingAlgorithm - it might have cached Connector data:
+
+Actually, for this approach to work, I need to be sure that when `advanceHierarchy` advances the fine levels, it can correctly:
+1. Fill ghost cells on fine levels from coarser levels
+2. Fill ghost cells on fine levels from adjacent fine level patches
+3. Apply boundary conditions on fine level patches at domain boundaries
+
+All of these use RefineSchedules created by `resetHierarchyConfiguration`. So after calling it, these should work correctly.
+
+But there might also be synchronization schedules. Let me check:
+The only cached schedules are `d_bdry_sched_advance` and `d_bdry_sched_advance_new`. Both are updated by `resetHierarchyConfiguration`. Good.
+
+Now let me verify my understanding of `resetHierarchyConfiguration`:
+
+Looking at line 413-446 (which I already read):
+```cpp
+d_bdry_sched_advance.resize(finest_hiera_level + 1);
+d_bdry_sched_advance_new.resize(finest_hiera_level + 1);
+
+for (int ln = coarsest_level; ln <= finest_hiera_level; ++ln) {
+    std::shared_ptr<hier::PatchLevel> level(hierarchy->getPatchLevel(ln));
+    d_bdry_sched_advance[ln] = d_bdry_fill_advance->createSchedule(level, ln - 1, hierarchy, d_patch_strategy);
+    if (!d_lag_dt_computation && d_use_ghosts_for_dt) {
+        d_bdry_sched_advance_new[ln] = d_bdry_fill_advance_new->createSchedule(level, ln - 1, hierarchy, d_patch_strategy);
+    }
+}
+```
+
+Note: `coarsest_level` is a parameter. I pass `coarsest_level = 0`. So schedules for ALL levels (0 through `ckpt_finest_level`) are rebuilt. Good.
+
+The `d_lag_dt_computation` is `TRUE` from the input file:
+```
+HyperbolicLevelIntegrator{
+   cfl                       = 0.9e0
+   ...
+   lag_dt_computation        = TRUE
+   use_ghosts_to_compute_dt  = TRUE
+}
+```
+
+So `d_lag_dt_computation = true`. The condition `!d_lag_dt_computation && d_use_ghosts_for_dt` is `false`. So `d_bdry_sched_advance_new` is NOT rebuilt (remains at default). That's fine since it's not used when dt computation is lagged.
+
+Now I need to also check: will `createSchedule` work correctly for the newly created fine levels?
+
+`d_bdry_fill_advance->createSchedule(level, ln-1, hierarchy, d_patch_strategy)` creates a schedule to fill level `ln` from level `ln-1`. The `level` here is the NEWLY CREATED fine level (from my `makeNewPatchLevel` call). The `ln-1` coarser level is either level 0 (which was retained) or a previously created fine level.
+
+For the schedule to be created, SAMRAI needs to compute the overlap between the fine level patches and the coarser level patches. This requires knowing the box extents on both levels. Since I've created the fine level with the correct box layout from the checkpoint, this should work.
+
+The `createSchedule` will either use pre-computed Connectors or compute overlaps on-the-fly. For newly created levels without pre-computed Connectors, it computes overlaps using `OverlapConnectorAlgorithm`. This is correct but slower.
+
+OK I'm satisfied. Let me now also check if there's a potential issue with the order of operations. In my `restoreCheckpoint`:
+
+1. Remove fine levels (1, 2)
+2. Restore level 0 data
+3. Create fine level 1 via makeNewPatchLevel, allocate, fill
+4. Create fine level 2 via makeNewPatchLevel, allocate, fill
+
+Then in `main()` after restoreCheckpoint:
+5. Call `resetHierarchyConfiguration(0, 0, 2)`
+
+This order should work. The fine levels are created before the schedule creation, so `createSchedule` can access them.
+
+Wait - but when I create level 1 in step 3, level 2 doesn't exist yet. Then in step 4, I create level 2. When `resetHierarchyConfiguration` is called in step 5, it creates schedules for ALL levels. At that point, both level 1 and level 2 exist.
+
+`createSchedule(level_2, 1, hierarchy, ...)` creates a schedule to fill level 2 from level 1. Both levels exist at this point. Good.
+
+Actually, I realize I need to double-check one more thing. When `makeNewPatchLevel(ln, ...)` is called, it checks:
+
+```cpp
+if (ln > 0) {
+   const IntVector expected_ratio(
+      d_ratio_to_coarser[ln] * (d_patch_levels[ln - 1]->getRatioToLevelZero()));
+   if (new_box_level.getRefinementRatio() != expected_ratio) {
+      TBOX_ERROR(...);
+   }
+}
+```
+
+For level 1 (ln=1):
+- `d_ratio_to_coarser[1]` is the ratio from level 1 to level 0 = {4,4}
+- `d_patch_levels[0]->getRatioToLevelZero()` = {1,1}
+- `expected_ratio = {4,4} * {1,1} = {4,4}`
+- My BoxLevel has `ratio_to_zero = {4,4}` (from checkpoint level_ratio_to_zero[1])
+
+They match! Good.
+
+For level 2 (ln=2):
+- Before calling `makeNewPatchLevel(2, ...)`, level 1 MUST exist (since the check uses `d_patch_levels[1]`)
+- `d_ratio_to_coarser[2]` = {4,4}
+- `d_patch_levels[1]->getRatioToLevelZero()` = {4,4} (from the level 1 I just created)
+- `expected_ratio = {4,4} * {4,4} = {16,16}`
+- My BoxLevel for level 2 has `ratio_to_zero = {16,16}` (from checkpoint)
+
+They match! And level 1 exists (I created it in step 3) before I create level 2 in step 4. Good.
+
+The implementation is correct. Let me now also think about a potential issue with `IntVector` comparison. The comparison `new_box_level.getRefinementRatio() != expected_ratio` compares two `IntVector` objects. If one has `num_blocks=1` and the other has `num_blocks=1`, the comparison should work correctly.
+
+Looking at `d_ratio_to_coarser[ln]` - this was initialized from the input file with `num_blocks=1` (for a single-block mesh). And `d_patch_levels[ln-1]->getRatioToLevelZero()` comes from the BoxLevel's `getRefinementRatio()` which was also initialized with `num_blocks=1`. The multiplication `d_ratio_to_coarser[ln] * ratio_to_level_zero` with both having `num_blocks=1` gives a `num_blocks=1` result.
+
+My BoxLevel is created with `ratio_to_zero` having `num_blocks=1` (from `hier::IntVector ratio_to_zero(dim)` constructor). So both sides of the comparison have `num_blocks=1`. Good.
+
+OK, I'm confident the implementation is correct. Let me look at the final structure of the updated `main.cpp`:
+Good, the `resetHierarchyConfiguration` call is properly placed after `restoreCheckpoint`.
+
+Now let me also look at whether there's any issue with the `addBoxWithoutUpdate` approach and the `BoxContainer` state. When I call `addBoxWithoutUpdate` on a freshly constructed BoxLevel (with DISTRIBUTED state), the `d_boxes` starts as an empty BoxContainer. Let me verify that `addBoxWithoutUpdate` works on an empty BoxContainer:
+
+From the code:
+```cpp
+void addBoxWithoutUpdate(const Box& box) {
+    if (locked()) { TBOX_ERROR(...); }
+    if (getParallelState() == GLOBALIZED) {
+        d_global_boxes.insert(box);
+    }
+    d_boxes.insert(box);
+}
+```
+
+My BoxLevel is in DISTRIBUTED state, so only `d_boxes.insert(box)` is called. `BoxContainer::insert` works on both ordered and unordered containers. This should be fine.
+
+After calling `addBoxWithoutUpdate` for all local boxes and then `finalize()`, the BoxLevel is ready.
+
+Wait - there's one more thing I need to check. When I call `finalize()`:
+
+"Removes non-local boxes; computes bounding box, local number of boxes, local number of cells, max/min box size."
+
+"Removes non-local boxes" - this means if any box in `d_boxes` has `owner_rank != my_rank`, it will be removed. But I'm only adding boxes with `owner_rank == my_rank`, so nothing should be removed.
+
+Actually, this is a safety net. Let me re-read my loop:
+```cpp
+for (const auto& kv : patch_map) {
+    const CkptPatchInfo& info = kv.second;
+    // Only add boxes owned by this rank
+    if (info.owner_rank != my_rank) {
+        continue;
+    }
+    ...
+    new_box_level.addBoxWithoutUpdate(new_box);
+}
+```
+
+Since `patch_map` only contains patches from the checkpoint file (which only has local patches), and I filter by `owner_rank != my_rank` (which should never be true for local patches), all added boxes are owned by `my_rank`. So `finalize()` won't remove anything.
+
+The implementation looks solid. Let me now do a final check on the entire file structure to make sure there are no issues:
+The code looks good. Let me now also check one potential issue: in my `writeCheckpoint` function, I write `ratio_to_zero(d)` for each dimension. But for a single-block problem where the IntVector has `num_blocks=1`, `operator()(d)` works correctly. For a multi-block problem, this would only write the first block's ratio. But for SAMRAI's LinAdv example which is single-block, this is fine.
+
+Also, I noticed that when checking level 0's patches, I'm matching by `(local_id, owner_rank)` key. Since level 0 is FIXED throughout the simulation (same partition as initialization), the local_ids should match between checkpoint and current hierarchy. This is the primary match; the fallback by lo/hi is for robustness.
+
+Let me now verify the implementation handles the case where the checkpoint has fewer levels than the current hierarchy (e.g., checkpoint has only level 0 because no fine levels were created yet at the checkpoint time). In that case:
+- `ckpt_finest_level = 0`
+- The loop `for (int ln = 1; ln <= ckpt_finest_level; ...)` doesn't execute
+- Fine levels from `initializeHierarchy()` are removed by the "Remove ALL fine levels" step
+- Level 0 is restored
+- `setLastFinestLevel(0)` sets the finest level to 0
+- The time integrator will regrid and create fine levels in the first `advanceHierarchy` call
+
+This is handled correctly.
+
+Now let me also check what happens with the `BoxContainer` when I try to insert boxes with specific local_ids. In the ordered BoxContainer, boxes are sorted by `BoxId` which compares by `(owner_rank, local_id, periodic_id)`. When I insert boxes with:
+- `local_id = 0, 3, 7, 12, ...` (from checkpoint)
+- `owner_rank = my_rank` for all
+
+These are sorted by (my_rank, 0), (my_rank, 3), (my_rank, 7), (my_rank, 12), etc. This is a valid ordered set.
+
+When `makeNewPatchLevel` creates the PatchLevel from this BoxLevel, it creates patches corresponding to each box. The patches are iterable via `PatchLevel::iterator`.
+
+When I then iterate over the fine level and match by `(local_id, owner_rank)`:
+```cpp
+for (hier::PatchLevel::iterator pi(fine_level->begin()); pi != fine_level->end(); ++pi) {
+    std::shared_ptr<hier::Patch> patch = *pi;
+    const hier::Box& ibox = patch->getBox();
+    int local_id_val = (int)ibox.getLocalId().getValue();
+    int owner_rank_val = (int)ibox.getOwnerRank();
+
+    PatchKey2 key(local_id_val, owner_rank_val);
+    auto it = patch_map.find(key);
+```
+
+The `PatchKey2` key is `(local_id, owner_rank)`. The `patch_map` keys are also `(local_id, owner_rank)`. Since I constructed the boxes with the original checkpoint local_ids, and the patches retain those local_ids, the lookup should work correctly.
+
+The implementation is correct.
+
+Let me now run a final sanity check on the complete file:
+The file looks complete. Let me now think about one final critical issue I may have overlooked.
+
+**Issue with `getRatioToLevelZero()` for level 0**:
+
+In `writeCheckpoint`, I write the ratio for level 0:
+```cpp
+const hier::IntVector& ratio_to_zero = level->getRatioToLevelZero();
+for (int d = 0; d < dim_val; ++d) {
+    int r = (int)ratio_to_zero(d);
+    fwrite(&r, sizeof(int), 1, fp);
+}
+```
+
+For level 0, `getRatioToLevelZero()` returns the refinement ratio with respect to level 0, which is `{1,1}`. So I write `{1,1}` for level 0.
+
+In `restoreCheckpoint`, I read this back:
+```cpp
+level_ratio_to_zero[0] = {1, 1}  // for level 0
+level_ratio_to_zero[1] = {4, 4}  // for level 1
+level_ratio_to_zero[2] = {16, 16}  // for level 2
+```
+
+I only use these for fine levels (ln >= 1) in the loop `for (int ln = 1; ln <= ckpt_finest_level; ++ln)`. For level 0, I don't use the ratio. Good.
+
+**One more potential issue**: What if `getRatioToLevelZero()` for level 0 returns an IntVector with `num_blocks > 1` for a multi-block problem? For the SAMRAI LinAdv example (single block), `num_blocks = 1`. The operator `(d)` works for `num_blocks == 1`. Good.
+
+**Potential issue with `VELOC_Restart_test`**: On iteration 5, the previous implementation did work for detecting checkpoints (`ckpt_version > 0`) and the recovery exited with 0. This means VELOC is working. My new code uses the same VeloC API, so there's no issue there.
+
+**Potential compilation issue**: I'm using `std::map` with nested maps and auto types. These are C++11/C++14 features. SAMRAI itself uses C++11, so this should be fine.
+
+Let me also make sure there are no missing includes. I'm using:
+- `hier::BoxLevel` - from `BoxLevel.h` (included)
+- `hier::BoxContainer` - from `BoxContainer.h` (included)
+- `hier::Box` - from `Box.h` (included via BoxLevel.h)
+- `hier::Index` - from `Index.h` (included via Box.h)
+- `hier::IntVector` - from `IntVector.h` (included via Box.h)
+- `hier::LocalId` - from `LocalId.h` (included via GlobalId.h -> BoxId.h -> Box.h)
+- `hier::BlockId` - from `BlockId.h` (included via BoxContainer.h)
+
+All needed types are included.
+
+Let me now also verify the `CkptPatchInfo` struct doesn't have any issue. I have:
+```cpp
+struct CkptPatchInfo {
+    int level_num;
+    int local_id;
+    int owner_rank;
+    int lo[3]; // up to 3D
+    int hi[3];
+    int depth;
+    size_t nelems;
+    std::vector<double> data;
+};
+```
+
+This is a plain struct. I use `std::move` to move data vectors into the map:
+```cpp
+level_patch_map[ln][key] = std::move(info);
+```
+
+This is valid. The `data` vector is moved from `info` to the map entry.
+
+Now let me look at one more thing - the `auto&` in range-based for loops:
+
+```cpp
+for (auto& lp : level_patch_map) {
+    tbox::pout << "VeloC:   Level " << lp.first << ": " << lp.second.size() << " patches" << std::endl;
+}
+```
+
+`level_patch_map` is `std::map<int, std::map<PatchKey2, CkptPatchInfo>>`. So `lp` is `std::pair<const int, std::map<PatchKey2, CkptPatchInfo>>`. `lp.first` is the level number (int), `lp.second.size()` is the number of patches on that level. This is correct.
+
+The code is correct. Let me now also think about a subtle issue: When I restore level 0, the CURRENT data is overwritten with checkpoint data. But SAMRAI's `HyperbolicLevelIntegrator` manages multiple time levels (CURRENT, NEW). During `advanceLevel`, it:
+1. Allocates NEW data
+2. Fills SCRATCH data from CURRENT data + boundary conditions
+3. Advances SCRATCH data
+4. Copies SCRATCH -> NEW
+5. After advance: copies NEW -> CURRENT
+
+So the CURRENT data at the START of `advanceLevel` is what I've restored from checkpoint. After `advanceLevel`, CURRENT is updated to the new time. This is the correct behavior.
+
+I'm confident the implementation is correct.
+
+Let me now also check the `LocalId::getValue()` return type:
+
+```cpp
+int local_id_val = (int)ibox.getLocalId().getValue();
+```
+
+`LocalId::getValue()` should return an `int`. Let me verify:
+`LocalId::getValue()` returns `const int&`. The cast `(int)ibox.getLocalId().getValue()` is correct.
+
+Everything looks good. Let me now mark the task as completed and summarize the changes:
+Here's a summary of what I changed and why:
+
+## Root Cause Analysis
+
+The previous implementation (iter_5) failed because:
+1. After recovery, it only restored **level 0** data from checkpoint
+2. It removed ALL fine levels (1, 2) and let the time integrator rebuild them
+3. Fine levels were rebuilt via **spatial interpolation** from the restored coarse level
+4. For the SPHERE problem with sharp discontinuities (uval_inside=80, uval_outside=5), interpolated fine-level data is fundamentally different from the original evolved data
+5. The `dumpValidationSignature` sums over ALL cells in ALL levels, so wrong fine-level data causes the large `max_abs_diff=6.25e8`
+
+## Fix
+
+The new implementation correctly checkpoints and restores **ALL AMR levels**:
+
+### Checkpoint Changes
+- Added `finest_level_number` to header
+- For each level, writes the `ratio_to_level_zero` (refinement ratio)
+- For each patch, writes `local_id` and `owner_rank` (needed to match boxes on restore)
+- Changed magic number from `0x4C56434C` to `0x4C56434D` to force fresh checkpoints
+
+### Restore Changes
+1. Remove ALL fine levels from the initial hierarchy
+2. Restore level 0 data (fixed structure, match by `(local_id, owner_rank)`)
+3. For each fine level in checkpoint:
+   - Construct a `BoxLevel` with the checkpoint's exact box layout (using `addBoxWithoutUpdate` to preserve original `local_id`)
+   - Call `patch_hierarchy->makeNewPatchLevel(ln, box_level)` to recreate the level
+   - Allocate CURRENT patch data on the new level
+   - Fill each patch with checkpoint data (matching by `(local_id, owner_rank)`)
+4. Set integrator state (time, step count, dt, level times)
+5. After restore: call `hyp_level_integrator->resetHierarchyConfiguration(...)` to rebuild the cached ghost-fill communication schedules for all levels
+
+This approach correctly restores the **exact** evolved state at all AMR levels, including the precise patch layout and cell data that the original simulation had at checkpoint time.

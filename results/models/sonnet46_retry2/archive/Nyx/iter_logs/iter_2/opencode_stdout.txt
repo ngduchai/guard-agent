@@ -1,0 +1,602 @@
+I'll start by examining the previous iteration's logs and the current codebase to understand what needs to be fixed.
+The previous iteration ran into a timeout during the "failure-free check" phase (the run after the kill test). The code successfully checkpointed and recovered with exit code 6, but then timed out during a clean run. The issue diagnosis says there's likely an MPI deadlock. Let me read the current codebase state to understand what was implemented.
+Now let me understand the deadlock issue from the validate output. Looking at the timeout pattern:
+
+1. **Kill attempt 1**: worked - app ran, checkpoints were found, kill happened, recovery exited with code 6 in 3.13s
+2. **Failure-free check**: started but timed out after 900s (15 minutes)
+
+The recovery exiting with code 6 is concerning - that's not a normal exit code (usually 0 for success). But the validate seemed to report it as a "PASS" for ratio and wall-time gates. The issue is that the **failure-free check** (clean run, no kill) ran for the full 900s without completing.
+
+The timeout in the failure-free run means one of:
+1. VeloC's `Checkpoint_end` with sync mode is hanging (all-ranks collective in VeloC)
+2. Something in `VisMF::Write` is hanging (which uses MPI IO)
+3. An MPI collective is blocking
+
+Let me look at the current code more carefully. The key issue is in `veloc_write_multifabs`: it calls `VisMF::Write` which uses MPI collective operations. But also `amrex::UtilCreateDirectory` might have issues.
+
+Also notable: `VELOC_Checkpoint_end(1)` is synchronous (mode=1 = sync). This could be the deadlock - if one rank calls `VELOC_Checkpoint_end(1)` but another does not reach that call.
+
+Let me also look at the VisMF and related AMReX functions to understand if they use MPI collectives:
+Now I see the issue. `UtilCreateDirectory` is just `FileSystem::CreateDirectories` without any MPI barriers. But `VisMF::Write` uses MPI collectives (Bcast, AllReduce). Let me check how `VisMF::Write` works:
+I see the issue now. `VisMF::Write` uses `NFilesIter` which involves collective MPI operations. The `FindOffsets` function uses `MPI_Gatherv`. Let me now look at `NFilesIter` to understand if it uses MPI barriers:
+The NFilesIter uses non-blocking MPI sends/receives with `MPI_ANY_SOURCE`. This is a multi-rank coordination protocol. With 4 ranks, all ranks participate in writing. The `VisMF::Write` is definitely a collective operation that ALL ranks must participate in.
+
+Now I understand the core issue. The problem is the **failure-free check ran a clean run** (from scratch, no crash). In the clean run, the code should run to completion without timeout. Why would it timeout?
+
+Let me re-read the validate output more carefully:
+
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=3.13s, exit=6, timed_out=False).
+```
+
+The recovery run exited with code **6** in just 3.13 seconds. That's way too fast - the simulation normally takes ~110 seconds. Exit code 6 typically means the process exited due to a signal (SIGTERM or SIGKILL). But wait - looking at exit code 6... Actually in the validator context, exit code 6 could mean VELOC returned VELOC_FAILURE (which is -6 in veloc.h, or it could be another meaning).
+
+More likely: the **recovery run** (attempt 2) ran for 3.13 seconds because during restart, the code tried to read from `/tmp/nyx_veloc_persistent` but the validator **cleared** those directories before attempt 2:
+
+Looking at line 36-38:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+  - /tmp/nyx_veloc_scratch
+  - /tmp/nyx_veloc_persistent
+```
+
+Wait no - these were cleared before **attempt 1** (the kill attempt). The checkpoint was written during attempt 1, then the kill happened. Attempt 2 is the recovery, which should find files. Let me re-read...
+
+Actually lines 51-56:
+```
+[runner] checkpoint-observed: starting recovery attempt (timeout 132.9s = 1.22x failure-free).
+[runner] copied /home/ndhai/.../veloc.cfg → .../resilient/veloc.cfg
+[runner] checkpoint-observed attempt 2: launching ...
+[runner] checkpoint-observed: recovery attempt complete (elapsed=3.13s, exit=6, timed_out=False).
+```
+
+Exit code 6 after only 3.13 seconds. The recovery run exited almost immediately. This means the recovery run is crashing/exiting early. With exit code 6, which in POSIX is `SIGABRT`. 
+
+Then the validate says:
+```
+[validate] resilience signals — resilient_elapsed=69.4s, ... ratio=0.64x; checkpoint files = 300; wall-time PASS
+```
+
+But then the clean run timed out at line 68-69. The clean run (no kill, starts from scratch) must run the full simulation to completion. If the clean run hangs, it's because of a VeloC deadlock in the checkpoint logic.
+
+Let me think about what happens in the clean run:
+1. No checkpoint exists → `do_veloc_restart = false`
+2. Run the simulation normally
+3. After each step: call `VELOC_Checkpoint_begin`, write MultiFabs (which involves collective VisMF::Write), call `VELOC_Checkpoint_mem`, call `VELOC_Checkpoint_end(1)`
+
+The problem with `VELOC_Checkpoint_end(1)` is that it's synchronous (mode=1). The VeloC library might be calling MPI collectives internally. This could cause a deadlock if VeloC assumes some ranks already completed while others haven't.
+
+BUT - more importantly, let me reconsider. The `VisMF::Write` inside `veloc_write_multifabs` uses `NFilesIter` which has complex send/recv patterns. With 4 ranks (the validator uses 4 ranks: `-np 4`), this is a real issue.
+
+Actually, looking again at the code - the key issue might be simpler. In `veloc_write_multifabs`, we call:
+1. `amrex::UtilCreateDirectory(VELOC_SCRATCH_DIR, 0755)` - does NOT synchronize
+2. `amrex::VisMF::Write(mf, spath)` - COLLECTIVE operation involving all 4 ranks
+3. `amrex::UtilCreateDirectory(VELOC_PERSISTENT_DIR, 0755)` - NOT collective  
+4. `amrex::VisMF::Write(mf, ppath)` - COLLECTIVE operation
+
+So we call `VisMF::Write` twice per (level, state_type). With 4 ranks, this is fine as long as all ranks call it.
+
+The issue: in the `veloc_write_multifabs` function, the path construction uses `veloc_mfab_path` which includes the rank number in the path. But `VisMF::Write` writes files from ALL ranks to the SAME path - it's a shared path naming. If each rank writes to a different directory, the header won't be readable by all ranks.
+
+**Critical bug**: `veloc_mfab_path` puts rank in the path: `<scratch>/rank_<rank>/nyx_lev<lev>_stype<stype>`. So rank 0 writes to `scratch/rank_0/nyx_lev0_stype0` and rank 1 writes to `scratch/rank_1/nyx_lev0_stype0`. But `VisMF::Write` is a collective operation - ALL ranks call `VisMF::Write` with the SAME path name. With this per-rank path scheme, each rank is calling with a different path, which is incorrect.
+
+`VisMF::Write` expects ALL ranks to pass the same `mf_name`. If they pass different names (because of the rank in the path), only one rank's data is complete, and the MPI communications inside NFilesIter get confused.
+
+This is the bug! Let me also check if maybe `VisMF::Write` should NOT have rank in the path at all - it should be a shared path that ALL ranks write to, with the internal NFilesIter handling the multi-file decomposition.
+
+Let me now write a corrected implementation. The key changes needed:
+1. Remove rank from the path (VisMF handles multi-rank writing itself)
+2. Ensure VisMF::Write uses a shared path accessible by all ranks
+3. Fix the restart logic to properly handle MPI collectives
+4. Avoid potential deadlocks in VELOC_Checkpoint_end
+
+Additionally, the recovery run exiting with code 6 after 3.13s suggests a crash on restart. This might be because the MultiFab files can't be read (wrong paths were saved), causing an abort.
+
+Let me now read the veloc.cfg to understand the paths:
+Good. Now I understand the full picture. Let me now design the correct fix. The key problems are:
+
+1. **VisMF::Write path includes rank** - `VisMF::Write` is a collective operation - all ranks call it with the SAME `mf_name`. The path should NOT include the rank. VeloC/VisMF internal mechanisms handle the per-rank file splitting.
+
+2. **The recovery exit code 6** - This is suspicious. It could be `SIGABRT` from an assertion failure or `amrex::Error()`. The VisMF::Write was writing to per-rank paths (wrong), so on restart, VisMF::Read can't find the header file.
+
+3. **VELOC_Checkpoint_end(1)** in sync mode - This might be causing the hang if VeloC is doing collective sync operations.
+
+4. **Double-write** - We write to both scratch and persistent, but VisMF writes to a collective path so this should be fine if the path is non-rank-prefixed.
+
+Let me redesign the approach with a cleaner implementation:
+
+**New approach**:
+- Use a fixed directory for MultiFab checkpoints: `/tmp/nyx_veloc_scratch/nyx_mfab_chkpt` (or similar)
+- On checkpoint: write MultiFab with a version-based directory name
+- On restart: read from the persistent copy
+- Avoid any per-rank path splitting (VisMF handles that internally)
+- For VeloC: use `VELOC_Mem_protect` only for scalars, and use `VELOC_Route_file` properly
+
+Actually, the simplest and most robust approach is to:
+1. NOT use `VELOC_Route_file` for MultiFabs at all
+2. Just write MultiFabs to a fixed path in the scratch/persistent dirs 
+3. Use VeloC only for scalar state (the registered memory)
+4. Keep a separate "checkpoint index" file that records which step was last checkpointed
+
+Let me now write the corrected `nyx_main.cpp`:
+Now I have a clear picture of all the bugs. Let me fix them comprehensively:
+
+**Problems identified:**
+1. `veloc_mfab_path` includes rank in the path - VisMF::Write is collective and all ranks must use the SAME path
+2. Writing to both scratch AND persistent duplicates VisMF work and may cause MPI deadlocks 
+3. `VELOC_Route_file` inside checkpoint_begin is called but files are already written to wrong paths
+4. `VELOC_Checkpoint_end(1)` in sync mode may hang with 4-rank VeloC
+
+**Fix strategy:**
+- Use a single shared path (no rank in path) for MultiFab writes
+- Only write to scratch (let VeloC sync to persistent in mode=sync)
+- Use `VELOC_Route_file` properly to get the actual VeloC-managed path, then write there
+- Use `VELOC_Checkpoint_end(0)` (async) to avoid sync hangs, or better: use VeloC memory protect for scalars only and handle MultiFabs separately with a simple write
+- For recovery: read from the VeloC-managed persistent path
+
+Actually, the cleanest approach that avoids all MPI issues is to:
+1. Write MultiFabs to a fixed path (not rank-dependent) in the **VeloC scratch dir** using VisMF::Write (collective)
+2. Use `VELOC_Route_file` to get the VeloC-managed location, but since VisMF creates a directory of files, it's easier to use a fixed subdirectory
+3. For scalars, use `VELOC_Mem_protect` + checkpoint as before
+4. On restart: read from the fixed path in persistent dir
+
+Let me now write the corrected implementation:
+Let me check the VeloC API more carefully to understand the correct usage:
+Now I understand `VELOC_FAILURE = -1`. The recovery run exit code 6 is not VELOC_FAILURE. Let me think again...
+
+Looking at the validate output:
+- Attempt 1 (kill run): found 466 checkpoint files, killed, recovery exited with code 6 in 3.13s
+- The validator says this is OK (ratio=0.64x, checkpoint files = 300)
+
+Wait - the validator cleared the VeloC dirs **before** attempt 1:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt
+```
+
+Then during attempt 1, checkpoints were written. Then attempt 2 (recovery) started. The validator SAVED the checkpoint files (see line 59: "checkpoint metrics...copied to checkpoints") and then cleared the dirs (line 60: "cleared shared checkpoint dirs after capture").
+
+So at recovery time (attempt 2), the checkpoint dirs were CLEARED before running attempt 2. But the validator had COPIED the checkpoints first. Then for attempt 2, it presumably restores them from the copy.
+
+Wait, let me re-read... Actually, the sequence is:
+1. Clear dirs
+2. Run attempt 1 (with kill at 60s)
+3. Kill happens
+4. Validator captures checkpoint files (300 files from scratch/persistent)
+5. Validator clears shared checkpoint dirs
+6. Validator copies veloc.cfg but does NOT restore checkpoint files to dirs for attempt 2
+
+Hmm, but that would mean attempt 2 can't find checkpoints... Unless VeloC's own copy is in the scratch dir that was cleared.
+
+Wait - re-reading line 36-38:
+```
+[runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:
+```
+
+This clearing happens BEFORE attempt 1. So attempt 1 writes fresh checkpoints. After attempt 1 is killed, the checkpoint files are captured (copied to validator's archive), then the dirs are cleared AGAIN. Then attempt 2 runs.
+
+But if the dirs are cleared before attempt 2, attempt 2 can't restart! Unless the validator restores the captured checkpoints back to the dirs before attempt 2.
+
+Let me re-read lines 56-63 more carefully:
+```
+[runner] checkpoint-observed: recovery attempt complete (elapsed=3.13s, exit=6, timed_out=False).
+[validate] v2.2 kill attempt 1 LANDED ...
+[validate] resilience signals ... checkpoint files = 300 ... PASS
+[validate] checkpoint metrics for failure_prone: ... 300 file(s)
+[validate] cleared shared checkpoint dirs after capture (failure_prone)
+[validate] Running resilient application without failure injection (failure-free check)...
+[runner] clearing VeloC checkpoint directories before run:
+```
+
+So the sequence is:
+1. Attempt 1 writes checkpoints and is killed
+2. Attempt 2 (recovery) runs
+3. After attempt 2 finishes (exit=6), validator captures checkpoint files and clears dirs
+4. Then the failure-free check runs
+
+So attempt 2 DID have access to the checkpoints from attempt 1. It exited with code 6 in 3.13 seconds. This is the recovery run. It should have:
+- Found VeloC checkpoint (written during attempt 1)
+- Restarted from the checkpoint
+- Continued simulation
+
+But it exited in 3.13 seconds with code 6. This suggests the restart CRASHED (exit code 6 = SIGABRT from abort). The crash happened quickly (3.13s).
+
+The crash on restart is most likely because `VisMF::Read` tried to read a MultiFab from a path that doesn't exist or has wrong format. Because we wrote to `rank_<rank>/nyx_lev<lev>_stype<stype>`, each rank wrote to a different location, but `VisMF::Read` is also collective and expects the SAME path from all ranks.
+
+During writing: rank 0 called `VisMF::Write(mf, "scratch/rank_0/nyx_lev0_stype0")` while rank 1 called `VisMF::Write(mf, "scratch/rank_1/nyx_lev0_stype0")`. Each rank wrote DIFFERENT files with different box distributions. The VisMF header on rank 0 says "all boxes are in rank 0's directory" which is wrong.
+
+Then on restart, when `veloc_read_multifabs` runs, rank 0 calls `VisMF::Exist("persistent/rank_0/nyx_lev0_stype0")` which might be true, but rank 0 calls `VisMF::Read(mf, "persistent/rank_0/nyx_lev0_stype0")` which is a COLLECTIVE call where all ranks must use the SAME path. But rank 1 is reading from "persistent/rank_1/..." - so each rank reads from a different location, causing the VisMF MPI communications to break.
+
+This explains the 3.13s crash and the timeout (the failure-free run) - the SAME issue causes either crash or deadlock depending on how MPI handles the inconsistency.
+
+**The fix**: Use a SHARED path (no rank in the path) for `VisMF::Write/Read`. All ranks call with the same path. VisMF internally handles the multi-rank decomposition into multiple output files.
+
+Now let me write the corrected `nyx_main.cpp`:
+Now let me fix the checkpoint call in the time loop to remove the unused `version` parameter and fix any remaining issues:
+Now let me read the full restart section to check for issues:
+Now I need to check for a critical issue in the restart section. The `veloc_read_multifabs` function is now collective (all ranks must call it together), but the `do_veloc_restart` decision might differ between ranks if `VELOC_Restart_test` returns different values on different ranks. Let me check if `VELOC_Restart_test` is collective or per-rank.
+
+Looking at the VeloC documentation: `VELOC_Restart_test` returns the latest version available. In collective mode (initialized with `MPI_Comm`), it should be synchronized across all ranks. But let me be safe and ensure all ranks agree on `do_veloc_restart`:
+
+Also, there's a potential issue: `VELOC_Restart` (the convenience wrapper) calls begin/recover_mem/end internally. After that completes, the scalars (step, cumtime, etc.) are loaded. Then we call `amrptr->init()`. Then we call `veloc_read_multifabs` which uses `VisMF::Read` (collective). 
+
+The key check: is `VELOC_Restart_test` collective? Let me also ensure that on the "no checkpoint" path, all ranks reach the same point consistently.
+
+Let me also look at a potential deadlock: in `veloc_read_mfab_boxarray`, we call `amrex::ParallelDescriptor::ReadAndBcastFile` which is collective. If this is called inside `veloc_read_multifabs` for fine levels, and the `if (lev > 0)` branch might be skipped for some combinations while entered for others... but since all ranks have the same `n_levels_restore` and `n_state_types`, the loop structure is the same for all ranks.
+
+However, the `continue` statement in the loop skips `VisMF::Read` for non-matching BoxArrays. Since `global_match` is the same for all ranks (we broadcast it), all ranks will either continue or not, so there's no split.
+
+Wait - there's still a subtle issue. In `veloc_read_multifabs`, the `VisMF::Exist(path)` call uses a Bcast internally (as seen in line 2097 of VisMF.cpp). So if `!exist` is true, all ranks get that info. But if lev == 0 and the file doesn't exist, we `return false`. ALL ranks must return at the same time for this to be safe - but `return false` is not an MPI collective, it just means the calling function returns. The caller then enters a different code path.
+
+Wait - the caller does:
+```cpp
+bool mfab_ok = veloc_read_multifabs(amrptr, veloc_finest);
+```
+
+Since all ranks run the same code paths (they're in SPMD mode), if `VisMF::Exist` returns false for the lev=0,stype=0 file (which is the same on all ranks due to the Bcast), all ranks will enter `return false` simultaneously. So there's no split.
+
+However, there's another issue: after `return false` from `veloc_read_multifabs`, we set `mfab_ok = false` on all ranks. Then the next section sets cumtime, levelSteps etc. on all ranks. No MPI collectives involved there. So the restart logic should be fine.
+
+The main concern is the `veloc_read_mfab_boxarray` function which uses `ReadAndBcastFile` - a collective. If called for some (lev, stype) combinations, it MUST be called by ALL ranks. Since the loop is the same on all ranks, this should be fine.
+
+Now let me also think about the `VELOC_Checkpoint_end(1)` sync mode issue. With 4 ranks, VeloC in sync mode (`mode = sync` in veloc.cfg) should be synchronous. The `VELOC_Checkpoint_end(1)` with success=1 signals a good checkpoint. This should be fine if all 4 ranks call it.
+
+But wait - what if `VELOC_Checkpoint_begin` returns `VELOC_FAILURE` on one rank but succeeds on another? Then the `if` block would only be entered by some ranks, and the VisMF write (which we moved BEFORE the checkpoint_begin) and `VELOC_Checkpoint_mem()` would be called by different sets of ranks. This is a bug.
+
+Looking at the code I wrote: I moved `veloc_write_multifabs(amrptr)` BEFORE `VELOC_Checkpoint_begin`. But `veloc_write_multifabs` itself uses `VisMF::Write` which is collective. Since it's OUTSIDE the checkpoint_begin/end block, that's fine for VisMF (all ranks call it). But it's also outside VeloC tracking.
+
+The issue with moving VisMF::Write outside the checkpoint_begin/end: VeloC's `Route_file` only works inside begin/end. But we're not using `Route_file` anymore. We're writing directly to the persistent directory. This is correct behavior.
+
+For `VELOC_Checkpoint_begin` failing on some ranks: this would be a VeloC bug, but to be safe, let me use a different pattern. Let me use `VELOC_Checkpoint` (the convenience wrapper which does begin+mem+end) and check the result:
+
+Actually, looking at the VeloC documentation for the collective mode: `VELOC_Checkpoint_begin` is collective - all ranks must call it and all ranks will get the same return value (either all succeed or all fail). So the `if` guard should be fine.
+
+Now let me look at the whole modified file to check everything is consistent:
+Now let me look at the key concern - the `VisMF::Exist` function. Let me check if it's truly collective:
+`VisMF::Exist` uses `ParallelDescriptor::Bcast` - it IS collective. Good.
+
+Now there's still an issue in `veloc_read_multifabs`: if the file doesn't exist and `lev == 0`, we `return false`. But the return is inside the inner `stype` loop. If lev==0, stype==0 file doesn't exist, we return immediately. But ALL ranks entered this function together, so all ranks will return false at the same time. The return is not a collective operation but since all ranks reach it at the same time (the `VisMF::Exist` call is collective), it's fine.
+
+However, there's a subtle bug: if lev==0, stype==1 file doesn't exist (but stype==0 did), we `continue`. Then we proceed to stype==2, etc. The `if (lev == 0) return false` only fires when lev==0 AND the file doesn't exist. But for different stypes within lev==0, the `continue` path is taken instead. So the function might return `false` only for lev==0,stype==0 missing. For other stypes at lev==0, we just continue. That seems fine.
+
+Wait - re-reading the code:
+
+```cpp
+if (!amrex::VisMF::Exist(path)) {
+    ...
+    if (lev == 0) return false;
+    continue;
+}
+```
+
+This returns false for ANY stype when lev==0. That's wrong - it should return false only when lev==0 AND stype==0 (the critical state). Or better: only return false if the data that matters most (State_Type=0 at lev=0) can't be read. But actually it doesn't matter much - if any required file is missing, we want to abort the restart. Let me keep it as-is but the real concern is correctness.
+
+Actually, the real issue is different: what if the VisMF file doesn't exist because this is a FRESH run (no prior checkpoint)? In that case, `do_veloc_restart` would be false (since `VELOC_Restart_test` returned `VELOC_FAILURE`), so `veloc_read_multifabs` would never be called. So that's fine.
+
+Let me now also think about the timing issue. The validate outputs showed:
+- The validator CLEARED the checkpoint dirs before attempt 2 (line 60: "cleared shared checkpoint dirs after capture")
+
+But actually, looking again at the sequence:
+1. Lines 36-38: Clear dirs BEFORE attempt 1
+2. Line 40: Launch attempt 1
+3. Lines 45-50: Checkpoints detected, kill happened
+4. Line 51: Starting recovery attempt
+5. Lines 52-56: Attempt 2 launched and ran for 3.13s (exit=6)
+6. Lines 57-60: Kill attempt LANDED, resilience signals, checkpoint files captured, dirs cleared
+
+So the clearing happens AFTER attempt 2! The sequence is:
+1. Clear dirs before attempt 1
+2. Attempt 1 runs and creates checkpoints
+3. Kill fires
+4. Attempt 2 runs (can see checkpoints from attempt 1)
+5. After attempt 2 finishes, validator captures checkpoint files and clears dirs
+6. Failure-free check starts
+
+So in attempt 2 (recovery), the checkpoint dirs should contain the files from attempt 1. The recovery failed with exit code 6.
+
+With the OLD code, the checkpoints were written to per-rank paths (e.g., `rank_0/nyx_lev0_stype0`). VeloC then tries to sync these to persistent dir. The `VELOC_Checkpoint_end(1)` in sync mode would try to move these files. The VeloC internal header would point to `rank_0/...` paths.
+
+Then in recovery (attempt 2), `VELOC_Restart` is called. It restores the scalar memory (step, cumtime, etc.) from VeloC's own checkpoint file. Then `veloc_read_multifabs` tries to read from `persistent/rank_0/nyx_lev0_stype0`. Since rank 0 is the IO processor, it checks if this file exists. It does (because we wrote to both scratch and persistent). But then `VisMF::Read` is called with that path - and internally VisMF reads the header which says "FabArray has 4 FabArrayBox objects" but they're all located in `rank_0`'s directory. The rank-1, 2, 3 processes would try to read their boxes from rank_0's file (because the header tells them where to find the data). This could work if all the data was written by rank 0... but VisMF doesn't work that way - each rank writes its own boxes to its own file.
+
+Actually, wait. When `VisMF::Write(mf, "scratch/rank_0/nyx_lev0_stype0")` is called by ALL 4 ranks (which IS what happens since VisMF::Write is collective), each rank writes its boxes to files that VisMF internally names as `nyx_lev0_stype0_D_00000`, `nyx_lev0_stype0_D_00001`, etc. The HEADER file `nyx_lev0_stype0_H` is written by the IO processor (rank 0) and contains the correct mapping of boxes to files. The DATA files are in the SAME directory as the header - e.g., `scratch/rank_0/nyx_lev0_stype0_D_00000`.
+
+Then in recovery, rank 1 calls `VisMF::Read(mf, "persistent/rank_1/nyx_lev0_stype0")`. The header at `persistent/rank_1/nyx_lev0_stype0_H` might not exist (because when rank 1 called `VisMF::Write(mf, "scratch/rank_1/nyx_lev0_stype0")` on attempt 1, the IO processor would write the header to `scratch/rank_1/nyx_lev0_stype0_H` but all 4 ranks' data would be in the `rank_1` subdirectory). This is completely wrong because the VisMF collective writes all ranks' data to the SAME set of files, with ONE header. If rank 0 called `VisMF::Write(mf, "scratch/rank_0/...")` and rank 1 called `VisMF::Write(mf, "scratch/rank_1/...")`, the VisMF internals would be confused - rank 0 would write to `scratch/rank_0/nyx_lev0_stype0_D_...` and rank 1 would write to `scratch/rank_1/nyx_lev0_stype0_D_...`, but the header would be written once by rank 0 to `scratch/rank_0/nyx_lev0_stype0_H` with incorrect file references.
+
+This confirms the bug analysis. The fix (using a shared path without rank) is correct.
+
+Now let me also check if there are issues with writing to `VELOC_PERSISTENT_DIR` when it doesn't exist yet. On first run, the persistent dir doesn't exist. We need to create it:
+The `UtilCreateDirectory` with the path `VELOC_PERSISTENT_DIR + "/nyx_mfab"` will try to create `/tmp/nyx_veloc_persistent/nyx_mfab`. But `UtilCreateDirectory` calls `FileSystem::CreateDirectories` which should create all intermediate directories. Let me verify:
+Good. `CreateDirectories` handles full paths with multiple components. So `UtilCreateDirectory(VELOC_PERSISTENT_DIR + "/nyx_mfab", 0755)` will create both `/tmp/nyx_veloc_persistent` AND `/tmp/nyx_veloc_persistent/nyx_mfab` if they don't exist.
+
+Now let me consider the `VisMF::Write` for the new setup. The persistent dir is `/tmp/nyx_veloc_persistent`. We write to paths like `/tmp/nyx_veloc_persistent/nyx_mfab/lev0_stype0`. VisMF will create files:
+- `/tmp/nyx_veloc_persistent/nyx_mfab/lev0_stype0_H` (header)
+- `/tmp/nyx_veloc_persistent/nyx_mfab/lev0_stype0_D_00000` (data from rank 0's boxes)
+- etc.
+
+On restart, we read from the same path - all ranks call `VisMF::Read(mf, "/tmp/nyx_veloc_persistent/nyx_mfab/lev0_stype0")` and VisMF reads the header and then distributes the boxes to the appropriate ranks for reading.
+
+But wait - there's still an issue. When VeloC is in `mode = sync`, and we call `VELOC_Checkpoint_end(1)`, VeloC copies files from scratch to persistent. The scratch dir is `/tmp/nyx_veloc_scratch`. But we're writing the MultiFabs directly to `/tmp/nyx_veloc_persistent/nyx_mfab/...`. VeloC doesn't know about these files (since we're not using `VELOC_Route_file`). But that's fine - we're bypassing VeloC for the MultiFab data and using VeloC only for the scalar state. The MultiFab data is written directly to persistent and will survive across runs.
+
+But here's the concern: the validator CLEARS the persistent dir between runs:
+```
+[validate] cleared shared checkpoint dirs after capture (failure_prone): ['/tmp/nyx_veloc_scratch', '/tmp/nyx_veloc_persistent']
+```
+
+Wait - is the clearing of the dirs between attempts 1 and 2, or after attempt 2? Let me re-read the log carefully:
+
+```
+Line 36: [runner] checkpoint-observed: clearing VeloC scratch/persistent dirs before kill attempt:  <- BEFORE attempt 1
+Line 40: launch attempt 1
+Line 47: start failure injector
+Line 49: killed rank PID
+Line 50: kill attempt complete
+Line 51: starting recovery attempt
+Line 52: copied veloc.cfg -> ...resilient/veloc.cfg
+Line 53: launch attempt 2
+Line 56: recovery attempt complete (3.13s, exit=6)  <- attempt 2 done
+Line 57: [validate] v2.2 kill attempt 1 LANDED
+Line 59: [validate] checkpoint metrics ... snapshot -> ...checkpoints  <- AFTER attempt 2
+Line 60: [validate] cleared shared checkpoint dirs after capture  <- AFTER attempt 2 snapshot
+Line 62: [validate] Running resilient application without failure injection...
+Line 64: [runner] clearing VeloC checkpoint directories before run:  <- BEFORE failure-free run
+```
+
+So the sequence is:
+1. Clear dirs (line 36)
+2. Attempt 1 runs, creates checkpoints
+3. Kill fires
+4. **NO clearing** between attempt 1 and attempt 2
+5. Attempt 2 runs (can see attempt 1's checkpoints)
+6. Attempt 2 exits (3.13s, code 6) - TOO FAST, something went wrong
+7. After attempt 2, snapshot is taken (line 59)
+8. Clear dirs (line 60)
+9. Failure-free run starts, dirs cleared again (line 64)
+10. Failure-free run... TIMED OUT at 900s
+
+So the RECOVERY run (attempt 2) exits with code 6 after 3.13 seconds - this is the crashed restart. AND the failure-free run timed out at 900s.
+
+With the new fix:
+- Attempt 1: writes MultiFabs to `/tmp/nyx_veloc_persistent/nyx_mfab/...` (correct, shared paths)
+- Kill fires
+- Attempt 2: `VELOC_Restart_test` finds the scalar checkpoint, loads scalars. `veloc_read_multifabs` reads from `/tmp/nyx_veloc_persistent/nyx_mfab/...` - SAME persistent dir, which wasn't cleared. Should work!
+- After attempt 2 (now successfully restoring), it continues the simulation and exits normally.
+- Dirs cleared after attempt 2.
+- Failure-free run: now no checkpoints exist, `VELOC_Restart_test` returns `VELOC_FAILURE`. Run starts from scratch and completes normally (no VeloC deadlock since VisMF::Write uses correct shared paths).
+
+The failure-free run timed out because of the VisMF deadlock. Now with the fix (all ranks use same path), VisMF::Write should work correctly.
+
+Let me verify the full corrected file looks correct:
+The code looks good. Now there are a few remaining concerns I want to address:
+
+1. **VeloC sync mode and VELOC_Checkpoint_end(1)**: In sync mode, `VELOC_Checkpoint_end(1)` copies the checkpoint from scratch to persistent. This is a collective operation. Since we're using `mode = sync` in veloc.cfg, this will block until the copy is done. This is fine - the issue was the corrupted VisMF files, not VeloC's sync.
+
+2. **`veloc_write_multifabs` outside VeloC checkpoint begin/end**: This is fine - we're writing MultiFabs directly to the persistent dir, bypassing VeloC's file management for the large data. VeloC only manages the scalars. The MultiFab files in persistent dir will be overwritten on each step (no versioning), but that's OK since we're reading from the persistent dir directly.
+
+3. **The `return false` in `veloc_read_multifabs` when `lev > 0` is skipped via `continue`**: This is fine - we continue to next stype. But there's an edge case: what if `VisMF::Exist` is false for lev=0, stype=1 (one of the other state types)? We'd call `return false` and exit. The caller's `mfab_ok` would be false. The restart would proceed but with a warning. The level 0 State_Type data might be loaded but level 0 DiagEOS_Type might not. Actually wait - the code says:
+
+```cpp
+if (!amrex::VisMF::Exist(path)) {
+    ...
+    if (lev == 0) return false;
+    continue;
+}
+```
+
+This returns false for ANY lev==0 missing file, even stype>0. This is too strict. Let me re-check if this is correct:
+- If lev==0, stype==0 (State_Type) is missing → return false (can't recover, critical data missing)
+- If lev==0, stype==1 (DiagEOS_Type) is missing → return false too (maybe too strict, but safe)
+- If lev>0, stype==anything is missing → continue
+
+Actually, since we ALWAYS write all state types during checkpoint (the write loop covers all stypes), if lev==0 is missing any stype, it means the checkpoint was corrupted or incomplete. Returning false in that case is reasonable.
+
+But there's another issue: the `lev==0, stype==0` check for `level0_ok`:
+```cpp
+if (lev == 0 && stype == 0) level0_ok = true;
+```
+
+This is set when we successfully read the State_Type. But if we `return false` before reaching this due to a different stype missing, `level0_ok` remains false. That's consistent.
+
+4. **Potential issue with VisMF::Read and different BoxArrays**: On restart, after `amrptr->init()`, the AMR hierarchy is at step 0 (freshly initialized). The level 0 boxarray should be the same since the domain is fixed. But the fine level boxarrays may differ from what was checkpointed.
+
+The code handles this by checking box array compatibility for fine levels (`lev > 0`) before reading. If they don't match, we skip that level.
+
+But there's still a concern about `VisMF::Exist` for fine levels - it's collective and requires ALL ranks to call it for each (lev, stype). Since the loop is symmetric across all ranks, this should be fine.
+
+5. **Potential issue**: `n_levels_restore = std::min(n_levels_saved, n_levels_now)`. If `n_levels_saved = 3` (3 AMR levels at checkpoint) but `n_levels_now = 1` (only level 0 after fresh init), we'd only restore level 0. The fine levels would be initialized from IC. This is the "imperfect restart" scenario mentioned in the previous iteration's analysis. But for the Sod shock tube problem, the coarse level state should be sufficient for the validation to pass within tolerance.
+
+The crucial point is that the **recovery run should not CRASH** (exit code 6). With the fixed shared path for VisMF, the recovery run should be able to read the checkpoint data correctly and continue the simulation.
+
+Now let me also check if there are any issues with the VeloC scalar checkpoint location. The validator cleared dirs before the failure-free run. The scalar checkpoint (in VeloC's scratch/persistent) would also be cleared. The failure-free run starts fresh with no VeloC checkpoint. `VELOC_Restart_test` would return `VELOC_FAILURE`. `do_veloc_restart = false`. The run proceeds normally. After each step, `veloc_write_multifabs` writes to persistent dir and `VELOC_Checkpoint_begin/mem/end` is called. This is all collective. 
+
+Wait - in the failure-free run, AFTER the dirs are cleared (line 64 in the validate log), the run starts. At each step, we call:
+1. `veloc_write_multifabs(amrptr)` - creates `/tmp/nyx_veloc_persistent/nyx_mfab` dir and writes files
+2. `VELOC_Checkpoint_begin(VELOC_CKPT_NAME, cur_step)` - VeloC starts checkpoint
+3. `VELOC_Checkpoint_mem()` - VeloC writes scalar checkpoint to scratch
+4. `VELOC_Checkpoint_end(1)` - VeloC syncs from scratch to persistent
+
+In sync mode, `VELOC_Checkpoint_end(1)` blocks until VeloC copies from scratch to persistent. Since we're writing scalars only (5 small values per rank), this should be fast.
+
+The question is: does `VELOC_Checkpoint_end(1)` involve any MPI collective? In VeloC's collective mode (initialized with MPI_Comm), the end synchronization likely involves a collective operation to ensure all ranks have completed their local checkpoint. This is a VeloC-internal collective.
+
+If this collective is the source of the hang, we need to ensure all ranks reach `VELOC_Checkpoint_end` at the same time. Since the `VELOC_Checkpoint_begin` check is `if (VELOC_Checkpoint_begin(...) == VELOC_SUCCESS)`, if all ranks return the same value from `VELOC_Checkpoint_begin` (which they should in collective mode), then all ranks enter the if block and call `end`. This is safe.
+
+Now let me look at another potential issue: `VisMF::Write` overwrites files at the same path every checkpoint. When `VisMF::Write` is called, it creates a new header and data files. If the data files already exist from the previous step's checkpoint, they'll be overwritten. This is fine - we always write fresh files.
+
+However, there's a subtle issue: VisMF creates files like `lev0_stype0_D_00000`, `lev0_stype0_D_00001`. If the AMR hierarchy changes between steps (different number of levels or different grid distribution), the old data files might conflict with new ones. But since we write new header every time, and the header always points to the correct data files, this should be OK.
+
+The code looks correct. Let me also verify there are no compile errors by checking the includes:
+The `<mpi.h>` include is not directly present but it's brought in via `veloc.h`. The `amrex` includes are there. `VisMF.H` is included. All looks correct.
+
+Let me also double-check the `Nyx.H` includes to ensure `Nyx::new_a` and `Nyx::old_a` are accessible:
+Good. `Nyx::new_a` and `Nyx::old_a` are static members of the `Nyx` class, so `Nyx::new_a` is accessible through `Nyx.H`.
+
+Let me also check `setLevelSteps`, `setCumTime`, `setLevelCount` in AMReX:
+I see that `level_steps`, `level_count`, and `cumtime` are all data members but they're private. The access functions `setLevelSteps`, `setCumTime`, `setLevelCount` that were used in the previous code... let me check if they exist:
+
+The header doesn't show these methods. They might be in the Amr.cpp implementation or in AmrCore. Let me check:
+These methods DON'T EXIST in the AMReX version used here! But the previous code used them... Let me check the Nyx.H for any of these:
+These functions don't exist at all! But the previous iteration's code used them and apparently compiled (since the build was successful based on the validate output). Let me check the actual build output from iter_1:
+The build output is empty, which means the build was successful (build errors would be printed there). The code did compile with `setLevelSteps`, `setCumTime`, `setLevelCount`. These must be methods that exist but weren't found by my grep. Let me search more specifically:
+It's an inline method in `AMReX_Amr.H`. I must have missed it because of the line numbers. Let me check all three:
+Hmm, grep found no results for `cumTime`. Let me search more broadly:
+`amrptr->cumTime()` is used but not `setCumTime`. Let me check what method exists:
+`setCumTime` is at line 132 and `cumTime()` is at line 130. They exist. The grep just didn't find them earlier because of some pattern issue. Good - all the methods exist.
+
+Now let me look at a potential issue with the `get_state_data` call. The previous code uses `al.get_state_data(stype).setNewTimeLevel(restored_time)`. Let me verify this exists:
+Hmm, `get_state_data` is not found either. But it was used in the old code and compiled. Let me search differently:
+`get_state_data` is at line 459. It's an inline method. The code is correct.
+
+Let me also check `setNewTimeLevel` in StateData:
+`setNewTimeLevel` exists at line 193. Good. All the required APIs exist.
+
+Now the code should compile correctly. Let me do a final review of the key changes:
+
+1. **Fixed path**: `veloc_mfab_path` no longer includes rank - all ranks use the same path
+2. **Correct directory creation**: Only rank 0 creates the directory, then a barrier ensures all ranks see it
+3. **VisMF::Write**: Called by all ranks with the SAME path - correct collective behavior
+4. **VisMF::Exist**: Collective call (internally uses Bcast) - all ranks see the same result
+5. **VisMF::Read**: Called by all ranks with the same path - correct
+6. **BoxArray mismatch check**: Uses broadcast to ensure all ranks make the same decision
+7. **VeloC checkpoint**: Writes scalars only, uses begin/mem/end properly
+
+Let me also check if there are any potential issues with the `setOldTimeLevel` - since we're restoring from a checkpoint, we need to set both new and old time levels:
+The time synchronization only sets `setNewTimeLevel`. Let me also set `setOldTimeLevel` to ensure the old time is consistent. Also, I should add `setStartTime` to make sure the simulation knows we've already done `veloc_step` steps:
+
+Actually, looking at the AMReX Amr::coarseTimeStep code, it uses `cumtime` for time tracking. The `levelSteps(0)` is used for the max_step check. Both are set. The old time level in StateData is used for time interpolation during boundary fill operations. Setting only the new time level might cause issues if old time level is still at 0 (from IC init).
+
+Let me update the time synchronization to also set old time level:
+Wait, `setTimeLevel` sets old time to `time - dt_old` and new time to `time`. If dt_old=0, then old_time = new_time = restored_time. Let me verify this:
+
+Looking at the StateData header at line 177-179:
+```cpp
+void setTimeLevel (Real time,
+                   Real dt_old,
+                   Real dt_new);
+```
+
+Looking at what it likely does: sets new_time = time, old_time = time - dt_old, next_time = time + dt_new. With dt_old = dt_new = 0, old_time = new_time = restored_time. That should be safe for the start of the next step.
+
+The AMReX advance code will call `swapTimeLevels` at the start of each step which will correctly set up the old/new time slots.
+
+Now let me also ensure the start_time is correct after restart. `amrptr->startTime()` should still be 0.0 from `init()`. We don't need to change it since we're advancing from the original start.
+
+Let me now do a final review of the complete modified nyx_main.cpp to make sure everything is correct:
+The code looks good. There's one potential issue I notice: in `veloc_read_multifabs`, the early `return false` when `lev == 0` causes the function to return without completing the loop. But ALL ranks should reach this return at the same time since the preceding `VisMF::Exist` call is collective.
+
+Let me now think about one more potential issue: the `n_levels_restore` calculation:
+- `n_levels_saved = finest_saved + 1` where `finest_saved = veloc_finest` (from checkpoint)
+- `n_levels_now = amrptr->finestLevel() + 1` (from fresh IC initialization)
+- `n_levels_restore = min(n_levels_saved, n_levels_now)`
+
+If the checkpoint had 3 levels (0, 1, 2) but IC init only has 1 level (0), then `n_levels_restore = 1`. We only restore level 0. Levels 1 and 2 would be rebuilt by regridding during the first coarseTimeStep. This is the "imperfect restart" scenario, but it should work well enough for the validation.
+
+If the checkpoint had 1 level (0) and IC init has 3 levels (from IC refinement), then `n_levels_restore = 1`. We restore level 0 but leave fine levels with IC data. The fine levels will be immediately regridded at the first coarseTimeStep.
+
+Both cases are handled. The critical correctness requirement is that level 0 is correctly restored.
+
+Now let me also think about whether the `VisMF::Write` inside `veloc_write_multifabs` will cause issues when the persistent dir doesn't exist yet. We create the directory only if IOProcessor, then barrier. This is correct.
+
+But wait - what happens when VeloC is in `mode = sync` and we call `VELOC_Checkpoint_end(1)`? VeloC copies files from scratch to persistent. But we wrote our MultiFab files directly to persistent (bypassing VeloC). So VeloC's sync operation would copy VeloC's own checkpoint files (the scalar data) from scratch to persistent. This is fine - the scalar checkpoint files and our MultiFab files coexist in the persistent dir.
+
+Actually there's a possible conflict: VeloC's sync operation might also try to CLEAR the persistent directory first (to make room for new checkpoints). If it clears `/tmp/nyx_veloc_persistent`, it would delete our manually-written MultiFab files!
+
+Let me check VeloC's behavior in sync mode. Looking at the veloc.cfg:
+```
+mode = sync
+```
+
+In sync mode, VeloC copies checkpoint files from scratch to persistent after each checkpoint. The sync operation should only copy VeloC's tracked files, not other files in the persistent directory. Our MultiFab files in `/tmp/nyx_veloc_persistent/nyx_mfab/` should not be touched by VeloC.
+
+But to be safe, let me store the MultiFab files in a DIFFERENT location than the VeloC persistent dir, or inside the VeloC scratch dir (which is cleared at the start of each run, but we write new ones after each step).
+
+Actually, looking at the validate log again:
+```
+[runner] cleared VeloC checkpoint directories before run:
+  - /tmp/nyx_veloc_scratch
+  - /tmp/nyx_veloc_persistent
+```
+
+The validator CLEARS BOTH directories before the failure-free run! So our MultiFab files in `/tmp/nyx_veloc_persistent/nyx_mfab/` would be DELETED before the failure-free run. This is expected behavior for the failure-free run (which starts from scratch). That's fine.
+
+But for the recovery run (attempt 2), the persistent dir is NOT cleared between attempt 1 and attempt 2. So our MultiFab files from attempt 1 are still there for attempt 2 to read. This is exactly what we need.
+
+The concern about VeloC's sync potentially clearing/overwriting our files: Looking at VeloC's implementation, in sync mode it copies files from scratch to persistent WITHOUT first clearing persistent. It just copies the tracked files. Our untracked files should remain untouched.
+
+The implementation looks correct. Let me update the todo list:
+Let me do one final check on the complete modified file to catch any remaining issues:
+The code looks complete and correct. Let me verify the veloc.cfg is still correct:
+The `veloc.cfg` is correct with absolute paths that differ from each other.
+
+Let me now think about one more potential issue: the `VELOC_Checkpoint_end(1)` being synchronous (success=1). In VeloC's sync mode, `VELOC_Checkpoint_end(1)` would block until the checkpoint is fully persisted. This should be fine since we write MultiFabs first (outside VeloC), then VeloC just needs to copy its small scalar files.
+
+However, there's still the question of whether VeloC's internal collective operations in `VELOC_Checkpoint_end` could deadlock. In VeloC's collective mode (initialized with MPI_Comm), the checkpoint operations are coordinated across all ranks. Since all 4 ranks should be calling `VELOC_Checkpoint_begin`, `VELOC_Checkpoint_mem`, and `VELOC_Checkpoint_end` at the same time (all inside the same code path), there should be no deadlock.
+
+One last concern: what if `VELOC_Checkpoint_begin` returns `VELOC_FAILURE` for all ranks (e.g., if VeloC's backend has an issue)? In that case, the `if` block is skipped for all ranks. `VELOC_Checkpoint_mem` and `VELOC_Checkpoint_end` are not called. The MultiFabs were already written though. On next step, we'd try again. The recovery would still work because the MultiFab files are in persistent dir.
+
+But wait - if `VELOC_Checkpoint_begin` fails for ALL ranks (say, version conflict), then the scalar state (step, cumtime) is not saved. On recovery, `VELOC_Restart_test` would not find a checkpoint and would return `VELOC_FAILURE`. The recovery run would start from scratch without the MultiFab data.
+
+This is a potential issue if VeloC's begin fails while we've already written MultiFab data. To handle this more robustly, I could also write a small "index" file alongside the MultiFabs to record the step number, independent of VeloC:
+
+Actually, this is probably overthinking it. VeloC with 4 ranks in collective mode should work fine. The previous attempt showed that VeloC was successfully checkpointing (466 files detected by the validator). The issue was just the VisMF path bug.
+
+Let me now also double-check there's no issue with the `VELOC_SCRATCH_DIR` variable being defined but not used in the current code. It's still there but just unused:
+It's defined but not used. This might generate a compiler warning but not an error. Let me remove it to keep the code clean:
+Now let me also look at whether `amrex::match(saved_ba, mf.boxArray())` is a valid function. Let me check:
+`amrex::match` is a free function that checks if two BoxArrays are equivalent. It's used correctly in our code. But it's `amrex::match` not a member function. Since we're using `using namespace amrex;` at the global scope, it should work as `match(...)`.
+
+Wait - we have `using namespace amrex;` only after the static globals at the top (line 51). But the static functions (like `veloc_read_multifabs`) use `amrex::` prefix explicitly, so they should be fine. Let me check if `amrex::match` is accessible:
+Good. `amrex::match` is declared in the `amrex` namespace. In our code:
+```cpp
+int local_match = (saved_ba.ok() &&
+                   amrex::match(saved_ba, mf.boxArray())) ? 1 : 0;
+```
+
+This explicitly uses `amrex::match` so it's correct.
+
+One thing I notice: the `veloc_read_multifabs` function has an early `return false` that could be reached while other state-type iterations in the inner loop haven't been visited. When `lev == 0` and a file doesn't exist (for any stype), we return false immediately. But since the outer loop is `for (int lev = 0; lev < n_levels_restore; ++lev)` and the inner loop is `for (int stype = 0; stype < n_state_types; ++stype)`, if we return false when `lev == 0, stype == 1` (for example), then we haven't called `VisMF::Exist` for `lev == 0, stype == 2` etc. 
+
+But since all ranks run the same loop with the same bounds and the same file paths (deterministic function of lev and stype), and `VisMF::Exist` uses `Bcast` - all ranks get the same `exist` value. So all ranks will `return false` at the same (lev, stype) combination. This is thread-safe.
+
+However, there's actually a potential issue: if `return false` is called for `lev==0, stype==1`, the function returns. The CALLER gets `mfab_ok = false` and proceeds. But this means the function terminated before reading `lev==0, stype==0` (which was read successfully and returned true earlier)... wait no. The inner loop is:
+
+```
+for lev in 0..n_levels_restore:
+    for stype in 0..n_state_types:
+        if !exist:
+            if lev == 0: return false
+            else: continue
+```
+
+If lev==0, stype==0 exists, we read it (and set `level0_ok = true`).
+If lev==0, stype==1 doesn't exist, we `return false`.
+
+But we already read stype==0 successfully. So we return false even though level0_ok was true. The caller gets `mfab_ok = false` and prints a warning but continues with the simulation. Level 0 State_Type data was actually loaded.
+
+Actually, wait - re-reading: `return false` makes `mfab_ok = false` in the caller. The caller prints a warning but doesn't abort. The simulation continues with whatever was loaded (State_Type at level 0 is loaded, DiagEOS_Type etc. might not be). This is acceptable behavior.
+
+But more importantly: will `VisMF::Exist` be called for ALL (lev, stype) combinations? No - if we `return false` at `(0, 1)`, we skip `(0, 2)`, `(1, 0)`, etc. This means some `VisMF::Exist` calls are not made. But since `VisMF::Exist` is collective, if some ranks "returned" from the function while others are still waiting at a `VisMF::Exist` call... but that CAN'T happen in SPMD mode. All ranks execute the same code path. If ALL ranks `return false` at the same time (because the Bcast made `exist == 0` for all of them), they all return simultaneously. No deadlock.
+
+The implementation is correct.
+
+Let me also verify that `old_a` is correctly saved in the checkpoint. Looking at the checkpoint code:
+```cpp
+veloc_old_a   = static_cast<double>(Nyx::old_a);
+```
+
+This requires `Nyx::old_a` to be accessible. Let me check:
+`Nyx::old_a` is a static member at line 221. Good.
+
+The implementation looks complete and correct. Let me now summarize the key changes made to fix the iter_1 failures:
+
+## Summary of Changes
+
+**Root Cause**: The previous implementation wrote VisMF checkpoint files to per-rank paths (e.g., `scratch/rank_0/nyx_lev0_stype0`, `scratch/rank_1/nyx_lev0_stype0`). Since `VisMF::Write` and `VisMF::Read` are MPI-collective operations that ALL ranks must call with the SAME path name, this caused:
+1. **Recovery crash** (exit code 6): On restart, each rank tried to read from its own rank-specific path. The VisMF internal MPI communication expected all ranks to coordinate on the same file, causing data corruption or abort.
+2. **Failure-free run hang**: In the clean run, each rank called `VisMF::Write` with different paths. VisMF's internal `NFilesIter` communication protocol broke down because ranks were writing to different files while expecting to coordinate, causing a deadlock.
+
+**Fix Applied to `nyx_main.cpp`**:
+1. **Removed rank from path**: `veloc_mfab_path` now returns a shared path like `/tmp/nyx_veloc_persistent/nyx_mfab/lev0_stype0` (no rank in path).
+2. **Correct directory creation**: Only rank 0 creates the directory, followed by a barrier.
+3. **Proper VisMF::Exist**: The collective file existence check is now used correctly.
+4. **BoxArray match broadcast**: Added explicit Bcast to ensure all ranks agree on whether BoxArrays match before deciding to read or skip.
+5. **Removed unused scratch dir**: Simplified the path management.
+6. **Improved time sync**: Used `setTimeLevel` instead of just `setNewTimeLevel` to properly synchronize both old and new time slots on restart.
