@@ -59,15 +59,30 @@ import matplotlib.pyplot as plt
 
 # --- Inputs ---------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VAL_OUT = REPO_ROOT / "build" / "validation_output"
+RESULTS = REPO_ROOT / "results"
 CONFIGS = REPO_ROOT / "tests" / "apps" / "configs"
 OUT_DIR = REPO_ROOT / "docs" / "figs"
-# Mirror PDFs into each active paper's Figures dir so the paper PDF always
-# reflects the newest trusted results without a manual copy step.
+# Mirror PDFs into the FlexScience paper's figures dir (this script is the
+# 3-bar Vanilla/LLM-modified/Reference 6-app generator that backs that
+# paper's main results figures; the eScience paper uses its own
+# multi-model script).
 PAPER_FIGURES_DIRS = [
-    REPO_ROOT / "docs" / "paper" / "eScience" / "Figures",
+    REPO_ROOT / "docs" / "paper" / "FlexScience" / "figures",
 ]
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _bench_dir(app: str, suffix: str) -> Path:
+    """Map (app, suffix) to the post-2026-05 results/ data layout.
+
+    suffix="baseline"  -> results/models/opus47/bench/<APP>/
+    suffix="reference" -> results/reference/<APP>/
+    """
+    if suffix == "baseline":
+        return RESULTS / "models" / "opus47" / "bench" / app
+    if suffix == "reference":
+        return RESULTS / "reference" / app
+    raise ValueError(f"unknown bench suffix: {suffix!r}")
 
 
 def _mirror_to_papers(stem: str) -> None:
@@ -99,51 +114,19 @@ def _mirror_to_papers(stem: str) -> None:
 # SAMRAI is listed but its _baseline bench is UNTRUSTED so the comparison
 # charts' missing-data filter will drop it automatically (LLM bars require
 # baseline bench data).
-# 17-app candidate set (MMSP removed per user instruction 2026-05-08).
-COMPLETED_APPS = [
-    "Athena++", "CLAMR", "CoMD", "HPCG", "HyPar",
-    "LAMMPS", "Nyx", "OpenLB", "PRK_Stencil",
-    "QMCPACK", "ROSS", "SAMRAI", "Smilei", "SPARTA",
-    "SPPARKS", "SW4lite", "WarpX",
-]
-
-# X-axis grouping: apps clustered by complexity group (paper \S\ref{sec:suite}).
-# Within each group apps are listed in increasing iter-count order.
-GROUPS = {
-    "Plain, fixed shape":       ["HPCG", "PRK_Stencil", "SW4lite", "HyPar"],
-    "Plain, variable per-rank": ["CoMD", "SPARTA", "SPPARKS", "CLAMR", "LAMMPS"],
-    "Encapsulated, accessible": ["Nyx", "Athena++", "WarpX"],
-    "Encapsulated, opaque":     ["OpenLB", "Smilei", "QMCPACK", "ROSS", "SAMRAI"],
-}
-DIFFICULTY_ORDER = [app for apps in GROUPS.values() for app in apps]
-
-
-def _group_boundaries() -> list[int]:
-    out, c = [], 0
-    for apps in GROUPS.values():
-        c += len(apps)
-        out.append(c)
-    return out[:-1]
+# FlexScience paper covers exactly these 6 apps in the displayed order
+# (matches the prose in docs/paper/FlexScience/main.tex lines 280-298,
+# ordered by increasing checkpointing difficulty).
+COMPLETED_APPS = ["HPCG", "CoMD", "OpenLB", "SPARTA", "Athena++", "LAMMPS"]
+DIFFICULTY_ORDER = list(COMPLETED_APPS)
+# Group separators are intentionally absent in the FlexScience layout: 6
+# apps don't warrant complexity-band labels.
+GROUPS: dict[str, list[str]] = {}
 
 
 def _draw_group_separators(ax, n_apps: int) -> None:
-    """Light vertical lines at each group boundary + small italic group labels
-    along the top inside the axes."""
-    bounds = _group_boundaries()
-    for b in bounds:
-        if 0 < b < n_apps:
-            ax.axvline(b - 0.5, color="#aaaaaa", linewidth=0.5,
-                       linestyle="--", zorder=0)
-    ymin, ymax = ax.get_ylim()
-    band_y = ymax * 0.95
-    rank = {a: i for i, a in enumerate(DIFFICULTY_ORDER)}
-    for label, apps in GROUPS.items():
-        idxs = [rank[a] for a in apps if a in rank]
-        if not idxs:
-            continue
-        center = (min(idxs) + max(idxs)) / 2.0
-        ax.text(center, band_y, label, fontsize=7, ha="center", va="top",
-                style="italic", color="#555555")
+    """No-op for the FlexScience 6-app layout (no complexity bands)."""
+    return
 
 # Trust filter: comparison charts need BOTH _baseline AND _reference
 # TRUSTED, since each bar shows LLM-vs-reference side-by-side.
@@ -279,7 +262,7 @@ def _load_archived_nofail_fallback(app: str, scenario: str, codebase: str) -> fl
     if "nofail" not in scenario:
         return None
     archives = sorted(
-        VAL_OUT.glob(f"{app}_reference.UNTRUSTED_pre_bench_recovery_*"),
+        (RESULTS / "reference").glob(f"{app}.UNTRUSTED_pre_bench_recovery_*"),
         key=lambda p: p.stat().st_mtime, reverse=True
     )
     for arc in archives:
@@ -327,7 +310,7 @@ def load_app(app: str) -> dict:
     """
     out = {"app": app, "category": _read_category(app)}
     for variant, suffix in [("llm", "baseline"), ("ref", "reference")]:
-        path = VAL_OUT / f"{app}_{suffix}" / "benchmarks" / "raw_metrics.json"
+        path = _bench_dir(app, suffix) / "benchmarks" / "raw_metrics.json"
         raw = json.loads(path.read_text()) if path.exists() else None
         if raw is None:
             out[f"ff_{variant}"] = None
@@ -370,7 +353,7 @@ def load_app(app: str) -> dict:
     # UNTRUSTED bench (post-recovery-fix re-collection dropped these cells).
     out["ff_van"] = None
     for suffix in ("reference", "baseline"):
-        ref_path = VAL_OUT / f"{app}_{suffix}" / "benchmarks" / "raw_metrics.json"
+        ref_path = _bench_dir(app, suffix) / "benchmarks" / "raw_metrics.json"
         if not ref_path.exists():
             continue
         ref_raw = json.loads(ref_path.read_text())
@@ -435,7 +418,10 @@ def plot_pair(
     value_fmt=lambda v: f"{v:.1f}",
     log_y: bool = False,
     legend_below: bool = False,
+    legend_loc: str = "upper right",
     strict_filter: bool = True,
+    fig_height: float = 3.8,
+    ylim: float | None = None,
 ) -> None:
     """Grouped bar chart: per app, one bar per `series` entry side by side.
 
@@ -479,7 +465,7 @@ def plot_pair(
     # in/app keeps bars + their value labels comfortably spaced as the app
     # set grows past the original fast tier).
     fig_w = max(7.0, 0.85 * n + 1.6)
-    fig, ax = plt.subplots(figsize=(fig_w, 3.8))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_height))
 
     # Bars take 80 % of the unit-wide app slot; remaining 20 % is the
     # inter-app gap.  With k bars per app, each bar gets 0.8/k width.
@@ -505,9 +491,7 @@ def plot_pair(
             ax.set_ylim(min(finite) * 0.4, max(finite) * 4.0)
     else:
         if finite:
-            # Headroom is 1.45× rather than 1.30× because the staggered
-            # value labels for the topmost bar can land 18+ pt above the bar.
-            ax.set_ylim(0, max(finite) * 1.45)
+            ax.set_ylim(0, ylim if ylim is not None else max(finite) * 1.45)
 
     # Compute the y position to use for "n/a" annotations (just above the
     # axis bottom).  On log scale we walk a decade up; on linear scale we
@@ -553,8 +537,7 @@ def plot_pair(
     # passes legend_below=True to relocate it under the plot.
     handles = [
         mpatches.Patch(facecolor=color, edgecolor="black", linewidth=0.6,
-                       hatch=hatch,
-                       label=(f"{label} — synthetic" if hatch else label))
+                       hatch=hatch, label=label)
         for label, color, _key, hatch in series
     ]
     if legend_below:
@@ -565,7 +548,7 @@ def plot_pair(
                   handlelength=1.2, handletextpad=0.5,
                   columnspacing=1.5, borderpad=0.4)
     else:
-        leg = ax.legend(handles=handles, loc="upper right",
+        leg = ax.legend(handles=handles, loc=legend_loc,
                   ncol=1, fontsize=9,
                   frameon=True, fancybox=False, edgecolor="black",
                   handlelength=1.0, handletextpad=0.5,
@@ -654,14 +637,16 @@ def main() -> None:
               ylabel="Execution time, failure-free (s)",
               fname_stem="fast_tier_compare_walltime_failure_free",
               value_fmt=_fmt_seconds,
-              strict_filter=False)
+              strict_filter=False,
+              fig_height=3.04, ylim=210)
 
     plot_pair(apps,
               series=time_series_once,
               ylabel="Execution time, failure-injected (s)",
               fname_stem="fast_tier_compare_walltime_failure_injected",
               value_fmt=_fmt_seconds,
-              strict_filter=False)
+              strict_filter=False,
+              fig_height=3.04, ylim=350)
 
     # Checkpoint-size chart: 2-bar LLM vs Reference (vanilla has no
     # checkpoint).  Log-scale y-axis spans many orders of magnitude.
@@ -674,8 +659,9 @@ def main() -> None:
               fname_stem="fast_tier_compare_checkpoint_per_frame",
               value_fmt=_fmt_bytes,
               log_y=True,
-              legend_below=True,
-              strict_filter=False)
+              legend_below=False, legend_loc="upper right",
+              strict_filter=False,
+              fig_height=3.04)
 
     print(f"\nSaved: {OUT_DIR}/")
     for f in sorted(OUT_DIR.glob("fast_tier_compare_*")):
